@@ -100,7 +100,12 @@ class QueryRouter:
         level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
     ) -> list[dict]:
         """
-        带三级降级链的检索入口。
+        带三级降级链 + Kuzu Cypher 最终兜底的检索入口。
+
+        L1 — HYPERGRAPH: Kuzu + FAISS 联合检索
+        L2 — VECTOR:     FAISS-only
+        L3 — KEYWORD:    TF-IDF 关键词检索
+        L4 — KUZU_FALLBACK: 直接 Cypher LIKE 查询（所有上游降级后的最终兜底）
 
         Args:
             query: 查询文本
@@ -108,10 +113,10 @@ class QueryRouter:
             level: 起始检索级别（默认从 L1 开始）
 
         Returns:
-            检索结果列表 [{"node_id": str, "content": str, "score": float, "level": str}, ...]
+            检索结果列表 [...]
 
         Raises:
-            RuntimeError: 三级全部降级失败
+            RuntimeError: 四级全部降级失败
         """
         strategy = self.detect_strategy(query)
         logger.info(
@@ -130,11 +135,9 @@ class QueryRouter:
         except FAISSUnavailable:
             logger.warning("L2 vector failed (FAISS unavailable), falling back to L3 keyword")
             return self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
-        except Exception:
-            logger.exception("All retrieval levels exhausted")
-            raise RuntimeError(
-                f"All three retrieval levels failed for query: {query[:100]}"
-            )
+        except Exception as e:
+            logger.exception("L1-L3 all failed, trying L4 Kuzu fallback")
+            return self._kuzu_text_fallback(query, str(e))
 
     def _hypergraph_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
@@ -157,16 +160,19 @@ class QueryRouter:
             raise FAISSUnavailable("No encoder available for query embedding")
 
         try:
-            hyperedge_scores = self.faiss_index.search(
+            distances, indices = self.faiss_index.search(
                 query_embedding, self.config.top_k_hyperedges
             )
+            hyperedge_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
         results: list[dict] = []
         for he_id, score in hyperedge_scores:
+            if he_id < 0:
+                continue
             try:
-                members = self.kuzu_store.get_hyperedge_members(he_id)
+                members = self.kuzu_store.get_hyperedge_members(str(he_id))
             except CircuitBreakerOpen:
                 raise
             except Exception:
@@ -177,7 +183,7 @@ class QueryRouter:
                     "content": member.get("content", ""),
                     "score": float(score),
                     "tau_value": member.get("tau_value", 0.0),
-                    "hyperedge_id": he_id,
+                    "hyperedge_id": str(he_id),
                     "level": RetrievalLevel.HYPERGRAPH.value,
                 })
 
@@ -200,21 +206,23 @@ class QueryRouter:
             raise FAISSUnavailable("No encoder available for query embedding")
 
         try:
-            node_scores = self.faiss_index.search(
+            distances, indices = self.faiss_index.search(
                 query_embedding, self.config.top_k_vector
             )
+            node_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
         return [
             {
-                "node_id": node_id,
+                "node_id": str(node_id) if node_id >= 0 else "",
                 "content": "",
                 "score": float(score),
                 "tau_value": 0.0,
                 "level": RetrievalLevel.VECTOR.value,
             }
             for node_id, score in node_scores
+            if node_id >= 0
         ]
 
     def _keyword_retrieve(self, query: str) -> list[dict]:
@@ -247,6 +255,58 @@ class QueryRouter:
                 "level": RetrievalLevel.KEYWORD.value,
             })
         return results
+
+    def _kuzu_text_fallback(
+        self, query: str, error_context: str = ""
+    ) -> list[dict]:
+        """
+        L4 Kuzu Cypher 全文兜底检索。
+
+        当 FAISS 和 TF-IDF 均不可用时，直接查询 Kuzu 数据库，
+        使用 Cypher CONTAINS 做文本匹配。
+
+        Returns:
+            检索结果列表 [{"node_id", "content", "score", "level": "kuzu_fallback"}, ...]
+            失败时返回空列表（不抛异常）。
+        """
+        if self.kuzu_store is None:
+            logger.warning("L4 fallback: kuzu_store unavailable")
+            return []
+
+        logger.info("L4 fallback: querying Kuzu directly", query=query[:80])
+        try:
+            # 提取关键词（取前5个有意义的词）
+            words = [w.strip().lower() for w in query.split() if len(w.strip()) > 1]
+            search_terms = words[:5]
+
+            if not search_terms:
+                return []
+
+            # 构建多个 CONTAINS 条件
+            conditions = " OR ".join(
+                f"e.content CONTAINS '{w}'" for w in search_terms
+            )
+            cypher = (
+                f"MATCH (e:EpisodeNode) WHERE {conditions} "
+                f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value "
+                f"LIMIT {self.config.top_k_keyword}"
+            )
+            rows = self.kuzu_store.query_cypher(cypher, {})
+            results = []
+            for row in rows:
+                rd = dict(row) if hasattr(row, "items") else row
+                results.append({
+                    "node_id": rd.get("node_id", ""),
+                    "content": rd.get("content", ""),
+                    "score": 0.5,
+                    "tau_value": rd.get("tau_value", 0.0),
+                    "level": "kuzu_fallback",
+                })
+            logger.info("L4 fallback results", count=len(results))
+            return results
+        except Exception:
+            logger.exception("L4 Kuzu text fallback failed")
+            return []
 
     def detect_strategy(self, query_text: str) -> RetrievalStrategy:
         """

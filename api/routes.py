@@ -172,7 +172,16 @@ async def create_episode(
         except Exception:
             emb = None
         if emb is not None and deps.faiss_index is not None:
-            pass  # FAISS 索引由梦境阶段统一更新
+            import numpy as np
+            emb_array = np.array([emb], dtype=np.float32)
+            faiss_id = abs(hash(episode_id)) % (2**63)
+            try:
+                deps.faiss_index.add_with_ids(emb_array, np.array([faiss_id], dtype=np.int64))
+                if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                    deps.faiss_id_map[faiss_id] = episode_id
+                logger.debug("FAISS index updated", new_size=deps.faiss_index.ntotal, episode_id=episode_id)
+            except Exception:
+                logger.warning("FAISS add_with_ids failed", episode_id=episode_id)
 
     if deps.dream_scheduler:
         await deps.dream_scheduler.on_activity()
@@ -284,6 +293,32 @@ async def retrieve(
     except Exception as exc:
         record_request("POST", "/memories/retrieve", "500", _now() - start)
         raise HTTPException(status_code=500, detail=str(exc))
+
+    # 当所有上游检索都返回空时，直接 Cypher 兜底
+    if not results_raw and deps.kuzu_store is not None:
+        try:
+            words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
+            if words:
+                conditions = " OR ".join(f"e.content CONTAINS '{w}'" for w in words[:5])
+                cypher = f"MATCH (e:EpisodeNode) WHERE {conditions} RETURN e.id AS node_id, e.content AS content LIMIT 10"
+                fallback_rows = deps.kuzu_store.query_cypher(cypher, {})
+                degraded = True
+                for row in fallback_rows:
+                    if isinstance(row, (list, tuple)):
+                        nid, content = row[0], row[1] if len(row) > 1 else ""
+                    elif isinstance(row, dict):
+                        nid, content = row.get("node_id", ""), row.get("content", "")
+                    else:
+                        continue
+                    results_raw.append({
+                        "node_id": str(nid),
+                        "content": str(content),
+                        "score": 0.5,
+                        "level": "kuzu_fallback",
+                    })
+                logger.info("Cypher fallback provided %d results", len(results_raw))
+        except Exception:
+            logger.exception("Cypher fallback failed")
 
     # 检查是否降级
     if results_raw:

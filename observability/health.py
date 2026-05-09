@@ -64,6 +64,34 @@ class HealthChecker:
             except Exception:
                 result.faiss_index_size = 0
 
+        # 查询真实节点数和超边数
+        if self.kuzu_store is not None:
+            try:
+                node_rows = self.kuzu_store.query_cypher(
+                    "MATCH (n) RETURN count(*) AS cnt"
+                )
+                if node_rows and len(node_rows) > 0:
+                    # Kuzu returns [[298]] not [{"cnt": 298}]
+                    row = node_rows[0]
+                    if isinstance(row, (list, tuple)):
+                        result.node_count = int(row[0])
+                    elif isinstance(row, dict):
+                        result.node_count = int(row.get("cnt", 0))
+            except Exception:
+                result.node_count = 0
+            try:
+                he_rows = self.kuzu_store.query_cypher(
+                    "MATCH (h:HyperedgeNode) RETURN count(*) AS cnt"
+                )
+                if he_rows and len(he_rows) > 0:
+                    row = he_rows[0]
+                    if isinstance(row, (list, tuple)):
+                        result.hyperedge_count = int(row[0])
+                    elif isinstance(row, dict):
+                        result.hyperedge_count = int(row.get("cnt", 0))
+            except Exception:
+                result.hyperedge_count = 0
+
         if self.audit_chain is not None:
             try:
                 result.chain_verified = self.audit_chain.verify_chain()

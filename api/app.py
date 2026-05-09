@@ -8,6 +8,7 @@ FastAPI 应用工厂
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -63,15 +64,11 @@ def _init_services() -> Services:
             import numpy as np
             dim = cfg.faiss.dimension
             index_type = cfg.faiss.index_type
-            if index_type == "IVFFlat":
-                quantizer = faiss.IndexFlatL2(dim)
-                svc.faiss_index = faiss.IndexIVFFlat(quantizer, dim, cfg.faiss.nlist)
-                if not svc.faiss_index.is_trained:
-                    svc.faiss_index.train(np.random.rand(1000, dim).astype(np.float32))
-                svc.faiss_index.nprobe = cfg.faiss.nprobe
-            else:
-                svc.faiss_index = faiss.IndexFlatL2(dim)
-            logger.info("FAISS index initialized", type=index_type, dim=dim)
+            base_index = faiss.IndexFlatL2(dim)
+            svc.faiss_index = faiss.IndexIDMap(base_index)
+            logger.info("FAISS index initialized", type="IDMap+FlatL2", dim=dim)
+            # 存储 faiss_id → node_id 的逆向映射（辅助调试）
+            svc.faiss_id_map: dict[int, str] = {}
         except Exception as e:
             errors.append(f"FAISS: {e}")
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))
@@ -228,8 +225,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     init_services(svc)
     logger.info("Services injected into route handlers")
 
+    # 启动梦境调度器后台轮询（每30秒检查一次触发条件）
+    DREAM_POLL_INTERVAL = 30.0
+
+    async def _dream_poll_loop() -> None:
+        logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)
+        while True:
+            try:
+                await asyncio.sleep(DREAM_POLL_INTERVAL)
+                if svc.dream_scheduler is not None and hasattr(svc.dream_scheduler, "check_and_trigger"):
+                    triggered = await svc.dream_scheduler.check_and_trigger()
+                    if triggered:
+                        logger.info("Dream triggered by poll loop")
+            except asyncio.CancelledError:
+                logger.info("Dream poll loop cancelled")
+                break
+            except Exception:
+                logger.exception("Dream poll error (non-fatal)")
+
+    poll_task = asyncio.create_task(_dream_poll_loop())
+
     yield
     # shutdown
+    poll_task.cancel()
     logger.info("SHM v4.0 shutting down")
 
 
