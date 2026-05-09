@@ -1,0 +1,88 @@
+# SHM v3.0 默认配置
+# 所有可调参数集中管理，运行时可通过环境变量 SHM_<section>__<key> 覆盖
+# 示例: SHM_TAU__TAU_DECAY_SECONDS=3600 覆盖 tau.tau_decay_seconds
+
+tau:
+  tau_initial: 1.0              # 初始 τ 值 (0, 1]
+  tau_decay_seconds: 1800        # 衰减时间常数（秒），30分钟
+  decay_threshold: 0.1           # 修剪阈值 (0, 1)
+  refresh_on_access: true        # 访问时是否刷新 τ
+
+hebbian:
+  k_sparsity: 8                  # 每节点保留的最强连接数 (DNC 经验值)
+  learning_rate: 0.1             # 学习率 η
+  decay_constant: 0.01           # 权重衰减常数
+  activation_threshold: 0.3      # 激活度阈值
+  max_connections_per_node: 64   # 单节点连接绝对上限
+
+ssm:
+  hidden_dim: 128                # 隐层维度
+  input_dim: 8                   # 输入特征维度
+  gate_threshold: 0.5            # 保留/遗忘阈值
+  state_decay: 0.9               # 状态衰减系数
+  feat_mean_activation: 0        # 特征索引: 超边内节点平均激活度
+  feat_age_hours: 1              # 特征索引: 超边年龄（小时）
+  feat_access_freq: 2            # 特征索引: 访问频率
+  feat_member_count: 3           # 特征索引: 成员节点数
+  feat_community_density: 4      # 特征索引: 社区密度
+  feat_tau_mean: 5               # 特征索引: 平均 τ 值
+  feat_tau_variance: 6           # 特征索引: τ 方差
+  feat_connection_entropy: 7     # 特征索引: 连接熵
+
+dream:
+  idle_timeout_seconds: 300      # 空闲触发等待时间（秒），5分钟
+  accum_threshold: 100           # 累积新节点触发阈值
+  min_interval_seconds: 60       # 最小梦境间隔（秒）
+  max_dream_duration_seconds: 300  # 单次梦境最长执行时间（秒）
+  cpu_affinity_low_priority: true  # 低优先级 CPU 亲和性
+  memory_limit_mb: 256           # 梦境线程内存限制（MB）
+
+kuzu:
+  database_path: "./data/shm_kuzu_db"  # Kuzu 数据库文件路径
+  buffer_pool_size_mb: 256       # 缓冲池大小（MB）
+  max_threads: 4                 # 最大工作线程数
+
+faiss:
+  dimension: 384                 # 向量维度（匹配 all-MiniLM-L6-v2）
+  index_type: "IVFFlat"          # FAISS 索引类型
+  nlist: 100                     # IVF 聚类中心数（IVFFlat 专用）
+  nprobe: 10                     # 搜索时探测的聚类数
+
+retrieval:
+  top_k_hyperedges: 5            # 粗粒度：返回的相关超边数
+  top_k_episodes: 20             # 中粒度：展开的情节数
+  top_k_facts: 50                # 细粒度：最终返回的事实数
+  score_threshold: 0.3           # 得分阈值过滤
+  use_tau_rerank: true           # 是否使用 τ 值重排序
+  tau_weight: 0.4                # τ 值权重（混合模式）
+  vector_weight: 0.6             # 向量相似度权重（混合模式）
+  max_topics: 3                  # 上下文预算：主题上限
+  max_episodes: 20               # 上下文预算：情节上限
+  max_facts: 50                  # 上下文预算：事实上限
+
+embedding:
+  model_name: "all-MiniLM-L6-v2" # sentence-transformers 模型名
+  device: "cpu"                  # 推理设备 (cpu/cuda)
+
+api:
+  host: "0.0.0.0"               # 服务监听地址
+  port: 8000                     # 服务监听端口
+  log_level: "INFO"              # 日志级别 (DEBUG/INFO/WARNING/ERROR)
+  cors_origins: ["*"]            # CORS 允许的源
+
+circuit_breaker:
+  failure_threshold: 0.5         # 错误率阈值（> 50% 跳闸）
+  recovery_timeout: 30.0         # 半开等待时间（秒）
+  half_open_max_requests: 1      # 半开探测请求数
+  window_size: 10                # 滑动窗口大小（最近 N 次请求）
+
+retry:
+  max_attempts: 3                # 最大重试次数
+  base_delay: 1.0                # 初始延迟（秒）
+  backoff: 2.0                   # 退避乘数
+  max_total_timeout: 0.0         # 全局超时（0=不限制）
+
+community:
+  template_threshold: 5          # ≤5 节点用模板，>5 用 LLM
+  jaccard_threshold: 0.8         # 冲突检测 Jaccard 相似度阈值
+  max_keywords: 10               # 模板报告最大关键词数
