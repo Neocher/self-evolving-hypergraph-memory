@@ -1,0 +1,145 @@
+"""
+深度健康检查
+===========
+提供系统各组件可用性和完整性检测：
+- Kuzu 连接状态 + 断路器状态
+- FAISS 索引状态（大小、可搜索）
+- BLAKE3 溯源链完整性
+- 梦境调度器状态
+- 系统资源使用情况
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+
+@dataclass
+class HealthCheckResult:
+    """健康检查结果（避免与 api/models.py 中的 HealthStatus 命名冲突）。"""
+
+    status: str  # 'ok' | 'degraded' | 'error'
+    kuzu_connected: bool
+    faiss_loaded: bool
+    faiss_index_size: int = 0
+    chain_verified: bool = True
+    dream_scheduler_running: bool = False
+    uptime_seconds: float = 0.0
+    node_count: int = 0
+    hyperedge_count: int = 0
+    last_dream_time: Optional[float] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+class HealthChecker:
+    """深度健康检查器，聚合各组件状态生成统一的健康检查报告。"""
+
+    def __init__(
+        self,
+        kuzu_store=None,
+        faiss_index=None,
+        audit_chain=None,
+        dream_scheduler=None,
+    ) -> None:
+        self.kuzu_store = kuzu_store
+        self.faiss_index = faiss_index
+        self.audit_chain = audit_chain
+        self.dream_scheduler = dream_scheduler
+        self._start_time = time.time()
+
+    def check(self) -> HealthCheckResult:
+        """执行完整的深度健康检查。"""
+        result = HealthCheckResult(
+            status="ok",
+            kuzu_connected=self._check_kuzu(),
+            faiss_loaded=self._check_faiss(),
+            uptime_seconds=time.time() - self._start_time,
+        )
+
+        if self.faiss_index is not None:
+            try:
+                result.faiss_index_size = self.faiss_index.ntotal
+            except Exception:
+                result.faiss_index_size = 0
+
+        if self.audit_chain is not None:
+            try:
+                result.chain_verified = self.audit_chain.verify_chain()
+            except Exception:
+                result.chain_verified = False
+
+        if self.dream_scheduler is not None:
+            result.dream_scheduler_running = getattr(
+                self.dream_scheduler, "_is_running", False
+            )
+
+        if not result.kuzu_connected:
+            result.status = "error"
+        elif not result.chain_verified or not result.faiss_loaded:
+            result.status = "degraded"
+
+        result.details = {
+            "circuit_breaker": self._check_circuit_breaker(),
+            "memory_usage": self._get_memory_usage(),
+        }
+
+        return result
+
+    def _check_kuzu(self) -> bool:
+        """检查 Kuzu 连接状态。"""
+        if self.kuzu_store is None:
+            return False
+        try:
+            self.kuzu_store.query_cypher("RETURN 1 AS test")
+            return True
+        except Exception:
+            return False
+
+    def _check_faiss(self) -> bool:
+        """检查 FAISS 索引状态。"""
+        if self.faiss_index is None:
+            return False
+        try:
+            _ = self.faiss_index.ntotal
+            return True
+        except Exception:
+            return False
+
+    def _check_circuit_breaker(self) -> Dict[str, Any]:
+        """检查断路器状态（适配滑动窗口接口）。"""
+        if self.kuzu_store is None:
+            return {"state": "unknown"}
+        cb = getattr(self.kuzu_store, "circuit_breaker", None)
+        if cb is None:
+            return {"state": "not_configured"}
+
+        window = getattr(cb, "_window", [])
+        window_size = len(window)
+        recent_failures = sum(1 for r in window if not r) if window_size > 0 else 0
+
+        return {
+            "state": cb.state.value if hasattr(cb.state, "value") else str(cb.state),
+            "window_size": window_size,
+            "recent_failures": recent_failures,
+            "success_rate": (
+                ((window_size - recent_failures) / window_size) * 100
+                if window_size > 0
+                else 100.0
+            ),
+        }
+
+    def _get_memory_usage(self) -> Dict[str, Any]:
+        """获取内存使用情况。"""
+        try:
+            import psutil
+
+            proc = psutil.Process()
+            mem = proc.memory_info()
+            return {
+                "rss_mb": round(mem.rss / 1024 / 1024, 2),
+                "vms_mb": round(mem.vms / 1024 / 1024, 2),
+            }
+        except ImportError:
+            return {"info": "psutil not available"}
