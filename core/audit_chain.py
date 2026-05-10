@@ -54,6 +54,13 @@ class AuditChain:
     def __init__(self, storage_backend: Optional[Callable] = None) -> None:
         self.storage = storage_backend
         self._chain: list[AuditBlock] = []
+        self._persist_path: Optional[str] = None  # 【FIX】文件持久化路径
+        if storage_backend is None:
+            # 默认使用文件持久化
+            import os
+            self._persist_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", "data", "audit_chain.json"
+            )
         self._load_chain()
 
     def _load_chain(self) -> None:
@@ -62,6 +69,22 @@ class AuditChain:
             data = self.storage("load")
             if data:
                 self._chain = data
+                return
+        # 【FIX】从文件加载兜底
+        if self._persist_path:
+            try:
+                import json
+                with open(self._persist_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._chain = []
+                for b in data:
+                    # 【FIX】将operations从dict还原为AuditOperation对象，保证hash计算正确
+                    ops = [AuditOperation(**op) if isinstance(op, dict) else op
+                           for op in b.get("operations", [])]
+                    b["operations"] = ops
+                    self._chain.append(AuditBlock(**b))
+            except (FileNotFoundError, json.JSONDecodeError, TypeError):
+                self._chain = []
 
     def _compute_hash(self, block: AuditBlock) -> str:
         """
@@ -140,6 +163,17 @@ class AuditChain:
         """保存链到存储"""
         if self.storage:
             self.storage("save", self._chain)
+            return
+        # 【FIX】写入文件兜底
+        if self._persist_path:
+            import json
+            import os
+            os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
+            with open(self._persist_path, 'w', encoding='utf-8') as f:
+                json.dump(
+                    [asdict(b) for b in self._chain],
+                    f, ensure_ascii=False, default=str
+                )
 
     @property
     def chain_length(self) -> int:
