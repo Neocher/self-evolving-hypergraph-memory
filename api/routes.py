@@ -655,6 +655,7 @@ async def health_check(
         "node_count": health.node_count,
         "hyperedge_count": health.hyperedge_count,
         "last_dream_time": health.last_dream_time,
+        "dream_run_count": health.dream_run_count,  # 【FIX】梦境运行次数
         "circuit_breaker": health.details.get("circuit_breaker", {}),
         "memory": health.details.get("memory_usage", {}),
     }
@@ -710,3 +711,76 @@ async def metrics() -> Response:
         return Response(content=data, media_type="text/plain; charset=utf-8")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Metrics collection failed: {e}")
+
+
+# ─── 【FIX】FAISS 索引重建 ─────────────────────────────────
+
+
+@router.post("/index/rebuild", summary="重建 FAISS 索引")
+async def rebuild_index(
+    deps: Services = Depends(get_services),
+) -> dict:
+    """
+    重建 FAISS 向量索引：
+    1. 从 Kuzu 读取所有 EpisodeNode
+    2. 对每个节点生成 embedding
+    3. 重建 FAISS IndexIDMap(FlatL2)
+    4. 返回重建结果统计
+    """
+    start = _now()
+    set_trace_id()
+
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.encoder is None:
+        raise HTTPException(status_code=503, detail="Text encoder not available")
+
+    import numpy as np
+    import faiss
+
+    # 获取所有节点
+    rows = deps.kuzu_store.query_cypher(
+        "MATCH (e:EpisodeNode) RETURN e.id, e.content LIMIT 10000"
+    )
+    if not rows:
+        return {"status": "ok", "indexed_count": 0, "message": "No episodes found"}
+
+    node_ids = []
+    contents = []
+    for row in rows:
+        if isinstance(row, (list, tuple)):
+            nid, content = str(row[0]), str(row[1]) if len(row) > 1 else ""
+        elif isinstance(row, dict):
+            nid, content = str(row.get("id", "")), str(row.get("content", ""))
+        else:
+            continue
+        if content.strip():
+            node_ids.append(nid)
+            contents.append(content)
+
+    if not contents:
+        return {"status": "ok", "indexed_count": 0, "message": "No episodes with content"}
+
+    # 批量编码
+    logger.info("Rebuilding FAISS index: encoding %d episodes", len(contents))
+    embeddings = deps.encoder.embed_batch(contents)
+    dim = embeddings.shape[1]
+
+    # 重建索引
+    new_index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+    faiss_ids = np.array([abs(hash(nid)) % (2**63) for nid in node_ids], dtype=np.int64)
+    new_index.add_with_ids(embeddings.astype(np.float32), faiss_ids)
+
+    # 替换现有索引
+    deps.faiss_index = new_index
+    if hasattr(deps, "faiss_id_map"):
+        deps.faiss_id_map = dict(zip(faiss_ids.tolist(), node_ids))
+
+    record_request("POST", "/index/rebuild", "200", _now() - start)
+    logger.info("FAISS index rebuilt: %d vectors", new_index.ntotal)
+    return {
+        "status": "ok",
+        "indexed_count": new_index.ntotal,
+        "total_nodes": len(node_ids),
+        "dimension": dim,
+    }
