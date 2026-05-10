@@ -61,6 +61,7 @@ class DreamScheduler:
         self._new_node_count: int = 0
         self._last_activity_time: float = time.time()
         self._lock = asyncio.Lock()
+        self._dream_run_count: int = 0  # 【FIX】梦境执行计数器
 
     async def on_activity(self) -> None:
         """记录活动时间戳（每次有节点创建/更新时调用）。"""
@@ -111,13 +112,57 @@ class DreamScheduler:
             return True
 
     async def _run_dream(self, trigger_mode: Optional[TriggerMode]) -> None:
-        """执行梦境管道（内部协程）。"""
+        """执行梦境管道（内部协程）。
+        
+        在调用 pipeline_fn 之前，从 Kuzu 拉取节点数据和连接图。
+        """
         logger.info("Dream triggered by %s mode", trigger_mode.value if trigger_mode else "unknown")
         try:
             if self.pipeline_fn:
-                await self.pipeline_fn()
+                # 【FIX】从Kuzu获取nodes和connections数据
+                nodes = []
+                connections = {}
+                kuzu_store = getattr(self, '_kuzu_store', None)
+                if kuzu_store is not None:
+                    try:
+                        # 获取所有EpisodeNode
+                        rows = kuzu_store.query_cypher(
+                            "MATCH (e:EpisodeNode) RETURN e.* ORDER BY e.created_at DESC LIMIT 10000"
+                        )
+                        if rows:
+                            for row in rows:
+                                if isinstance(row, dict):
+                                    nodes.append(row)
+                                elif isinstance(row, (list, tuple)) and len(row) > 0:
+                                    nodes.append({
+                                        "id": str(row[0]),
+                                        "content": str(row[1]) if len(row) > 1 else "",
+                                        "created_at": float(row[3]) if len(row) > 3 else 0.0,
+                                        "tau_initial": float(row[4]) if len(row) > 4 else 1.0,
+                                    })
+                        # 获取Hebbian连接
+                        edge_rows = kuzu_store.query_cypher(
+                            "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) "
+                            "RETURN a.id AS src, b.id AS dst, r.weight AS w LIMIT 5000"
+                        )
+                        if edge_rows:
+                            for row in edge_rows:
+                                if isinstance(row, dict):
+                                    s, d, w = row.get("src", ""), row.get("dst", ""), float(row.get("w", 0))
+                                elif isinstance(row, (list, tuple)):
+                                    s, d, w = str(row[0]), str(row[1]), float(row[2]) if len(row) > 2 else 0.0
+                                else:
+                                    continue
+                                connections.setdefault(s, {})[d] = w
+                        logger.info("Dream sourced data: %d nodes, %d connections", len(nodes), len(connections))
+                    except Exception as src_exc:
+                        logger.warning("Dream data sourcing failed, running with empty data: %s", src_exc)
+                
+                # 【FIX】正确传递nodes, connections, trigger_mode
+                await self.pipeline_fn(nodes, connections, trigger_mode.value if trigger_mode else "idle")
             self._new_node_count = 0
             self._last_run_time = time.time()
+            self._dream_run_count += 1  # 【FIX】计数
         except Exception:
             logger.exception("Dream pipeline failed")
         finally:
