@@ -26,6 +26,7 @@ class HealthCheckResult:
     faiss_index_size: int = 0
     chain_verified: bool = True
     dream_scheduler_running: bool = False
+    dream_run_count: int = 0  # 【FIX】梦境运行次数
     uptime_seconds: float = 0.0
     node_count: int = 0
     hyperedge_count: int = 0
@@ -102,6 +103,12 @@ class HealthChecker:
             result.dream_scheduler_running = getattr(
                 self.dream_scheduler, "_is_running", False
             )
+            # 【FIX】从调度器读取上次梦境运行时间
+            last_run = getattr(self.dream_scheduler, "_last_run_time", 0.0)
+            if last_run > 0.0:
+                result.last_dream_time = last_run
+            # 【FIX】读取梦境运行次数
+            result.dream_run_count = getattr(self.dream_scheduler, "_dream_run_count", 0)
 
         if not result.kuzu_connected:
             result.status = "error"
