@@ -117,13 +117,22 @@ def _init_services() -> Services:
         errors.append(f"SSMGate: {e}")
         logger.warning("SSMGate init failed", error=str(e))
 
-    # 7. 梦境管道 & 调度器
+    # 8. 溯源链（【FIX】移到了前面，确保dream_pipeline能接收audit_chain）
+    try:
+        from core.audit_chain import AuditChain
+        svc.audit_chain = AuditChain()
+        logger.info("AuditChain initialized")
+    except Exception as e:
+        errors.append(f"AuditChain: {e}")
+        logger.warning("AuditChain init failed", error=str(e))
+
+    # 7. 梦境管道 & 调度器（【FIX】移到audit_chain之后）
     try:
         from core.dream_pipeline import DreamPipeline
         svc.dream_pipeline = DreamPipeline(
             tau_engine=svc.tau_engine,
             hebbian_updater=svc.hebbian_updater,
-            audit_chain=svc.audit_chain,
+            audit_chain=svc.audit_chain,  # ← 现在有值了
         )
         from core.dream_scheduler import DreamScheduler, DreamSchedulerConfig
         dcfg = cfg.dream
@@ -140,19 +149,12 @@ def _init_services() -> Services:
             config=dream_cfg,
             pipeline_fn=pipeline_fn,
         )
+        # 【FIX】注入Kuzu引用供梦境调度器拉取数据
+        svc.dream_scheduler._kuzu_store = svc.kuzu_store
         logger.info("Dream system initialized")
     except Exception as e:
         errors.append(f"DreamSystem: {e}")
         logger.warning("Dream system init failed", error=str(e))
-
-    # 8. 溯源链
-    try:
-        from core.audit_chain import AuditChain
-        svc.audit_chain = AuditChain()
-        logger.info("AuditChain initialized")
-    except Exception as e:
-        errors.append(f"AuditChain: {e}")
-        logger.warning("AuditChain init failed", error=str(e))
 
     # 9. 查询路由
     try:
