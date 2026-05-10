@@ -158,8 +158,12 @@ class DreamScheduler:
                     except Exception as src_exc:
                         logger.warning("Dream data sourcing failed, running with empty data: %s", src_exc)
                 
-                # 【FIX】正确传递nodes, connections, trigger_mode
-                await self.pipeline_fn(nodes, connections, trigger_mode.value if trigger_mode else "idle")
+                # 【FIX】正确传递nodes, connections, trigger_mode, kuzu_store
+                await self.pipeline_fn(
+                    nodes, connections,
+                    trigger_mode.value if trigger_mode else "idle",
+                    kuzu_store=self._kuzu_store
+                )
             self._new_node_count = 0
             self._last_run_time = time.time()
             self._dream_run_count += 1  # 【FIX】计数

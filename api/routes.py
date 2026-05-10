@@ -179,6 +179,43 @@ async def create_episode(
                 deps.faiss_index.add_with_ids(emb_array, np.array([faiss_id], dtype=np.int64))
                 if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
                     deps.faiss_id_map[faiss_id] = episode_id
+
+                # 【FIX】Hebbian 连接：在FAISS中搜索最相似的前5个已有节点并建立连接
+                if deps.faiss_index.ntotal > 1:
+                    try:
+                        distances, indices = deps.faiss_index.search(emb_array, 6)  # 6 = 自己 + 5个邻居
+                        conn_count = 0
+                        for rank in range(1, len(indices[0])):  # range(1,6)跳过自己
+                            nb_id = int(indices[0][rank])
+                            if nb_id < 0 or nb_id == faiss_id:
+                                continue
+                            similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)  # L2转相似度
+                            if similarity < 0.3:
+                                continue  # 相似度太低不建连接
+                            # 查邻居的 episode_id
+                            nb_ep_id = None
+                            if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                                nb_ep_id = deps.faiss_id_map.get(nb_id)
+                            if not nb_ep_id:
+                                continue
+                            # 创建 HEBBIAN_CONNECTION（双向）
+                            deps.kuzu_store.query_cypher(
+                                "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
+                                "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                                {"aid": episode_id, "bid": nb_ep_id, "w": round(similarity, 4)}
+                            )
+                            deps.kuzu_store.query_cypher(
+                                "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
+                                "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                                {"aid": nb_ep_id, "bid": episode_id, "w": round(similarity, 4)}
+                            )
+                            conn_count += 1
+                        if conn_count > 0:
+                            logger.debug("Hebbian connections created: %d for episode %s",
+                                         conn_count, episode_id)
+                    except Exception as he:
+                        logger.warning("Hebbian connection creation failed: %s", he)
+
                 logger.debug("FAISS index updated", new_size=deps.faiss_index.ntotal, episode_id=episode_id)
             except Exception:
                 logger.warning("FAISS add_with_ids failed", episode_id=episode_id)
@@ -495,6 +532,18 @@ async def list_communities(
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Kuzu query failed: {e}")
 
+    def _to_dict(row):
+        """将 query_cypher 返回的 tuple 转为 dict（列名已知）。"""
+        keys = ["id", "name", "summary", "leiden_score", "created_at",
+                "member_count", "keywords"]
+        if isinstance(row, dict):
+            return row
+        if isinstance(row, (list, tuple)):
+            return {keys[i] if i < len(keys) else f"col_{i}": row[i]
+                    for i in range(len(row))}
+        return {}
+
+    row_dicts = [_to_dict(r) for r in rows]
     communities = [
         CommunityInfo(
             id=row.get("id", ""),
@@ -504,7 +553,7 @@ async def list_communities(
             keywords=row.get("keywords", []),
             leiden_score=row.get("leiden_score", 0.0),
         )
-        for row in rows
+        for row in row_dicts
     ]
 
     record_request("GET", "/communities", "200", _now() - start)
@@ -776,11 +825,46 @@ async def rebuild_index(
     if hasattr(deps, "faiss_id_map"):
         deps.faiss_id_map = dict(zip(faiss_ids.tolist(), node_ids))
 
+    # 【FIX】同时重建Hebbian连接
+    logger.info("Rebuilding Hebbian connections...")
+    hebbian_count = 0
+    # 先清空旧连接
+    try:
+        deps.kuzu_store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
+    except Exception:
+        pass
+    # 为每个节点找5个最相似邻居建连接
+    for i in range(len(node_ids)):
+        query_vec = embeddings[i:i+1].astype(np.float32)
+        try:
+            distances, indices = new_index.search(query_vec, 6)
+            for rank in range(1, len(indices[0])):
+                nb_idx = int(indices[0][rank])
+                if nb_idx < 0 or nb_idx == faiss_ids[i]:
+                    continue
+                similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)
+                if similarity < 0.3:
+                    continue
+                nb_node_id = node_ids[np.where(faiss_ids == nb_idx)[0][0]]
+                try:
+                    deps.kuzu_store.query_cypher(
+                        "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
+                        "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                        {"aid": node_ids[i], "bid": nb_node_id, "w": round(similarity, 4)}
+                    )
+                    hebbian_count += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     record_request("POST", "/index/rebuild", "200", _now() - start)
-    logger.info("FAISS index rebuilt: %d vectors", new_index.ntotal)
+    logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",
+                new_index.ntotal, hebbian_count)
     return {
         "status": "ok",
         "indexed_count": new_index.ntotal,
         "total_nodes": len(node_ids),
         "dimension": dim,
+        "hebbian_connections": hebbian_count,
     }
