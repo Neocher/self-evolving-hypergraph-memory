@@ -72,6 +72,7 @@ class DreamPipeline:
         nodes: list[dict],
         connections: dict[str, dict[str, float]],
         trigger_mode: str = "explicit",
+        kuzu_store=None,  # 【FIX】接收Kuzu引用，用于持久化结果
     ) -> DreamReport:
         """
         执行完整梦境管道。
@@ -82,7 +83,8 @@ class DreamPipeline:
         4. COMPRESS   → 报告限 500 token，前 20 TF-IDF 关键词，输出预算控制
         5. PRUNE      → TauDecayEngine + Hebbian 剪枝
         6. RESOLVE    → 检测同名/同事实的多版本冲突
-        7. AUDIT      → AuditChain.append_block()
+        7. PERSIST    → 【FIX】将结果写回Kuzu（CommunityNode/DELETE/合并/HyperedgeNode）
+        8. AUDIT      → AuditChain.append_block()
 
         Args:
             nodes: [{"id": str, "content": str, "created_at": float, ...}, ...]
@@ -127,7 +129,21 @@ class DreamPipeline:
         stats["updated"] += conflict_count
         logger.info("Dream %s: RESOLVE — %d conflicts resolved", dream_id, conflict_count)
 
-        # Step 7: AUDIT — 写入溯源链
+        # Step 7: PERSIST — 【FIX】将结果写回Kuzu
+        persist_created = 0
+        persist_deleted = 0
+        if kuzu_store is not None:
+            # 【FIX】先删再建：先执行PRUNE（DETACH DELETE）避免边约束冲突
+            persist_deleted = self._persist_prune(kuzu_store, prune_ops)
+            # 再建社区+超边
+            persist_created = self._persist_communities(kuzu_store, communities, dream_id)
+            self._persist_merge(kuzu_store, merge_ops)
+            self._persist_hyperedges(kuzu_store, communities, dream_id)
+            logger.info("Dream %s: PERSIST — %d communities created, %d nodes deleted",
+                        dream_id, persist_created, persist_deleted)
+        stats["created"] += persist_created
+
+        # Step 8: AUDIT — 写入溯源链
         audit_hash = ""
         if self.audit_chain:
             from core.audit_chain import AuditOperation
@@ -520,6 +536,119 @@ class DreamPipeline:
 
         remaining = [n for n in nodes if n["id"] not in merged]
         return remaining, ops
+
+    # ─── 【FIX】Kuzu持久化方法 ──────────────────────────────
+
+    def _persist_communities(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
+        """将CLUSTER结果写回Kuzu CommunityNode。
+        
+        先清理旧社区（DETACH DELETE所有CommunityNode及其边），再创建新的。
+        """
+        import json
+        created = 0
+        try:
+            # 【FIX】先清理旧社区，防止无限累积
+            kuzu_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c")
+        except Exception:
+            pass
+        for comm in communities:
+            try:
+                kuzu_store.query_cypher(
+                    "CREATE (c:CommunityNode {id: $id, name: $name, summary: $summary, "
+                    "leiden_score: $score, created_at: $created_at})",
+                    {
+                        "id": comm["id"],
+                        "name": f"dream_{dream_id[:8]}_comm_{created}",
+                        "summary": comm.get("report", "")[:800],
+                        "score": 0.0,
+                        "created_at": time.time(),
+                    }
+                )
+                for member_id in comm.get("members", []):
+                    try:
+                        kuzu_store.query_cypher(
+                            "MATCH (c:CommunityNode {id: $cid}), (e:EpisodeNode {id: $eid}) "
+                            "CREATE (c)-[:COMMUNITY_MEMBER]->(e)",
+                            {"cid": comm["id"], "eid": member_id}
+                        )
+                    except Exception:
+                        pass
+                created += 1
+            except Exception as e:
+                logger.warning("Community persist failed: %s", e)
+        return created
+
+    def _persist_prune(self, kuzu_store, prune_ops: list) -> int:
+        """将PRUNE剪枝结果执行真实的Kuzu DELETE。
+        
+        先删边再删节点，避免Kuzu外键约束错误。
+        """
+        deleted = 0
+        for op in prune_ops:
+            if op.op_type == "delete":
+                try:
+                    # 先用 DETACH 删掉所有指向该节点的边
+                    kuzu_store.query_cypher(
+                        "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
+                        {"id": op.node_id}
+                    )
+                    deleted += 1
+                except Exception:
+                    pass
+        return deleted
+
+    def _persist_merge(self, kuzu_store, merge_ops: list) -> None:
+        """将RESOLVE合并结果写回Kuzu（打标记 + DETACH DELETE被合并节点）。"""
+        for op in merge_ops:
+            if op.op_type == "update" and op.new_value:
+                try:
+                    # 把被合并节点的内容保存到目标节点
+                    kuzu_store.query_cypher(
+                        "MATCH (target:EpisodeNode {id: $target}) "
+                        "SET target.content = target.content + ' | merged: ' + $content",
+                        {"target": op.new_value, "content": op.old_value or ""}
+                    )
+                    # 删除被合并节点（DETACH先删边）
+                    kuzu_store.query_cypher(
+                        "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
+                        {"id": op.node_id}
+                    )
+                except Exception:
+                    pass
+
+    def _persist_hyperedges(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
+        """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。"""
+        import json
+        created = 0
+        for comm in communities:
+            members = comm.get("members", [])
+            if len(members) < 2:
+                continue
+            try:
+                hyperedge_id = str(uuid.uuid4())
+                metadata = json.dumps({
+                    "dream_id": dream_id,
+                    "community_id": comm["id"],
+                    "keywords": comm.get("keywords", []),
+                }, ensure_ascii=False)
+                kuzu_store.query_cypher(
+                    "CREATE (h:HyperedgeNode {id: $id, type: 'semantic', "
+                    "created_at: $created_at, gate_value: 1.0, metadata: $metadata})",
+                    {"id": hyperedge_id, "created_at": time.time(), "metadata": metadata}
+                )
+                for member_id in members:
+                    try:
+                        kuzu_store.query_cypher(
+                            "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: $eid}) "
+                            "CREATE (h)-[:HYPEREDGE_MEMBER]->(e)",
+                            {"hid": hyperedge_id, "eid": member_id}
+                        )
+                    except Exception:
+                        pass
+                created += 1
+            except Exception as e:
+                logger.warning("Hyperedge persist failed: %s", e)
+        return created
 
     def _jaccard_similarity(self, text_a: str, text_b: str) -> float:
         """计算两个文本的 Jaccard 相似度（基于词集）。"""
