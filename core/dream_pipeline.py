@@ -212,10 +212,10 @@ class DreamPipeline:
         connections: dict[str, dict[str, float]],
     ) -> list[dict]:
         """
-        Leiden 社区检测。
+        [C3] 并行 Leiden 社区检测。
 
-        将节点和连接转为 NetworkX 图，运行社区检测算法。
-        如 cdlib 不可用，回退到连通分量检测。
+        将图拆分为连通分量，每个分量独立并行运行社区检测，
+        最后合并结果。连通分量之间无边连接，天然独立可并行。
         """
         if len(nodes) < 2:
             return [
@@ -232,7 +232,50 @@ class DreamPipeline:
             ]
 
         G = self._build_nx_graph(nodes, connections)
-        partition = self._detect_communities(G)
+        import networkx as nx
+
+        # 拆为连通分量：每个分量独立可并行处理
+        components = list(nx.connected_components(G))
+        logger.info("CLUSTER: %d connected components from %d nodes",
+                    len(components), len(nodes))
+
+        # 并行处理 ≥2 个节点的分量，1 节点分量直接跳过
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        big_components = [comp for comp in components if len(comp) >= 2]
+        singleton_nodes = [list(comp)[0] for comp in components if len(comp) < 2]
+
+        sub_results: list[dict[str, int]] = []
+        if big_components:
+            def _cluster_subgraph(comp_nodes: set[str]) -> dict[str, int]:
+                """对单个连通分量运行社区检测。"""
+                sub = G.subgraph(comp_nodes).copy()
+                return self._detect_communities(sub)
+
+            with ThreadPoolExecutor(max_workers=min(4, len(big_components))) as pool:
+                futures = {pool.submit(_cluster_subgraph, comp): comp
+                          for comp in big_components}
+                for future in as_completed(futures):
+                    try:
+                        sub_results.append(future.result())
+                    except Exception:
+                        logger.exception("Subgraph clustering failed, "
+                                         "falling back to singletons")
+                        # 失败分量退回为单节点社区
+                        for nid in futures[future]:
+                            singleton_nodes.append(nid)
+
+        # 合并所有分区
+        partition: dict[str, int] = {}
+        next_comm = 0
+        for sp in sub_results:
+            for nid, cid in sp.items():
+                if nid not in partition:
+                    partition[nid] = next_comm
+                    next_comm += 1
+        for nid in singleton_nodes:
+            if nid not in partition:
+                partition[nid] = next_comm
+                next_comm += 1
 
         # 将节点按社区分组
         community_map: dict[int, list[dict]] = {}
