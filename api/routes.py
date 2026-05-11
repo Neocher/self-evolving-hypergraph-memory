@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from shm._version import __version__, __version_name__
+
 import numpy as np
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -798,6 +800,8 @@ async def health_check(
         record_circuit_breaker("kuzu", state_map.get(cb_state, 0))
 
     stats: Dict[str, Any] = {
+        "version": __version__,
+        "version_name": __version_name__,
         "uptime_seconds": health.uptime_seconds,
         "faiss_index_size": health.faiss_index_size,
         "chain_verified": health.chain_verified,

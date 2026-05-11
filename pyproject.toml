@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "4.0.0"
+version = "4.1.0"
 description = "Self-evolving Hypergraph Memory v4.0"
 requires-python = ">=3.10"
 dependencies = []
