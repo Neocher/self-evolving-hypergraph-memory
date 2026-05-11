@@ -156,6 +156,11 @@ def _init_services() -> Services:
         )
         # 【FIX】注入Kuzu引用供梦境调度器拉取数据
         svc.dream_scheduler._kuzu_store = svc.kuzu_store
+        # 注入FAISS引用供梦境后增量更新索引
+        svc.dream_scheduler._faiss_index = svc.faiss_index
+        svc.dream_scheduler._faiss_id_map = getattr(svc, "faiss_id_map", {})
+        from api.routes import incremental_faiss_update
+        svc.dream_scheduler._incremental_update_fn = incremental_faiss_update
         logger.info("Dream system initialized")
     except Exception as e:
         errors.append(f"DreamSystem: {e}")

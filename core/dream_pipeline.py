@@ -36,6 +36,8 @@ class DreamReport:
     compressed_episodes: int = 0
     compressed_facts: int = 0
     keywords_extracted: int = 0
+    pruned_node_ids: list[str] = field(default_factory=list)
+    new_episode_ids: list[str] = field(default_factory=list)
 
 
 class DreamPipeline:
@@ -132,15 +134,18 @@ class DreamPipeline:
         # Step 7: PERSIST — 【FIX】将结果写回Kuzu
         persist_created = 0
         persist_deleted = 0
+        all_removed_ids: list[str] = []  # FAISS 增量更新用
         if kuzu_store is not None:
             # 【FIX】先删再建：先执行PRUNE（DETACH DELETE）避免边约束冲突
-            persist_deleted = self._persist_prune(kuzu_store, prune_ops)
+            persist_deleted, pruned_ids = self._persist_prune(kuzu_store, prune_ops)
+            all_removed_ids.extend(pruned_ids)
             # 再建社区+超边
             persist_created = self._persist_communities(kuzu_store, communities, dream_id)
-            self._persist_merge(kuzu_store, merge_ops)
+            all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
+            self._persist_merge(kuzu_store, merge_ops)  # 执行实际 Kuzu DELETE
             self._persist_hyperedges(kuzu_store, communities, dream_id)
-            logger.info("Dream %s: PERSIST — %d communities created, %d nodes deleted",
-                        dream_id, persist_created, persist_deleted)
+            logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup",
+                        dream_id, persist_created, persist_deleted, len(all_removed_ids))
         stats["created"] += persist_created
 
         # Step 8: AUDIT — 写入溯源链
@@ -177,6 +182,7 @@ class DreamPipeline:
             compressed_episodes=episode_count,
             compressed_facts=fact_count,
             keywords_extracted=kw_count,
+            pruned_node_ids=all_removed_ids,
         )
 
     # ─── Step 1: GATHER ───────────────────────────────────
@@ -578,12 +584,14 @@ class DreamPipeline:
                 logger.warning("Community persist failed: %s", e)
         return created
 
-    def _persist_prune(self, kuzu_store, prune_ops: list) -> int:
+    def _persist_prune(self, kuzu_store, prune_ops: list) -> tuple[int, list[str]]:
         """将PRUNE剪枝结果执行真实的Kuzu DELETE。
-        
+
         先删边再删节点，避免Kuzu外键约束错误。
+        返回 (删除数量, 被删节点ID列表)
         """
         deleted = 0
+        pruned_ids: list[str] = []
         for op in prune_ops:
             if op.op_type == "delete":
                 try:
@@ -593,9 +601,10 @@ class DreamPipeline:
                         {"id": op.node_id}
                     )
                     deleted += 1
+                    pruned_ids.append(op.node_id)
                 except Exception:
                     logger.warning("Failed to DETACH DELETE pruned node from Kuzu", exc_info=True)
-        return deleted
+        return deleted, pruned_ids
 
     def _persist_merge(self, kuzu_store, merge_ops: list) -> None:
         """将RESOLVE合并结果写回Kuzu（打标记 + DETACH DELETE被合并节点）。"""
@@ -615,6 +624,12 @@ class DreamPipeline:
                     )
                 except Exception:
                     logger.warning("Failed to persist merge resolution in Kuzu", exc_info=True)
+
+    @staticmethod
+    def _persist_merge_get_removed(merge_ops: list) -> list[str]:
+        """从 merge_ops 中提取被删除的节点ID（给FAISS增量更新用）。"""
+        return [op.node_id for op in merge_ops
+                if op.op_type == "update" and op.node_id]
 
     def _persist_hyperedges(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
         """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。"""

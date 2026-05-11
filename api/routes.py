@@ -141,6 +141,43 @@ def flush_faiss_buffer(deps: Services) -> int:
         return 0
 
 
+def incremental_faiss_update(deps: Services, removed_node_ids: list[str]) -> int:
+    """
+    梦境后增量更新 FAISS 索引：删除被 PRUNE/RESOLVE 移除的节点向量。
+
+    Args:
+        deps: 服务容器
+        removed_node_ids: 从 Kuzu 删除的 EpisodeNode ID 列表
+
+    Returns:
+        实际从 FAISS 删除的向量数
+    """
+    if not removed_node_ids or deps.faiss_index is None:
+        return 0
+    try:
+        import numpy as np
+        removed = [int(uuid.uuid5(uuid.NAMESPACE_OID, str(nid)).int & ((1 << 63) - 1))
+                   for nid in removed_node_ids]
+        id_selector = np.array(removed, dtype=np.int64)
+        removed_count = deps.faiss_index.remove_ids(id_selector)
+
+        # 同步 faiss_id_map
+        if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+            remove_set = set(removed)
+            deps.faiss_id_map = {
+                k: v for k, v in deps.faiss_id_map.items()
+                if k not in remove_set
+            }
+
+        logger.info("FAISS incremental update: %d vectors removed (of %d requested)",
+                     removed_count, len(removed_node_ids))
+        return removed_count
+    except Exception:
+        logger.exception("FAISS incremental update failed, %d nodes pending cleanup",
+                         len(removed_node_ids))
+        return 0
+
+
 # ═══════════════════════════════════════════════════════════
 # 记忆写入
 # ═══════════════════════════════════════════════════════════

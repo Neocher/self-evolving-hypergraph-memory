@@ -62,6 +62,10 @@ class DreamScheduler:
         self._last_activity_time: float = time.time()
         self._lock = asyncio.Lock()
         self._dream_run_count: int = 0  # 【FIX】梦境执行计数器
+        # FAISS 增量更新引用（由 app.py 注入）
+        self._faiss_index = None
+        self._faiss_id_map: dict = {}
+        self._incremental_update_fn = None  # incremental_faiss_update 引用
 
     async def on_activity(self) -> None:
         """记录活动时间戳（每次有节点创建/更新时调用）。"""
@@ -168,11 +172,31 @@ class DreamScheduler:
                         logger.warning("Dream data sourcing failed, running with empty data: %s", src_exc)
                 
                 # 【FIX】正确传递nodes, connections, trigger_mode, kuzu_store
-                await self.pipeline_fn(
+                report = await self.pipeline_fn(
                     nodes, connections,
                     trigger_mode.value if trigger_mode else "idle",
                     kuzu_store=self._kuzu_store
                 )
+
+                # FAISS 增量更新：移除 PRUNE/RESOLVE 中删除的节点
+                if report and hasattr(report, "pruned_node_ids"):
+                    removed = report.pruned_node_ids
+                    if removed and self._incremental_update_fn:
+                        try:
+                            # 为增量更新构建临时依赖对象
+                            class _FaissDeps:
+                                faiss_index = self._faiss_index
+                                faiss_id_map = self._faiss_id_map
+                            count = self._incremental_update_fn(
+                                _FaissDeps(), removed
+                            )
+                            if count:
+                                logger.info(
+                                    "Dream FAISS cleanup: %d vectors removed",
+                                    count,
+                                )
+                        except Exception:
+                            logger.exception("Dream FAISS cleanup failed")
             self._new_node_count = 0
             self._last_run_time = time.time()
             self._dream_run_count += 1  # 【FIX】计数
