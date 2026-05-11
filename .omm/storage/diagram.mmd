@@ -1,0 +1,28 @@
+graph TD
+    subgraph "Kuzu GraphDB"
+        EN["EpisodeNode\nid, content, created_at\n1564 nodes"]
+        HN["HyperedgeNode\nid, name, score\n1526 edges"]
+        CN["CommunityNode\nid, summary, leiden_score\n(dream output)"]
+        CB["Circuit Breaker\nkuzu_store.py:45\n⚠️ HALF_OPEN → OPEN broken"]
+    end
+
+    subgraph "FAISS Vector Index"
+        FI["IndexIDMap + FlatL2\n44 vectors\n⚠️ ignore IVFFlat config"]
+        FM["faiss_id_map\nint → str(node_id)"]
+    end
+
+    subgraph "Hyperedge Manager"
+        HM["HyperedgeManager\ngraph/hyperedge.py"]
+        RES["Resolve Members\n:resolve_member_ids"]
+    end
+
+    EN ---|"HYPEREDGE_MEMBER"| HN
+    HN ---|"COMMUNITY_MEMBER"| CN
+    EN -->|"hash → faiss_id"| FI
+    HM -->|"get/create/delete"| HN
+    CB -->|"protects"| EN
+
+    classDef db fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    classDef warn fill:#f9e2af,stroke:#f9e2af,color:#1e1e2e
+    class EN,HN,CN db
+    class CB warn

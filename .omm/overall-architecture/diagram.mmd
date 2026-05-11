@@ -1,0 +1,50 @@
+graph TD
+    %% === 入口层 Layer1 ===
+    subgraph "Layer1: Memory Buffer"
+        sensory["Sensory Buffer\napi/routes.py:write_sensory"]
+        episode["Episode\napi/routes.py:create_episode"]
+        semantic["Semantic\n(via Hyperedge)"]
+    end
+
+    %% === 核心引擎 Layer2-4 ===
+    subgraph "Core Engine"
+        tau["τ Decay\ncore/tau_decay.py"]
+        hebbian["Hebbian\ncore/hebbian.py"]
+        ssm["SSM Gate\ncore/ssm_gate.py\n⚠️ NEVER CALLED"]
+        dream["Dream Pipeline\ncore/dream_pipeline.py"]
+        audit["Audit Chain\ncore/audit_chain.py"]
+    end
+
+    %% === 存储层 ===
+    subgraph "Storage Backend"
+        kuzu["Kuzu GraphDB\ngraph/kuzu_store.py"]
+        faiss["FAISS Vector Index\napi/app.py:67"]
+        hyperedge["Hyperedge Manager\ngraph/hyperedge.py"]
+    end
+
+    %% === 检索层 ===
+    subgraph "Retrieval"
+        router["Query Router\nretrieval/query_router.py"]
+        ctf["CoarseToFine\nretrieval/coarse_to_fine.py\n⚠️ DEAD CODE"]
+        community["Community Report\nretrieval/community_report.py"]
+    end
+
+    %% === 数据流 ===
+    sensory -->|"write_sensory"| episode
+    episode -->|"create_episode"| kuzu
+    episode -->|"add_with_ids"| faiss
+    episode -->|"should_keep?"| ssm
+    kuzu -->|"query_cypher"| dream
+    dream -->|"CLUSTER/RESOLVE"| kuzu
+    dream -->|"NOT indexed"| faiss
+    kuzu -->|"MATCH"| router
+    faiss -->|"search"| router
+    router -->|"L1→L2→L3→L4"| community
+
+    %% === 标注 ===
+    classDef concern fill:#f38ba8,stroke:#f38ba8,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    class ssm,ctf concern
+    class kuzu,faiss store
+    class sensory,episode entry

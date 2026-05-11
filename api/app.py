@@ -63,12 +63,17 @@ def _init_services() -> Services:
             import faiss
             import numpy as np
             dim = cfg.faiss.dimension
-            index_type = cfg.faiss.index_type
+            # 启动时始终用 FlatL2（不需要训练，立即可用）
+            # IVFFlat 在 POST /index/rebuild 时有真实数据才切换
             base_index = faiss.IndexFlatL2(dim)
             svc.faiss_index = faiss.IndexIDMap(base_index)
-            logger.info("FAISS index initialized", type="IDMap+FlatL2", dim=dim)
-            # 存储 faiss_id → node_id 的逆向映射（辅助调试）
+            svc.faiss_dim = dim
+            svc.faiss_index_type = cfg.faiss.index_type
+            svc.faiss_nlist = cfg.faiss.nlist
+
+            # 存 faiss_id → node_id 逆向映射
             svc.faiss_id_map: dict[int, str] = {}
+            logger.info("FAISS index initialized", type="FlatL2", dim=dim)
         except Exception as e:
             errors.append(f"FAISS: {e}")
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))
@@ -194,10 +199,11 @@ def _init_services() -> Services:
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(
-            tau_weight=getattr(rcfg, "tau_weight", 0.4),
-            vector_weight=getattr(rcfg, "vector_weight", 0.6),
-            top_k_hyperedges=getattr(rcfg, "top_k_hyperedges", 5),
-            top_k_episodes=getattr(rcfg, "top_k_episodes", 20),
+            tau_weight=rcfg.tau_weight,
+            vector_weight=rcfg.vector_weight,
+            top_k_l1=rcfg.top_k_l1,
+            top_k_vector=rcfg.top_k_vector,
+            top_k_keyword=rcfg.top_k_keyword,
         )
         svc.query_router = QueryRouter(**qr_kwargs)
         logger.info("QueryRouter initialized")
@@ -235,6 +241,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         while True:
             try:
                 await asyncio.sleep(DREAM_POLL_INTERVAL)
+                # 定期 flush FAISS 缓冲区
+                try:
+                    from api.routes import flush_faiss_buffer
+                    flushed = flush_faiss_buffer(svc)
+                    if flushed:
+                        logger.info("Periodic FAISS buffer flush: %d vectors", flushed)
+                except Exception:
+                    pass
                 if svc.dream_scheduler is not None and hasattr(svc.dream_scheduler, "check_and_trigger"):
                     triggered = await svc.dream_scheduler.check_and_trigger()
                     if triggered:
@@ -250,6 +264,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     yield
     # shutdown
     poll_task.cancel()
+    if svc.kuzu_store:
+        svc.kuzu_store.close()
     logger.info("SHM v4.0 shutting down")
 
 

@@ -60,6 +60,7 @@ class EpisodeResponse(BaseModel):
     tau_decay_seconds: float = Field(default=1800.0, description="τ 衰减时间常数（秒）")
     created_at: float = Field(..., description="创建时间戳（Unix 秒）")
     source: str = Field(default="user", description="来源标签")
+    status: str = Field(default="created", description="创建状态: created/filtered/error")
 
 
 # ─── Hyperedge 请求/响应 ───────────────────────────────────

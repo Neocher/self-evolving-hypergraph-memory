@@ -46,8 +46,7 @@ class QueryRouterConfig:
     """查询路由配置"""
     tau_weight: float = 0.4         # τ 值权重（混合模式）
     vector_weight: float = 0.6      # 向量相似度权重（混合模式）
-    top_k_hyperedges: int = 5       # L1 超边检索 top-K
-    top_k_episodes: int = 20        # L1 展开情节数
+    top_k_l1: int = 5               # L1 FAISS 检索 top-K (直接查 EpisodeNode)
     top_k_vector: int = 20          # L2 向量检索 top-K
     top_k_keyword: int = 20         # L3 关键词检索 top-K
 
@@ -161,31 +160,27 @@ class QueryRouter:
 
         try:
             distances, indices = self.faiss_index.search(
-                query_embedding, self.config.top_k_hyperedges
+                query_embedding, self.config.top_k_l1
             )
-            hyperedge_scores = list(zip(indices[0], distances[0]))
+            episode_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
         results: list[dict] = []
-        for he_id, score in hyperedge_scores:
-            if he_id < 0:
+        for ep_id, score in episode_scores:
+            if ep_id < 0:
                 continue
             try:
-                members = self.kuzu_store.get_hyperedge_members(str(he_id))
+                episode = self.kuzu_store.get_episode(str(ep_id))
             except CircuitBreakerOpen:
                 raise
             except Exception:
                 continue
-            for member in members[:self.config.top_k_episodes]:
-                results.append({
-                    "node_id": member.get("id", ""),
-                    "content": member.get("content", ""),
-                    "score": float(score),
-                    "tau_value": member.get("tau_value", 0.0),
-                    "hyperedge_id": str(he_id),
-                    "level": RetrievalLevel.HYPERGRAPH.value,
-                })
+            if episode:
+                episode["score"] = float(score)
+                episode["level"] = "l1_faiss"
+                episode["_source"] = "faiss"
+                results.append(episode)
 
         return self._deduplicate_and_sort(results)
 
@@ -283,15 +278,16 @@ class QueryRouter:
                 return []
 
             # 构建多个 CONTAINS 条件
+            params = {f"w{i}": w for i, w in enumerate(search_terms)}
             conditions = " OR ".join(
-                f"e.content CONTAINS '{w}'" for w in search_terms
+                f"e.content CONTAINS $w{i}" for i in range(len(search_terms))
             )
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE {conditions} "
                 f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value "
                 f"LIMIT {self.config.top_k_keyword}"
             )
-            rows = self.kuzu_store.query_cypher(cypher, {})
+            rows = self.kuzu_store.query_cypher(cypher, params)
             results = []
             for row in rows:
                 rd = dict(row) if hasattr(row, "items") else row

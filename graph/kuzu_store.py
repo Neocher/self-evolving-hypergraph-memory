@@ -12,6 +12,7 @@ Kuzu 嵌入式列式图数据库，Cypher 查询引擎。
 from __future__ import annotations
 
 import kuzu
+import logging
 import time
 from pathlib import Path
 from enum import Enum
@@ -75,6 +76,9 @@ class CircuitBreaker:
         if error_rate > self.config.failure_threshold:
             self.state = CircuitState.OPEN
             self.last_failure_time = time.time()
+        elif self.state == CircuitState.HALF_OPEN:
+            self.state = CircuitState.OPEN
+            self.last_failure_time = time.time()
 
     def is_available(self) -> bool:
         """
@@ -130,16 +134,34 @@ class KuzuStore:
     def __init__(self, config: Optional[KuzuConfig] = None) -> None:
         self.config = config or KuzuConfig()
         self.db: Optional[kuzu.Database] = None
-        self.conn: Optional[kuzu.Connection] = None
+        self._connections: list[kuzu.Connection] = []  # 连接池
+        self._conn_pool_idx: int = 0
         # [Harness Fix] 断路器实例
         self.circuit_breaker: CircuitBreaker = CircuitBreaker()
+        from collections import deque
+        self._sensory_buffer: deque = deque(maxlen=1000)
+
+    @property
+    def conn(self) -> kuzu.Connection:
+        """轮询从连接池中获取下一个连接。"""
+        if not self._connections:
+            raise RuntimeError("KuzuStore not connected (connection pool empty)")
+        self._conn_pool_idx = (self._conn_pool_idx + 1) % len(self._connections)
+        return self._connections[self._conn_pool_idx]
 
     def connect(self) -> None:
-        """连接/创建 Kuzu 数据库并初始化 schema"""
+        """连接/创建 Kuzu 数据库并初始化 schema + 连接池。"""
         db_path = Path(self.config.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = kuzu.Database(str(db_path))
-        self.conn = kuzu.Connection(self.db)
+
+        # 创建连接池（默认 4 个连接，与 max_threads 一致）
+        pool_size = max(2, self.config.max_threads or 4)
+        for i in range(pool_size):
+            c = kuzu.Connection(self.db)
+            self._connections.append(c)
+        logger.info("Kuzu connection pool created", pool_size=pool_size)
+
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -349,12 +371,17 @@ class KuzuStore:
             dicts = rows.to_dicts()
             if dicts:
                 return [_clean_kuzu_row(r) for r in dicts]
+            return []
 
         return self._execute_with_circuit_breaker(_do_query)
 
     def close(self) -> None:
-        """关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
+        """关闭所有数据库连接"""
+        for c in self._connections:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._connections.clear()
         if self.db:
             self.db.close()

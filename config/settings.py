@@ -84,16 +84,15 @@ class FAISSConfig:
 
 @dataclass
 class RetrievalConfig:
-    top_k_hyperedges: int = 5
-    top_k_episodes: int = 20
-    top_k_facts: int = 50
-    score_threshold: float = 0.3
-    use_tau_rerank: bool = True
-    tau_weight: float = 0.4
-    vector_weight: float = 0.6
-    max_topics: int = 3
-    max_episodes: int = 20
-    max_facts: int = 50
+    top_k_l1: int = 5              # L1 FAISS 检索 top-K
+    top_k_vector: int = 20         # L2 向量检索 top-K
+    top_k_keyword: int = 20        # L3 关键词检索 top-K
+    top_k_episodes: int = 20       # 中粒度：展开的情节数
+    top_k_facts: int = 50          # 细粒度：最终返回的事实数
+    score_threshold: float = 0.3   # 得分阈值过滤
+    use_tau_rerank: bool = True    # 是否使用 τ 值重排序
+    tau_weight: float = 0.4        # τ 值权重（混合模式）
+    vector_weight: float = 0.6     # 向量相似度权重（混合模式）
 
 
 @dataclass

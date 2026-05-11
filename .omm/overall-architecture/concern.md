@@ -1,0 +1,1 @@
+P0级问题：① FAISS存储EpisodeNode哈希ID但检索端当Hyperedge UUID查（query_router.py:175），L1检索永远返回空；② KuzuStore._sensory_buffer从未定义（routes.py:115），Layer1环形缓冲区不存在，感觉数据直接写EpisodeNode；③ SSM门控（ssm_gate.py）在app.py:112初始化但从未被任何代码调用；④ CoarseToFineRetriever（coarse_to_fine.py）207行孤立死代码，无人导入。

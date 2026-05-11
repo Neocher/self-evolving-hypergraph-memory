@@ -1,0 +1,42 @@
+graph TD
+    subgraph "Phase 0 🔥 安全底线"
+        P0A["Cypher注入\nroutes.py:339\n→ $param"]
+        P0B["Cypher注入\nquery_router.py:287\n→ $param"]
+        P0C["get_hyperedges\n返回None\n→ +return []"]
+        P0D["梦境异常静默\n5处except pass\n→ +logger"]
+        P0E["shutdown释放\napp.py:250\n→ +close()"]
+    end
+
+    subgraph "Phase 1 ⚡ 功能修复"
+        P1A["FAISS检索错位\nquery_router.py:163\n→ ep_id→episode查"]
+        P1B["sensory_buffer\nkuzu_store.py\n→ +deque maxlen"]
+        P1C["HALF_OPEN\nkuzu_store.py:68\n→ +elif check"]
+        P1D["SSM接入\nroutes.py:create_episode\n→ +step调用"]
+    end
+
+    subgraph "Phase 2 🧹 质量加固"
+        P2A["删死代码\ncoarse_to_fine.py\n→ -207行"]
+        P2B["FAISS_ID稳定\nhash→UUID.int\nroutes.py:177"]
+        P2C["配置统一\n3份→1份\nsettings.py"]
+        P2D["FAISS IVFFlat\napp.py:67\n→ +index_type check"]
+    end
+
+    subgraph "Phase 3 🏗️ 架构升级"
+        P3A["测试覆盖\ntests/*.py\n→ +200行"]
+        P3B["梦境异步化\nrun_in_executor\ndream_pipeline.py"]
+        P3C["梦境结果检索\n→ 加入FAISS"]
+    end
+
+    P0A --> P1A --> P2A --> P3A
+    P0B --> P1B --> P2B --> P3B
+    P0C --> P1C
+    P0D --> P1D
+
+    classDef p0 fill:#f38ba8,stroke:#f38ba8,color:#1e1e2e
+    classDef p1 fill:#fab387,stroke:#fab387,color:#1e1e2e
+    classDef p2 fill:#f9e2af,stroke:#f9e2af,color:#1e1e2e
+    classDef p3 fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    class P0A,P0B,P0C,P0D,P0E p0
+    class P1A,P1B,P1C,P1D p1
+    class P2A,P2B,P2C,P2D p2
+    class P3A,P3B,P3C p3

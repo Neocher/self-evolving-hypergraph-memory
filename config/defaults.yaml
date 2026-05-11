@@ -49,16 +49,15 @@ faiss:
   nprobe: 10                     # 搜索时探测的聚类数
 
 retrieval:
-  top_k_hyperedges: 5            # 粗粒度：返回的相关超边数
+  top_k_l1: 5                    # L1 FAISS 检索 top-K (直接查 EpisodeNode)
+  top_k_vector: 20               # L2 向量检索 top-K
+  top_k_keyword: 20              # L3 关键词检索 top-K
   top_k_episodes: 20             # 中粒度：展开的情节数
   top_k_facts: 50                # 细粒度：最终返回的事实数
   score_threshold: 0.3           # 得分阈值过滤
   use_tau_rerank: true           # 是否使用 τ 值重排序
   tau_weight: 0.4                # τ 值权重（混合模式）
   vector_weight: 0.6             # 向量相似度权重（混合模式）
-  max_topics: 3                  # 上下文预算：主题上限
-  max_episodes: 20               # 上下文预算：情节上限
-  max_facts: 50                  # 上下文预算：事实上限
 
 embedding:
   model_name: "all-MiniLM-L6-v2" # sentence-transformers 模型名

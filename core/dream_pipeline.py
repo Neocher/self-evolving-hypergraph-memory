@@ -550,7 +550,7 @@ class DreamPipeline:
             # 【FIX】先清理旧社区，防止无限累积
             kuzu_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c")
         except Exception:
-            pass
+            logger.warning("Community DETACH DELETE failed", exc_info=True)
         for comm in communities:
             try:
                 kuzu_store.query_cypher(
@@ -572,7 +572,7 @@ class DreamPipeline:
                             {"cid": comm["id"], "eid": member_id}
                         )
                     except Exception:
-                        pass
+                        logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
                 created += 1
             except Exception as e:
                 logger.warning("Community persist failed: %s", e)
@@ -594,7 +594,7 @@ class DreamPipeline:
                     )
                     deleted += 1
                 except Exception:
-                    pass
+                    logger.warning("Failed to DETACH DELETE pruned node from Kuzu", exc_info=True)
         return deleted
 
     def _persist_merge(self, kuzu_store, merge_ops: list) -> None:
@@ -614,7 +614,7 @@ class DreamPipeline:
                         {"id": op.node_id}
                     )
                 except Exception:
-                    pass
+                    logger.warning("Failed to persist merge resolution in Kuzu", exc_info=True)
 
     def _persist_hyperedges(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
         """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。"""
@@ -644,7 +644,7 @@ class DreamPipeline:
                             {"hid": hyperedge_id, "eid": member_id}
                         )
                     except Exception:
-                        pass
+                        logger.warning("Failed to CREATE HYPEREDGE_MEMBER edge", exc_info=True)
                 created += 1
             except Exception as e:
                 logger.warning("Hyperedge persist failed: %s", e)

@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from api.models import (
@@ -58,6 +60,9 @@ class Services:
 
     kuzu_store: Any = None
     faiss_index: Any = None
+    faiss_dim: int = 384
+    faiss_index_type: str = "IVFFlat"
+    faiss_nlist: int = 100
     tau_engine: Any = None
     hebbian_updater: Any = None
     ssm_gate: Any = None
@@ -67,6 +72,9 @@ class Services:
     query_router: Any = None
     encoder: Any = None
     hyperedge_manager: Any = None
+    # FAISS 批量写入缓冲区
+    _faiss_buffer: list[tuple] = field(default_factory=list)
+    _faiss_buffer_lock: Any = None
 
 
 _services: Optional[Services] = None
@@ -75,6 +83,8 @@ _services: Optional[Services] = None
 def init_services(svc: Services) -> None:
     """由 app.py 在启动时调用，注入服务容器。"""
     global _services
+    import threading
+    svc._faiss_buffer_lock = threading.Lock()
     _services = svc
 
 
@@ -93,6 +103,42 @@ def _ok(data: dict) -> dict:
 
 def _now() -> float:
     return time.time()
+
+
+_FAISS_BATCH_SIZE = 10  # 攒够 10 条后批量写入 FAISS
+
+
+def flush_faiss_buffer(deps: Services) -> int:
+    """
+    将 FAISS 缓冲区中的待写入项批量写入索引。
+
+    Returns:
+        实际写入的数量
+    """
+    if not deps._faiss_buffer or deps.faiss_index is None:
+        return 0
+    with deps._faiss_buffer_lock:
+        batch = deps._faiss_buffer[:]
+        deps._faiss_buffer.clear()
+    if not batch:
+        return 0
+    try:
+        import numpy as np
+        ids = np.array([item[0] for item in batch], dtype=np.int64)
+        vecs = np.array([item[1] for item in batch], dtype=np.float32)
+        deps.faiss_index.add_with_ids(vecs, ids)
+        # 更新 id_map
+        if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+            for faiss_id, ep_id in batch:
+                deps.faiss_id_map[int(faiss_id)] = ep_id
+        logger.debug("FAISS batch flush: %d vectors added", len(batch))
+        return len(batch)
+    except Exception:
+        logger.warning("FAISS batch flush failed, %d vectors pending", len(batch))
+        # 重新放回缓冲区
+        with deps._faiss_buffer_lock:
+            deps._faiss_buffer.extend(batch)
+        return 0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -158,6 +204,22 @@ async def create_episode(
         if tau_initial < deps.tau_engine.config.decay_threshold and not req.force_promote:
             raise HTTPException(status_code=400, detail="τ below threshold; use force_promote=true")
 
+    # SSM门控过滤：低价值内容跳过持久化
+    if deps.ssm_gate is not None and deps.tau_engine is not None:
+        features = np.array([
+            float(len(req.content)),            # 内容长度
+            float(created_at - time.time()),    # 时间衰减信号
+        ], dtype=np.float32)
+        if features.shape[0] != deps.ssm_gate.config.state_dim:
+            features = np.pad(features, (0, max(0, deps.ssm_gate.config.state_dim - features.shape[0])),
+                             mode="constant")[:deps.ssm_gate.config.state_dim]
+        hidden, gate_value = deps.ssm_gate.step(features, deps.ssm_gate.hidden_state)
+        deps.ssm_gate.hidden_state = hidden
+        if not deps.ssm_gate.should_keep(gate_value, threshold=0.3):
+            logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))
+            return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
+                                   content=req.content, source=req.source)
+
     deps.kuzu_store.create_episode({
         "id": episode_id,
         "content": req.content,
@@ -173,52 +235,52 @@ async def create_episode(
             emb = None
         if emb is not None and deps.faiss_index is not None:
             import numpy as np
-            emb_array = np.array([emb], dtype=np.float32)
-            faiss_id = abs(hash(episode_id)) % (2**63)
+            faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, str(episode_id)).int & ((1 << 63) - 1))
+            emb_array = emb.reshape(1, -1).astype(np.float32)
+
+            # 缓冲写入，攒够批量再 flush
+            with deps._faiss_buffer_lock:
+                deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
+                buf_size = len(deps._faiss_buffer)
+
+            # 攒够批量 → 立即 flush
+            if buf_size >= _FAISS_BATCH_SIZE:
+                flush_faiss_buffer(deps)
+
+            # 【FIX】Hebbian 连接：立即 flush 以确保新向量在索引中可搜索
             try:
-                deps.faiss_index.add_with_ids(emb_array, np.array([faiss_id], dtype=np.int64))
-                if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
-                    deps.faiss_id_map[faiss_id] = episode_id
-
-                # 【FIX】Hebbian 连接：在FAISS中搜索最相似的前5个已有节点并建立连接
+                flush_faiss_buffer(deps)
                 if deps.faiss_index.ntotal > 1:
-                    try:
-                        distances, indices = deps.faiss_index.search(emb_array, 6)  # 6 = 自己 + 5个邻居
-                        conn_count = 0
-                        for rank in range(1, len(indices[0])):  # range(1,6)跳过自己
-                            nb_id = int(indices[0][rank])
-                            if nb_id < 0 or nb_id == faiss_id:
-                                continue
-                            similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)  # L2转相似度
-                            if similarity < 0.3:
-                                continue  # 相似度太低不建连接
-                            # 查邻居的 episode_id
-                            nb_ep_id = None
-                            if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
-                                nb_ep_id = deps.faiss_id_map.get(nb_id)
-                            if not nb_ep_id:
-                                continue
-                            # 创建 HEBBIAN_CONNECTION（双向）
-                            deps.kuzu_store.query_cypher(
-                                "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                                "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
-                                {"aid": episode_id, "bid": nb_ep_id, "w": round(similarity, 4)}
-                            )
-                            deps.kuzu_store.query_cypher(
-                                "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                                "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
-                                {"aid": nb_ep_id, "bid": episode_id, "w": round(similarity, 4)}
-                            )
-                            conn_count += 1
-                        if conn_count > 0:
-                            logger.debug("Hebbian connections created: %d for episode %s",
-                                         conn_count, episode_id)
-                    except Exception as he:
-                        logger.warning("Hebbian connection creation failed: %s", he)
-
-                logger.debug("FAISS index updated", new_size=deps.faiss_index.ntotal, episode_id=episode_id)
-            except Exception:
-                logger.warning("FAISS add_with_ids failed", episode_id=episode_id)
+                    distances, indices = deps.faiss_index.search(emb_array, 6)
+                    conn_count = 0
+                    for rank in range(1, len(indices[0])):
+                        nb_id = int(indices[0][rank])
+                        if nb_id < 0 or nb_id == faiss_id:
+                            continue
+                        similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)
+                        if similarity < 0.3:
+                            continue
+                        nb_ep_id = None
+                        if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                            nb_ep_id = deps.faiss_id_map.get(nb_id)
+                        if not nb_ep_id:
+                            continue
+                        deps.kuzu_store.query_cypher(
+                            "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
+                            "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                            {"aid": episode_id, "bid": nb_ep_id, "w": round(similarity, 4)}
+                        )
+                        deps.kuzu_store.query_cypher(
+                            "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
+                            "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                            {"aid": nb_ep_id, "bid": episode_id, "w": round(similarity, 4)}
+                        )
+                        conn_count += 1
+                    if conn_count > 0:
+                        logger.debug("Hebbian connections created: %d for episode %s",
+                                     conn_count, episode_id)
+            except Exception as he:
+                logger.warning("Hebbian connection creation failed: %s", he)
 
     if deps.dream_scheduler:
         await deps.dream_scheduler.on_activity()
@@ -336,9 +398,10 @@ async def retrieve(
         try:
             words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
             if words:
-                conditions = " OR ".join(f"e.content CONTAINS '{w}'" for w in words[:5])
+                params = {f"w{i}": w for i, w in enumerate(words[:5])}
+                conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words[:5])))
                 cypher = f"MATCH (e:EpisodeNode) WHERE {conditions} RETURN e.id AS node_id, e.content AS content LIMIT 10"
-                fallback_rows = deps.kuzu_store.query_cypher(cypher, {})
+                fallback_rows = deps.kuzu_store.query_cypher(cypher, params)
                 degraded = True
                 for row in fallback_rows:
                     if isinstance(row, (list, tuple)):
@@ -813,11 +876,27 @@ async def rebuild_index(
     # 批量编码
     logger.info("Rebuilding FAISS index: encoding %d episodes", len(contents))
     embeddings = deps.encoder.embed_batch(contents)
-    dim = embeddings.shape[1]
 
     # 重建索引
-    new_index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
-    faiss_ids = np.array([abs(hash(nid)) % (2**63) for nid in node_ids], dtype=np.int64)
+    dim = deps.faiss_dim
+    index_type = deps.faiss_index_type
+
+    if index_type == "IVFFlat" and len(embeddings) >= deps.faiss_nlist * 2:
+        nlist = min(deps.faiss_nlist, len(embeddings) // 2)
+        quantizer = faiss.IndexFlatL2(dim)
+        base_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
+        base_index.train(embeddings.astype(np.float32))
+        new_index = faiss.IndexIDMap(base_index)
+        new_index.set_nprobe(min(deps.faiss_nlist // 10, 10))  # 搜索探测数
+        logger.info("FAISS rebuilt with IVFFlat", dim=dim, nlist=nlist, nprobe=10, vectors=len(embeddings))
+    else:
+        new_index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+        logger.info("FAISS rebuilt with FlatL2", dim=dim, vectors=len(embeddings))
+
+    faiss_ids = np.array([
+        uuid.uuid5(uuid.NAMESPACE_OID, str(nid)).int & ((1 << 63) - 1)
+        for nid in node_ids
+    ], dtype=np.int64)
     new_index.add_with_ids(embeddings.astype(np.float32), faiss_ids)
 
     # 替换现有索引

@@ -1,0 +1,21 @@
+graph LR
+    %% === 写路径 ===
+    subgraph "WRITE PATH: POST /memories/episodes"
+        A["routes.create_episode\nroutes.py:161"] --> B["Create Kuzu Node\nkuzu_store.py:create_episode\n:120-160"]
+        A --> C["Compute τ\nτ → tau_initial only\n:165"]
+        A --> D["Embed + FAISS Index\nencoder.embed → faiss.add_with_ids\n:170-180"]
+        D --> E["Build Hebbian\nFAISS search(k=6) → Kuzu CREATE\n:184-212 ⚠️ 60+行单函数"]
+        E --> F["Notify Dream\nscheduler.on_node_created\n:214"]
+    end
+
+    subgraph "READ PATH: POST /query"
+        G["router.retrieve\nquery_router.py:130"] --> H["L1: FAISS search\n:163 ⚠️ 存的是episode查的是hyperedge"]
+        H -->|"L1 fails (always)"| I["L2: CoarseToFine\n:200 ⚠️ DEAD CODE never imported"]
+        I -->|"L2 unavailable"| J["L3: Community Report\n:230"]
+        J -->|"L3 falls back"| K["L4: Kuzu Cypher\nroutes.py:339 ⚠️ Cypher injection"]
+    end
+
+    classDef concern fill:#f38ba8,stroke:#f38ba8,color:#1e1e2e
+    classDef ok fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class H,I,K concern
+    class A,G entry

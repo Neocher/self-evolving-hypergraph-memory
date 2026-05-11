@@ -1,0 +1,29 @@
+graph LR
+    subgraph "Data Write Flow"
+        S["Sensory Input\nroutes.py:105"] -->|"🔴 goes to EpisodeNode\n_sensory_buffer missing"| K1["Kuzu: EpisodeNode"]
+        EP["POST /memories/episodes\nroutes.py:161"] -->|"✅ create_episode"| K1
+        K1 -->|"✅ τ calculated"| T["tau_decay.py"]
+        K1 -->|"✅ embeddings"| F["FAISS Index\n(episode_id → vector)"]
+        K1 -->|"⚠️ Hebbian连接\n用FAISS搜6个邻居"| K2["Kuzu: HyperedgeNode"]
+    end
+
+    subgraph "Dream Pipeline Flow"
+        D["Dream Scheduler\ncore/dream_scheduler.py"] -->|"每60s轮询"| PL["Dream Pipeline\ncore/dream_pipeline.py"]
+        PL -->|"CLUSTER"| K3["Kuzu: CommunityNode"]
+        PL -->|"CREATE Hyperedge"| K2
+        PL -->|"🔴 NOT in FAISS"| F
+        PL -->|"🔴 PRUNE delete"| K1
+    end
+
+    subgraph "Read Flow"
+        Q["/query\nroutes.py:328"] -->|"query_router.retrieve"| R["Query Router\nretrieval/query_router.py"]
+        R -->|"L1: 🔴 FAISS search\nepisode_id→hyperedge_id"| F
+        R -->|"L2: 🔴 DEAD CODE"| C["CoarseToFine\ncoarse_to_fine.py"]
+        R -->|"L3: ✅ Community"| COM["Community Report"]
+        R -->|"L4: ⚠️ Cypher注入"| K1
+    end
+
+    classDef danger fill:#f38ba8,stroke:#f38ba8,color:#1e1e2e
+    classDef ok fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class S,C danger
+    class K1,F,T ok

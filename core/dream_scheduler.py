@@ -125,11 +125,17 @@ class DreamScheduler:
                 kuzu_store = getattr(self, '_kuzu_store', None)
                 if kuzu_store is not None:
                     try:
-                        # 获取所有EpisodeNode
-                        rows = kuzu_store.query_cypher(
-                            "MATCH (e:EpisodeNode) RETURN e.* ORDER BY e.created_at DESC LIMIT 10000"
-                        )
-                        if rows:
+                        # 分页获取节点，避免全量加载
+                        page_size = 1000
+                        offset = 0
+                        nodes = []
+                        while True:
+                            rows = kuzu_store.query_cypher(
+                                f"MATCH (e:EpisodeNode) RETURN e.* "
+                                f"ORDER BY e.created_at DESC LIMIT {page_size} SKIP {offset}"
+                            )
+                            if not rows:
+                                break
                             for row in rows:
                                 if isinstance(row, dict):
                                     nodes.append(row)
@@ -140,6 +146,9 @@ class DreamScheduler:
                                         "created_at": float(row[3]) if len(row) > 3 else 0.0,
                                         "tau_initial": float(row[4]) if len(row) > 4 else 1.0,
                                     })
+                            offset += len(rows)
+                            if len(nodes) >= 10000:
+                                break
                         # 获取Hebbian连接
                         edge_rows = kuzu_store.query_cypher(
                             "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) "
