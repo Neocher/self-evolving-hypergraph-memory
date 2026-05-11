@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -129,12 +129,12 @@ def flush_faiss_buffer(deps: Services) -> int:
         deps.faiss_index.add_with_ids(vecs, ids)
         # 更新 id_map
         if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
-            for faiss_id, ep_id in batch:
+            for faiss_id, _emb, ep_id in batch:
                 deps.faiss_id_map[int(faiss_id)] = ep_id
         logger.debug("FAISS batch flush: %d vectors added", len(batch))
         return len(batch)
     except Exception:
-        logger.warning("FAISS batch flush failed, %d vectors pending", len(batch))
+        logger.exception("FAISS batch flush failed, %d vectors pending", len(batch))
         # 重新放回缓冲区
         with deps._faiss_buffer_lock:
             deps._faiss_buffer.extend(batch)

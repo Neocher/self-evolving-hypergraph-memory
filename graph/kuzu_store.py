@@ -19,6 +19,8 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
+logger = logging.getLogger(__name__)
+
 
 # ─── [Harness Fix] 断路器 ───────────────────────────────────
 
