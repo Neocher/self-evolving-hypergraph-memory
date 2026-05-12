@@ -238,8 +238,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     init_services(svc)
     logger.info("Services injected into route handlers")
 
-    # 启动梦境调度器后台轮询（每30秒检查一次触发条件）
-    DREAM_POLL_INTERVAL = 30.0
+    # 启动梦境调度器后台轮询（每10秒检查一次触发条件）
+    DREAM_POLL_INTERVAL = 10.0
 
     async def _dream_poll_loop() -> None:
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)

@@ -38,6 +38,9 @@ from api.models import (
     PromoteResponse,
     RetrieveRequest,
     RetrieveResponse,
+    SearchVectorRequest,
+    SearchVectorResult,
+    SearchVectorResponse,
     SensoryRecord,
     SensoryResponse,
 )
@@ -498,6 +501,105 @@ async def retrieve(
     )
 
 
+@router.post("/search/vector", summary="纯向量检索（直通 FAISS）")
+async def search_vector(
+    req: SearchVectorRequest,
+    deps: Services = Depends(get_services),
+) -> SearchVectorResponse:
+    """使用 FAISS 向量索引执行纯向量检索，回查 Kuzu 获取节点详情。
+
+    当 encoder 或 FAISS 索引不可用时自动降级返回空结果。
+    """
+    start = _now()
+    set_trace_id()
+    degraded = False
+
+    # 降级检查
+    if deps.encoder is None or deps.faiss_index is None:
+        degraded = True
+        logger.warning("Vector search degraded: encoder=%s, faiss_index=%s",
+                       deps.encoder is not None, deps.faiss_index is not None)
+        latency = (_now() - start) * 1000
+        record_request("POST", "/search/vector", "200", _now() - start)
+        return SearchVectorResponse(
+            query=req.query,
+            results=[],
+            total_found=0,
+            latency_ms=round(latency, 2),
+            degraded=degraded,
+        )
+
+    try:
+        # 1. 编码查询文本
+        emb = deps.encoder.embed(req.query)
+        if emb is None:
+            raise ValueError("Encoder returned None")
+
+        import numpy as np
+        emb_array = emb.reshape(1, -1).astype(np.float32)
+
+        # 2. FAISS 向量检索
+        k = min(req.limit, deps.faiss_index.ntotal) if deps.faiss_index.ntotal > 0 else req.limit
+        if k == 0:
+            latency = (_now() - start) * 1000
+            record_request("POST", "/search/vector", "200", _now() - start)
+            return SearchVectorResponse(
+                query=req.query,
+                results=[],
+                total_found=0,
+                latency_ms=round(latency, 2),
+                degraded=False,
+            )
+
+        distances, indices = deps.faiss_index.search(emb_array, k)
+
+        # 3. 回查 Kuzu 获取节点详情
+        results: list[SearchVectorResult] = []
+        faiss_id_map = getattr(deps, "faiss_id_map", {}) or {}
+        for rank in range(len(indices[0])):
+            faiss_id = int(indices[0][rank])
+            if faiss_id < 0:
+                continue
+
+            # 距离转得分 (L2 → 相似度)
+            l2_dist = float(distances[0][rank])
+            score = max(0.0, 1.0 - l2_dist / 2.0)
+
+            # 通过 faiss_id_map 回查 episode ID
+            episode_id = faiss_id_map.get(faiss_id)
+            if not episode_id:
+                continue
+
+            # 从 Kuzu 获取节点详情
+            try:
+                node = deps.kuzu_store.get_episode(episode_id) if deps.kuzu_store else None
+                content = node.get("content", "") if node else ""
+            except Exception:
+                content = ""
+
+            results.append(SearchVectorResult(
+                node_id=episode_id,
+                content=content,
+                score=round(score, 4),
+                faiss_id=faiss_id,
+            ))
+
+    except Exception as exc:
+        logger.exception("Vector search failed")
+        record_request("POST", "/search/vector", "500", _now() - start)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    latency = (_now() - start) * 1000
+    record_request("POST", "/search/vector", "200", _now() - start)
+    return SearchVectorResponse(
+        query=req.query,
+        results=results,
+        total_found=len(results),
+        latency_ms=round(latency, 2),
+        degraded=degraded,
+    )
+
+
 # ═══════════════════════════════════════════════════════════
 # 超边管理
 # ═══════════════════════════════════════════════════════════
@@ -719,6 +821,20 @@ async def trigger_dream(
         return DreamTriggerResponse(accepted=True, message="Dream triggered successfully")
     else:
         return DreamTriggerResponse(accepted=False, message="Dream already running")
+
+
+@router.post("/dream/notify", summary="通知调度器有新节点创建")
+async def dream_notify(
+    deps: Services = Depends(get_services),
+) -> dict:
+    """
+    通知梦境调度器有新节点创建。
+    供 Hermes SHM 插件在写入记忆后调用，加速梦境触发。
+    """
+    if deps.dream_scheduler is not None and hasattr(deps.dream_scheduler, "on_node_created"):
+        await deps.dream_scheduler.on_node_created()
+        logger.debug("Dream scheduler notified of new node")
+    return {"status": "ok"}
 
 
 # ═══════════════════════════════════════════════════════════

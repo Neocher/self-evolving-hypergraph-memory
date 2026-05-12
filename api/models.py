@@ -251,6 +251,32 @@ class CommunityListResponse(BaseModel):
 
 # ─── 配置（API 透出） ──────────────────────────────────────
 
+# ─── 向量搜索 ──────────────────────────────────────────────
+
+
+class SearchVectorRequest(BaseModel):
+    """向量搜索请求。"""
+    query: str = Field(..., min_length=1, max_length=10_000, description="查询文本")
+    limit: int = Field(default=10, ge=1, le=200, description="返回结果数上限")
+
+
+class SearchVectorResult(BaseModel):
+    """单条向量搜索结果。"""
+    node_id: str = Field(..., description="节点 ID")
+    content: str = Field(default="", description="节点内容")
+    score: float = Field(ge=0.0, le=1.0, description="余弦相似度得分")
+    faiss_id: int = Field(..., description="FAISS 内部 ID")
+
+
+class SearchVectorResponse(BaseModel):
+    """向量搜索结果响应。"""
+    query: str = Field(..., description="原始查询文本")
+    results: List[SearchVectorResult] = Field(default_factory=list, description="搜索结果列表")
+    total_found: int = Field(default=0, ge=0, description="结果总数")
+    latency_ms: float = Field(default=0.0, description="检索耗时（毫秒）")
+    degraded: bool = Field(default=False, description="是否因组件不可用而降级")
+
+
 class TauDecayConfig(BaseModel):
     """τ 衰减配置（API 可见子集）。"""
     tau_initial: float = Field(default=1.0, gt=0.0, le=1.0)
