@@ -187,7 +187,8 @@ class KuzuStore:
         self.conn.execute(
             "CREATE NODE TABLE IF NOT EXISTS EpisodeNode ("
             "id STRING, content STRING, embedding FLOAT[384], "
-            "created_at DOUBLE, tau_initial DOUBLE, source STRING, "
+            "created_at DOUBLE, tau_initial DOUBLE, tau_value DOUBLE, "
+            "trust_score DOUBLE, ontology_type STRING, source STRING, "
             "PRIMARY KEY (id))"
         )
         self.conn.execute(

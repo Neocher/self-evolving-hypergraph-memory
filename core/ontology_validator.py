@@ -28,37 +28,37 @@ logger = logging.getLogger(__name__)
 ONTOLOGY_TYPES: dict[str, dict[str, Any]] = {
     "person_birth": {
         "description": "人的出生日期/地点",
-        "conflict_keys": ["person", "birth"],
+        "conflict_keys": ["person", "birth", "出生于", "生于", "出生"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "person_death": {
         "description": "人的死亡日期/地点",
-        "conflict_keys": ["person", "death"],
+        "conflict_keys": ["person", "death", "死于", "逝世", "去世"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "organization_founded": {
         "description": "组织/公司成立时间",
-        "conflict_keys": ["org", "founded"],
+        "conflict_keys": ["org", "founded", "成立于", "成立", "创办", "创立"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "scientific_claim": {
         "description": "科学声明/事实陈述",
-        "conflict_keys": ["claim", "finding"],
+        "conflict_keys": ["claim", "finding", "导致", "实验", "证明"],
         "contradiction_pattern": "contradictory_claim",
     },
     "event_date": {
         "description": "事件发生时间",
-        "conflict_keys": ["event", "date"],
+        "conflict_keys": ["event", "date", "举行", "召开", "于.*年"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "location_fact": {
         "description": "地理位置事实",
-        "conflict_keys": ["location", "place"],
+        "conflict_keys": ["location", "place", "位于", "地处"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "relationship": {
         "description": "人与人/组织间的关系",
-        "conflict_keys": ["relation", "between"],
+        "conflict_keys": ["relation", "between", "关系", "婚姻", "夫妻"],
         "contradiction_pattern": "same_entity_diff_value",
     },
     "generic_fact": {
@@ -74,10 +74,10 @@ CONTRADICTION_RULES: dict[str, str] = {
         MATCH (existing:EpisodeNode)
         WHERE existing.id <> $new_id
           AND existing.ontology_type = $ontology_type
-          AND existing.txt_content CONTAINS $entity_name
-          AND NOT existing.txt_content CONTAINS $new_value
+          AND existing.content CONTAINS $entity_name
+          AND NOT existing.content CONTAINS $new_value
         RETURN existing.id AS conflict_id,
-               existing.txt_content AS conflict_content,
+               existing.content AS conflict_content,
                existing.trust_score AS conflict_trust,
                existing.tau_value AS conflict_tau
         LIMIT 5
@@ -86,9 +86,9 @@ CONTRADICTION_RULES: dict[str, str] = {
         MATCH (existing:EpisodeNode)
         WHERE existing.id <> $new_id
           AND existing.ontology_type = $ontology_type
-          AND existing.txt_content CONTAINS $entity_name
+          AND existing.content CONTAINS $entity_name
         RETURN existing.id AS conflict_id,
-               existing.txt_content AS conflict_content,
+               existing.content AS conflict_content,
                existing.trust_score AS conflict_trust,
                existing.tau_value AS conflict_tau
         LIMIT 5
@@ -167,7 +167,7 @@ class OntologyValidator:
         """
         entities = []
         # 英文：提取连续大写词（人名/地名）
-        en_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+        en_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text, re.ASCII)
         entities.extend(en_entities)
         # 中文：提取有意义的实体（人物/组织/地点）
         cn_entities = []
@@ -175,11 +175,22 @@ class OntologyValidator:
         org_matches = re.findall(r'[\u4e00-\u9fff]{2,6}(?:公司|集团|有限|科技|大学|学院|银行|证券)', text)
         cn_entities.extend(org_matches)
         # 提取"XX出生于/毕业于/任职于"前的人名
-        person_matches = re.findall(r'([\u4e00-\u9fff]{2,3})(?:出生于|毕业于|任职于|生于)', text)
+        person_matches = re.findall(r'([\u4e00-\u9fff]{2,3}?)(?:出生于|毕业于|任职于|生于)', text)
         cn_entities.extend(person_matches)
-        # 回退：提取2字中文词作为实体候选
+        # 回退：提取2-4字中文实体（在结构词边界处分隔）
         if not cn_entities:
-            cn_entities = re.findall(r'[\u4e00-\u9fff]{2,3}', text)
+            cn_entities = []
+            for run in re.findall(r'[\u4e00-\u9fff]+', text):
+                # 用多字结构词做分词（避免单字分裂实体名，如被"因"分裂"爱因斯坦"）
+                parts = re.split(
+                    r'(?:因为|所以|但是|虽然|而且|或者|并且|然而|因此|'
+                    r'如果|那么|由于|为了|在于|位于|就是|不是|而是|只是|还有|'
+                    r'以及|或者|还是|直到|关于|对于|根据|按照|通过|经过)',
+                    run
+                )
+                for p in parts:
+                    if 2 <= len(p) <= 4:
+                        cn_entities.append(p)
         stop_words = {'我们', '他们', '这个', '那个', '什么', '如何', '可以', '进行', '一个'}
         entities.extend(e for e in cn_entities if e not in stop_words)
         return list(set(entities))
@@ -196,12 +207,12 @@ class OntologyValidator:
     def _extract_values(self, text: str, ontology_type: str) -> Dict[str, str]:
         """提取用于矛盾检测的关键值。"""
         values = {}
-        # 提取年份
-        years = re.findall(r'\b(19|20)\d{2}\b', text)
+        # 提取年份（re.ASCII保证\b不被Unicode中文干扰）
+        years = re.findall(r'\b(?:19|20)\d{2}\b', text, re.ASCII)
         if years:
             values["year"] = years[0]
-        # 提取日期
-        dates = re.findall(r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b', text)
+        # 提取日期（re.ASCII保证\b不被Unicode中文干扰）
+        dates = re.findall(r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b', text, re.ASCII)
         if dates:
             values["date"] = dates[0]
         return values
