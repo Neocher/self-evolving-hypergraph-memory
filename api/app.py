@@ -122,6 +122,20 @@ def _init_services() -> Services:
         errors.append(f"SSMGate: {e}")
         logger.warning("SSMGate init failed", error=str(e))
 
+    # 7b. 本体验证器（[Ontology] 写时+读时验证层）
+    if svc.kuzu_store is not None:
+        try:
+            from core.ontology_validator import OntologyValidator
+            svc.ontology_validator = OntologyValidator(
+                kuzu_store=svc.kuzu_store,
+                encoder=svc.encoder,
+                config=cfg.ontology,
+            )
+            logger.info("OntologyValidator initialized", enabled=cfg.ontology.enabled)
+        except Exception as e:
+            errors.append(f"OntologyValidator: {e}")
+            logger.warning("OntologyValidator init failed (fallback: no ontology validation)", error=str(e))
+
     # 8. 溯源链（【FIX】移到了前面，确保dream_pipeline能接收audit_chain）
     try:
         from core.audit_chain import AuditChain

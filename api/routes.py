@@ -77,6 +77,7 @@ class Services:
     query_router: Any = None
     encoder: Any = None
     hyperedge_manager: Any = None
+    ontology_validator: Any = None
     # FAISS 批量写入缓冲区
     _faiss_buffer: list[tuple] = field(default_factory=list)
     _faiss_buffer_lock: Any = None
@@ -262,6 +263,25 @@ async def create_episode(
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
                                    content=req.content, source=req.source)
 
+    # [Ontology] 写时验证
+    ontology_note = None
+    if deps.ontology_validator is not None:
+        val_result = deps.ontology_validator.write_validate(req.content, episode_id)
+        if not val_result.passed:
+            logger.warning("Ontology write_validate rejected", content=req.content[:50],
+                          reason=f"confidence={val_result.confidence:.2f}, conflicts={val_result.conflict_count}")
+        if val_result.conflict_count > 0:
+            ontology_note = f"[本体警告] 与 {val_result.conflict_count} 条已有事实存在矛盾"
+            for c in val_result.contradictions:
+                try:
+                    deps.kuzu_store.execute_cypher(
+                        "MERGE (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
+                        "rule_id: $rule, detected_at: $t, resolved: false})",
+                        {"id": f"conflict_{episode_id}_{c.get(conflict_id,)}",
+                         "a": episode_id, "b": c.get("conflict_id", ""),
+                         "rule": "write_validate", "t": 0.0})
+                except Exception:
+                    pass
     deps.kuzu_store.create_episode({
         "id": episode_id,
         "content": req.content,
@@ -466,6 +486,28 @@ async def retrieve(
     if results_raw:
         first_level = results_raw[0].get("level", "hypergraph") if isinstance(results_raw[0], dict) else "hypergraph"
         degraded = first_level != "hypergraph"
+
+    # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
+    if deps.ontology_validator is not None and results_raw:
+        validated = deps.ontology_validator.read_validate(
+            [{
+                "id": r.get("node_id", ""),
+                "score": r.get("score", 0.0),
+                "tau_value": r.get("tau_value", r.get("tau", 0.5)),
+                "trust_score": r.get("trust_score", 0.5),
+                "content": r.get("content", ""),
+            } for r in results_raw[:req.top_k]],
+            req.query,
+        )
+        # 用调整后的分数覆盖原始分数
+        v_map = {v.episode_id: v for v in validated}
+        for r in results_raw[:req.top_k]:
+            rid = r.get("node_id", "")
+            if rid in v_map:
+                v = v_map[rid]
+                r["score"] = v.adjusted_score
+                if v.conflict_note:
+                    r["conflict_note"] = v.conflict_note
 
     results: list[EpisodicResult] = []
     for r in results_raw[:req.top_k]:

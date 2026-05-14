@@ -377,6 +377,19 @@ class KuzuStore:
 
         return self._execute_with_circuit_breaker(_do_query)
 
+    def execute_cypher(self, query: str, params: dict) -> list[dict]:
+        """Execute a raw CYPHER query and return results as list of dicts."""
+        try:
+            result = self.conn.execute(query, params or {})
+            rows = result.get_as_pl()
+            dicts = rows.to_dicts()
+            if dicts:
+                return [_clean_kuzu_row(r) for r in dicts]
+            return []
+        except Exception:
+            logger.exception("execute_cypher failed")
+            return []
+
     def close(self) -> None:
         """关闭所有数据库连接"""
         for c in self._connections:

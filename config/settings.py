@@ -133,8 +133,21 @@ class CommunityConfig:
 
 
 @dataclass
+class OntologyConfig:
+    """本体验证器配置"""
+    enabled: bool = True
+    write_validation: bool = True
+    read_validation: bool = True
+    confidence_threshold: float = 0.3
+    contradiction_threshold: float = 0.7
+    max_contradictions_per_fact: int = 5
+    reject_on_contradiction: bool = False
+    rules_path: str = "./data/ontology_rules.yaml"
+
+
+@dataclass
 class Settings:
-    """SHM v3.0 全局配置聚合。"""
+    """SHM v4.0 全局配置聚合。"""
 
     tau: TauConfig = field(default_factory=TauConfig)
     hebbian: HebbianConfig = field(default_factory=HebbianConfig)
@@ -148,6 +161,7 @@ class Settings:
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
     community: CommunityConfig = field(default_factory=CommunityConfig)
+    ontology: OntologyConfig = field(default_factory=OntologyConfig)
 
 
 def _env_override(raw: dict[str, Any], prefix: str = "SHM") -> dict[str, Any]:
@@ -207,6 +221,7 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "circuit_breaker": CircuitBreakerConfig,
         "retry": RetryConfig,
         "community": CommunityConfig,
+        "ontology": OntologyConfig,
     }
     kwargs: dict[str, Any] = {}
     for section, cls in section_map.items():

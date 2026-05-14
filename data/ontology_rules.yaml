@@ -1,0 +1,35 @@
+# 本体矛盾规则配置
+# 每个规则定义：如何检测同一实体在不同事实间的逻辑矛盾
+
+rules:
+
+  # 规则1：同一实体的日期/年份不能冲突
+  - id: "same_entity_date_collision"
+    description: "同一个实体的时间属性不能有两个不同值"
+    cypher: |
+      MATCH (e:EpisodeNode)
+      WHERE e.id <> $new_id
+        AND e.txt_content CONTAINS $entity_name
+        AND e.ontology_type = $ontology_type
+        AND e.txt_content CONTAINS $existing_value
+        AND NOT e.txt_content CONTAINS $new_value
+      RETURN e.id AS conflict_id, e.txt_content AS text, e.trust_score AS trust
+    enabled: true
+
+  # 规则2：同一实体不能同时属于互斥类别
+  - id: "contradictory_classification"
+    description: "实体的分类不能自相矛盾"
+    cypher: |
+      MATCH (e:EpisodeNode)-[:INSTANCE_OF]->(c:OntologyClass)
+      WHERE e.id <> $new_id
+        AND e.txt_content CONTAINS $entity_name
+        AND c.name IN $excluded_classes
+      RETURN e.id AS conflict_id, c.name AS class_name
+    enabled: false
+
+  # 规则3：科学声明不能与已确认事实直接对立
+  - id: "scientific_claim_contradiction"
+    description: "科学类声明的对立检测（通过embedding相似度）"
+    type: "embedding"
+    threshold: 0.85
+    enabled: false
