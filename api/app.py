@@ -50,13 +50,37 @@ def _init_services() -> Services:
     if svc.kuzu_store is not None:
         try:
             from embedding.encoder import TextEncoder
+            # 预检 HuggingFace 网络可达性（中国网络HF被阻断，快速跳过避免进程挂起）
+            import urllib.request, urllib.error
+            _hf_ok = False
+            try:
+                _req = urllib.request.Request(
+                    "https://huggingface.co",
+                    method="HEAD",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                urllib.request.urlopen(_req, timeout=3)
+                _hf_ok = True
+            except Exception:
+                _hf_ok = False
+
+            if not _hf_ok:
+                raise RuntimeError(
+                    f"HuggingFace unreachable → encoder model {cfg.embedding.model_name} skipped"
+                )
+
             svc.encoder = TextEncoder(
                 model_name=cfg.embedding.model_name,
                 device=cfg.embedding.device,
             )
+            # 同步加载（网络已验证可达，短超时即可）
+            import os
+            os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "10")
+            svc.encoder.load()
             logger.info("TextEncoder initialized", model=cfg.embedding.model_name)
         except Exception as e:
             errors.append(f"TextEncoder: {e}")
+            svc.encoder = None
             logger.warning("TextEncoder init failed (fallback: embedding disabled)", error=str(e))
 
         try:

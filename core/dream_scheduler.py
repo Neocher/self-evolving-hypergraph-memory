@@ -135,8 +135,9 @@ class DreamScheduler:
                         nodes = []
                         while True:
                             rows = kuzu_store.query_cypher(
-f"MATCH (e:EpisodeNode) RETURN e.* "
-f"ORDER BY e.created_at DESC LIMIT {page_size} OFFSET {offset}"
+                                "MATCH (e:EpisodeNode) RETURN e.* "
+                                "ORDER BY e.created_at DESC LIMIT $limit OFFSET $offset",
+                                {"limit": page_size, "offset": offset}
                             )
                             if not rows:
                                 break

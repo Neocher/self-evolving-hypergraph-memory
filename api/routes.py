@@ -253,12 +253,17 @@ async def create_episode(
             float(len(req.content)),            # 内容长度
             float(created_at - time.time()),    # 时间衰减信号
         ], dtype=np.float32)
-        if features.shape[0] != deps.ssm_gate.config.state_dim:
-            features = np.pad(features, (0, max(0, deps.ssm_gate.config.state_dim - features.shape[0])),
-                             mode="constant")[:deps.ssm_gate.config.state_dim]
+        if features.shape[0] != deps.ssm_gate.config.input_dim:
+            features = np.pad(features, (0, max(0, deps.ssm_gate.config.input_dim - features.shape[0])),
+                             mode="constant")[:deps.ssm_gate.config.input_dim]
+        # 懒初始化 hidden_state
+        try:
+            deps.ssm_gate.hidden_state
+        except AttributeError:
+            deps.ssm_gate.hidden_state = deps.ssm_gate.reset_state()
         hidden, gate_value = deps.ssm_gate.step(features, deps.ssm_gate.hidden_state)
         deps.ssm_gate.hidden_state = hidden
-        if not deps.ssm_gate.should_keep(gate_value, threshold=0.3):
+        if not deps.ssm_gate.should_keep(gate_value):
             logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
                                    content=req.content, source=req.source)
@@ -292,11 +297,11 @@ async def create_episode(
 
     if deps.encoder:
         try:
+            # asyncio-compatible embed timeout
             emb = deps.encoder.embed(req.content)
         except Exception:
             emb = None
         if emb is not None and deps.faiss_index is not None:
-            import numpy as np
             faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, str(episode_id)).int & ((1 << 63) - 1))
             emb_array = emb.reshape(1, -1).astype(np.float32)
 
@@ -772,7 +777,7 @@ async def list_communities(
     try:
         rows = deps.kuzu_store.query_cypher(
             "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
-            "SKIP $offset LIMIT $limit",
+            "OFFSET $offset LIMIT $limit",
             {"offset": offset, "limit": limit},
         )
     except Exception as e:
@@ -895,11 +900,12 @@ async def get_audit_trail(
     if deps.audit_chain is None:
         raise HTTPException(status_code=503, detail="Audit chain not available")
 
+    logger = get_logger()
     chain_verified = False
     try:
         chain_verified = deps.audit_chain.verify_chain()
     except Exception:
-        pass
+        logger.warning("Health check: audit chain verification failed, defaulting to False")
 
     ops_raw = deps.audit_chain.trace_node(node_id)
     chain_length = deps.audit_chain.chain_length
