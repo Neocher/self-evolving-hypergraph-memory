@@ -50,34 +50,86 @@ def _init_services() -> Services:
     if svc.kuzu_store is not None:
         try:
             from embedding.encoder import TextEncoder
-            # 预检 HuggingFace 网络可达性（中国网络HF被阻断，快速跳过避免进程挂起）
-            import urllib.request, urllib.error
-            _hf_ok = False
-            try:
-                _req = urllib.request.Request(
-                    "https://huggingface.co",
-                    method="HEAD",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                urllib.request.urlopen(_req, timeout=3)
-                _hf_ok = True
-            except Exception:
-                _hf_ok = False
-
-            if not _hf_ok:
-                raise RuntimeError(
-                    f"HuggingFace unreachable → encoder model {cfg.embedding.model_name} skipped"
-                )
-
-            svc.encoder = TextEncoder(
-                model_name=cfg.embedding.model_name,
-                device=cfg.embedding.device,
-            )
-            # 同步加载（网络已验证可达，短超时即可）
             import os
-            os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "10")
-            svc.encoder.load()
-            logger.info("TextEncoder initialized", model=cfg.embedding.model_name)
+
+            _cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            _model_cache_name = f"models--sentence-transformers--{cfg.embedding.model_name.replace('/', '--')}"
+            _model_cached = os.path.isdir(os.path.join(_cache_dir, _model_cache_name))
+
+            if _model_cached:
+                logger.info("Encoder model found in local cache", model=cfg.embedding.model_name)
+                svc.encoder = TextEncoder(
+                    model_name=cfg.embedding.model_name,
+                    device=cfg.embedding.device,
+                )
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                svc.encoder.load()
+                logger.info("TextEncoder initialized from local cache", model=cfg.embedding.model_name)
+            else:
+                logger.warning("Encoder model not in local cache, using sklearn TF-IDF fallback")
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.random_projection import SparseRandomProjection
+                import numpy as _np
+
+                class LocalFallbackEncoder:
+                    def __init__(self):
+                        self._model = "local_fallback"
+                        self._vectorizer = TfidfVectorizer(max_features=1024, analyzer="char_wb", ngram_range=(2, 4))
+                        self._projector = None
+                        self._fitted = False
+
+                    def load(self):
+                        pass
+
+                    def embed(self, text: str) -> _np.ndarray:
+                        if not self._fitted:
+                            self._vectorizer.fit([text])
+                            self._projector = SparseRandomProjection(n_components=384, random_state=42)
+                            sample = self._vectorizer.transform(["", text])
+                            self._projector.fit(sample)
+                            self._fitted = True
+                        vec = self._vectorizer.transform([text])
+                        projected = self._projector.transform(vec)
+                        return projected.toarray().astype(_np.float32).flatten()
+
+                    def embed_batch(self, texts: list) -> _np.ndarray:
+                        if not self._fitted:
+                            self._vectorizer.fit(texts)
+                            self._projector = SparseRandomProjection(n_components=384, random_state=42)
+                            sample = self._vectorizer.transform(texts)
+                            self._projector.fit(sample)
+                            self._fitted = True
+                        vec = self._vectorizer.transform(texts)
+                        projected = self._projector.transform(vec)
+                        return projected.toarray().astype(_np.float32)
+
+                    @property
+                    def dimension(self) -> int:
+                        return 384
+
+                    def track_indexed_node(self, node_id: str) -> None:
+                        pass
+                    def remove_pruned_nodes(self, pruned_node_ids: list) -> None:
+                        pass
+                    def should_rebuild_index(self) -> bool:
+                        return False
+                    def on_dream_cycle_complete(self) -> None:
+                        pass
+                    @property
+                    def needs_rebuild(self) -> bool:
+                        return False
+                    @needs_rebuild.setter
+                    def needs_rebuild(self, value: bool) -> None:
+                        pass
+                    @property
+                    def indexed_count(self) -> int:
+                        return 0
+
+                svc.encoder = LocalFallbackEncoder()
+                svc.encoder.load()
+                logger.info("TextEncoder initialized (local TF-IDF fallback, 384-dim)")
+
         except Exception as e:
             errors.append(f"TextEncoder: {e}")
             svc.encoder = None
