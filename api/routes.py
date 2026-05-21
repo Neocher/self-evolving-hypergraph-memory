@@ -129,7 +129,6 @@ def flush_faiss_buffer(deps: Services) -> int:
     if not batch:
         return 0
     try:
-        import numpy as np
         ids = np.array([item[0] for item in batch], dtype=np.int64)
         vecs = np.array([item[1] for item in batch], dtype=np.float32)
         deps.faiss_index.add_with_ids(vecs, ids)
@@ -161,7 +160,7 @@ def incremental_faiss_update(deps: Services, removed_node_ids: list[str]) -> int
     if not removed_node_ids or deps.faiss_index is None:
         return 0
     try:
-        import numpy as np
+
         removed = [int(uuid.uuid5(uuid.NAMESPACE_OID, str(nid)).int & ((1 << 63) - 1))
                    for nid in removed_node_ids]
         id_selector = np.array(removed, dtype=np.int64)
@@ -582,7 +581,7 @@ async def search_vector(
         if emb is None:
             raise ValueError("Encoder returned None")
 
-        import numpy as np
+
         emb_array = emb.reshape(1, -1).astype(np.float32)
 
         # 2. FAISS 向量检索
@@ -777,7 +776,7 @@ async def list_communities(
     try:
         rows = deps.kuzu_store.query_cypher(
             "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
-            "OFFSET $offset LIMIT $limit",
+            "LIMIT $limit",
             {"offset": offset, "limit": limit},
         )
     except Exception as e:

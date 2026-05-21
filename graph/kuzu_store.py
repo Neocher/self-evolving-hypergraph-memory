@@ -155,7 +155,12 @@ class KuzuStore:
         """连接/创建 Kuzu 数据库并初始化 schema + 连接池。"""
         db_path = Path(self.config.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = kuzu.Database(str(db_path))
+        self.db = kuzu.Database(
+            str(db_path),
+            auto_checkpoint=True,
+            checkpoint_threshold=4_194_304,  # 4MB: frequent checkpointing reduces WAL corruption risk
+            max_num_threads=self.config.max_threads,
+        )
 
         # 创建连接池（默认 4 个连接，与 max_threads 一致）
         pool_size = max(2, self.config.max_threads or 4)
@@ -219,6 +224,42 @@ class KuzuStore:
             "CREATE REL TABLE IF NOT EXISTS TEMPORAL_LINK "
             "(FROM EpisodeNode TO EpisodeNode, time_diff DOUBLE)"
         )
+
+        # [Migration] 添加旧版本可能缺失的列
+        # Kuzu 0.11.x does not support "IF NOT EXISTS" in ALTER TABLE
+        # Kuzu 0.11.x also does NOT support ALTER TABLE ADD COLUMN at all
+        # We detect this by checking the available ALTER options
+        _supports_alter_add = True
+        for col_type in [
+            ("ontology_type", "STRING"),
+            ("trust_score", "DOUBLE"),
+            ("tau_value", "DOUBLE"),
+        ]:
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE EpisodeNode ADD COLUMN {col_type[0]} {col_type[1]}"
+                )
+            except RuntimeError as e:
+                err_msg = str(e).lower()
+                if "already exists" in err_msg:
+                    pass  # Column already exists — expected
+                elif "add column" in err_msg and "not supported" in err_msg:
+                    _supports_alter_add = False
+                elif "invalid input" in err_msg and "add column" in err_msg:
+                    # Kuzu 0.11.x: Parser exception — ALTER ADD COLUMN not supported
+                    _supports_alter_add = False
+                else:
+                    # Use stdlib-safe logging (no extra kwargs)
+                    logger.warning(f"Schema migration skipped: {col_type[0]} -> {e}")
+
+        # If ALTER ADD COLUMN is not supported, log a one-time warning
+        # The database must be recreated from scratch with the correct schema
+        if not _supports_alter_add:
+            logger.warning(
+                "Kuzu version does not support ALTER TABLE ADD COLUMN. "
+                "All required columns must be present at CREATE TABLE time. "
+                "If you are migrating from an older database, delete the DB file and restart."
+            )
 
     def _execute_with_circuit_breaker(self, query_func, *args, **kwargs):
         """
