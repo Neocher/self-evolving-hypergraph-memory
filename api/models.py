@@ -7,7 +7,6 @@ Hyperedge 成员数 ≥2 由 field_validator 校验。
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 

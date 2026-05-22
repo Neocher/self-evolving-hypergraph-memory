@@ -15,6 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+from core.audit_chain import AuditOperation
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,6 @@ class DreamPipeline:
         # Step 8: AUDIT — 写入溯源链
         audit_hash = ""
         if self.audit_chain:
-            from core.audit_chain import AuditOperation
 
             audit_stats = {
                 "created": stats["created"],
@@ -478,7 +478,6 @@ class DreamPipeline:
         剪枝步骤：删除 τ 值低于阈值的节点及其连接。
         使用 Hebbian 更新器剪枝每个节点的弱连接。
         """
-        from core.audit_chain import AuditOperation
 
         prune_ops: list = []
         keep_nodes: list[dict] = []
@@ -532,7 +531,6 @@ class DreamPipeline:
         检测内容高度相似（Jaccard ≥ 0.8）的同社区节点对，
         合并为单条记录。
         """
-        from core.audit_chain import AuditOperation
 
         merge_ops: list = []
         conflict_count = 0
@@ -549,7 +547,6 @@ class DreamPipeline:
 
     def _find_and_merge_conflicts(self, nodes: list[dict]) -> tuple[list[dict], list]:
         """在一个社区内检测并合并冲突节点对。"""
-        from core.audit_chain import AuditOperation
 
         ops: list = []
         merged: set[str] = set()

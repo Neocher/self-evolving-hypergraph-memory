@@ -8,7 +8,6 @@ FastAPI 路由注册
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1007,12 +1006,14 @@ async def cypher_query(
     deps: Services = Depends(get_services),
 ) -> dict:
     # 执行原始 Cypher 查询（只读）。用于 Hermes SHM 插件的搜索检索。
-    blocked_keywords = ["CREATE", "DELETE", "SET", "DROP", "MERGE"]
-    upper_q = req.query.strip().upper()
-    for kw in blocked_keywords:
-        if upper_q.startswith(kw):
-            from fastapi import HTTPException as _HE
-            raise _HE(status_code=400, detail=f"Write queries blocked: {kw}")
+    import re
+    blocked_pattern = re.compile(
+        r'\b(?:CREATE|DELETE|SET|DROP|MERGE|REMOVE|DETACH)\b',
+        re.IGNORECASE
+    )
+    if blocked_pattern.search(req.query):
+        from fastapi import HTTPException as _HE
+        raise _HE(status_code=400, detail=f"Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH")
     try:
         rows = deps.kuzu_store.query_cypher(req.query, req.params)
         return {"rows": rows, "count": len(rows)}
