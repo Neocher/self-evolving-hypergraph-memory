@@ -224,11 +224,28 @@ def _init_services() -> Services:
     # 7. 梦境管道 & 调度器（【FIX】移到audit_chain之后）
     try:
         from core.dream_pipeline import DreamPipeline
+        # 【P0-1】LLM 客户端注入
+        llm_client = None
+        try:
+            from core.llm_client import LLMClient
+            llm_client = LLMClient()
+            logger.info("LLMClient initialized for dream synthesis")
+        except Exception as e:
+            logger.warning("LLMClient init skipped (dreams will use TF-IDF fallback): %s", e)
+
         svc.dream_pipeline = DreamPipeline(
             tau_engine=svc.tau_engine,
             hebbian_updater=svc.hebbian_updater,
             audit_chain=svc.audit_chain,  # ← 现在有值了
+            llm_client=llm_client,
         )
+        # 【P0-2】梦境候选存储（非破坏性模式）
+        try:
+            from core.dream_candidate_store import DreamCandidateStore
+            svc.dream_candidate_store = DreamCandidateStore()
+            logger.info("DreamCandidateStore initialized")
+        except Exception as e:
+            logger.warning("DreamCandidateStore init skipped: %s", e)
         from core.dream_scheduler import DreamScheduler, DreamSchedulerConfig
         dcfg = cfg.dream
         dream_cfg = DreamSchedulerConfig(
@@ -251,6 +268,9 @@ def _init_services() -> Services:
         svc.dream_scheduler._faiss_id_map = getattr(svc, "faiss_id_map", {})
         from api.routes import incremental_faiss_update
         svc.dream_scheduler._incremental_update_fn = incremental_faiss_update
+        # 【P0-2】注入候选存储引用
+        if hasattr(svc, 'dream_candidate_store'):
+            svc.dream_scheduler._candidate_store = svc.dream_candidate_store
         logger.info("Dream system initialized")
     except Exception as e:
         errors.append(f"DreamSystem: {e}")
@@ -328,8 +348,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     init_services(svc)
     logger.info("Services injected into route handlers")
 
-    # 启动梦境调度器后台轮询（每10秒检查一次触发条件）
-    DREAM_POLL_INTERVAL = 10.0
+    # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
+    DREAM_POLL_INTERVAL = 60.0
 
     async def _dream_poll_loop() -> None:
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)

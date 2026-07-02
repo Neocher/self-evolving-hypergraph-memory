@@ -43,15 +43,20 @@ class DreamReport:
 
 class DreamPipeline:
     """
-    梦境七步管道。
+    梦境八步管道。
 
     GATHER:     收集所有未处理的节点
     CLUSTER:    运行 Leiden 社区检测
-    SYNTHESIZE: 生成社区报告
+    SYNTHESIZE: 生成社区报告（可选用 LLM 语义摘要）
     COMPRESS:   [Harness Fix] 压缩社区报告，限制 Token 预算
     PRUNE:      删除 τ 低于阈值且低连接度的节点
     RESOLVE:    矛盾检测与消歧
+    PERSIST:    写回结果到候选存储或 Kuzu
     AUDIT:      写入 BLAKE3 溯源链
+
+    支持两种模式：
+    - 直接模式 (candidate_store=None): 直接修改 Kuzu 生产数据（原行为）
+    - 候选模式 (candidate_store 有效): 写入临时候选区，供审查后上线
     """
 
     def __init__(
@@ -59,23 +64,27 @@ class DreamPipeline:
         tau_engine=None,
         hebbian_updater=None,
         audit_chain=None,
+        llm_client=None,
     ) -> None:
         """
         Args:
             tau_engine: TauDecayEngine 实例
             hebbian_updater: SparseHebbianUpdater 实例
             audit_chain: AuditChain 实例
+            llm_client: LLMClient 实例（可选，提供时启用 LLM 语义摘要）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
         self.audit_chain = audit_chain
+        self.llm_client = llm_client
 
     async def run(
         self,
         nodes: list[dict],
         connections: dict[str, dict[str, float]],
         trigger_mode: str = "explicit",
-        kuzu_store=None,  # 【FIX】接收Kuzu引用，用于持久化结果
+        kuzu_store=None,  # 接收Kuzu引用，用于持久化结果
+        candidate_store=None,  # 可选：DreamCandidateStore，启用候选模式
     ) -> DreamReport:
         """
         执行完整梦境管道。
@@ -132,18 +141,45 @@ class DreamPipeline:
         stats["updated"] += conflict_count
         logger.info("Dream %s: RESOLVE — %d conflicts resolved", dream_id, conflict_count)
 
-        # Step 7: PERSIST — 【FIX】将结果写回Kuzu
+        # Step 7: PERSIST — 将结果写回Kuzu或候选存储
         persist_created = 0
         persist_deleted = 0
         all_removed_ids: list[str] = []  # FAISS 增量更新用
-        if kuzu_store is not None:
-            # 【FIX】先删再建：先执行PRUNE（DETACH DELETE）避免边约束冲突
+        
+        # 先计算统计信息（用于候选存储和 report）
+        topic_count = sum(1 for c in communities if c.get("topics"))
+        episode_count = sum(len(c.get("episodes", [])) for c in communities)
+        fact_count = sum(len(c.get("facts", [])) for c in communities)
+        
+        if candidate_store is not None:
+            # 候选模式：写入临时候选集，不修改生产数据
+            candidate_store.save_candidate(
+                dream_id=dream_id,
+                communities=communities,
+                prune_ops=prune_ops,
+                merge_ops=merge_ops,
+                dream_report_kwargs={
+                    "dream_id": dream_id,
+                    "trigger_mode": trigger_mode,
+                    "timestamp": start_time,
+                    "stats": stats,
+                    "community_count": len(communities),
+                    "prune_count": prune_count,
+                    "conflict_count": conflict_count,
+                    "compressed_topics": topic_count,
+                    "compressed_episodes": episode_count,
+                    "compressed_facts": fact_count,
+                    "keywords_extracted": kw_count,
+                },
+            )
+            logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
+        elif kuzu_store is not None:
+            # 直接模式（原行为）：直接修改生产数据
             persist_deleted, pruned_ids = self._persist_prune(kuzu_store, prune_ops)
             all_removed_ids.extend(pruned_ids)
-            # 再建社区+超边
             persist_created = self._persist_communities(kuzu_store, communities, dream_id)
             all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-            self._persist_merge(kuzu_store, merge_ops)  # 执行实际 Kuzu DELETE
+            self._persist_merge(kuzu_store, merge_ops)
             self._persist_hyperedges(kuzu_store, communities, dream_id)
             logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup",
                         dream_id, persist_created, persist_deleted, len(all_removed_ids))
@@ -164,9 +200,6 @@ class DreamPipeline:
             audit_hash = block.hash
 
         duration = time.time() - start_time
-        topic_count = sum(1 for c in communities if c.get("topics"))
-        episode_count = sum(len(c.get("episodes", [])) for c in communities)
-        fact_count = sum(len(c.get("facts", [])) for c in communities)
 
         return DreamReport(
             dream_id=dream_id,
@@ -372,10 +405,27 @@ class DreamPipeline:
     # ─── Step 3: SYNTHESIZE ───────────────────────────────
 
     def _synthesize_step(self, communities: list[dict]) -> list[dict]:
-        """为每个社区生成模板化摘要。"""
+        """为每个社区生成摘要。
+
+        如果有 LLMClient，用模型生成语义摘要；
+        否则用 TF-IDF 模板方法（原有回退）。
+        """
         for community in communities:
             nodes = community.get("nodes", [])
-            community["report"] = self._generate_community_report(nodes)
+            if self.llm_client and len(nodes) >= 2:
+                # LLM 语义摘要
+                contents = [n.get("content", "") for n in nodes]
+                llm_result = self.llm_client.summarize_community(contents)
+                community["report"] = llm_result["summary"]
+                community["keywords"] = llm_result["keywords"]
+                community["llm_patterns"] = llm_result["patterns"]
+                community["llm_contradictions"] = llm_result["contradictions"]
+            else:
+                # 原有模板方法（回退）
+                community["report"] = self._generate_community_report(nodes)
+                community["keywords"] = self._extract_keywords(
+                    [n.get("content", "") for n in nodes], max_features=10
+                )
             community["episodes"] = [
                 {"id": n["id"], "content": n.get("content", "")} for n in nodes
             ]

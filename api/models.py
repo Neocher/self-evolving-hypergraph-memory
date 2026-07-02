@@ -197,6 +197,58 @@ class DreamTriggerResponse(BaseModel):
     message: str = Field(default="", description="状态说明")
 
 
+# ─── 梦境候选（非破坏性梦境审查） ──────────────────────────
+
+
+class DreamCandidateSummary(BaseModel):
+    """梦境候选列表项（供 review 列表使用）。"""
+    dream_id: str = Field(..., description="梦境 ID")
+    created_at: float = Field(..., description="创建时间戳")
+    trigger_mode: str = Field(default="unknown", description="触发模式")
+    community_count: int = Field(default=0, description="社区数")
+    prune_count: int = Field(default=0, description="剪枝节点数")
+    conflict_count: int = Field(default=0, description="冲突解决数")
+    stats: Dict[str, int] = Field(default_factory=dict, description="{created, updated, deleted}")
+
+
+class DreamCandidateListResponse(BaseModel):
+    """梦境候选列表响应。"""
+    candidates: List[DreamCandidateSummary] = Field(default_factory=list)
+    total: int = Field(default=0, description="待审查候选总数")
+
+
+class DreamCandidateDetail(BaseModel):
+    """梦境候选详情（供 review）。"""
+    dream_id: str = Field(..., description="梦境 ID")
+    created_at: float = Field(..., description="创建时间戳")
+    trigger_mode: str = Field(default="unknown", description="触发模式")
+    stats: Dict[str, int] = Field(default_factory=dict)
+    community_count: int = Field(default=0)
+    prune_count: int = Field(default=0)
+    conflict_count: int = Field(default=0)
+    community_summaries: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="社区摘要列表（含 report/keywords/patterns/contradictions）",
+    )
+    prune_ops: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="将要删除的节点操作",
+    )
+    merge_ops: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="将要合并的节点操作",
+    )
+    applied: bool = Field(default=False)
+    discarded: bool = Field(default=False)
+
+
+class DreamApplyResponse(BaseModel):
+    """梦境候选应用响应。"""
+    success: bool = Field(..., description="是否应用成功")
+    dream_id: str = Field(..., description="梦境 ID")
+    message: str = Field(default="", description="状态说明")
+
+
 # ─── 溯源 ──────────────────────────────────────────────────
 
 class AuditOperation(BaseModel):

@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "4.1.0"
-__version_info__ = (4, 1, 0)
-__version_name__ = "C1+C3 增量重建·并行梦境"
+__version__ = "4.2.0"
+__version_info__ = (4, 2, 0)
+__version_name__ = "稳定加固版 · OOM防护 + 优雅关闭 + 心跳优化"
 __release_date__ = "2026-05-11"
 
 VERSION_SUMMARY = f"""

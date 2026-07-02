@@ -163,11 +163,13 @@ class DreamScheduler:
                     except Exception as src_exc:
                         logger.warning("Dream data sourcing failed, running with empty data: %s", src_exc)
                 
-                # 【FIX】正确传递nodes, connections, trigger_mode, kuzu_store
+                # 【FIX】正确传递nodes, connections, trigger_mode, kuzu_store, candidate_store
+                candidate_store = getattr(self, '_candidate_store', None)
                 report = await self.pipeline_fn(
                     nodes, connections,
                     trigger_mode.value if trigger_mode else "idle",
-                    kuzu_store=self._kuzu_store
+                    kuzu_store=self._kuzu_store,
+                    candidate_store=candidate_store,
                 )
 
                 # FAISS 增量更新：移除 PRUNE/RESOLVE 中删除的节点

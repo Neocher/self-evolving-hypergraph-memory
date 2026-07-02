@@ -883,6 +883,103 @@ async def dream_notify(
 
 
 # ═══════════════════════════════════════════════════════════
+# 梦境候选（非破坏性模式）
+# ═══════════════════════════════════════════════════════════
+
+
+@router.get("/dream/candidates", summary="列出梦境候选（待审查）")
+async def list_dream_candidates(
+    deps: Services = Depends(get_services),
+):
+    """列出所有待审查的梦境候选。"""
+    from api.models import DreamCandidateListResponse, DreamCandidateSummary
+
+    store = getattr(deps, "dream_candidate_store", None)
+    if store is None:
+        return DreamCandidateListResponse(candidates=[], total=0)
+
+    raw = store.list_candidates(limit=50)
+    candidates = [
+        DreamCandidateSummary(**r) for r in raw
+    ]
+    return DreamCandidateListResponse(candidates=candidates, total=len(candidates))
+
+
+@router.get("/dream/candidates/{dream_id}", summary="审查梦境候选详情")
+async def review_dream_candidate(
+    dream_id: str,
+    deps: Services = Depends(get_services),
+):
+    """查看梦境候选的详细内容，审查后再决定 apply 或 discard。"""
+    from api.models import DreamCandidateDetail
+
+    store = getattr(deps, "dream_candidate_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Dream candidate store not available")
+
+    candidate = store.get_candidate(dream_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"Dream candidate {dream_id} not found")
+
+    return DreamCandidateDetail(
+        dream_id=candidate.dream_id,
+        created_at=candidate.created_at,
+        trigger_mode=candidate.trigger_mode,
+        stats=candidate.stats,
+        community_count=candidate.community_count,
+        prune_count=candidate.prune_count,
+        conflict_count=candidate.conflict_count,
+        community_summaries=candidate.community_summaries,
+        prune_ops=candidate.prune_ops,
+        merge_ops=candidate.merge_ops,
+        applied=candidate.applied,
+        discarded=candidate.discarded,
+    )
+
+
+@router.post("/dream/candidates/{dream_id}/apply", summary="应用梦境候选到生产库")
+async def apply_dream_candidate(
+    dream_id: str,
+    deps: Services = Depends(get_services),
+):
+    """
+    将梦境候选中的 PRUNE 和 MERGE 操作应用到生产 Kuzu 数据库。
+    操作不可逆，请先 review。
+    """
+    from api.models import DreamApplyResponse
+
+    store = getattr(deps, "dream_candidate_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Dream candidate store not available")
+
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+
+    success = store.apply_candidate(dream_id, deps.kuzu_store)
+    if success:
+        return DreamApplyResponse(success=True, dream_id=dream_id, message="Dream applied to production")
+    else:
+        return DreamApplyResponse(success=False, dream_id=dream_id, message="Apply failed (see logs)")
+
+
+@router.post("/dream/candidates/{dream_id}/discard", summary="丢弃梦境候选")
+async def discard_dream_candidate(
+    dream_id: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """丢弃梦境候选，不做任何修改。"""
+    store = getattr(deps, "dream_candidate_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Dream candidate store not available")
+
+    success = store.discard_candidate(dream_id)
+    if success:
+        return {"status": "ok", "dream_id": dream_id, "message": "Dream candidate discarded"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Dream candidate {dream_id} not found")
+
+
+# ═══════════════════════════════════════════════════════════
 # 溯源
 # ═══════════════════════════════════════════════════════════
 

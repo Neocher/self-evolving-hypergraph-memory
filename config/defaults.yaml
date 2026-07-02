@@ -39,7 +39,7 @@ dream:
 
 kuzu:
   database_path: "./data/shm_kuzu_db"  # Kuzu 数据库文件路径
-  buffer_pool_size_mb: 256       # 缓冲池大小（MB）
+  buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
   max_threads: 4                 # 最大工作线程数
 
 faiss:
