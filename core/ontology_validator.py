@@ -217,7 +217,212 @@ class OntologyValidator:
             values["date"] = dates[0]
         return values
 
-    # ─── 写时验证 ─────────────────────────────────────────────
+    # ─── 实体提取增强 ─────────────────────────────────────────
+
+    # 已知实体 → 本体类型 映射表（搜索时类型一致性校验用）
+    ENTITY_TYPE_MAP: dict[str, str] = {
+        # 深度学习框架
+        "pytorch": "deep_learning_framework",
+        "tensorflow": "deep_learning_framework",
+        "jax": "deep_learning_framework",
+        "mxnet": "deep_learning_framework",
+        "paddlepaddle": "deep_learning_framework",
+        "onnx": "deep_learning_framework",
+        # 机器学习模型/架构
+        "transformer": "ml_model",
+        "bert": "ml_model",
+        "gpt": "ml_model",
+        "llama": "ml_model",
+        "clip": "ml_model",
+        "vit": "ml_model",
+        "resnet": "ml_model",
+        "textencoder": "ml_model",
+        "sentencetransformer": "ml_model",
+        "all-minilm-l6-v2": "ml_model",
+        "word2vec": "ml_model",
+        # 硬件
+        "cpu": "hardware",
+        "gpu": "hardware",
+        "tpu": "hardware",
+        "nvidia": "hardware",
+        "amd": "hardware",
+        "intel": "hardware",
+        "cuda": "hardware",
+        "rocm": "hardware",
+        "mps": "hardware",
+        # 计算/部署技术
+        "faiss": "vector_database",
+        "kuzu": "graph_database",
+        "neo4j": "graph_database",
+        "redis": "database",
+        "docker": "infrastructure",
+        "kubernetes": "infrastructure",
+        "fastapi": "web_framework",
+        "uvicorn": "web_server",
+        # 系统
+        "shm": "memory_system",
+        "hermes": "ai_agent",
+        "cursor": "ide",
+        "claude": "ai_assistant",
+        "deepseek": "ai_assistant",
+        "openai": "ai_platform",
+        # 文件/数据格式
+        "json": "data_format",
+        "yaml": "data_format",
+        "toml": "data_format",
+        "csv": "data_format",
+        "parquet": "data_format",
+        "numpy": "data_processing",
+        "pandas": "data_processing",
+        # 操作系统/环境
+        "linux": "os",
+        "ubuntu": "os",
+        "centos": "os",
+        "python": "programming_language",
+        "rust": "programming_language",
+        "go": "programming_language",
+        "javascript": "programming_language",
+        "typescript": "programming_language",
+    }
+
+    # 实体类型 → 类别（用于泛化匹配）
+    ENTITY_TYPE_CATEGORIES: dict[str, str] = {
+        "deep_learning_framework": "ml_infra",
+        "ml_model": "ml_infra",
+        "hardware": "infrastructure",
+        "vector_database": "data_infra",
+        "graph_database": "data_infra",
+        "database": "data_infra",
+        "infrastructure": "infrastructure",
+        "web_framework": "software",
+        "web_server": "software",
+        "memory_system": "system",
+        "ai_agent": "ai_software",
+        "ai_assistant": "ai_software",
+        "data_format": "data",
+        "data_processing": "data_infra",
+        "os": "platform",
+        "programming_language": "language",
+        "ide": "software",
+        "ai_platform": "ai_software",
+    }
+
+    def _extract_types(self, text: str) -> List[Dict[str, str]]:
+        """从文本中提取实体及其类型。
+
+        返回: [{"entity": "PyTorch", "type": "deep_learning_framework",
+                  "category": "ml_infra", "matched": True}, ...]
+        """
+        text_lower = text.lower()
+        found: List[Dict[str, str]] = []
+
+        # 1. 查已知实体词典
+        for entity, etype in self.ENTITY_TYPE_MAP.items():
+            if entity in text_lower:
+                # re.ASCII 确保 \\b 只匹配 ASCII 单词边界（CJK 字符不是 \\w）
+                try:
+                    if re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
+                        category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
+                        found.append({
+                            "entity": entity,
+                            "type": etype,
+                            "category": category,
+                            "matched": True,
+                        })
+                except Exception:
+                    # 回退：直接子串匹配
+                    category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
+                    found.append({
+                        "entity": entity,
+                        "type": etype,
+                        "category": category,
+                        "matched": True,
+                    })
+
+        # 2. 正则模式匹配（未在词典中但可推断类型）
+        patterns = {
+            "ml_model": [
+                r'\b(?:model|encoder|decoder|transformer|embedding|tokenizer)\b',
+            ],
+            "hardware": [
+                r'\b(?:cpu|gpu|tpu|ram|vram|memory|processor|chip)\b',
+            ],
+            "infrastructure": [
+                r'\b(?:server|cloud|cluster|container|deploy|pipeline)\b',
+            ],
+            "programming_language": [
+                r'\bpython\b', r'\bjavascript\b', r'\btypescript\b',
+                r'\brust\b', r'\bgo\b', r'\bjava\b', r'\bc\+\+\b',
+            ],
+            "data_format": [
+                r'\b(?:json|yaml|toml|csv|xml|parquet)\b',
+            ],
+        }
+        for etype, pats in patterns.items():
+            for pat in pats:
+                m = re.search(pat, text_lower)
+                if m:
+                    raw = m.group(0)
+                    # 避免重复
+                    if not any(f["entity"] == raw for f in found):
+                        category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
+                        found.append({
+                            "entity": raw,
+                            "type": etype,
+                            "category": category,
+                            "matched": False,  # 推断匹配（非精确词典）
+                        })
+
+        # 去重
+        seen = set()
+        unique = []
+        for f in found:
+            key = f"{f['entity']}|{f['type']}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+        return unique
+
+    def _compute_type_overlap(
+        self,
+        query_types: List[Dict[str, str]],
+        result_types: List[Dict[str, str]],
+    ) -> float:
+        """计算查询与检索结果的实体类型重叠度。
+
+        score = w1 * exact_type_overlap + w2 * category_overlap
+
+        精确类型重叠: 查询实体A[type=X] × 结果实体B[type=X]
+        类别重叠:      查询实体A[cat=Y] × 结果实体B[cat=Y]
+        """
+        if not query_types or not result_types:
+            return 0.5  # 无法判断时返回中性值
+
+        exact_hits = 0
+        cat_hits = 0
+
+        q_types = set(f["type"] for f in query_types)
+        r_types = set(f["type"] for f in result_types)
+        q_cats = set(f["category"] for f in query_types)
+        r_cats = set(f["category"] for f in result_types)
+
+        # 精确类型重叠
+        exact_overlap = q_types & r_types
+        exact_hits = len(exact_overlap)
+
+        # 类别重叠
+        cat_overlap = q_cats & r_cats
+        cat_hits = len(cat_overlap)
+
+        # 归一化分数
+        total_unique = len(q_types | r_types)
+        if total_unique == 0:
+            return 0.5
+        exact_ratio = exact_hits / total_unique
+        cat_ratio = cat_hits / max(len(q_cats | r_cats), 1)
+
+        # 加权: 精确匹配权重高
+        return round(0.6 * exact_ratio + 0.4 * cat_ratio, 3)
 
     def write_validate(
         self,
@@ -318,12 +523,10 @@ class OntologyValidator:
         """
         读取后验证：对检索结果做一致性检验 + 置信度修正。
 
-        Args:
-            results: 检索结果列表（含 id, score, tau_value, trust_score, content 等字段）
-            query: 原始查询文本
-
-        Returns:
-            带有调整后分数和冲突注释的结果列表
+        [增强] 新增实体类型一致性评分：
+        1. 从查询文本提取实体类型
+        2. 对每条候选结果对比类型重叠度
+        3. 综合分数 = original_score × type_overlap × τ_factor × conflict_penalty
         """
         if not self.config.enabled or not self.config.read_validation:
             return [
@@ -338,31 +541,39 @@ class OntologyValidator:
                 for r in results
             ]
 
+        # 0. 提取查询的实体类型
+        query_types = self._extract_types(query) if query else []
+
         validated = []
         for r in results:
             ep_id = r.get("id", "")
-            tau = r.get("tau_value", r.get("tau", 0.5))
+            tau = r.get("tau_value", r.get("tau", 0.5)) or 0.5
             trust = r.get("trust_score", 0.5)
             score = r.get("score", 0.0)
             content = r.get("content", r.get("txt_content", ""))
 
-            # 1. 提取实体
+            # 1. 提取实体（传统方法）
             entities = self._extract_entities(content)
 
-            # 2. 计算本体置信度
+            # 2. 提取结果中的类型（新方法）
+            result_types = self._extract_types(content)
+
+            # 3. 计算类型一致性重叠度
+            type_overlap = self._compute_type_overlap(query_types, result_types)
+
+            # 4. 检查 Kuzu 矛盾（原有逻辑，容错处理）
             ontology_conf = 1.0
             conflict_count = 0
 
-            if entities and self.kuzu is not None:
+            if entities and self.kuzu is not None and len(entities) > 0:
                 try:
-                    # 检查是否有矛盾标记
                     otype = self._classify_ontology_type(content, entities)
                     rule = CONTRADICTION_RULES.get(
                         ONTOLOGY_TYPES.get(otype, {}).get(
                             "contradiction_pattern", "contradictory_claim"
                         )
                     )
-                    if rule:
+                    if rule and ep_id:
                         params = {
                             "new_id": ep_id,
                             "ontology_type": otype,
@@ -370,30 +581,36 @@ class OntologyValidator:
                             "new_value": "",
                         }
                         conflicts = self.kuzu.execute_cypher(rule, params)
-                        if conflicts:
+                        if conflicts and isinstance(conflicts, list):
                             conflict_count = len(conflicts)
                             ontology_conf = max(
                                 0.1,
                                 1.0 - self.config.conflict_penalty_factor * conflict_count
                             )
-                except Exception as e:
-                    logger.warning("Ontology read_validate failed for %s: %s", ep_id, e)
+                except Exception:
+                    # Kuzu 矛盾查询不可用时不阻塞类型一致性评分
+                    pass
 
-            # 3. 综合分数 = 原始分数 × τ值 × 本体置信度
+            # 5. 综合分数: original_score × type_overlap × τ × conflict_penalty
+            #    type_overlap 是核心提升：匹配的类型越多 → 置信度越高
             tau_factor = min(1.0, tau / 0.5) if tau > 0 else 0.5
-            adjusted = score * tau_factor * ontology_conf
+            adjusted = score * type_overlap * tau_factor * ontology_conf
 
             note = ""
             if conflict_count > 0:
                 note = f"[本体矛盾] 关于「{entities[0]}」有 {conflict_count} 条冲突记录，此条置信度已下调"
+            if query_types and result_types and type_overlap < 0.3:
+                qtypes_str = ", ".join(sorted(set(f["type"] for f in query_types)))
+                rtypes_str = ", ".join(sorted(set(f["type"] for f in result_types)))
+                note = f"[类型不匹配] 查询实体类型({qtypes_str}) ≠ 结果类型({rtypes_str})，分数已下调"
 
             validated.append(ReadValidationResult(
                 episode_id=ep_id,
                 original_score=score,
-                ontology_confidence=round(ontology_conf, 3),
+                ontology_confidence=round(type_overlap * ontology_conf, 3),
                 adjusted_score=round(adjusted, 4),
                 conflict_count=conflict_count,
-                has_conflicts=conflict_count > 0,
+                has_conflicts=conflict_count > 0 or type_overlap < 0.3,
                 conflict_note=note,
             ))
 
