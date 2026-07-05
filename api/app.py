@@ -432,6 +432,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     triggered = await svc.dream_scheduler.check_and_trigger()
                     if triggered:
                         logger.info("Dream triggered by poll loop")
+                    # 自动 apply 梦境候选
+                    if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
+                        try:
+                            applied, communities = svc.dream_candidate_store.auto_apply_candidates(svc.kuzu_store)
+                            if applied > 0:
+                                logger.info("Auto-applied %d dreams: %d communities created", applied, communities)
+                        except Exception:
+                            logger.exception("Auto-apply error (non-fatal)")
             except asyncio.CancelledError:
                 logger.info("Dream poll loop cancelled")
                 break

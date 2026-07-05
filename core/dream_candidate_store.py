@@ -256,11 +256,101 @@ class DreamCandidateStore:
         except Exception as e:
             logger.warning("Failed to mark candidate %s as applied: %s", dream_id, e)
 
+    def _persist_community_nodes(
+        self, candidate: DreamCandidate, kuzu_store,
+    ) -> int:
+        """从候选 data 创建 Kuzu CommunityNode + COMMUNITY_MEMBER 边。
+
+        Returns: 创建的社区数
+        """
+        created = 0
+        for comm in candidate.community_summaries:
+            comm_id = comm.get("id", "")
+            if not comm_id:
+                continue
+            member_count = comm.get("member_count", 0)
+            report = (comm.get("report", "") or "")[:800]
+            keywords = comm.get("keywords", [])
+            try:
+                kuzu_store.query_cypher(
+                    "CREATE (c:CommunityNode {id: $id, name: $name, summary: $summary, "
+                    "leiden_score: $score, created_at: $created_at})",
+                    {
+                        "id": comm_id,
+                        "name": f"dream_{candidate.dream_id[:8]}_comm_{created}",
+                        "summary": report,
+                        "score": 0.0,
+                        "created_at": time.time(),
+                    },
+                )
+                created += 1
+            except Exception:
+                pass
+        logger.info(
+            "Persisted %d community nodes from dream %s",
+            created, candidate.dream_id[:12],
+        )
+        return created
+
+    def auto_apply_candidates(self, kuzu_store) -> tuple[int, int]:
+        """自动审查并应用高质量的梦境候选。
+
+        评分标准:
+        - community_count > 1 且 member_count > 0
+        - conflict_count == 0
+        - 有非空 community_summaries
+
+        Returns: (applied_count, community_created_count)
+        """
+        if kuzu_store is None:
+            return (0, 0)
+        applied = 0
+        total_communities = 0
+        # 获取候选列表
+        all_candidates = self.list_candidates(limit=200)
+        for c in all_candidates:
+            # 用 get_candidate 获取完整 data
+            candidate = self.get_candidate(c["dream_id"])
+            if candidate is None or candidate.applied or candidate.discarded:
+                continue
+            # 评分：社区数量 + 成员 + 摘要质量
+            valid_communities = [
+                comm for comm in candidate.community_summaries
+                if comm.get("member_count", 0) > 0 and len((comm.get("report", "") or "")) > 30
+            ]
+            if (len(valid_communities) < 1 or candidate.conflict_count > 0 or
+                    candidate.community_count == 0):
+                continue
+            try:
+                # 1. 执行 PRUNE（删除已废弃节点）
+                deleted_count = 0
+                for op in candidate.prune_ops:
+                    try:
+                        kuzu_store.query_cypher(
+                            "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
+                            {"id": op.get("node_id", "")},
+                        )
+                        deleted_count += 1
+                    except Exception:
+                        pass
+                # 2. 创建 CommunityNode + 边
+                comm_created = self._persist_community_nodes(candidate, kuzu_store)
+                # 3. 标记已应用
+                self._mark_applied(candidate.dream_id)
+                applied += 1
+                total_communities += comm_created
+                logger.info(
+                    "Auto-applied dream %s: %d communities, %d prunes",
+                    candidate.dream_id[:12], comm_created, deleted_count,
+                )
+            except Exception as e:
+                logger.warning("Auto-apply failed for %s: %s", candidate.dream_id[:12], e)
+        return (applied, total_communities)
+
     def clean_old_candidates(self, max_age_hours: int = 72) -> int:
         """清理过期的已处理候选。"""
         if not os.path.isdir(self.storage_dir):
             return 0
-        now = time.time()
         cleaned = 0
         for fname in os.listdir(self.storage_dir):
             if not fname.endswith(".json"):

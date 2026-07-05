@@ -194,6 +194,14 @@ class DreamScheduler:
             self._new_node_count = 0
             self._last_run_time = time.time()
             self._dream_run_count += 1  # 【FIX】计数
+            # 梦境完成后自动 apply 高质量候选
+            if candidate_store is not None and self._kuzu_store is not None:
+                try:
+                    applied, communities = candidate_store.auto_apply_candidates(self._kuzu_store)
+                    if applied > 0:
+                        logger.info("Dream auto-apply: %d candidates → %d communities", applied, communities)
+                except Exception:
+                    logger.exception("Dream auto-apply failed (non-fatal)")
         except Exception:
             logger.exception("Dream pipeline failed")
         finally:
