@@ -71,19 +71,22 @@ class QueryRouter:
         tfidf_index,
         encoder=None,
         config: Optional[QueryRouterConfig] = None,
+        faiss_id_map: Optional[dict] = None,
     ) -> None:
         """
         Args:
             kuzu_store: KuzuStore 实例
-            faiss_index: FAISS 向量索引（需有 search(embedding, k) -> list[(id, score)] 方法）
-            tfidf_index: TF-IDF 关键词索引（需有 search(query, k) -> list[(id, score)] 方法）
-            encoder: 文本嵌入编码器（可选，需有 embed(text) -> np.ndarray 方法）
+            faiss_index: FAISS 向量索引
+            tfidf_index: TF-IDF 关键词索引
+            encoder: 文本嵌入编码器（可选）
             config: 路由配置
+            faiss_id_map: FAISS int id → Kuzu UUID string 映射（用于 L1 超图检索反查）
         """
         self.kuzu_store = kuzu_store
         self.faiss_index = faiss_index
         self.tfidf_index = tfidf_index
         self.encoder = encoder
+        self.faiss_id_map = faiss_id_map or {}
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
             "最近", "刚刚", "刚才", "之前说的", "上一条",
@@ -121,22 +124,43 @@ class QueryRouter:
         logger.info(
             "Retrieval started", query=query[:80], level=level.value, strategy=strategy
         )
-        try:
-            if level == RetrievalLevel.HYPERGRAPH:
-                return self._hypergraph_retrieve(query, query_embedding)
-            elif level == RetrievalLevel.VECTOR:
-                return self._vector_retrieve(query, query_embedding)
-            else:
-                return self._keyword_retrieve(query)
-        except CircuitBreakerOpen:
-            logger.warning("L1 hypergraph failed (circuit breaker open), falling back to L2 vector")
+
+        # 从指定级别开始，逐级尝试（空结果自动级联）
+        results: list[dict] = []
+        if level == RetrievalLevel.HYPERGRAPH:
+            try:
+                results = self._hypergraph_retrieve(query, query_embedding)
+            except CircuitBreakerOpen:
+                logger.warning("L1 circuit breaker open, cascading to L2")
+                return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+            except FAISSUnavailable:
+                logger.warning("L1 FAISS unavailable, cascading to L2")
+                return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+            if results:
+                return results
+            logger.info("L1 empty, cascading to L2")
             return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
-        except FAISSUnavailable:
-            logger.warning("L2 vector failed (FAISS unavailable), falling back to L3 keyword")
+
+        if level == RetrievalLevel.VECTOR:
+            try:
+                results = self._vector_retrieve(query, query_embedding)
+            except FAISSUnavailable:
+                logger.warning("L2 FAISS unavailable, cascading to L3")
+                return self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+            if results:
+                return results
+            logger.info("L2 empty, cascading to L3")
             return self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+
+        # L3 keyword + L4 Kuzu fallback
+        try:
+            results = self._keyword_retrieve(query)
         except Exception as e:
-            logger.exception("L1-L3 all failed, trying L4 Kuzu fallback")
             return self._kuzu_text_fallback(query, str(e))
+        if results:
+            return results
+        logger.info("L3 empty, trying L4 Kuzu fallback")
+        return self._kuzu_text_fallback(query, "L3 empty")
 
     def _hypergraph_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
@@ -171,15 +195,18 @@ class QueryRouter:
             if ep_id < 0:
                 continue
             try:
-                episode = self.kuzu_store.get_episode(str(ep_id))
+                # 【修复】通过 faiss_id_map 将 FAISS int id 转为 Kuzu UUID string
+                node_uuid = self.faiss_id_map.get(ep_id, str(ep_id))
+                episode = self.kuzu_store.get_episode(node_uuid)
             except CircuitBreakerOpen:
                 raise
             except Exception:
                 continue
             if episode:
-                episode["score"] = float(score)
+                episode["score"] = round(1.0 / (1.0 + float(score)), 4)
                 episode["level"] = "l1_faiss"
                 episode["_source"] = "faiss"
+                episode["node_id"] = episode.pop("id", "")
                 results.append(episode)
 
         return self._deduplicate_and_sort(results)
@@ -212,7 +239,7 @@ class QueryRouter:
             {
                 "node_id": str(node_id) if node_id >= 0 else "",
                 "content": "",
-                "score": float(score),
+                "score": round(1.0 / (1.0 + float(score)), 4),
                 "tau_value": 0.0,
                 "level": RetrievalLevel.VECTOR.value,
             }
@@ -277,10 +304,10 @@ class QueryRouter:
             if not search_terms:
                 return []
 
-            # 构建多个 CONTAINS 条件
-            params = {f"w{i}": w for i, w in enumerate(search_terms)}
+            # 构建多个 CONTAINS 条件（大小写不敏感）
+            params = {f"w{i}": w.lower() for i, w in enumerate(search_terms)}
             conditions = " OR ".join(
-                f"e.content CONTAINS $w{i}" for i in range(len(search_terms))
+                f"toLower(e.content) CONTAINS $w{i}" for i in range(len(search_terms))
             )
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE {conditions} "
@@ -290,14 +317,22 @@ class QueryRouter:
             rows = self.kuzu_store.query_cypher(cypher, params)
             results = []
             for row in rows:
-                rd = dict(row) if hasattr(row, "items") else row
-                results.append({
-                    "node_id": rd.get("node_id", ""),
-                    "content": rd.get("content", ""),
-                    "score": 0.5,
-                    "tau_value": rd.get("tau_value", 0.0),
-                    "level": "kuzu_fallback",
-                })
+                if isinstance(row, dict):
+                    results.append({
+                        "node_id": row.get("node_id", ""),
+                        "content": row.get("content", ""),
+                        "score": 0.5,
+                        "tau_value": row.get("tau_value", 0.0),
+                        "level": "kuzu_fallback",
+                    })
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    results.append({
+                        "node_id": str(row[0]),
+                        "content": str(row[1]),
+                        "score": 0.5,
+                        "tau_value": float(row[2]) if len(row) > 2 else 0.0,
+                        "level": "kuzu_fallback",
+                    })
             logger.info("L4 fallback results", count=len(results))
             return results
         except Exception:
@@ -333,11 +368,14 @@ class QueryRouter:
         )
 
     def _encode_query(self, query: str) -> Optional[np.ndarray]:
-        """编码查询文本为向量，无 encoder 时返回 None"""
+        """编码查询文本为 2D 向量 (1, dim)，FAISS 要求 2D 输入"""
         if self.encoder is None:
             return None
         try:
-            return self.encoder.embed(query)
+            emb = self.encoder.embed(query)
+            if emb.ndim == 1:
+                emb = emb.reshape(1, -1)
+            return emb
         except Exception:
             logger.exception("Query encoding failed")
             return None

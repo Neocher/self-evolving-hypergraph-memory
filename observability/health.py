@@ -34,6 +34,29 @@ class HealthCheckResult:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+class _ChainVerificationCache:
+    """缓存审计链验证结果，避免每次健康检查都遍历 244MB 审计链。"""
+
+    def __init__(self, max_age: float = 300.0) -> None:
+        self._last_result: bool = True
+        self._last_check: float = 0.0
+        self._max_age = max_age
+
+    def get_or_refresh(self, audit_chain) -> bool:
+        now = time.time()
+        if now - self._last_check > self._max_age:
+            try:
+                self._last_result = audit_chain.verify_chain()
+            except Exception:
+                self._last_result = False
+            self._last_check = now
+        return self._last_result
+
+
+# 模块级共享缓存实例，跨请求复用
+_CHAIN_CACHE = _ChainVerificationCache(max_age=300.0)
+
+
 class HealthChecker:
     """深度健康检查器，聚合各组件状态生成统一的健康检查报告。"""
 
@@ -94,10 +117,7 @@ class HealthChecker:
                 result.hyperedge_count = 0
 
         if self.audit_chain is not None:
-            try:
-                result.chain_verified = self.audit_chain.verify_chain()
-            except Exception:
-                result.chain_verified = False
+            result.chain_verified = _CHAIN_CACHE.get_or_refresh(self.audit_chain)
 
         if self.dream_scheduler is not None:
             result.dream_scheduler_running = getattr(

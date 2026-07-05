@@ -49,25 +49,42 @@ def _init_services() -> Services:
     # 2. FAISS 向量索引
     if svc.kuzu_store is not None:
         try:
-            from embedding.encoder import TextEncoder
-            import os
+            # ── 编码器初始化（TextEncoder → 失败时降级到 TF-IDF） ──
+            _encoder = None
+            _encoder_cls = None
+            try:
+                from embedding.encoder import TextEncoder
+                _encoder_cls = TextEncoder
+            except Exception:
+                logger.warning("TextEncoder import failed (CUDA/torch not available), using TF-IDF fallback")
 
+            import os
             _cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
             _model_cache_name = f"models--sentence-transformers--{cfg.embedding.model_name.replace('/', '--')}"
             _model_cached = os.path.isdir(os.path.join(_cache_dir, _model_cache_name))
 
-            if _model_cached:
-                logger.info("Encoder model found in local cache", model=cfg.embedding.model_name)
-                svc.encoder = TextEncoder(
-                    model_name=cfg.embedding.model_name,
-                    device=cfg.embedding.device,
-                )
-                os.environ["TRANSFORMERS_OFFLINE"] = "1"
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                svc.encoder.load()
-                logger.info("TextEncoder initialized from local cache", model=cfg.embedding.model_name)
+            # 尝试加载 TextEncoder（本地缓存 + 非 CUDA）
+            if _model_cached and _encoder_cls is not None:
+                try:
+                    logger.info("Encoder model found in local cache", model=cfg.embedding.model_name)
+                    svc.encoder = _encoder_cls(
+                        model_name=cfg.embedding.model_name,
+                        device=cfg.embedding.device,
+                    )
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    svc.encoder.load()
+                    logger.info("TextEncoder initialized from local cache", model=cfg.embedding.model_name)
+                    _encoder_ok = True
+                except Exception as load_err:
+                    logger.warning("TextEncoder load failed (no CUDA), falling back to TF-IDF: %s", load_err)
+                    _encoder_ok = False
             else:
-                logger.warning("Encoder model not in local cache, using sklearn TF-IDF fallback")
+                _encoder_ok = False
+
+            # TextEncoder 不可用时降级到 TF-IDF 本地编码器
+            if not _encoder_ok:
+                logger.info("Using sklearn TF-IDF fallback encoder (384-dim)")
                 from sklearn.feature_extraction.text import TfidfVectorizer
                 from sklearn.random_projection import SparseRandomProjection
                 import numpy as _np
@@ -305,12 +322,14 @@ def _init_services() -> Services:
                 return [(self.texts[i], float(scores[i])) for i in top_indices]
 
         tfidf_index = TfidfSearchIndex()
+        svc.tfidf_index = tfidf_index
 
         qr_kwargs = {
             "kuzu_store": svc.kuzu_store,
             "faiss_index": svc.faiss_index,
             "tfidf_index": tfidf_index,
             "encoder": svc.encoder,
+            "faiss_id_map": getattr(svc, "faiss_id_map", {}),
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(
@@ -347,6 +366,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     svc = _init_services()
     init_services(svc)
     logger.info("Services injected into route handlers")
+
+    # 启动后台重建 FAISS 索引 + TF-IDF 拟合（非阻塞）
+    async def _startup_rebuild() -> None:
+        try:
+            from api.routes import rebuild_index
+            from fastapi import Depends
+            logger.info("Startup: auto-building FAISS + TF-IDF...")
+            result = await rebuild_index(svc)
+            idx = result.get("indexed_count", 0)
+            # 拟合 TF-IDF
+            if idx > 0 and hasattr(svc, "tfidf_index") and svc.tfidf_index is not None and svc.kuzu_store is not None:
+                rows = svc.kuzu_store.query_cypher("MATCH (e:EpisodeNode) RETURN e.content LIMIT 10000")
+                texts = []
+                for row in rows:
+                    if isinstance(row, (list, tuple)) and len(row) > 0:
+                        texts.append(str(row[0]))
+                    elif isinstance(row, dict):
+                        texts.append(str(row.get("content", "")))
+                if texts:
+                    svc.tfidf_index.fit(texts)
+                    logger.info("Startup: TF-IDF fitted with %d texts", len(texts))
+            logger.info("Startup: FAISS auto-build complete", indexed=idx)
+        except Exception as e:
+            logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
+
+    startup_task = asyncio.create_task(_startup_rebuild())
 
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
     DREAM_POLL_INTERVAL = 60.0

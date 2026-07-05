@@ -18,8 +18,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "deepseek-chat"
-_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+_DEFAULT_MODEL = "deepseek-v4-flash"
+_DEFAULT_BASE_URL = "https://api.deepseek.com"
 _DEFAULT_TIMEOUT = 30.0
 _MAX_RETRIES = 2
 

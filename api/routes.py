@@ -464,7 +464,7 @@ async def retrieve(
             words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
             if words:
                 params = {f"w{i}": w for i, w in enumerate(words[:5])}
-                conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words[:5])))
+                conditions = " OR ".join(f"toLower(e.content) CONTAINS $w{i}" for i in range(len(words[:5])))
                 cypher = f"MATCH (e:EpisodeNode) WHERE {conditions} RETURN e.id AS node_id, e.content AS content LIMIT 10"
                 fallback_rows = deps.kuzu_store.query_cypher(cypher, params)
                 degraded = True
@@ -492,25 +492,28 @@ async def retrieve(
 
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
-        validated = deps.ontology_validator.read_validate(
-            [{
-                "id": r.get("node_id", ""),
-                "score": r.get("score", 0.0),
-                "tau_value": r.get("tau_value", r.get("tau", 0.5)),
-                "trust_score": r.get("trust_score", 0.5),
-                "content": r.get("content", ""),
-            } for r in results_raw[:req.top_k]],
-            req.query,
-        )
-        # 用调整后的分数覆盖原始分数
-        v_map = {v.episode_id: v for v in validated}
-        for r in results_raw[:req.top_k]:
-            rid = r.get("node_id", "")
-            if rid in v_map:
-                v = v_map[rid]
-                r["score"] = v.adjusted_score
-                if v.conflict_note:
-                    r["conflict_note"] = v.conflict_note
+        try:
+            validated = deps.ontology_validator.read_validate(
+                [{
+                    "id": r.get("node_id", ""),
+                    "score": r.get("score", 0.0),
+                    "tau_value": r.get("tau_value", r.get("tau", 0.5)),
+                    "trust_score": r.get("trust_score", 0.5),
+                    "content": r.get("content", ""),
+                } for r in results_raw[:req.top_k]],
+                req.query,
+            )
+            # 用调整后的分数覆盖原始分数
+            v_map = {v.episode_id: v for v in validated}
+            for r in results_raw[:req.top_k]:
+                rid = r.get("node_id", "")
+                if rid in v_map:
+                    v = v_map[rid]
+                    r["score"] = v.adjusted_score if v.adjusted_score is not None else 0.0
+                    if v.conflict_note:
+                        r["conflict_note"] = v.conflict_note
+        except Exception as val_err:
+            logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
 
     results: list[EpisodicResult] = []
     for r in results_raw[:req.top_k]:
@@ -518,9 +521,9 @@ async def retrieve(
             results.append(EpisodicResult(
                 node_id=r.get("node_id", ""),
                 content=r.get("content", ""),
-                score=r.get("score", 0.0),
-                tau_value=r.get("tau_value"),
-                source=r.get("level", "hypergraph"),
+                score=r.get("score", 0.0) or 0.0,
+                tau_value=r.get("tau_value") or 0.0,
+                source=r.get("level", "hypergraph") or "hypergraph",
                 hyperedge_id=r.get("hyperedge_id"),
                 retrieval_level=r.get("level", "hypergraph"),
                 created_at=r.get("created_at"),
@@ -1183,15 +1186,16 @@ async def rebuild_index(
     dim = deps.faiss_dim
     index_type = deps.faiss_index_type
 
-    if index_type == "IVFFlat" and len(embeddings) >= deps.faiss_nlist * 2:
+    if index_type == "IVFFlat" and len(embeddings) >= max(deps.faiss_nlist * 2, 2000):
         nlist = min(deps.faiss_nlist, len(embeddings) // 2)
         quantizer = faiss.IndexFlatL2(dim)
         base_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
         base_index.train(embeddings.astype(np.float32))
+        base_index.nprobe = min(deps.faiss_nlist // 10, 10)  # 搜索探测数
         new_index = faiss.IndexIDMap(base_index)
-        new_index.set_nprobe(min(deps.faiss_nlist // 10, 10))  # 搜索探测数
         logger.info("FAISS rebuilt with IVFFlat", dim=dim, nlist=nlist, nprobe=10, vectors=len(embeddings))
     else:
+        # FlatL2 — 小数据集精确检索，无量化损失
         new_index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
         logger.info("FAISS rebuilt with FlatL2", dim=dim, vectors=len(embeddings))
 
@@ -1205,6 +1209,14 @@ async def rebuild_index(
     deps.faiss_index = new_index
     if hasattr(deps, "faiss_id_map"):
         deps.faiss_id_map = dict(zip(faiss_ids.tolist(), node_ids))
+    # 同步更新查询路由的索引引用
+    if deps.query_router is not None:
+        deps.query_router.faiss_index = new_index
+        deps.query_router.faiss_id_map = deps.faiss_id_map
+        # 同步 TF-IDF 索引
+        tfidf = getattr(deps, "tfidf_index", None)
+        if tfidf is not None:
+            deps.query_router.tfidf_index = tfidf
 
     # 【FIX】同时重建Hebbian连接
     logger.info("Rebuilding Hebbian connections...")
@@ -1242,6 +1254,16 @@ async def rebuild_index(
     record_request("POST", "/index/rebuild", "200", _now() - start)
     logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",
                 new_index.ntotal, hebbian_count)
+
+    # 拟合 TF-IDF 索引（提升 L3 关键词检索质量）
+    try:
+        tfidf = getattr(deps, "tfidf_index", None)
+        if tfidf is not None and hasattr(tfidf, "fit") and contents:
+            tfidf.fit(contents)
+            logger.info("TF-IDF index fitted with %d texts", len(contents))
+    except Exception:
+        logger.exception("TF-IDF fit failed (non-fatal)")
+
     return {
         "status": "ok",
         "indexed_count": new_index.ntotal,

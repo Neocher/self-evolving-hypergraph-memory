@@ -33,3 +33,5 @@ Thumbs.db
 # Reports
 *.html
 *.excalidraw
+graphify-out/
+graphify-out/
