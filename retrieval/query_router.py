@@ -94,6 +94,73 @@ class QueryRouter:
             "recent", "just now", "earlier", "last",
             "previous", "yesterday",
         ]
+        # 中英文技术术语映射（all-MiniLM-L6-v2 是英文优化，中文术语→英文提升对齐）
+        self._zh_en_tech_map: dict[str, str] = {
+            "深度学习": "deep learning",
+            "框架": "framework",
+            "向量": "vector",
+            "数据库": "database",
+            "编码器": "encoder",
+            "解码器": "decoder",
+            "图数据库": "graph database",
+            "神经网络": "neural network",
+            "机器学习": "machine learning",
+            "自然语言": "natural language",
+            "训练": "training",
+            "推理": "inference",
+            "离线": "offline",
+            "在线": "online",
+            "加载": "load",
+            "嵌入": "embedding",
+            "相似度": "similarity",
+            "搜索": "search",
+            "检索": "retrieval",
+            "分类": "classification",
+            "回归": "regression",
+            "聚类": "clustering",
+            "社区": "community",
+            "梦境": "dream",
+            "记忆": "memory",
+            "知识图谱": "knowledge graph",
+            "超图": "hypergraph",
+            "图查询": "graph query",
+            "监听": "monitor",
+            "健康": "health",
+            "错误": "error",
+            "恢复": "recovery",
+            "备份": "backup",
+            "缓存": "cache",
+            "索引": "index",
+            "重建": "rebuild",
+            "部署": "deploy",
+            "容器": "container",
+            "服务器": "server",
+            "爬虫": "crawler",
+        }
+
+    def _normalize_query(self, query: str) -> str:
+        """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
+
+        1. 统一中文/英文标点
+        2. 中文术语→英文（提升 all-MiniLM-L6-v2 对齐）
+        3. 去除多余空格
+        """
+        import re
+        q = query.strip()
+        # 统一标点：中文标点→英文
+        q = q.replace("，", " ").replace("。", " ").replace("；", " ")
+        q = q.replace("：", " ").replace("？", " ").replace("！", " ")
+        q = q.replace("「", " ").replace("」", " ").replace("『", " ").replace("』", " ")
+        q = q.replace("（", " (").replace("）", ") ").replace("【", "").replace("】", "")
+        # 统一空格
+        q = re.sub(r'\s+', ' ', q).strip()
+        # 中文技术术语→英文（仅替换出现在文本中的术语）
+        q_lower = q.lower()
+        for zh, en in self._zh_en_tech_map.items():
+            if zh in q_lower:
+                q = q.replace(zh, en)
+        # 最终清理多余空格
+        return re.sub(r'\s+', ' ', q).strip()
 
     def retrieve(
         self,
@@ -120,6 +187,9 @@ class QueryRouter:
         Raises:
             RuntimeError: 四级全部降级失败
         """
+        # 【P8】查询归一化：中文标点统一 + 中文技术术语→英文
+        query = self._normalize_query(query)
+
         strategy = self.detect_strategy(query)
         logger.info(
             "Retrieval started", query=query[:80], level=level.value, strategy=strategy
