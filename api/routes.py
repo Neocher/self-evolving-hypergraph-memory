@@ -491,6 +491,7 @@ async def retrieve(
         degraded = first_level != "hypergraph"
 
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
+    # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
         try:
             validated = deps.ontology_validator.read_validate(
@@ -512,6 +513,8 @@ async def retrieve(
                     r["score"] = v.adjusted_score if v.adjusted_score is not None else 0.0
                     if v.conflict_note:
                         r["conflict_note"] = v.conflict_note
+        except Exception as val_err:
+            logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
         except Exception as val_err:
             logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
 
@@ -1209,6 +1212,14 @@ async def rebuild_index(
     deps.faiss_index = new_index
     if hasattr(deps, "faiss_id_map"):
         deps.faiss_id_map = dict(zip(faiss_ids.tolist(), node_ids))
+    # 同步更新查询路由的索引引用
+    if deps.query_router is not None:
+        deps.query_router.faiss_index = new_index
+        deps.query_router.faiss_id_map = deps.faiss_id_map
+        # 同步 TF-IDF 索引
+        tfidf = getattr(deps, "tfidf_index", None)
+        if tfidf is not None:
+            deps.query_router.tfidf_index = tfidf
     # 同步更新查询路由的索引引用
     if deps.query_router is not None:
         deps.query_router.faiss_index = new_index

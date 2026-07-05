@@ -224,6 +224,25 @@ class KuzuStore:
             "CREATE REL TABLE IF NOT EXISTS TEMPORAL_LINK "
             "(FROM EpisodeNode TO EpisodeNode, time_diff DOUBLE)"
         )
+        # 本体论节点/边
+        self.conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS OntologyType ("
+            "name STRING, category STRING, "
+            "PRIMARY KEY (name))"
+        )
+        self.conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS OntologyEntity ("
+            "name STRING, type STRING, category STRING, "
+            "PRIMARY KEY (name))"
+        )
+        self.conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS IS_A "
+            "(FROM OntologyEntity TO OntologyType)"
+        )
+        self.conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS RELATES_TO "
+            "(FROM OntologyEntity TO OntologyEntity, relation STRING)"
+        )
 
         # [Migration] 添加旧版本可能缺失的列
         # Kuzu 0.11.x does not support "IF NOT EXISTS" in ALTER TABLE

@@ -157,6 +157,7 @@ class OntologyValidator:
         self.kuzu = kuzu_store
         self.encoder = encoder
         self.config = config or OntologyConfig()
+        self._ontology_synced = False  # lazy sync on first use
 
     # ─── 实体提取 ─────────────────────────────────────────────
 
@@ -424,6 +425,181 @@ class OntologyValidator:
         # 加权: 精确匹配权重高
         return round(0.6 * exact_ratio + 0.4 * cat_ratio, 3)
 
+    # ─── Phase 2: Kuzu 本体图同步 + 拓扑验证 ─────────────────────
+
+    def _ensure_ontology_schema(self) -> None:
+        """确保 Kuzu 中存在本体论节点/边表（幂等）。"""
+        if self.kuzu is None:
+            return
+        try:
+            self.kuzu.execute_cypher(
+                "CREATE NODE TABLE IF NOT EXISTS OntologyType ("
+                "name STRING, category STRING, PRIMARY KEY (name))",
+                {},
+            )
+            self.kuzu.execute_cypher(
+                "CREATE NODE TABLE IF NOT EXISTS OntologyEntity ("
+                "name STRING, type STRING, category STRING, PRIMARY KEY (name))",
+                {},
+            )
+            self.kuzu.execute_cypher(
+                "CREATE REL TABLE IF NOT EXISTS IS_A "
+                "(FROM OntologyEntity TO OntologyType)",
+                {},
+            )
+            self.kuzu.execute_cypher(
+                "CREATE REL TABLE IF NOT EXISTS RELATES_TO "
+                "(FROM OntologyEntity TO OntologyEntity, relation STRING)",
+                {},
+            )
+        except Exception:
+            pass
+
+    def sync_entity_types_to_kuzu(self) -> int:
+        """同步 ENTITY_TYPE_MAP 到 Kuzu，创建节类型/实体节点 + IS_A 边。
+
+        Returns: 同步的实体数
+        """
+        if self.kuzu is None:
+            return 0
+        self._ensure_ontology_schema()
+        count = 0
+        for entity, etype in self.ENTITY_TYPE_MAP.items():
+            category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
+            try:
+                # 创建类型节点
+                self.kuzu.execute_cypher(
+                    "MERGE (t:OntologyType {name: $type, category: $cat})",
+                    {"type": etype, "cat": category},
+                )
+                # 创建实体节点 + IS_A 边
+                self.kuzu.execute_cypher(
+                    "MERGE (e:OntologyEntity {name: $name, type: $etype, category: $cat}) "
+                    "WITH e "
+                    "MATCH (t:OntologyType {name: $type}) "
+                    "MERGE (e)-[:IS_A]->(t)",
+                    {"name": entity, "etype": etype, "cat": category, "type": etype},
+                )
+                count += 1
+            except Exception:
+                pass
+        logger.info("Ontology synced to Kuzu: %d entities", count)
+        return count
+
+    def _extract_entity_cooccurrence(self, content: str) -> List[str]:
+        """从文本中找出哪些 ENTITY_TYPE_MAP 实体共同出现。
+
+        用于推断实体间关系（同一段话中出现的实体可能有关联）。
+        返回: 共现实体名列表（小写去重）
+        """
+        text_lower = content.lower()
+        found_names: List[str] = []
+        for entity in self.ENTITY_TYPE_MAP:
+            if entity in text_lower:
+                try:
+                    if re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
+                        found_names.append(entity)
+                except Exception:
+                    if entity in text_lower:
+                        found_names.append(entity)
+        return list(set(found_names))
+
+    def _populate_relationships(self) -> int:
+        """扫描 EpisodeNode 内容，提取实体共现关系 → 创建 RELATES_TO 边。
+
+        Returns: 新增的关系数
+        """
+        if self.kuzu is None:
+            return 0
+        self._ensure_ontology_schema()
+        try:
+            rows = self.kuzu.execute_cypher(
+                "MATCH (e:EpisodeNode) RETURN e.content LIMIT 5000",
+                {},
+            )
+        except Exception:
+            return 0
+        rel_count = 0
+        for row in rows:
+            content = row.get("content", "") if isinstance(row, dict) else str(row[0]) if isinstance(row, (list, tuple)) and len(row) > 0 else ""
+            if not content:
+                continue
+            entities = self._extract_entity_cooccurrence(content)
+            if len(entities) < 2:
+                continue
+            # 同一段话中每对实体创建 RELATES_TO 边
+            for i in range(len(entities)):
+                for j in range(i + 1, len(entities)):
+                    try:
+                        self.kuzu.execute_cypher(
+                            "MATCH (a:OntologyEntity {name: $a_name}) "
+                            "MATCH (b:OntologyEntity {name: $b_name}) "
+                            "MERGE (a)-[:RELATES_TO {relation: 'co_occur'}]->(b) "
+                            "MERGE (b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                            {"a_name": entities[i], "b_name": entities[j]},
+                        )
+                        rel_count += 1
+                    except Exception:
+                        pass
+        return rel_count
+
+    def _compute_topology_score(
+        self,
+        query_entities: List[Dict[str, str]],
+        result_content: str,
+    ) -> float:
+        """拓扑验证：查询实体与结果实体的关系路径一致性。
+
+        1. 从结果内容中提取实体
+        2. 对查询与结果中共同出现的实体对，检查 Kuzu 中是否有 RELATES_TO 路径
+        3. 有路径 → 1.0（高度一致）；无路径 → 0.6（中性）
+        Returns: 拓扑置信度 (0.0 ~ 1.0)
+        """
+        if not query_entities or self.kuzu is None:
+            return 1.0
+
+        result_entity_names = self._extract_entity_cooccurrence(result_content)
+        if not result_entity_names:
+            return 1.0
+
+        query_entity_names = [q["entity"] for q in query_entities]
+        # 找查询与结果的共同实体
+        shared = set(query_entity_names) & set(result_entity_names)
+        # 找查询与结果的不同实体对（需要检查关系）
+        query_only = [e for e in query_entity_names if e not in shared]
+        result_only = [e for e in result_entity_names if e not in shared]
+
+        if not query_only or not result_only:
+            return 1.0
+
+        # 检查是否有 RELATES_TO 路径连接查询和结果的实体
+        path_found = 0
+        total_checked = 0
+        for qe in query_only:
+            for re_name in result_only:
+                total_checked += 1
+                try:
+                    result = self.kuzu.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $a_name}) "
+                        "MATCH (b:OntologyEntity {name: $b_name}) "
+                        "MATCH (a)-[:RELATES_TO*1..3]-(b) "
+                        "RETURN count(*) AS cnt LIMIT 1",
+                        {"a_name": qe, "b_name": re_name},
+                    )
+                    if result and len(result) > 0:
+                        row = result[0]
+                        cnt = row.get("cnt", 0) if isinstance(row, dict) else int(row[0]) if isinstance(row, (list, tuple)) else 0
+                        if cnt > 0:
+                            path_found += 1
+                except Exception:
+                    pass
+
+        if total_checked == 0:
+            return 1.0
+        ratio = path_found / total_checked
+        # 有路径 → 1.0 (确认关系); 无路径 → 0.6 (非关系但也不是矛盾)
+        return round(0.6 + 0.4 * ratio, 3)
+
     def write_validate(
         self,
         content: str,
@@ -541,6 +717,13 @@ class OntologyValidator:
                 for r in results
             ]
 
+        # lazy: 首次调用时同步实体类型到 Kuzu 并建立关系图
+        if not self._ontology_synced:
+            self.sync_entity_types_to_kuzu()
+            rels = self._populate_relationships()
+            logger.info("Ontology graph synced: %d relationships from content", rels)
+            self._ontology_synced = True
+
         # 0. 提取查询的实体类型
         query_types = self._extract_types(query) if query else []
 
@@ -591,10 +774,12 @@ class OntologyValidator:
                     # Kuzu 矛盾查询不可用时不阻塞类型一致性评分
                     pass
 
-            # 5. 综合分数: original_score × type_overlap × τ × conflict_penalty
-            #    type_overlap 是核心提升：匹配的类型越多 → 置信度越高
+            # 5. 拓扑验证：检查查询与结果实体间的关系路径
+            topology_score = self._compute_topology_score(query_types, content)
+
+            # 6. 综合分数: original_score × type_overlap × topology × τ × conflict
             tau_factor = min(1.0, tau / 0.5) if tau > 0 else 0.5
-            adjusted = score * type_overlap * tau_factor * ontology_conf
+            adjusted = score * type_overlap * topology_score * tau_factor * ontology_conf
 
             note = ""
             if conflict_count > 0:
