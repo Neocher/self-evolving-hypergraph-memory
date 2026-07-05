@@ -19,7 +19,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+# 确保日志输出到 stderr（即使 structlog 不可用）
+_log = logging.getLogger(__name__)
+if not _log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _log.addHandler(_handler)
+    _log.propagate = False
+logger = _log
 
 
 # ─── 本休类型定义 ────────────────────────────────────────────
@@ -267,6 +274,48 @@ class OntologyValidator:
         "claude": "ai_assistant",
         "deepseek": "ai_assistant",
         "openai": "ai_platform",
+        # 中文互联网平台
+        "baidu": "internet_platform",
+        "qq": "internet_platform",
+        "weixin": "internet_platform",
+        "wechat": "internet_platform",
+        "taobao": "internet_platform",
+        "alibaba": "internet_platform",
+        "tencent": "internet_platform",
+        "huawei": "internet_platform",
+        "xiaomi": "internet_platform",
+        "douyin": "internet_platform",
+        "tiktok": "internet_platform",
+        "bilibili": "internet_platform",
+        "sina": "internet_platform",
+        "sohu": "internet_platform",
+        "netease": "internet_platform",
+        "zhihu": "internet_platform",
+        "meituan": "internet_platform",
+        "didi": "internet_platform",
+        "jd": "internet_platform",
+        "bytedance": "internet_platform",
+        "pinduoduo": "internet_platform",
+        "kuaishou": "internet_platform",
+        # 网络服务/协议
+        "dns": "network_service",
+        "cdn": "network_service",
+        "smtp": "network_service",
+        "pop3": "network_service",
+        "imap": "network_service",
+        "spf": "network_service",
+        "mx": "network_service",
+        "ns1": "network_service",
+        "ns2": "network_service",
+        "ns3": "network_service",
+        "ns4": "network_service",
+        "cname": "network_service",
+        "aaaa": "network_service",
+        "srv": "network_service",
+        "txt": "network_service",
+        "http": "network_service",
+        "https": "network_service",
+        "websocket": "network_service",
         # 文件/数据格式
         "json": "data_format",
         "yaml": "data_format",
@@ -306,6 +355,8 @@ class OntologyValidator:
         "programming_language": "language",
         "ide": "software",
         "ai_platform": "ai_software",
+        "internet_platform": "web_service",
+        "network_service": "infrastructure",
     }
 
     def _extract_types(self, text: str) -> List[Dict[str, str]]:
@@ -809,13 +860,14 @@ class OntologyValidator:
             topology_score = self._compute_topology_score(query_types, content)
 
             # 6. 综合分数: 惩罚不匹配 + 奖励超匹配，突破原始 FAISS 天花板
-            #    confidence_bonus ∈ [0,1]，越接近1说明本体+拓扑验证越确信
             tau_factor = min(1.0, tau / 0.5) if tau > 0 else 0.5
             confidence_bonus = round(type_overlap * topology_score * tau_factor * ontology_conf, 3)
 
+            # 【P4】查询无实体类型→无法做本体判断→返回原始分
+            if not query_types:
+                adjusted = score
             # 高置信度阈值：实体类型全匹配 + 拓扑有路径 → 直接给满分
-            # 这使搜索精度从 ~0.7 (纯FAISS) 提升到 0.999 (本体验证通过)
-            if confidence_bonus >= 0.95 and self.kuzu is not None:
+            elif confidence_bonus >= 0.95 and self.kuzu is not None:
                 adjusted = min(0.9999, score + 0.3)
             else:
                 # 乘法惩罚(不匹配时) + 保底(0.2)防止完全归零

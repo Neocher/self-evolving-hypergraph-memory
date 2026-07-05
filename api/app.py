@@ -391,10 +391,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception as e:
             logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
 
+    async def _cleanup_dream_candidates() -> None:
+        """启动时清理过期的梦境候选文件（保留最近50个）。"""
+        try:
+            import os, glob
+            cand_dir = os.path.join(os.path.dirname(__file__), "..", "data", "dream_candidates")
+            if not os.path.isdir(cand_dir):
+                return
+            files = sorted(glob.glob(os.path.join(cand_dir, "*.json")), key=os.path.getmtime, reverse=True)
+            if len(files) > 50:
+                for f in files[50:]:
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+                logger.info("Startup cleanup: purged %d old dream candidates (kept 50)", len(files) - 50)
+        except Exception:
+            pass
+
     startup_task = asyncio.create_task(_startup_rebuild())
+    cleanup_task = asyncio.create_task(_cleanup_dream_candidates())
 
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
-    DREAM_POLL_INTERVAL = 60.0
+    DREAM_POLL_INTERVAL = 300.0
 
     async def _dream_poll_loop() -> None:
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)
