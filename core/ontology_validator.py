@@ -543,6 +543,37 @@ class OntologyValidator:
                         pass
         return rel_count
 
+    def extract_and_relate(self, content: str) -> int:
+        """写入时提取实体共现关系 → 创建 RELATES_TO 边。
+
+        每次新记忆写入时调用，确保拓扑图即时更新。
+        Returns: 创建的关系数
+        """
+        if self.kuzu is None:
+            return 0
+        # lazy sync on first write
+        if not self._ontology_synced:
+            self.sync_entity_types_to_kuzu()
+            self._ontology_synced = True
+        entities = self._extract_entity_cooccurrence(content)
+        if len(entities) < 2:
+            return 0
+        count = 0
+        for i in range(len(entities)):
+            for j in range(i + 1, len(entities)):
+                try:
+                    self.kuzu.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $a_name}) "
+                        "MATCH (b:OntologyEntity {name: $b_name}) "
+                        "MERGE (a)-[:RELATES_TO {relation: 'co_occur'}]->(b) "
+                        "MERGE (b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                        {"a_name": entities[i], "b_name": entities[j]},
+                    )
+                    count += 1
+                except Exception:
+                    pass
+        return count
+
     def _compute_topology_score(
         self,
         query_entities: List[Dict[str, str]],

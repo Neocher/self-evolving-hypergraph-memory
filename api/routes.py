@@ -293,6 +293,15 @@ async def create_episode(
         "tau_initial": tau_initial,
     })
 
+    # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边
+    if deps.ontology_validator is not None:
+        try:
+            rel_count = deps.ontology_validator.extract_and_relate(req.content)
+            if rel_count > 0:
+                logger.info("Write-time entity relations: %d edges", rel_count)
+        except Exception:
+            pass
+
     if deps.encoder:
         try:
             # asyncio-compatible embed timeout
