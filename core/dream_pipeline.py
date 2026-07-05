@@ -537,7 +537,11 @@ class DreamPipeline:
             tau = node.get("tau_value", 1.0)
             node_id = node["id"]
             degree = len(connections.get(node_id, {}))
-            if self.tau_engine and tau < self.tau_engine.config.decay_threshold and degree <= 1:
+            created_at = node.get("created_at", 0)
+            age_seconds = time.time() - created_at
+            # 保护规则：新节点（< 2h）、高 τ（> 0.3）、或高连接度 不剪枝
+            is_protected = (age_seconds < 7200) or (tau > 0.3) or (degree > 1)
+            if not is_protected and self.tau_engine and tau < self.tau_engine.config.decay_threshold:
                 pruned_ids.add(node_id)
                 prune_ops.append(
                     AuditOperation(

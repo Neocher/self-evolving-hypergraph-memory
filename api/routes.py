@@ -494,6 +494,19 @@ async def retrieve(
         except Exception:
             logger.exception("Cypher fallback failed")
 
+    # 【P2】结果去重：按 content 去重，保留最高分
+    if results_raw:
+        seen = set()
+        deduped = []
+        for r in results_raw:
+            key = r.get("content", "")[:100]
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(r)
+        if len(deduped) < len(results_raw):
+            logger.debug("Dedup removed %d duplicate results", len(results_raw) - len(deduped))
+        results_raw = deduped
+
     # 检查是否降级
     if results_raw:
         first_level = results_raw[0].get("level", "hypergraph") if isinstance(results_raw[0], dict) else "hypergraph"

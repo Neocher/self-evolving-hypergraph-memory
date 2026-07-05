@@ -261,10 +261,22 @@ class DreamCandidateStore:
     ) -> int:
         """从候选 data 创建 Kuzu CommunityNode + COMMUNITY_MEMBER 边。
 
+        先清理所有旧社区，再创建新的（最多 50 个最高质量的）。
         Returns: 创建的社区数
         """
+        # 先清理旧社区
+        try:
+            kuzu_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c", {})
+        except Exception:
+            pass
         created = 0
-        for comm in candidate.community_summaries:
+        # 按 member_count 倒序，只创建 top-50
+        sorted_comms = sorted(
+            candidate.community_summaries,
+            key=lambda c: c.get("member_count", 0),
+            reverse=True,
+        )
+        for comm in sorted_comms[:50]:
             comm_id = comm.get("id", "")
             if not comm_id:
                 continue
