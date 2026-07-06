@@ -628,14 +628,16 @@ class OntologyValidator:
         for entity, etype in self.ENTITY_TYPE_MAP.items():
             category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
             try:
-                # 创建类型节点
+                # 创建类型节点（只对主键 name MERGE）
                 self.kuzu.execute_cypher(
-                    "MERGE (t:OntologyType {name: $type, category: $cat})",
+                    "MERGE (t:OntologyType {name: $type}) "
+                    "SET t.category = $cat",
                     {"type": etype, "cat": category},
                 )
-                # 创建实体节点 + IS_A 边
+                # 创建实体节点 + IS_A 边（只对主键 name MERGE，防止重复键冲突）
                 self.kuzu.execute_cypher(
-                    "MERGE (e:OntologyEntity {name: $name, type: $etype, category: $cat}) "
+                    "MERGE (e:OntologyEntity {name: $name}) "
+                    "SET e.type = $etype, e.category = $cat "
                     "WITH e "
                     "MATCH (t:OntologyType {name: $type}) "
                     "MERGE (e)-[:IS_A]->(t)",
