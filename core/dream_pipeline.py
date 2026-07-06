@@ -410,9 +410,10 @@ class DreamPipeline:
         如果有 LLMClient，用模型生成语义摘要；
         否则用 TF-IDF 模板方法（原有回退）。
         """
-        for community in communities:
+        for i, community in enumerate(communities):
             nodes = community.get("nodes", [])
-            if self.llm_client and len(nodes) >= 2:
+            # 前 20 个最大社区用 LLM，其余用 TF-IDF 回退（平衡质量与速度）
+            if self.llm_client and len(nodes) >= 2 and i < 20:
                 # LLM 语义摘要
                 contents = [n.get("content", "") for n in nodes]
                 llm_result = self.llm_client.summarize_community(contents)
@@ -569,6 +570,15 @@ class DreamPipeline:
                 conns = clean_connections.get(nid, {})
                 if len(conns) > self.hebbian_updater.config.k_sparsity:
                     clean_connections[nid] = self.hebbian_updater.prune_connections(conns)
+
+        # 【P4】τ-Hebbian 联动：低 τ 节点连接权重衰减
+        if self.hebbian_updater and self.tau_engine:
+            tau_map = {n["id"]: n.get("tau_value", n.get("tau_initial", 1.0))
+                       for n in keep_nodes}
+            clean_connections = self.hebbian_updater.tau_decay_connections(
+                clean_connections, tau_map,
+                decay_threshold=self.tau_engine.config.decay_threshold,
+            )
 
         return keep_nodes, clean_connections, len(pruned_ids), prune_ops
 

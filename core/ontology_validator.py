@@ -503,8 +503,8 @@ class OntologyValidator:
                 "(FROM OntologyEntity TO OntologyEntity, relation STRING)",
                 {},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to create ontology schema: %s", e)
 
     def sync_entity_types_to_kuzu(self) -> int:
         """同步 ENTITY_TYPE_MAP 到 Kuzu，创建节类型/实体节点 + IS_A 边。
@@ -532,8 +532,8 @@ class OntologyValidator:
                     {"name": entity, "etype": etype, "cat": category, "type": etype},
                 )
                 count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to sync entity %s→%s: %s", entity, etype, e)
         logger.info("Ontology synced to Kuzu: %d entities", count)
         return count
 
@@ -568,7 +568,8 @@ class OntologyValidator:
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 5000",
                 {},
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to query EpisodeNode contents: %s", e)
             return 0
         rel_count = 0
         for row in rows:
@@ -590,8 +591,8 @@ class OntologyValidator:
                             {"a_name": entities[i], "b_name": entities[j]},
                         )
                         rel_count += 1
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to create RELATES_TO edge: %s", e)
         return rel_count
 
     def extract_and_relate(self, content: str) -> int:
@@ -621,8 +622,8 @@ class OntologyValidator:
                         {"a_name": entities[i], "b_name": entities[j]},
                     )
                     count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Topology path query failed: %s", e)
         return count
 
     def _compute_topology_score(
@@ -673,8 +674,8 @@ class OntologyValidator:
                         cnt = row.get("cnt", 0) if isinstance(row, dict) else int(row[0]) if isinstance(row, (list, tuple)) else 0
                         if cnt > 0:
                             path_found += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Topology path query failed: %s", e)
 
         if total_checked == 0:
             return 1.0
@@ -852,9 +853,9 @@ class OntologyValidator:
                                 0.1,
                                 1.0 - self.config.conflict_penalty_factor * conflict_count
                             )
-                except Exception:
+                except Exception as e:
                     # Kuzu 矛盾查询不可用时不阻塞类型一致性评分
-                    pass
+                    logger.debug("Contradiction query skipped (non-fatal): %s", e)
 
             # 5. 拓扑验证：检查查询与结果实体间的关系路径
             topology_score = self._compute_topology_score(query_types, content)

@@ -110,9 +110,32 @@ class SparseHebbianUpdater:
         return eta * (node_i_activation * node_j_activation - current_weight * decay)
 
     def prune_connections(self, connections: dict[str, float]) -> dict[str, float]:
-        """将连接数剪枝到 K 个最强。"""
+        """保留 top-K 最强连接，其余删除。"""
         K = self.config.k_sparsity
         if len(connections) <= K:
             return connections
-        pruned = heapq.nlargest(K, connections.items(), key=lambda x: x[1])
-        return dict(pruned)
+        top_k = heapq.nlargest(K, connections.items(), key=lambda x: x[1])
+        return dict(top_k)
+
+    def tau_decay_connections(
+        self,
+        all_connections: dict[str, dict[str, float]],
+        tau_map: dict[str, float],
+        decay_threshold: float = 0.1,
+    ) -> dict[str, dict[str, float]]:
+        """【P4】τ-Hebbian 联动：低 τ 节点的连接权重衰减。
+
+        τ 值越低，连接衰减越强。
+        当 τ < decay_threshold 时，权重乘以 τ/decay_threshold。
+        """
+        if not tau_map:
+            return all_connections
+        for nid, conns in all_connections.items():
+            tau = tau_map.get(nid, 0.5)
+            if tau < decay_threshold:
+                factor = tau / decay_threshold  # τ=0.05 → 0.5, τ=0.01 → 0.1
+                all_connections[nid] = {
+                    neighbor: w * factor
+                    for neighbor, w in conns.items()
+                }
+        return all_connections

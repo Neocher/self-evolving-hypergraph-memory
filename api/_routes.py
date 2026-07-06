@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +112,46 @@ def _now() -> float:
 
 
 _FAISS_BATCH_SIZE = 10  # 攒够 10 条后批量写入 FAISS
+
+# 【P6】异步 embedding 队列
+_embed_queue: list[tuple[str, str, float]] = []  # (episode_id, content, created_at)
+_embed_queue_lock: threading.Lock = threading.Lock()
+
+
+def _process_embed_queue(deps: Services) -> int:
+    """消费 embedding 队列：异步编码并加入 FAISS 缓冲。"""
+    global _embed_queue
+    if not deps.encoder:
+        return 0
+    with _embed_queue_lock:
+        batch = _embed_queue[:]
+        _embed_queue.clear()
+    if not batch:
+        return 0
+    count = 0
+    for episode_id, content, created_at in batch:
+        try:
+            emb = deps.encoder.embed(content)
+            if emb is not None and deps.faiss_index is not None:
+                faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, str(episode_id)).int & ((1 << 63) - 1))
+                emb_array = emb.reshape(1, -1).astype(np.float32)
+                with deps._faiss_buffer_lock:
+                    deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
+                try:
+                    if deps.hebbian_updater and deps.kuzu_store:
+                        deps.hebbian_updater.update(
+                            {episode_id: 1.0}, deps.kuzu_store.get_all_connections()
+                        )
+                except Exception:
+                    pass
+                count += 1
+        except Exception:
+            pass
+    # 批量 flush FAISS
+    flush_faiss_buffer(deps)
+    if count:
+        logger.debug("Embed queue: processed %d items", count)
+    return count
 
 
 def flush_faiss_buffer(deps: Services) -> int:
@@ -302,59 +343,15 @@ async def create_episode(
         except Exception:
             pass
 
-    if deps.encoder:
-        try:
-            # asyncio-compatible embed timeout
-            emb = deps.encoder.embed(req.content)
-        except Exception:
-            emb = None
-        if emb is not None and deps.faiss_index is not None:
-            faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, str(episode_id)).int & ((1 << 63) - 1))
-            emb_array = emb.reshape(1, -1).astype(np.float32)
+    # 【P6】异步 embedding：入队后立即返回，后台消费
+    with _embed_queue_lock:
+        _embed_queue.append((episode_id, req.content, created_at))
 
-            # 缓冲写入，攒够批量再 flush
-            with deps._faiss_buffer_lock:
-                deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
-                buf_size = len(deps._faiss_buffer)
-
-            # 攒够批量 → 立即 flush
-            if buf_size >= _FAISS_BATCH_SIZE:
-                flush_faiss_buffer(deps)
-
-            # 【FIX】Hebbian 连接：立即 flush 以确保新向量在索引中可搜索
-            try:
-                flush_faiss_buffer(deps)
-                if deps.faiss_index.ntotal > 1:
-                    distances, indices = deps.faiss_index.search(emb_array, 6)
-                    conn_count = 0
-                    for rank in range(1, len(indices[0])):
-                        nb_id = int(indices[0][rank])
-                        if nb_id < 0 or nb_id == faiss_id:
-                            continue
-                        similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)
-                        if similarity < 0.3:
-                            continue
-                        nb_ep_id = None
-                        if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
-                            nb_ep_id = deps.faiss_id_map.get(nb_id)
-                        if not nb_ep_id:
-                            continue
-                        deps.kuzu_store.query_cypher(
-                            "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                            "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
-                            {"aid": episode_id, "bid": nb_ep_id, "w": round(similarity, 4)}
-                        )
-                        deps.kuzu_store.query_cypher(
-                            "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                            "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
-                            {"aid": nb_ep_id, "bid": episode_id, "w": round(similarity, 4)}
-                        )
-                        conn_count += 1
-                    if conn_count > 0:
-                        logger.debug("Hebbian connections created: %d for episode %s",
-                                     conn_count, episode_id)
-            except Exception as he:
-                logger.warning("Hebbian connection creation failed: %s", he)
+    # 尝试消费队列（非阻塞）
+    try:
+        _process_embed_queue(deps)
+    except Exception:
+        pass
 
     if deps.dream_scheduler:
         await deps.dream_scheduler.on_activity()
