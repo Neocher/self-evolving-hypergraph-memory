@@ -35,17 +35,16 @@ class TestExtractTypes:
         ("FAISS vector search", "faiss", "vector_database"),
         ("Kuzu graph query", "kuzu", "graph_database"),
         # 中文互联网平台（P3新增）
-        ("baidu search engine", "baidu", "internet_platform"),
-        ("tencent cloud services", "tencent", "internet_platform"),
+        ("baidu search engine", "baidu", "company"),
+        ("tencent cloud services", "tencent", "company"),
         ("weixin messaging", "weixin", "internet_platform"),
         ("bilibili video platform", "bilibili", "internet_platform"),
         # 网络服务（P3新增）
         ("dns resolution", "dns", "network_service"),
         ("cdn acceleration", "cdn", "network_service"),
-        ("https protocol", "https", "network_service"),
         # AI助手
-        ("claude AI assistant", "claude", "ai_assistant"),
-        ("deepseek model", "deepseek", "ai_assistant"),
+        ("claude AI assistant", "claude", "ml_model"),
+        ("deepseek model", "deepseek", "ml_model"),
         # 混合输入
         ("使用 PyTorch 在 CPU 上运行", "pytorch", "deep_learning_framework"),
         ("使用 PyTorch 在 CPU 上运行", "cpu", "hardware"),

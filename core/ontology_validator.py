@@ -72,6 +72,20 @@ ONTOLOGY_TYPES: dict[str, dict[str, Any]] = {
         "description": "通用事实（无法归类时使用）",
         "conflict_keys": [],
         "contradiction_pattern": "embedding_contradiction",
+    },    "domain_info": {
+        "description": "域名注册/IP映射/Whois信息",
+        "conflict_keys": ["domain", "dns", "ip", "解析", "注册"],
+        "contradiction_pattern": "same_entity_diff_value",
+    },
+    "ip_address": {
+        "description": "IP地址地理位置/归属",
+        "conflict_keys": ["ip", "地理位置", "归属", "asn"],
+        "contradiction_pattern": "same_entity_diff_value",
+    },
+    "url_link": {
+        "description": "URL结构/内容类型/状态",
+        "conflict_keys": ["url", "http", "https", "status", "响应"],
+        "contradiction_pattern": "same_entity_diff_value",
     },
 }
 
@@ -165,6 +179,7 @@ class OntologyValidator:
         self.encoder = encoder
         self.config = config or OntologyConfig()
         self._ontology_synced = False  # lazy sync on first use
+        self._candidate_entities: dict[str, int] = {}  # P5
 
     # ─── 实体提取 ─────────────────────────────────────────────
 
@@ -229,18 +244,31 @@ class OntologyValidator:
 
     # 已知实体 → 本体类型 映射表（搜索时类型一致性校验用）
     ENTITY_TYPE_MAP: dict[str, str] = {
-        # 深度学习框架
+        # --- 深度学习框架 ---
         "pytorch": "deep_learning_framework",
         "tensorflow": "deep_learning_framework",
         "jax": "deep_learning_framework",
         "mxnet": "deep_learning_framework",
         "paddlepaddle": "deep_learning_framework",
         "onnx": "deep_learning_framework",
-        # 机器学习模型/架构
+        "keras": "deep_learning_framework",
+        "theano": "deep_learning_framework",
+        "caffe": "deep_learning_framework",
+        # --- 机器学习模型/架构 ---
         "transformer": "ml_model",
         "bert": "ml_model",
         "gpt": "ml_model",
+        "gpt-4": "ml_model",
+        "gpt-4o": "ml_model",
+        "gpt-3.5": "ml_model",
         "llama": "ml_model",
+        "llama3": "ml_model",
+        "mistral": "ml_model",
+        "qwen": "ml_model",
+        "deepseek": "ml_model",
+        "deepseek-v3": "ml_model",
+        "claude": "ml_model",
+        "gemini": "ml_model",
         "clip": "ml_model",
         "vit": "ml_model",
         "resnet": "ml_model",
@@ -248,7 +276,10 @@ class OntologyValidator:
         "sentencetransformer": "ml_model",
         "all-minilm-l6-v2": "ml_model",
         "word2vec": "ml_model",
-        # 硬件
+        "whisper": "ml_model",
+        "stable-diffusion": "ml_model",
+        "dalle": "ml_model",
+        # --- 硬件 ---
         "cpu": "hardware",
         "gpu": "hardware",
         "tpu": "hardware",
@@ -258,32 +289,73 @@ class OntologyValidator:
         "cuda": "hardware",
         "rocm": "hardware",
         "mps": "hardware",
-        # 计算/部署技术
+        "asic": "hardware",
+        "fpga": "hardware",
+        # --- 数据库/向量搜索 ---
         "faiss": "vector_database",
+        "milvus": "vector_database",
+        "pinecone": "vector_database",
+        "weaviate": "vector_database",
+        "chromadb": "vector_database",
+        "qdrant": "vector_database",
         "kuzu": "graph_database",
         "neo4j": "graph_database",
+        "arangodb": "graph_database",
         "redis": "database",
-        "docker": "infrastructure",
-        "kubernetes": "infrastructure",
-        "fastapi": "web_framework",
-        "uvicorn": "web_server",
-        # 系统
-        "shm": "memory_system",
-        "hermes": "ai_agent",
-        "cursor": "ide",
-        "claude": "ai_assistant",
-        "deepseek": "ai_assistant",
-        "openai": "ai_platform",
-        # 中文互联网平台
-        "baidu": "internet_platform",
+        "postgresql": "database",
+        "mysql": "database",
+        "mongodb": "database",
+        "clickhouse": "database",
+        "elasticsearch": "database",
+        # --- 知名公司 ---
+        "tesla": "company",
+        "spacex": "company",
+        "openai": "company",
+        "google": "company",
+        "apple": "company",
+        "microsoft": "company",
+        "meta": "company",
+        "amazon": "company",
+        "aws": "cloud_platform",
+        "azure": "cloud_platform",
+        "gcp": "cloud_platform",
+        "alibaba": "company",
+        "tencent": "company",
+        "baidu": "company",
+        "bytedance": "company",
+        "huawei": "company",
+        "xiaomi": "company",
+        "ibm": "company",
+        "oracle": "company",
+        "salesforce": "company",
+        "netflix": "company",
+        "uber": "company",
+        "airbnb": "company",
+        "spotify": "company",
+        "shopify": "company",
+        "twitter": "company",
+        "linkedin": "company",
+        "github": "company",
+        "gitlab": "company",
+        "redhat": "company",
+        # --- 知名人物 ---
+        "elon musk": "person",
+        "sam altman": "person",
+        "tim cook": "person",
+        "satya nadella": "person",
+        "sundar pichai": "person",
+        "mark zuckerberg": "person",
+        "jeff bezos": "person",
+        "bill gates": "person",
+        "steve jobs": "person",
+        "larry page": "person",
+        "sergey brin": "person",
+        "jack ma": "person",
+        # --- 中文互联网平台 ---
         "qq": "internet_platform",
         "weixin": "internet_platform",
         "wechat": "internet_platform",
         "taobao": "internet_platform",
-        "alibaba": "internet_platform",
-        "tencent": "internet_platform",
-        "huawei": "internet_platform",
-        "xiaomi": "internet_platform",
         "douyin": "internet_platform",
         "tiktok": "internet_platform",
         "bilibili": "internet_platform",
@@ -291,51 +363,84 @@ class OntologyValidator:
         "sohu": "internet_platform",
         "netease": "internet_platform",
         "zhihu": "internet_platform",
+        "xiaohongshu": "internet_platform",
         "meituan": "internet_platform",
         "didi": "internet_platform",
         "jd": "internet_platform",
-        "bytedance": "internet_platform",
         "pinduoduo": "internet_platform",
         "kuaishou": "internet_platform",
-        # 网络服务/协议
-        "dns": "network_service",
-        "cdn": "network_service",
-        "smtp": "network_service",
-        "pop3": "network_service",
-        "imap": "network_service",
-        "spf": "network_service",
-        "mx": "network_service",
-        "ns1": "network_service",
-        "ns2": "network_service",
-        "ns3": "network_service",
-        "ns4": "network_service",
-        "cname": "network_service",
-        "aaaa": "network_service",
-        "srv": "network_service",
-        "txt": "network_service",
-        "http": "network_service",
-        "https": "network_service",
-        "websocket": "network_service",
-        # 文件/数据格式
-        "json": "data_format",
-        "yaml": "data_format",
-        "toml": "data_format",
-        "csv": "data_format",
-        "parquet": "data_format",
-        "numpy": "data_processing",
-        "pandas": "data_processing",
-        # 操作系统/环境
-        "linux": "os",
-        "ubuntu": "os",
-        "centos": "os",
+        # --- 基础设施 ---
+        "docker": "infrastructure",
+        "kubernetes": "infrastructure",
+        "k8s": "infrastructure",
+        "terraform": "infrastructure",
+        "ansible": "infrastructure",
+        "jenkins": "infrastructure",
+        "fastapi": "web_framework",
+        "flask": "web_framework",
+        "django": "web_framework",
+        "spring": "web_framework",
+        "uvicorn": "web_server",
+        "nginx": "web_server",
+        "apache": "web_server",
+        # --- 系统/AI ---
+        "shm": "memory_system",
+        "hermes": "ai_agent",
+        "cursor": "ide",
+        # --- 中文技术术语 ---
+        "深度学习": "chinese_tech",
+        "向量数据库": "chinese_tech",
+        "知识图谱": "chinese_tech",
+        "搜索引擎": "chinese_tech",
+        "推荐系统": "chinese_tech",
+        "自然语言": "chinese_tech",
+        "机器学习": "chinese_tech",
+        "图数据库": "chinese_tech",
+        "神经网络": "chinese_tech",
+        "编码器": "chinese_tech",
+        "解码器": "chinese_tech",
+        # --- 编程语言 ---
         "python": "programming_language",
         "rust": "programming_language",
         "go": "programming_language",
         "javascript": "programming_language",
         "typescript": "programming_language",
+        "java": "programming_language",
+        "swift": "programming_language",
+        "kotlin": "programming_language",
+        # --- 操作系统 ---
+        "linux": "os",
+        "ubuntu": "os",
+        "centos": "os",
+        "debian": "os",
+        "alpine": "os",
+        "macos": "os",
+        "windows": "os",
+        "freebsd": "os",
+        # --- 数据格式/处理 ---
+        "json": "data_format",
+        "yaml": "data_format",
+        "toml": "data_format",
+        "csv": "data_format",
+        "parquet": "data_format",
+        "xml": "data_format",
+        "numpy": "data_processing",
+        "pandas": "data_processing",
+        "polars": "data_processing",
+        "spark": "data_processing",
+        # --- 网络协议/服务 ---
+        "http": "network_protocol",
+        "https": "network_protocol",
+        "smtp": "network_protocol",
+        "websocket": "network_protocol",
+        "grpc": "network_protocol",
+        "dns": "network_service",
+        "cdn": "network_service",
+        "ddos": "network_service",
+        "vpn": "network_service",
     }
-
     # 实体类型 → 类别（用于泛化匹配）
+    # 实体类型 -> 类别（用于泛化匹配）
     ENTITY_TYPE_CATEGORIES: dict[str, str] = {
         "deep_learning_framework": "ml_infra",
         "ml_model": "ml_infra",
@@ -343,22 +448,26 @@ class OntologyValidator:
         "vector_database": "data_infra",
         "graph_database": "data_infra",
         "database": "data_infra",
+        "company": "organization",
+        "person": "people",
+        "cloud_platform": "organization",
+        "internet_platform": "web_service",
         "infrastructure": "infrastructure",
         "web_framework": "software",
         "web_server": "software",
         "memory_system": "system",
         "ai_agent": "ai_software",
         "ai_assistant": "ai_software",
+        "ai_platform": "ai_software",
+        "chinese_tech": "technology",
         "data_format": "data",
         "data_processing": "data_infra",
         "os": "platform",
         "programming_language": "language",
         "ide": "software",
-        "ai_platform": "ai_software",
-        "internet_platform": "web_service",
+        "network_protocol": "infrastructure",
         "network_service": "infrastructure",
     }
-
     def _extract_types(self, text: str) -> List[Dict[str, str]]:
         """从文本中提取实体及其类型。
 
@@ -373,7 +482,8 @@ class OntologyValidator:
             if entity in text_lower:
                 # re.ASCII 确保 \\b 只匹配 ASCII 单词边界（CJK 字符不是 \\w）
                 try:
-                    if re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
+                    has_cjk = any(ord(c) > 0x2E80 for c in entity)
+                    if has_cjk or re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
                         category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
                         found.append({
                             "entity": entity,
@@ -548,7 +658,8 @@ class OntologyValidator:
         for entity in self.ENTITY_TYPE_MAP:
             if entity in text_lower:
                 try:
-                    if re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
+                    has_cjk = any(ord(c) > 0x2E80 for c in entity)
+                    if has_cjk or re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
                         found_names.append(entity)
                 except Exception:
                     if entity in text_lower:
@@ -595,6 +706,20 @@ class OntologyValidator:
                         logger.warning("Failed to create RELATES_TO edge: %s", e)
         return rel_count
 
+    def _learn_candidate_entities(self, content: str, threshold: int = 3) -> None:
+        """P5: discover unknown entity candidates."""
+        import re
+        candidates = re.findall(r'\b[A-Z][a-zA-Z0-9._-]{2,49}\b', content)
+        for c in candidates:
+            c_lower = c.lower()
+            if c_lower not in self.ENTITY_TYPE_MAP and c_lower not in self._candidate_entities:
+                self._candidate_entities[c_lower] = 1
+            elif c_lower not in self.ENTITY_TYPE_MAP:
+                self._candidate_entities[c_lower] = self._candidate_entities.get(c_lower, 0) + 1
+                freq = self._candidate_entities[c_lower]
+                if freq == threshold:
+                    logger.info("P5: New entity candidate '%s' appeared %d times", c, freq)
+
     def extract_and_relate(self, content: str) -> int:
         """写入时提取实体共现关系 → 创建 RELATES_TO 边。
 
@@ -607,6 +732,7 @@ class OntologyValidator:
         if not self._ontology_synced:
             self.sync_entity_types_to_kuzu()
             self._ontology_synced = True
+        self._learn_candidate_entities(content)
         entities = self._extract_entity_cooccurrence(content)
         if len(entities) < 2:
             return 0
@@ -676,6 +802,27 @@ class OntologyValidator:
                             path_found += 1
                 except Exception as e:
                     logger.debug("Topology path query failed: %s", e)
+
+        # P3: also check paths between shared entities
+        shared_list = list(shared)
+        for i in range(len(shared_list)):
+            for j in range(i + 1, len(shared_list)):
+                total_checked += 1
+                try:
+                    result = self.kuzu.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $a_name}) "
+                        "MATCH (b:OntologyEntity {name: $b_name}) "
+                        "OPTIONAL MATCH (a)-[:RELATES_TO*1..3]-(b) "
+                        "RETURN count(*) AS cnt",
+                        {"a_name": shared_list[i], "b_name": shared_list[j]},
+                    )
+                    if result and len(result) > 0:
+                        row = result[0]
+                        cnt = row.get("cnt", 0) if isinstance(row, dict) else int(row[0]) if isinstance(row, (list, tuple)) else 0
+                        if cnt > 0:
+                            path_found += 1
+                except Exception:
+                    pass
 
         if total_checked == 0:
             return 1.0
