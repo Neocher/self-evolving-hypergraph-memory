@@ -320,14 +320,21 @@ async def create_episode(
             ontology_note = f"[本体警告] 与 {val_result.conflict_count} 条已有事实存在矛盾"
             for c in val_result.contradictions:
                 try:
+                    conflict_id = c.get("conflict_id", "")
                     deps.kuzu_store.execute_cypher(
                         "MERGE (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
                         "rule_id: $rule, detected_at: $t, resolved: false})",
-                        {"id": f"conflict_{episode_id}_{c.get(conflict_id,)}",
-                         "a": episode_id, "b": c.get("conflict_id", ""),
-                         "rule": "write_validate", "t": 0.0})
+                        {"id": f"conflict_{episode_id}_{conflict_id}",
+                         "a": episode_id, "b": conflict_id,
+                         "rule": "write_validate", "t": _now()})
                 except Exception:
                     pass
+            # P2: 通知梦境调度器有冲突产生
+            try:
+                if deps.dream_scheduler:
+                    await deps.dream_scheduler.on_conflict_detected()
+            except Exception:
+                pass
     deps.kuzu_store.create_episode({
         "id": episode_id,
         "content": req.content,
@@ -1202,6 +1209,88 @@ async def get_session_memories(
 
     record_request("GET", f"/sessions/{session_id}/memories", "200", _now() - start)
     return {"session_id": session_id, "memories": memories, "total": len(memories)}
+
+
+# ═══════════════════════════════════════════════════════════
+# 冲突 (Conflict) 端点
+# ═══════════════════════════════════════════════════════════
+
+
+@router.get("/conflicts", summary="列出所有未解决冲突")
+async def list_conflicts(
+    limit: int = Query(default=50, ge=1, le=500),
+    deps: Services = Depends(get_services),
+) -> dict:
+    """列出所有未解决的冲突（Contradiction-driven dream 的输入）。"""
+    start = _now()
+    set_trace_id()
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+
+    rows = deps.kuzu_store.execute_cypher(
+        "MATCH (c:ConflictNode) WHERE c.resolved = false "
+        "RETURN c.id, c.episode_a, c.episode_b, c.rule_id, "
+        "c.detected_at, c.resolved ORDER BY c.detected_at DESC LIMIT $limit",
+        {"limit": limit}
+    )
+    conflicts = []
+    for r in rows:
+        conflicts.append({
+            "id": r.get("c.id", ""),
+            "episode_a": r.get("c.episode_a", ""),
+            "episode_b": r.get("c.episode_b", ""),
+            "rule_id": r.get("c.rule_id", ""),
+            "detected_at": r.get("c.detected_at", 0.0),
+        })
+
+    record_request("GET", "/conflicts", "200", _now() - start)
+    return {"conflicts": conflicts, "total": len(conflicts)}
+
+
+@router.post("/conflicts/{conflict_id}/resolve", summary="标记冲突为已解决")
+async def resolve_conflict(
+    conflict_id: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """标记指定冲突为已解决。"""
+    start = _now()
+    set_trace_id()
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+
+    deps.kuzu_store.execute_cypher(
+        "MATCH (c:ConflictNode) WHERE c.id = $id "
+        "SET c.resolved = true",
+        {"id": conflict_id}
+    )
+
+    record_request("POST", f"/conflicts/{conflict_id}/resolve", "200", _now() - start)
+    return {"status": "resolved", "conflict_id": conflict_id}
+
+
+@router.post("/conflicts/resolve-all", summary="标记所有冲突为已解决")
+async def resolve_all_conflicts(
+    deps: Services = Depends(get_services),
+) -> dict:
+    """标记所有未解决冲突为已解决。"""
+    start = _now()
+    set_trace_id()
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+
+    deps.kuzu_store.execute_cypher(
+        "MATCH (c:ConflictNode) WHERE c.resolved = false "
+        "SET c.resolved = true",
+        {}
+    )
+
+    record_request("POST", "/conflicts/resolve-all", "200", _now() - start)
+    return {"status": "all resolved"}
+
+
+# ═══════════════════════════════════════════════════════════
+# 超边 (Hyperedge) 端点
+# ═══════════════════════════════════════════════════════════
 
 
 @router.post("/hyperedges", summary="手动创建超边")

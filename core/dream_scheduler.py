@@ -27,6 +27,7 @@ class TriggerMode(Enum):
     IDLE = "idle"  # 空闲触发
     ACCUMULATED = "accum"  # 累积触发
     EXPLICIT = "explicit"  # 显式触发
+    CONFLICT_RESOLUTION = "conflict"  # P2: 矛盾驱动触发
 
 
 @dataclass
@@ -39,6 +40,7 @@ class DreamSchedulerConfig:
     max_dream_duration_seconds: int = 300  # 单次梦境最长 5 分钟
     cpu_affinity_low_priority: bool = True  # 低优先级 CPU 亲和性
     memory_limit_mb: int = 256  # 梦境线程内存限制
+    conflict_accum_threshold: int = 5  # P2: 累积 5 个未解决冲突触发矛盾驱动梦境
 
 
 class DreamScheduler:
@@ -66,6 +68,16 @@ class DreamScheduler:
         self._faiss_index = None
         self._faiss_id_map: dict = {}
         self._incremental_update_fn = None  # incremental_faiss_update 引用
+        # P2: 冲突驱动梦境
+        self._unresolved_conflict_count: int = 0
+
+    async def on_conflict_detected(self) -> None:
+        """P2: 记录一个新冲突（达到阈值时触发矛盾解析梦境）。"""
+        self._unresolved_conflict_count += 1
+        # 如果冲突积压已达阈值，触发检查
+        if self._unresolved_conflict_count >= self.config.conflict_accum_threshold:
+            logger.info("Conflict accum %d >= threshold %d, scheduling conflict resolution",
+                        self._unresolved_conflict_count, self.config.conflict_accum_threshold)
 
     async def on_activity(self) -> None:
         """记录活动时间戳（每次有节点创建/更新时调用）。"""
@@ -99,6 +111,9 @@ class DreamScheduler:
             elif self._new_node_count >= self.config.accum_threshold:
                 should_run = True
                 trigger_mode = TriggerMode.ACCUMULATED
+            elif self._unresolved_conflict_count >= self.config.conflict_accum_threshold:
+                should_run = True
+                trigger_mode = TriggerMode.CONFLICT_RESOLUTION
 
             if should_run:
                 self._is_running = True
@@ -194,6 +209,9 @@ class DreamScheduler:
             self._new_node_count = 0
             self._last_run_time = time.time()
             self._dream_run_count += 1  # 【FIX】计数
+            # P2: 矛盾驱动梦境后重置冲突计数
+            if trigger_mode == TriggerMode.CONFLICT_RESOLUTION:
+                self._unresolved_conflict_count = 0
             # 梦境完成后自动 apply 高质量候选
             if candidate_store is not None and self._kuzu_store is not None:
                 try:
