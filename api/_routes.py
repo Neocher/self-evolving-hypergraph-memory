@@ -34,6 +34,7 @@ from api.models import (
     HyperedgeCreate,
     HyperedgeListResponse,
     HyperedgeResponse,
+    HyperedgeType as APIHyperedgeType,
     PromoteRequest,
     PromoteResponse,
     RetrieveRequest,
@@ -356,6 +357,12 @@ async def create_episode(
     if deps.dream_scheduler:
         await deps.dream_scheduler.on_activity()
         await deps.dream_scheduler.on_node_created()
+
+    # 【P0】自动超边创建：检测同源节点形成时态/情节超边
+    try:
+        await _auto_create_hyperedges(episode_id, req.source.value, req.content, deps)
+    except Exception:
+        pass
 
     record_request("POST", "/memories/episodes", "200", _now() - start)
     return EpisodeResponse(
@@ -1150,6 +1157,244 @@ async def metrics() -> Response:
         return Response(content=data, media_type="text/plain; charset=utf-8")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Metrics collection failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 超边 (Hyperedge) 端点
+# ═══════════════════════════════════════════════════════════
+
+
+@router.post("/hyperedges", summary="手动创建超边")
+async def create_hyperedge(
+    req: HyperedgeCreate,
+    deps: Services = Depends(get_services),
+) -> HyperedgeResponse:
+    """手动创建超边（有 member_ids 自动校验 ≥2）。"""
+    start = _now()
+    set_trace_id()
+
+    if deps.hyperedge_manager is None:
+        raise HTTPException(status_code=503, detail="HyperedgeManager not available")
+
+    try:
+        if req.type == APIHyperedgeType.EPISODE:
+            edge = deps.hyperedge_manager.create_episode_hyperedge(
+                member_ids=req.member_ids, topic=req.topic
+            )
+        elif req.type == APIHyperedgeType.SEMANTIC:
+            edge = deps.hyperedge_manager.create_semantic_hyperedge(
+                member_ids=req.member_ids, conclusion=req.conclusion or ""
+            )
+        elif req.type == APIHyperedgeType.TEMPORAL:
+            edge = deps.hyperedge_manager.create_temporal_hyperedge(
+                member_ids=req.member_ids,
+                start_time=req.start_time or start,
+                end_time=req.end_time or start,
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown hyperedge type: {req.type}")
+
+        record_request("POST", "/hyperedges", "200", _now() - start)
+        return HyperedgeResponse(
+            id=edge.id,
+            type=APIHyperedgeType(edge.type.value),
+            member_ids=edge.member_ids,
+            created_at=edge.created_at,
+            gate_value=edge.gate_value,
+            metadata=edge.metadata,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/hyperedges", summary="列出所有超边")
+async def list_hyperedges(
+    limit: int = Query(default=50, ge=1, le=500),
+    deps: Services = Depends(get_services),
+) -> HyperedgeListResponse:
+    """查询所有超边（按创建时间倒序）。"""
+    start = _now()
+    set_trace_id()
+
+    if deps.hyperedge_manager is None or deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Hyperedge system not available")
+
+    try:
+        rows = deps.kuzu_store.query_cypher(
+            "MATCH (h:HyperedgeNode) RETURN h.* ORDER BY h.created_at DESC LIMIT $limit",
+            {"limit": limit},
+        )
+        results = []
+        for row in rows:
+            if isinstance(row, (list, tuple)):
+                h = {"id": row[0], "type": row[1], "created_at": row[2], "gate_value": row[3], "metadata": row[4]}
+            elif isinstance(row, dict):
+                h = {k.split(".")[-1]: v for k, v in row.items()}
+            else:
+                continue
+            # 解析成员
+            member_rows = deps.kuzu_store.query_cypher(
+                "MATCH (h:HyperedgeNode {id: $id})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id",
+                {"id": h["id"]},
+            )
+            member_ids = []
+            for mr in member_rows:
+                if isinstance(mr, (list, tuple)):
+                    member_ids.append(str(mr[0]))
+                elif isinstance(mr, dict):
+                    member_ids.append(str(mr.get("id", "")))
+            import json as _j
+            try:
+                metadata = _j.loads(h.get("metadata", "{}")) if isinstance(h.get("metadata"), str) else h.get("metadata", {})
+            except Exception:
+                metadata = {}
+            results.append(HyperedgeResponse(
+                id=h["id"],
+                type=APIHyperedgeType(h["type"]),
+                member_ids=member_ids,
+                created_at=h.get("created_at", 0.0),
+                gate_value=h.get("gate_value", 1.0),
+                metadata=metadata or {},
+            ))
+
+        record_request("GET", "/hyperedges", "200", _now() - start)
+        return HyperedgeListResponse(hyperedges=results, total=len(results))
+    except Exception as e:
+        logger.exception("Failed to list hyperedges")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/hyperedges/{hyperedge_id}", summary="查询单个超边")
+async def get_hyperedge(
+    hyperedge_id: str,
+    deps: Services = Depends(get_services),
+) -> HyperedgeResponse:
+    """按 ID 查询超边详情（含成员节点列表）。"""
+    start = _now()
+    set_trace_id()
+
+    if deps.hyperedge_manager is None:
+        raise HTTPException(status_code=503, detail="HyperedgeManager not available")
+
+    edge = deps.hyperedge_manager.get_hyperedge(hyperedge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail=f"Hyperedge {hyperedge_id} not found")
+
+    record_request("GET", f"/hyperedges/{hyperedge_id}", "200", _now() - start)
+    return HyperedgeResponse(
+        id=edge.id,
+        type=APIHyperedgeType(edge.type.value),
+        member_ids=edge.member_ids,
+        created_at=edge.created_at,
+        gate_value=edge.gate_value,
+        metadata=edge.metadata,
+    )
+
+
+@router.get("/hyperedges/by-node/{node_id}", summary="查询节点所属的所有超边")
+async def get_node_hyperedges(
+    node_id: str,
+    deps: Services = Depends(get_services),
+) -> HyperedgeListResponse:
+    """查询包含指定节点的所有超边。"""
+    start = _now()
+    set_trace_id()
+
+    if deps.hyperedge_manager is None:
+        raise HTTPException(status_code=503, detail="HyperedgeManager not available")
+
+    edges = deps.hyperedge_manager.get_hyperedges_by_node(node_id)
+    record_request("GET", f"/hyperedges/by-node/{node_id}", "200", _now() - start)
+    return HyperedgeListResponse(
+        hyperedges=[
+            HyperedgeResponse(
+                id=e.id,
+                type=APIHyperedgeType(e.type.value),
+                member_ids=e.member_ids,
+                created_at=e.created_at,
+                gate_value=e.gate_value,
+                metadata=e.metadata,
+            )
+            for e in edges
+        ],
+        total=len(edges),
+    )
+
+
+# ─── 【P0】写入时自动创建超边 ────────────────────────────
+
+
+async def _auto_create_hyperedges(episode_id: str, source: str, content: str, deps: Services) -> int:
+    """
+    写入新情节节点后自动检测并创建超边：
+    - 时态超边：同一 source 在 300s 内写入的节点
+    - 情节超边：同一 source 在 3600s 内连续写入的节点
+    """
+    if deps.hyperedge_manager is None or deps.kuzu_store is None:
+        return 0
+
+    try:
+        created = 0
+        now = _now()
+
+        # 时态超边：最近 300s 内的同源节点
+        recent_rows = deps.kuzu_store.query_cypher(
+            "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
+            "AND e.created_at >= $cutoff "
+            "RETURN e.id ORDER BY e.created_at DESC LIMIT 5",
+            {"id": episode_id, "src": source, "cutoff": now - 300},
+        )
+        recent_ids = []
+        for row in recent_rows:
+            if isinstance(row, (list, tuple)):
+                recent_ids.append(str(row[0]))
+            elif isinstance(row, dict):
+                recent_ids.append(str(row.get("id", "")))
+        if len(recent_ids) >= 2:
+            # 用所有最近的 + 新节点一起创建时态超边
+            member_ids = [episode_id] + recent_ids[:4]
+            deps.hyperedge_manager.create_temporal_hyperedge(
+                member_ids=member_ids,
+                start_time=now - 300,
+                end_time=now,
+            )
+            created += 1
+            logger.info("Auto-created TEMPORAL hyperedge: %d members (source=%s)", len(member_ids), source)
+        elif len(recent_ids) == 1:
+            member_ids = [episode_id, recent_ids[0]]
+            deps.hyperedge_manager.create_temporal_hyperedge(
+                member_ids=member_ids, start_time=now - 300, end_time=now,
+            )
+            created += 1
+            logger.info("Auto-created TEMPORAL hyperedge (pair): source=%s", source)
+
+        # 情节超边：同一 source 在 3600s 内的节点池
+        window_rows = deps.kuzu_store.query_cypher(
+            "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
+            "AND e.created_at >= $cutoff_window "
+            "RETURN e.id ORDER BY e.created_at DESC LIMIT 20",
+            {"id": episode_id, "src": source, "cutoff_window": now - 3600},
+        )
+        window_ids = []
+        for row in window_rows:
+            if isinstance(row, (list, tuple)):
+                window_ids.append(str(row[0]))
+            elif isinstance(row, dict):
+                window_ids.append(str(row.get("id", "")))
+        # 如果同一 source 在 1h 内有 5+ 个节点 → 创建情节超边
+        if len(window_ids) >= 4:
+            member_ids = [episode_id] + window_ids[:7]
+            deps.hyperedge_manager.create_episode_hyperedge(
+                member_ids=member_ids,
+                topic=f"batch_{source}_{int(now)}",
+            )
+            created += 1
+            logger.info("Auto-created EPISODE hyperedge: %d members (source=%s)", len(member_ids), source)
+
+        return created
+    except Exception as e:
+        logger.warning("Auto-hyperedge creation failed (non-fatal): %s", e)
+        return 0
 
 
 # ─── 【FIX】FAISS 索引重建 ─────────────────────────────────

@@ -445,12 +445,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 break
             except Exception:
                 logger.exception("Dream poll error (non-fatal)")
+        logger.info("Dream poll loop ended")
+
+    async def _hyperedge_sweep() -> None:
+        """定时扫描未形成超边的节点，尝试自动创建超边。"""
+        import asyncio
+        HYPEREDGE_SWEEP_INTERVAL = 600.0  # 每10分钟
+        await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)  # 启动后延迟
+        while True:
+            try:
+                await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)
+                if svc.hyperedge_manager is not None and svc.kuzu_store is not None:
+                    # 扫描长时间窗口内的同源节点
+                    rows = svc.kuzu_store.query_cypher(
+                        "MATCH (e:EpisodeNode) WHERE e.created_at >= $cutoff "
+                        "RETURN e.id, e.source, e.content ORDER BY e.created_at DESC LIMIT 100",
+                        {"cutoff": time.time() - 7200},
+                    )
+                    if rows and len(rows) >= 2:
+                        logger.debug("Hyperedge sweep: %d recent episodes found, idle check", len(rows))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     poll_task = asyncio.create_task(_dream_poll_loop())
+    hyperedge_task = asyncio.create_task(_hyperedge_sweep())
 
     yield
     # shutdown
     poll_task.cancel()
+    hyperedge_task.cancel()
     if svc.kuzu_store:
         svc.kuzu_store.close()
     logger.info("SHM v4.0 shutting down")
