@@ -143,6 +143,7 @@ class OntologyConfig:
     max_contradictions_per_fact: int = 5
     reject_on_contradiction: bool = False
     rules_path: str = "./data/ontology_rules.yaml"
+    semantic_threshold: float = 0.85  # 语义归一化余弦相似度阈值
 
 
 @dataclass

@@ -18,7 +18,7 @@ from shm._version import __version__, __version_name__
 
 import numpy as np
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from api.models import (
     AuditOperation,
@@ -271,6 +271,7 @@ async def write_sensory(
 @router.post("/memories/episodes", summary="直接创建情节节点 (Layer2)")
 async def create_episode(
     req: EpisodeCreate,
+    request: Request,
     deps: Services = Depends(get_services),
 ) -> EpisodeResponse:
     """直接创建 Layer2 情节节点，可选强制提升。"""
@@ -361,6 +362,18 @@ async def create_episode(
     # 【P0】自动超边创建：检测同源节点形成时态/情节超边
     try:
         await _auto_create_hyperedges(episode_id, req.source.value, req.content, deps)
+    except Exception:
+        pass
+
+    # 【P0-①】会话观测节点：通过 X-Session-Id header 关联记忆到同一会话
+    try:
+        session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
+        if session_id and deps.kuzu_store is not None:
+            session_node_id = deps.kuzu_store.get_or_create_session(
+                session_id, metadata='{"source": "' + req.source.value + '"}'
+            )
+            if session_node_id:
+                deps.kuzu_store.link_session_member(session_node_id, episode_id)
     except Exception:
         pass
 
@@ -1162,6 +1175,33 @@ async def metrics() -> Response:
 # ═══════════════════════════════════════════════════════════
 # 超边 (Hyperedge) 端点
 # ═══════════════════════════════════════════════════════════
+
+
+@router.get("/sessions/{session_id}/memories", summary="查询会话的所有记忆")
+async def get_session_memories(
+    session_id: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    deps: Services = Depends(get_services),
+) -> dict:
+    """查询指定会话 ID 关联的所有记忆节点。"""
+    start = _now()
+    set_trace_id()
+
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+
+    rows = deps.kuzu_store.get_session_memories(session_id, limit)
+    memories = []
+    for r in rows:
+        memories.append({
+            "id": r.get("id", ""),
+            "content": r.get("content", "")[:200],
+            "created_at": r.get("created_at", 0.0),
+            "source": r.get("source", ""),
+        })
+
+    record_request("GET", f"/sessions/{session_id}/memories", "200", _now() - start)
+    return {"session_id": session_id, "memories": memories, "total": len(memories)}
 
 
 @router.post("/hyperedges", summary="手动创建超边")

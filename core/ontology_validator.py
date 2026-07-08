@@ -128,6 +128,7 @@ class OntologyConfig:
     max_contradictions_per_fact: int = 5
     reject_on_contradiction: bool = False
     conflict_penalty_factor: float = 0.5
+    semantic_threshold: float = 0.85  # P0-② 语义归一化阈值
 
 
 @dataclass
@@ -180,6 +181,10 @@ class OntologyValidator:
         self.config = config or OntologyConfig()
         self._ontology_synced = False  # lazy sync on first use
         self._candidate_entities: dict[str, int] = {}  # P5
+        # P0-②: 语义对齐缓存
+        self._entity_embeddings: dict[str, np.ndarray] = {}  # entity_name → vector
+        self._entity_list: list[str] = []  # for batch encoding
+        self._entity_emb_matrix: Optional[np.ndarray] = None  # (N, dim) matrix
 
     # ─── 实体提取 ─────────────────────────────────────────────
 
@@ -832,6 +837,68 @@ class OntologyValidator:
         # 有路径 → 1.0 (确认关系); 无路径 → 0.6 (非关系但也不是矛盾)
         return round(0.6 + 0.4 * ratio, 3)
 
+    # ─── P0-②: 语义对齐 ─────────────────────────────────────
+
+    def _build_entity_embeddings(self) -> None:
+        """预计算 ENTITY_TYPE_MAP 所有实体的 embedding（复用 encoder）。"""
+        if self.encoder is None:
+            return
+        names = list(self.ENTITY_TYPE_MAP.keys())
+        if not names:
+            return
+        try:
+            if hasattr(self.encoder, 'embed_batch'):
+                embs = self.encoder.embed_batch(names)
+                if embs is not None and len(embs) == len(names):
+                    for i, name in enumerate(names):
+                        self._entity_embeddings[name] = embs[i]
+                    self._entity_list = names
+                    self._entity_emb_matrix = np.array(embs)
+                    logger.info("Semantic alignment: %d entity embeddings built", len(names))
+            else:
+                for name in names:
+                    emb = self.encoder.embed(name)
+                    if emb is not None:
+                        self._entity_embeddings[name] = emb
+                self._entity_list = names
+        except Exception as e:
+            logger.warning("Entity embedding build failed (semantic alignment degraded): %s", e)
+
+    def _semantic_normalize(self, raw_entity: str) -> str:
+        """用语义相似度将提取的实体名映射到标准实体名。
+
+        例: "deeplearning" → "deep_learning_framework" 的词表中找最近邻
+             "Deep Learning" → "deep_learning_framework"
+        Returns: 标准实体名（无匹配则返回原串）
+        """
+        if self.encoder is None or not self._entity_embeddings:
+            return raw_entity
+
+        try:
+            raw_vec = self.encoder.embed(raw_entity)
+            if raw_vec is None or self._entity_emb_matrix is None:
+                return raw_entity
+            raw_vec = raw_vec.reshape(1, -1)
+            # 余弦相似度
+            norms = np.linalg.norm(self._entity_emb_matrix, axis=1)
+            raw_norm = np.linalg.norm(raw_vec)
+            if raw_norm == 0 or np.any(norms == 0):
+                return raw_entity
+            dots = self._entity_emb_matrix @ raw_vec.T
+            sims = (dots.flatten()) / (norms * raw_norm + 1e-10)
+            best_idx = int(np.argmax(sims))
+            best_score = float(sims[best_idx])
+            if best_score >= self.config.semantic_threshold:
+                matched = self._entity_list[best_idx]
+                if matched.lower() != raw_entity.lower():
+                    logger.debug("Semantic normalize: '%s' → '%s' (cos=%.3f)",
+                                 raw_entity, matched, best_score)
+                return matched
+            return raw_entity
+        except Exception as e:
+            logger.debug("Semantic normalize failed for '%s': %s", raw_entity, e)
+            return raw_entity
+
     def write_validate(
         self,
         content: str,
@@ -854,10 +921,25 @@ class OntologyValidator:
 
         result = ValidationResult(passed=True)
 
+        # 0. 语义对齐：构建/使用 entity embeddings
+        if not self._entity_embeddings and self.encoder is not None:
+            try:
+                self._build_entity_embeddings()
+            except Exception:
+                pass
+
         # 1. 提取实体
         entities = self._extract_entities(content)
         if not entities:
             return result
+
+        # 1b. 语义归一化：将提取实体映射到标准实体名
+        normalized_entities = []
+        for ent in entities:
+            norm = self._semantic_normalize(ent)
+            normalized_entities.append(norm)
+        # 用归一化后的实体替换
+        entities = list(set(normalized_entities))
 
         # 2. 推断本体类型
         ontology_type = self._classify_ontology_type(content, entities)
@@ -958,6 +1040,16 @@ class OntologyValidator:
 
         # 0. 提取查询的实体类型
         query_types = self._extract_types(query) if query else []
+
+        # 0b. 语义归一化查询实体
+        if query_types and self.encoder is not None:
+            if not self._entity_embeddings:
+                try:
+                    self._build_entity_embeddings()
+                except Exception:
+                    pass
+            for qt in query_types:
+                qt["entity"] = self._semantic_normalize(qt.get("entity", ""))
 
         validated = []
         for r in results:

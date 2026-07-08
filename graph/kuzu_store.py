@@ -182,12 +182,15 @@ class KuzuStore:
                            gate_value DOUBLE, metadata STRING)
           - CommunityNode (id STRING, name STRING, summary STRING,
                            leiden_score DOUBLE, created_at DOUBLE)
+          - **SessionNode** (id STRING, session_id STRING, created_at DOUBLE,
+                             metadata STRING)
 
         Edge tables:
           - HEBBIAN_CONNECTION (from EpisodeNode, to EpisodeNode, weight DOUBLE)
           - HYPEREDGE_MEMBER (from HyperedgeNode, to EpisodeNode|CommunityNode)
           - COMMUNITY_MEMBER (from CommunityNode, to EpisodeNode)
           - TEMPORAL_LINK (from EpisodeNode, to EpisodeNode, time_diff DOUBLE)
+          - **SESSION_MEMBER (from SessionNode, to EpisodeNode)**
         """
         self.conn.execute(
             "CREATE NODE TABLE IF NOT EXISTS EpisodeNode ("
@@ -223,6 +226,17 @@ class KuzuStore:
         self.conn.execute(
             "CREATE REL TABLE IF NOT EXISTS TEMPORAL_LINK "
             "(FROM EpisodeNode TO EpisodeNode, time_diff DOUBLE)"
+        )
+        # 会话观测节点 — 连接同一交互会话中的多个 EpisodeNode
+        self.conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS SessionNode ("
+            "id STRING, session_id STRING, created_at DOUBLE, "
+            "metadata STRING, "
+            "PRIMARY KEY (id))"
+        )
+        self.conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS SESSION_MEMBER "
+            "(FROM SessionNode TO EpisodeNode)"
         )
         # 本体论节点/边
         self.conn.execute(
@@ -436,6 +450,73 @@ class KuzuStore:
                 return [_clean_kuzu_row(r) for r in dicts]
             return []
 
+        return self._execute_with_circuit_breaker(_do_query)
+
+    # ─── Session 操作 ─────────────────────────────────────
+
+    def create_session_node(self, session: dict) -> str:
+        """创建会话观测节点。"""
+        def _do_create():
+            self.conn.execute(
+                "CREATE (s:SessionNode {id: $id, session_id: $session_id, "
+                "created_at: $created_at, metadata: $metadata})",
+                session
+            )
+            return session['id']
+        return self._execute_with_circuit_breaker(_do_create)
+
+    def get_or_create_session(self, session_id: str, metadata: str = "{}") -> str:
+        """按 session_id 查找或创建 SessionNode。"""
+        def _do_get_or_create():
+            result = self.conn.execute(
+                "MATCH (s:SessionNode) WHERE s.session_id = $sid "
+                "RETURN s.id ORDER BY s.created_at DESC LIMIT 1",
+                {"sid": session_id}
+            )
+            rows = result.get_as_pl()
+            dicts = rows.to_dicts()
+            if dicts:
+                row = _clean_kuzu_row(dicts[0])
+                return row.get("id", "")
+            # 不存在则创建
+            import uuid
+            import time
+            node_id = str(uuid.uuid4())
+            self.conn.execute(
+                "CREATE (s:SessionNode {id: $id, session_id: $session_id, "
+                "created_at: $created_at, metadata: $metadata})",
+                {"id": node_id, "session_id": session_id,
+                 "created_at": time.time(), "metadata": metadata}
+            )
+            return node_id
+        return self._execute_with_circuit_breaker(_do_get_or_create)
+
+    def link_session_member(self, session_node_id: str, episode_id: str) -> None:
+        """将 EpisodeNode 连接到 SessionNode。"""
+        def _do_link():
+            self.conn.execute(
+                "MATCH (s:SessionNode), (e:EpisodeNode) "
+                "WHERE s.id = $sid AND e.id = $eid "
+                "CREATE (s)-[:SESSION_MEMBER]->(e)",
+                {"sid": session_node_id, "eid": episode_id}
+            )
+        return self._execute_with_circuit_breaker(_do_link)
+
+    def get_session_memories(self, session_id: str, limit: int = 100) -> List[dict]:
+        """查询某会话的所有关联记忆。"""
+        def _do_query():
+            result = self.conn.execute(
+                "MATCH (s:SessionNode)-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                "WHERE s.session_id = $sid "
+                "RETURN e.id, e.content, e.created_at, e.source "
+                "ORDER BY e.created_at DESC LIMIT $limit",
+                {"sid": session_id, "limit": limit}
+            )
+            rows = result.get_as_pl()
+            dicts = rows.to_dicts()
+            if dicts:
+                return [_clean_kuzu_row(r) for r in dicts]
+            return []
         return self._execute_with_circuit_breaker(_do_query)
 
     def execute_cypher(self, query: str, params: dict) -> list[dict]:
