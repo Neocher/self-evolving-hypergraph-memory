@@ -238,6 +238,17 @@ class KuzuStore:
             "CREATE REL TABLE IF NOT EXISTS SESSION_MEMBER "
             "(FROM SessionNode TO EpisodeNode)"
         )
+        # 多模态：视觉节点 — 存储图像记忆
+        self.conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS VisualNode ("
+            "id STRING, image_path STRING, caption STRING, "
+            "embedding FLOAT[384], source STRING, created_at DOUBLE, "
+            "PRIMARY KEY (id))"
+        )
+        self.conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS VISUAL_HYPEREDGE_MEMBER "
+            "(FROM HyperedgeNode TO VisualNode)"
+        )
         # 本体论节点/边
         self.conn.execute(
             "CREATE NODE TABLE IF NOT EXISTS OntologyType ("
@@ -517,6 +528,53 @@ class KuzuStore:
             if dicts:
                 return [_clean_kuzu_row(r) for r in dicts]
             return []
+        return self._execute_with_circuit_breaker(_do_query)
+
+    # ─── 多模态视觉操作 ──────────────────────────────────
+
+    def create_visual_node(self, visual: dict) -> str:
+        """创建视觉节点。"""
+        def _do_create():
+            self.conn.execute(
+                "CREATE (v:VisualNode {id: $id, image_path: $image_path, "
+                "caption: $caption, embedding: $embedding, "
+                "source: $source, created_at: $created_at})",
+                visual
+            )
+            return visual['id']
+        return self._execute_with_circuit_breaker(_do_create)
+
+    def get_visual_nodes(self, limit: int = 50) -> list[dict]:
+        """列出所有视觉节点。"""
+        def _do_query():
+            result = self.conn.execute(
+                "MATCH (v:VisualNode) "
+                "RETURN v.id, v.image_path, v.caption, "
+                "v.source, v.created_at "
+                "ORDER BY v.created_at DESC LIMIT $limit",
+                {"limit": limit}
+            )
+            rows = result.get_as_pl()
+            dicts = rows.to_dicts()
+            if dicts:
+                return [_clean_kuzu_row(r) for r in dicts]
+            return []
+        return self._execute_with_circuit_breaker(_do_query)
+
+    def get_visual_node(self, visual_id: str) -> Optional[dict]:
+        """查询单个视觉节点。"""
+        def _do_query():
+            result = self.conn.execute(
+                "MATCH (v:VisualNode) WHERE v.id = $id "
+                "RETURN v.id, v.image_path, v.caption, "
+                "v.embedding, v.source, v.created_at",
+                {"id": visual_id}
+            )
+            rows = result.get_as_pl()
+            dicts = rows.to_dicts()
+            if dicts:
+                return _clean_kuzu_row(dicts[0])
+            return None
         return self._execute_with_circuit_breaker(_do_query)
 
     def execute_cypher(self, query: str, params: dict) -> list[dict]:
