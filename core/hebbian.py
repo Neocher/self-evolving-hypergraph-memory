@@ -41,15 +41,20 @@ class SparseHebbianUpdater:
         self,
         active_nodes: dict[str, float],
         all_connections: dict[str, dict[str, float]],
+        ontological_distance_map: Optional[dict[tuple[str, str], float]] = None,
     ) -> dict[str, dict[str, float]]:
         """
         执行一次稀疏 Hebbian 更新。
 
+        [P1] 加入本体层次距离调制：
+            Δw = η · (a_i · a_j · d_ij - w · τ_decay)
+            其中 d_ij ∈ [0.3, 1.0] 是本体距离因子
+
         Args:
             active_nodes: {node_id: activation_value, ...}
-                当前共现激活的节点及其激活度 (0~1)
             all_connections: {node_id: {neighbor_id: weight, ...}, ...}
-                全部节点的连接矩阵（稀疏存储）
+            ontological_distance_map: {(node_a, node_b): distance_factor, ...}
+                来自 OntologyValidator 的本体距离，加速语义相关节点的连接
 
         Returns:
             更新后的连接矩阵（原地修改 + 返回引用）
@@ -59,6 +64,16 @@ class SparseHebbianUpdater:
         decay = self.config.decay_constant
 
         active_ids = list(active_nodes.keys())
+
+        def _get_ont_dist(ni: str, nj: str) -> float:
+            if ontological_distance_map is None:
+                return 1.0
+            # 尝试两种顺序
+            d = ontological_distance_map.get((ni, nj))
+            if d is not None:
+                return d
+            d = ontological_distance_map.get((nj, ni))
+            return d if d is not None else 1.0
 
         # Step 1: 预计算每个激活节点的 top-K 连接
         top_k_map: dict[str, set[str]] = {}
@@ -78,7 +93,9 @@ class SparseHebbianUpdater:
                 aj = active_nodes[nj]
                 if aj < self.config.activation_threshold:
                     continue
-                delta = eta * (ai * aj - all_connections.get(ni, {}).get(nj, 0) * decay)
+                d_ij = _get_ont_dist(ni, nj)
+                # Δw = η · (a_i · a_j · d_ij - w · τ_decay)
+                delta = eta * (ai * aj * d_ij - all_connections.get(ni, {}).get(nj, 0) * decay)
                 all_connections.setdefault(ni, {})[nj] = (
                     all_connections.get(ni, {}).get(nj, 0) + delta
                 )

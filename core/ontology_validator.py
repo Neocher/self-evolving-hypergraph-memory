@@ -759,6 +759,93 @@ class OntologyValidator:
                     logger.warning("Topology path query failed: %s", e)
         return count
 
+    # ─── P1: 本体层次距离 ─────────────────────────────────────
+
+    # 类别层次树：category → parent_category（用于计算本体距离）
+    ONTOLOGY_TREE: dict[str, str] = {
+        # 根 → AI/技术
+        "ml_infra": "ai_technology",
+        "ai_software": "ai_technology",
+        "ai_assistant": "ai_technology",
+        "ai_platform": "ai_technology",
+        # 根 → 软件/开发
+        "software": "development",
+        "programming_language": "development",
+        "language": "development",
+        "ide": "development",
+        "platform": "development",
+        "data_format": "development",
+        # 根 → 数据/基础设施
+        "data_infra": "data_engineering",
+        "data": "data_engineering",
+        "data_processing": "data_engineering",
+        # 根 → 基础设施
+        "infrastructure": "infrastructure",
+        "system": "infrastructure",
+        "memory_system": "infrastructure",
+        # 根 → 组织/人
+        "organization": "human_world",
+        "people": "human_world",
+        # 根 → 网络/服务
+        "web_service": "internet",
+        "web_platform": "internet",
+        # 根 → 技术（通用）
+        "technology": "general_tech",
+
+        # entity_type → category 已经由 ENTITY_TYPE_CATEGORIES 定义
+    }
+
+    def _get_entity_type(self, entity_name: str) -> str:
+        """获取实体的类型。"""
+        return self.ENTITY_TYPE_MAP.get(entity_name.lower(), "")
+
+    def _get_category(self, entity_type: str) -> str:
+        """获取类型所属的类别。"""
+        return self.ENTITY_TYPE_CATEGORIES.get(entity_type, "")
+
+    def _get_parent_category(self, category: str) -> str:
+        """获取类别的父类别（用于距离计算）。"""
+        return self.ONTOLOGY_TREE.get(category, "")
+
+    def _compute_ontological_distance(self, entity_a: str, entity_b: str) -> float:
+        """计算两个实体之间的本体层次距离。
+
+        层级: entity_name → entity_type → category → parent_category
+
+        Returns:
+            1.0 同实体
+            0.9 同类型（同为deep_learning_framework）
+            0.7 同类别（同为ml_infra）
+            0.5 同父类别（同为ai_technology下）
+            0.3 不同分支
+        """
+        if entity_a.lower() == entity_b.lower():
+            return 1.0
+
+        ta = self._get_entity_type(entity_a)
+        tb = self._get_entity_type(entity_b)
+        if not ta or not tb:
+            return 1.0  # 未知实体，保底
+
+        if ta == tb:
+            return 0.9
+
+        ca = self._get_category(ta)
+        cb = self._get_category(tb)
+        if not ca or not cb:
+            return 1.0
+        if ca == cb:
+            return 0.7
+
+        pa = self._get_parent_category(ca)
+        pb = self._get_parent_category(cb)
+        if not pa or not pb:
+            return 0.5
+        if pa == pb:
+            return 0.5
+
+        return 0.3
+
     def _compute_topology_score(
         self,
         query_entities: List[Dict[str, str]],

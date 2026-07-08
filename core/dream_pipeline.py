@@ -65,6 +65,7 @@ class DreamPipeline:
         hebbian_updater=None,
         audit_chain=None,
         llm_client=None,
+        ontology_validator=None,
     ) -> None:
         """
         Args:
@@ -72,11 +73,13 @@ class DreamPipeline:
             hebbian_updater: SparseHebbianUpdater 实例
             audit_chain: AuditChain 实例
             llm_client: LLMClient 实例（可选，提供时启用 LLM 语义摘要）
+            ontology_validator: OntologyValidator 实例（可选，P1 本体约束社区检测）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
         self.audit_chain = audit_chain
         self.llm_client = llm_client
+        self.ontology_validator = ontology_validator
 
     async def run(
         self,
@@ -337,16 +340,46 @@ class DreamPipeline:
         nodes: list[dict],
         connections: dict[str, dict[str, float]],
     ):
-        """构建 NetworkX 图用于社区检测。"""
+        """构建 NetworkX 图用于社区检测。
+
+        [P1] 加入本体约束边：共享实体类型的节点之间添加弱连接，
+        使语义相关的节点更容易聚到同一社区。
+        """
         import networkx as nx
 
         G = nx.Graph()
+        node_map = {n["id"]: n for n in nodes}
         for node in nodes:
             G.add_node(node["id"], **node)
+
+        # Hebbian 连接
         for src, targets in connections.items():
             for dst, weight in targets.items():
                 if G.has_node(src) and G.has_node(dst):
                     G.add_edge(src, dst, weight=max(weight, 0.01))
+
+        # P1: 本体约束边 — 相同实体类型的节点间添加弱连接
+        if self.ontology_validator is not None and len(nodes) > 1:
+            ont_edge_count = 0
+            for i, (nid_a, node_a) in enumerate(node_map.items()):
+                content_a = node_a.get("content", "")
+                for nid_b, node_b in list(node_map.items())[i + 1 :]:
+                    if G.has_edge(nid_a, nid_b):
+                        continue  # 已有连接，不覆盖
+                    content_b = node_b.get("content", "")
+                    # 提取实体类型
+                    types_a = self.ontology_validator._extract_types(content_a)
+                    types_b = self.ontology_validator._extract_types(content_b)
+                    if types_a and types_b:
+                        # 检查是否有共享实体类型
+                        type_set_a = {t.get("type", "") for t in types_a if t.get("type")}
+                        type_set_b = {t.get("type", "") for t in types_b if t.get("type")}
+                        shared_types = type_set_a & type_set_b
+                        if shared_types:
+                            G.add_edge(nid_a, nid_b, weight=0.15)
+                            ont_edge_count += 1
+            if ont_edge_count > 0:
+                logger.info("P1 ontology edges added: %d", ont_edge_count)
         return G
 
     def _detect_communities(self, G) -> dict[str, int]:

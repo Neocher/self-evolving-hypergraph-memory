@@ -255,6 +255,7 @@ def _init_services() -> Services:
             hebbian_updater=svc.hebbian_updater,
             audit_chain=svc.audit_chain,  # ← 现在有值了
             llm_client=llm_client,
+            ontology_validator=svc.ontology_validator if hasattr(svc, 'ontology_validator') else None,
         )
         # 【P0-2】梦境候选存储（非破坏性模式）
         try:
