@@ -1,9 +1,9 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.3.0"
-__version_info__ = (5, 3, 0)
-__version_name__ = "本体增强版 · 实体扩军180 + CJK匹配 + OSINT类型"
-__release_date__ = "2026-07-06"
+__version__ = "5.3.1"
+__version_info__ = (5, 3, 1)
+__version_name__ = "超边修复版 · 超图记忆API+自动创建+定时扫描"
+__release_date__ = "2026-07-08"
 
 VERSION_SUMMARY = f"""
 SHM v{__version__} ({__version_name__})
