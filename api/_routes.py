@@ -1374,11 +1374,11 @@ async def list_visual_memories(
     items = []
     for r in rows:
         items.append({
-            "id": r.get("v.id", ""),
-            "caption": r.get("v.caption", ""),
-            "image_path": r.get("v.image_path", ""),
-            "source": r.get("v.source", ""),
-            "created_at": r.get("v.created_at", 0.0),
+            "id": r.get("id", ""),
+            "caption": r.get("caption", ""),
+            "image_path": r.get("image_path", ""),
+            "source": r.get("source", ""),
+            "created_at": r.get("created_at", 0.0),
         })
     return {"visuals": items, "total": len(items)}
 
@@ -1398,17 +1398,17 @@ async def get_visual_memory(
 
     # 读取图像并转 base64
     image_data = ""
-    image_path = node.get("v.image_path", "")
+    image_path = node.get("image_path", "")
     if image_path and os.path.exists(image_path):
         with open(image_path, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
 
     return {
-        "id": node.get("v.id", ""),
-        "caption": node.get("v.caption", ""),
+        "id": node.get("id", ""),
+        "caption": node.get("caption", ""),
         "image_base64": image_data,
-        "source": node.get("v.source", ""),
-        "created_at": node.get("v.created_at", 0.0),
+        "source": node.get("source", ""),
+        "created_at": node.get("created_at", 0.0),
     }
 
 
@@ -1429,7 +1429,7 @@ async def visualize_attention(
     if not node:
         raise HTTPException(status_code=404, detail="Visual node not found")
 
-    caption = node.get("v.caption", "")
+    caption = node.get("caption", "")
     # 模拟热图：分词 → 每个词分配注意力权重
     words = caption.strip().split()
     total = max(len(words), 1)
