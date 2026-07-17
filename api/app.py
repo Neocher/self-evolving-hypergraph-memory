@@ -421,6 +421,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         while True:
             try:
                 await asyncio.sleep(DREAM_POLL_INTERVAL)
+                # ── API Key 热同步：检查 Hermes 的 .env 文件是否有更新 ──
+                try:
+                    if hasattr(svc, 'dream_pipeline') and svc.dream_pipeline is not None:
+                        llm = getattr(svc.dream_pipeline, 'llm_client', None)
+                        if llm and hasattr(llm, 'hot_reload'):
+                            if llm.hot_reload():
+                                logger.info("API Key hot-reloaded from ~/.hermes/.env")
+                except Exception:
+                    pass
                 # 定期 flush FAISS 缓冲区
                 try:
                     from api.routes import flush_faiss_buffer

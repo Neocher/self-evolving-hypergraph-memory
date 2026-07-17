@@ -18,8 +18,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "deepseek-v4-flash"
-_DEFAULT_BASE_URL = "https://api.deepseek.com"
+_DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+_DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 _DEFAULT_TIMEOUT = 30.0
 _MAX_RETRIES = 2
 
@@ -42,18 +42,68 @@ class LLMClient:
         self.timeout = timeout
 
         # API Key 优先级：构造参数 > 环境变量
-        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        self.api_key = api_key or self._load_key_from_env()
         if not self.api_key:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 
         self._client = httpx.Client(
             base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=self._build_headers(),
             timeout=timeout,
         )
+
+    _HERMES_ENV = os.path.expanduser("~/.hermes/.env")
+    _HERMES_ENV_MTIME: float = 0.0
+
+    @staticmethod
+    def _load_key_from_env() -> str:
+        """从环境变量读取 API Key，支持多个 provider。"""
+        for k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                  "ANTHROPIC_API_KEY", "KIMI_API_KEY",
+                  "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+            v = os.environ.get(k, "")
+            if v:
+                return v
+        return ""
+
+    def _build_headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def hot_reload(self) -> bool:
+        """检查 Hermes 的 .env 文件是否有更新，有则热加载 API Key。
+        
+        这样改了 Hermes 的 API Key 后，SHM 无需重启自动同步。
+        Returns: True 如果 Key 有更新
+        """
+        if not os.path.exists(self._HERMES_ENV):
+            return False
+        new_mtime = os.path.getmtime(self._HERMES_ENV)
+        if new_mtime <= self._HERMES_ENV_MTIME:
+            return False
+        
+        # 文件变了，读取所有 API Key 到环境变量
+        self._HERMES_ENV_MTIME = new_mtime
+        for line in open(self._HERMES_ENV):
+            line = line.strip()
+            if line and '=' in line and not line.startswith('#'):
+                k, v = line.split('=', 1)
+                if k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                         "ANTHROPIC_API_KEY", "KIMI_API_KEY",
+                         "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+                    if v:
+                        os.environ[k] = v  # 同步到当前进程环境
+        
+        # 用统一优先级逻辑读取（保证与 __init__ 一致）
+        new_key = self._load_key_from_env()
+        if new_key and new_key != self.api_key:
+            logger.info(f"LLMClient: API Key 已热更新 (从 {self._HERMES_ENV})")
+            self.api_key = new_key
+            self._client.headers.update(self._build_headers())
+            return True
+        return False
 
     def chat(
         self,
@@ -93,7 +143,9 @@ class LLMClient:
                 resp.raise_for_status()
                 data = resp.json()
                 choice = data["choices"][0]
-                content = choice["message"]["content"]
+                content = choice["message"].get("content", "") or ""
+                if not content:
+                    content = choice["message"].get("reasoning_content", "") or ""
                 if content:
                     return content.strip()
                 logger.warning("LLMClient: empty response (attempt %d)", attempt + 1)
