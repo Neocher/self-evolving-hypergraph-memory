@@ -1,34 +1,105 @@
 """
 文本嵌入编码器
 =============
-使用 sentence-transformers 生成 384 维文本嵌入向量。
+三层降级架构：
+  Tier 1 — Cloud Embedding API（云端 API，零本地负载）
+  Tier 2 — Local sentence-transformers（CPU，本地缓存模型）
+  Tier 3 — TF-IDF 本地编码器（零依赖，最后兜底）
 
-默认模型: all-MiniLM-L6-v2
-- 384 维输出，平衡效率与精度
-- 本地部署，无 API 依赖
+默认使用 Tier 2（本地 all-MiniLM-L6-v2，384维，CPU 0.01s/条）。
+配置 DEEPSEEK_API_KEY + DEEPSEEK_EMBED_MODEL 可启用 Tier 1。
 
 FAISS 索引过期策略：
 - 跟踪索引中的节点 ID 集合
-- 梦境阶段检查哪些节点已被修剪，从索引中标记删除
+- 梦境阶段检查哪些节点已被修剪
 - 每 10 个梦境周期重建一次索引
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import List, Optional, Set
+import os
+from typing import Any, List, Optional, Set
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ─── Tier 1: Cloud Embedding API ──────────────────────────
+
+_CLOUD_PROVIDERS = [
+    {
+        "key_env": "DEEPSEEK_API_KEY",
+        "model_env": "DEEPSEEK_EMBED_MODEL",
+        "default_model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com/v1/embeddings",
+        "provider": "deepseek",
+    },
+    {
+        "key_env": "OPENAI_API_KEY",
+        "model_env": "OPENAI_EMBED_MODEL",
+        "default_model": "text-embedding-3-small",
+        "base_url": "https://api.openai.com/v1/embeddings",
+        "provider": "openai",
+    },
+    {
+        "key_env": "KIMI_API_KEY",
+        "model_env": "KIMI_EMBED_MODEL",
+        "default_model": "kimi-k2.6",
+        "base_url": "https://api.moonshot.cn/v1/embeddings",
+        "provider": "kimi",
+    },
+]
+
+
+def _cloud_embed(texts: list[str]) -> Optional[list[list[float]]]:
+    """Tier 1: 尝试调用云端 Embedding API。
+    
+    按 DEEPSEEK → OPENAI → KIMI 顺序尝试，第一个成功的返回。
+    Returns None 如果所有 API 都不可用。
+    """
+    import httpx
+
+    for provider in _CLOUD_PROVIDERS:
+        api_key = os.environ.get(provider["key_env"], "")
+        if not api_key:
+            continue
+        model = os.environ.get(provider["model_env"], provider["default_model"])
+        try:
+            with httpx.Client(base_url=provider["base_url"], timeout=10.0) as client:
+                # 单条输入需要处理
+                payload_input = texts if len(texts) > 1 else texts[0]
+                resp = client.post(
+                    "",
+                    json={"model": model, "input": payload_input, "encoding_format": "float"},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if resp.status_code != 200:
+                    logger.debug("Cloud API %s returned %d, skip", provider["provider"], resp.status_code)
+                    continue
+                data = resp.json()
+                if "data" not in data:
+                    continue
+                results = [d["embedding"] for d in data["data"]]
+                logger.info("Cloud embedding via %s (%s): %d vectors", provider["provider"], model, len(results))
+                return results
+        except Exception as e:
+            logger.debug("Cloud API %s failed: %s", provider["provider"], e)
+            continue
+    return None
+
+
+# ─── Tier 2: 本地 sentence-transformers ────────────────────
+
 
 class TextEncoder:
     """
-    文本嵌入编码器。
+    文本嵌入编码器（Tier 2）。
 
     封装 sentence-transformers，提供文本到向量的转换，
     集成 FAISS 索引过期管理。
+    支持 CPU (device='cpu') 和 GPU (device='cuda')。
     """
 
     def __init__(
@@ -40,65 +111,200 @@ class TextEncoder:
         self._indexed_node_ids: Set[str] = set()
         self._dream_cycle_count: int = 0
         self._needs_rebuild: bool = False
+        self._cloud_available: bool = False  # Tier 1 是否可用
 
     def load(self) -> None:
-        """加载 sentence-transformers 模型（首次调用时自动加载）。"""
+        """加载 sentence-transformers 模型。"""
         from sentence_transformers import SentenceTransformer
 
+        logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
         self._model = SentenceTransformer(self.model_name, device=self.device)
+        logger.info("Local embedding model loaded: dim=%d", self.dimension)
 
     def embed(self, text: str) -> np.ndarray:
-        """将单条文本编码为 embedding 向量，返回 shape (384,) 的 float32 数组。"""
+        """单条文本 → embedding 向量 (384,) float32。
+        
+        优先 Tier 1（Cloud API），不可用时降级到 Tier 2（本地模型）。
+        """
+        # Tier 1: Cloud API
+        if self._cloud_available:
+            try:
+                result = _cloud_embed([text])
+                if result:
+                    return np.array(result[0], dtype=np.float32)
+            except Exception:
+                self._cloud_available = False
+                logger.info("Cloud API degraded, falling back to local model")
+
+        # Tier 2: Local model
         if self._model is None:
             self.load()
         return self._model.encode(text)
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
-        """批量编码文本，返回 shape (len(texts), 384) 的 float32 矩阵。"""
+        """批量 → embedding 矩阵 (N, 384) float32。
+        
+        优先 Tier 1（Cloud API 批量），不可用时降级到 Tier 2。
+        """
+        # Tier 1: Cloud API (批量调用更高效)
+        if self._cloud_available:
+            try:
+                result = _cloud_embed(texts)
+                if result:
+                    return np.array(result, dtype=np.float32)
+            except Exception:
+                self._cloud_available = False
+                logger.info("Cloud API degraded, falling back to local model")
+
+        # Tier 2: Local model
         if self._model is None:
             self.load()
         return self._model.encode(texts)
 
     @property
     def dimension(self) -> int:
-        """返回向量维度。"""
         return 384
 
     # ─── FAISS 索引过期管理 ───────────────────────────
 
     def track_indexed_node(self, node_id: str) -> None:
-        """记录已索引的节点 ID。"""
         self._indexed_node_ids.add(node_id)
 
     def remove_pruned_nodes(self, pruned_node_ids: List[str]) -> None:
-        """从索引跟踪中移除已修剪的节点。"""
         for nid in pruned_node_ids:
             self._indexed_node_ids.discard(nid)
 
     def should_rebuild_index(self) -> bool:
-        """检查是否应重建 FAISS 索引（每 10 个梦境周期）。"""
         return self._dream_cycle_count >= 10
 
     def on_dream_cycle_complete(self) -> None:
-        """梦境周期完成回调：增加计数，达到阈值时触发重建。"""
         self._dream_cycle_count += 1
         if self.should_rebuild_index():
-            logger.info(
-                "Rebuilding FAISS index after %d dream cycles", self._dream_cycle_count
-            )
             self._dream_cycle_count = 0
             self._needs_rebuild = True
 
     @property
     def needs_rebuild(self) -> bool:
-        """是否需要重建 FAISS 索引（由检索层读取并执行实际重建）。"""
         return self._needs_rebuild
 
     @needs_rebuild.setter
     def needs_rebuild(self, value: bool) -> None:
         self._needs_rebuild = value
 
+
+# ─── Tier 3: TF-IDF 本地编码器（零依赖兜底） ──────────────
+
+
+class TfidfEncoder:
+    """TF-IDF 本地编码器（Tier 3 降级）。
+    
+    使用 sklearn 的字符级 n-gram TF-IDF + 随机投影到 384 维。
+    零网络依赖，零模型下载，纯 CPU。
+    """
+
+    def __init__(self, dimension: int = 384):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.random_projection import SparseRandomProjection
+
+        self._model = "tfidf_fallback"
+        self._dimension = dimension
+        self._vectorizer = TfidfVectorizer(max_features=1024, analyzer="char_wb", ngram_range=(2, 4))
+        self._projector = None
+        self._fitted = False
+        self._indexed_node_ids: Set[str] = set()
+        self._dream_cycle_count: int = 0
+        self._needs_rebuild: bool = False
+
+    def load(self) -> None:
+        """TF-IDF 不需要加载，懒初始化。"""
+        pass
+
+    def embed(self, text: str) -> np.ndarray:
+        from sklearn.random_projection import SparseRandomProjection
+        import numpy as _np
+
+        if not self._fitted:
+            self._vectorizer.fit([text])
+            self._projector = SparseRandomProjection(n_components=self._dimension, random_state=42)
+            sample = self._vectorizer.transform(["", text])
+            self._projector.fit(sample)
+            self._fitted = True
+        vec = self._vectorizer.transform([text])
+        projected = self._projector.transform(vec)
+        return projected.toarray().astype(_np.float32).flatten()
+
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        import numpy as _np
+
+        if not self._fitted:
+            self._vectorizer.fit(texts)
+            self._projector = SparseRandomProjection(n_components=self._dimension, random_state=42)
+            sample = self._vectorizer.transform(texts)
+            self._projector.fit(sample)
+            self._fitted = True
+        vec = self._vectorizer.transform(texts)
+        projected = self._projector.transform(vec)
+        return projected.toarray().astype(_np.float32)
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def track_indexed_node(self, node_id: str) -> None:
+        self._indexed_node_ids.add(node_id)
+
+    def remove_pruned_nodes(self, pruned_node_ids: List[str]) -> None:
+        for nid in pruned_node_ids:
+            self._indexed_node_ids.discard(nid)
+
+    def should_rebuild_index(self) -> bool:
+        return False
+
+    def on_dream_cycle_complete(self) -> None:
+        pass
+
+    @property
+    def needs_rebuild(self) -> bool:
+        return False
+
+    @needs_rebuild.setter
+    def needs_rebuild(self, value: bool) -> None:
+        pass
+
     @property
     def indexed_count(self) -> int:
-        """当前索引跟踪的节点数。"""
-        return len(self._indexed_node_ids)
+        return 0
+
+
+# ─── 工厂函数 ───────────────────────────────────────────────
+
+
+def create_encoder(
+    model_name: str = "all-MiniLM-L6-v2",
+    device: str = "cpu",
+    prefer_cloud: bool = True,
+) -> TextEncoder:
+    """创建三层降级编码器。
+    
+    返回 TextEncoder 实例（Tier 1 + Tier 2）。
+    调用者应在外层 catch Exception，降级到 TfidfEncoder。
+    
+    Args:
+        model_name: sentence-transformers 模型名
+        device: 'cpu' 或 'cuda'
+        prefer_cloud: 是否启用 Tier 1（Cloud API）
+    
+    Returns:
+        配置好的 TextEncoder 实例
+    """
+    encoder = TextEncoder(model_name=model_name, device=device)
+    
+    if prefer_cloud:
+        # 检查是否有可用的 Cloud API Key
+        for provider in _CLOUD_PROVIDERS:
+            if os.environ.get(provider["key_env"], ""):
+                encoder._cloud_available = True
+                logger.info("Cloud embedding available via %s", provider["provider"])
+                break
+    
+    return encoder

@@ -10,7 +10,11 @@ GATHER → CLUSTER → SYNTHESIZE → COMPRESS → PRUNE → RESOLVE → AUDIT
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -460,6 +464,7 @@ class DreamPipeline:
                 community["keywords"] = self._extract_keywords(
                     [n.get("content", "") for n in nodes], max_features=10
                 )
+            community["generated_at"] = time.time()
             community["episodes"] = [
                 {"id": n["id"], "content": n.get("content", "")} for n in nodes
             ]
@@ -467,6 +472,8 @@ class DreamPipeline:
                 {"id": n["id"], "content": n.get("content", "")[:200]} for n in nodes
             ]
             community["topics"] = self._extract_topics(nodes)
+            # 实体链接：提取命名实体并在社区节点间交叉匹配
+            community["entity_links"] = self._entity_linking_step(nodes)
         return communities
 
     def _generate_community_report(self, nodes: list[dict]) -> str:
@@ -477,8 +484,10 @@ class DreamPipeline:
         contents = [n.get("content", "") for n in nodes]
         keywords = self._extract_keywords(contents, max_features=10)
 
+        timestamp_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         lines = [
             f"Community Size: {len(nodes)} nodes",
+            f"Generated At: {timestamp_str}",
             f"Keywords: {', '.join(keywords)}" if keywords else "",
             "Member Nodes Summary:",
         ]
@@ -486,6 +495,179 @@ class DreamPipeline:
             content = node.get("content", "")
             lines.append(f"- {content[:100]}")
         return "\n".join(lines)
+
+    # ─── 实体链接 ──────────────────────────────────────────
+
+    def _entity_linking_step(self, nodes: list[dict]) -> list[dict]:
+        """
+        实体链接：提取命名实体并在社区节点间交叉匹配。
+
+        两步策略:
+        1. 用 LLM 做命名实体识别（降级：正则提取大写词和引号内专名）
+        2. 跨节点匹配相同实体，生成实体链接关系
+
+        Args:
+            nodes: 社区内节点列表
+
+        Returns:
+            entity_links: [{"entity": str, "occurrences": [node_id, ...], "count": int}, ...]
+            按出现次数降序排列，失败时返回空列表
+        """
+        try:
+            # Step 1: 提取实体 — 统一入口，优先 LLM 降级到正则
+            entity_map = self._extract_entities_from_nodes(nodes)
+            if not entity_map:
+                return []
+
+            # Step 2: 交叉匹配 — 统计每个实体出现在哪些节点
+            entity_links: dict[str, dict] = {}
+            for nid, entities in entity_map.items():
+                for ent in entities:
+                    if ent not in entity_links:
+                        entity_links[ent] = {"entity": ent, "occurrences": [], "count": 0}
+                    if nid not in entity_links[ent]["occurrences"]:
+                        entity_links[ent]["occurrences"].append(nid)
+                        entity_links[ent]["count"] += 1
+
+            # 只保留出现 ≥ 2 次的实体（跨节点链接才有意义）
+            result = [
+                v for v in entity_links.values() if v["count"] >= 2
+            ]
+            result.sort(key=lambda x: x["count"], reverse=True)
+            return result
+        except Exception:
+            logger.exception("Entity linking failed, skipping")
+            return []  # 降级：异常时返回空列表
+
+    def _extract_entities_from_nodes(self, nodes: list[dict]) -> dict[str, list[str]]:
+        """
+        统一实体提取入口。
+
+        优先用 LLM 做命名实体识别，失败时降级到正则提取。
+        返回 {node_id: [entity_name, ...], ...}
+        """
+        # 先尝试 LLM
+        llm_result = self._ner_with_llm(nodes)
+        if llm_result:
+            return llm_result
+
+        # 降级：正则提取
+        result: dict[str, list[str]] = {}
+        for node in nodes:
+            nid = node.get("id", "")
+            content = node.get("content", "")
+            if content:
+                entities = self._extract_entities_regex(content)
+                if entities:
+                    result[nid] = entities
+        return result
+
+    def _extract_entities_regex(self, content: str) -> list[str]:
+        """
+        正则提取命名实体。
+
+        提取规则:
+        - 中文：连续2个以上的中文字符（排除标点和停用词）
+        - 英文：首字母大写的连续单词（专名）
+        - 引号内文本
+
+        Args:
+            content: 节点文本内容
+
+        Returns:
+            去重后的实体名称列表
+        """
+        entities: set[str] = set()
+
+        # 提取引号内的内容（中英文引号）
+        for match in re.finditer(r'["「『""]([^"「』""]{2,50})["」』""]', content):
+            name = match.group(1).strip()
+            if name and len(name) >= 2:
+                entities.add(name)
+
+        # 提取首字母大写的英文专名（2-4个连续大写词）
+        for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b', content):
+            name = match.group(1).strip()
+            if name and len(name) >= 2 and name.lower() not in {
+                "this", "that", "the", "what", "when", "where", "which",
+                "there", "these", "those", "then", "than", "also", "with", "from",
+            }:
+                entities.add(name)
+
+        # 提取连续大写缩写（2-8个字符）
+        for match in re.finditer(r'\b([A-Z]{2,8})\b', content):
+            name = match.group(1)
+            if name not in {"AI", "API", "I", "II", "III", "IV", "VI"}:
+                entities.add(name)
+
+        return sorted(entities)
+
+    def _ner_with_llm(self, nodes: list[dict]) -> dict[str, list[str]]:
+        """
+        用 LLM 从节点内容中提取命名实体。
+
+        使用 self.llm_client（已配置 DEEPSEEK_API_KEY），
+        LLM 不可用或调用失败时返回空 dict（触发降级到正则提取）。
+
+        Args:
+            nodes: 社区内节点列表
+
+        Returns:
+            {node_id: [entity_name, ...], ...} 或 {}（失败时）
+        """
+        # 尝试使用内部 llm_client
+        llm = None
+        if self.llm_client and self.llm_client.api_key:
+            llm = self.llm_client
+        else:
+            # 尝试直接用环境变量创建临时客户端
+            key = os.environ.get("DEEPSEEK_API_KEY", "")
+            if not key:
+                return {}  # 无 API Key，降级
+            try:
+                from core.llm_client import LLMClient
+                llm = LLMClient(api_key=key)
+            except Exception:
+                return {}  # 创建失败，降级
+
+        result: dict[str, list[str]] = {}
+        for node in nodes:
+            nid = node.get("id", "")
+            content = node.get("content", "")
+
+            if not content or len(content.strip()) < 5:
+                continue
+
+            prompt = f"""Extract named entities from the following text. Return ONLY a JSON array of entity names (people, organizations, technologies, products, locations, projects).
+
+Rules:
+- Include proper nouns, technical terms, project names, organization names
+- Exclude common words, generic terms, numbers, dates
+- Return as a JSON array of strings only
+- If no entities found, return an empty array []
+
+Text:
+{content[:500]}"""
+
+            try:
+                response = llm.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=256,
+                    response_format={"type": "json_object"},
+                )
+                if response:
+                    parsed = json.loads(response)
+                    if isinstance(parsed, dict):
+                        entities = parsed.get("entities", [])
+                        if isinstance(entities, list):
+                            result[nid] = [str(e).strip() for e in entities if str(e).strip()]
+                    elif isinstance(parsed, list):
+                        result[nid] = [str(e).strip() for e in parsed if str(e).strip()]
+            except Exception:
+                continue  # 单节点失败不中断整体流程
+
+        return result
 
     def _extract_topics(self, nodes: list[dict]) -> list[str]:
         """从社区节点中提取主题关键词。"""

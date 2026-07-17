@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -114,6 +115,24 @@ class DreamScheduler:
             elif self._unresolved_conflict_count >= self.config.conflict_accum_threshold:
                 should_run = True
                 trigger_mode = TriggerMode.CONFLICT_RESOLUTION
+
+            # 候选文件触发：data/dream_candidates/ 目录中候选文件 > 10 时触发
+            if not should_run:
+                candidate_dir = os.path.join(os.path.dirname(__file__), "..", "data", "dream_candidates")
+                candidate_dir = os.path.abspath(candidate_dir)
+                try:
+                    if os.path.exists(candidate_dir):
+                        candidate_files = [f for f in os.listdir(candidate_dir)
+                                           if os.path.isfile(os.path.join(candidate_dir, f))]
+                        if len(candidate_files) > 10:
+                            should_run = True
+                            trigger_mode = TriggerMode.ACCUMULATED
+                            logger.info(
+                                "Candidate trigger: %d candidate files > 10 in %s",
+                                len(candidate_files), candidate_dir,
+                            )
+                except OSError:
+                    pass
 
             if should_run:
                 self._is_running = True
@@ -215,9 +234,9 @@ class DreamScheduler:
             # 梦境完成后自动 apply 高质量候选
             if candidate_store is not None and self._kuzu_store is not None:
                 try:
-                    applied, communities = candidate_store.auto_apply_candidates(self._kuzu_store)
+                    applied, communities, deleted = candidate_store.auto_apply_candidates(self._kuzu_store)
                     if applied > 0:
-                        logger.info("Dream auto-apply: %d candidates → %d communities", applied, communities)
+                        logger.info("Dream auto-apply: %d candidates → %d communities (%d files cleaned)", applied, communities, deleted)
                 except Exception:
                     logger.exception("Dream auto-apply failed (non-fatal)")
         except Exception:

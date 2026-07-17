@@ -1,22 +1,32 @@
-"""
-三级降级链查询路由
-===============
-[Harness Fix] 三级检索降级链：
+"""多信号检索融合引擎
+====================
+三路并行融合（向量 + BM25 + 实体匹配）：
+  - VECTOR:    向量相似度检索（FAISS）
+  - BM25:      关键词检索（sklearn TfidfVectorizer IDF + BM25 评分）
+  - ENTITY:    实体名称匹配（Kuzu Cypher CONTAINS）
+
+融合权重：vector=0.5, bm25=0.3, entity=0.2
+时序衰减：score = score * (1 + 1/(1 + exp(-τ/60)))
+去重策略：按 content[:100] 保留最高分
+
+向后兼容降级链：
   L1 — HYPERGRAPH: 超图检索（Kuzu + FAISS 联合）
   L2 — VECTOR:     纯向量检索（FAISS-only）
   L3 — KEYWORD:    关键词检索（TF-IDF）
-
-当上游降级时自动回退到下一级别。
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import re
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, List
+from typing import Optional
 
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from graph.kuzu_store import CircuitBreakerOpen
 
@@ -24,41 +34,59 @@ logger = logging.getLogger(__name__)
 
 
 class RetrievalLevel(Enum):
-    """三级检索级别"""
+    """三级检索级别 + 并行融合"""
+
     HYPERGRAPH = "hypergraph"  # L1: 超图检索（Kuzu + FAISS）
-    VECTOR = "vector"          # L2: 纯向量检索（FAISS-only）
-    KEYWORD = "keyword"        # L3: 关键词检索（TF-IDF）
+    VECTOR = "vector"  # L2: 纯向量检索（FAISS-only）
+    KEYWORD = "keyword"  # L3: 关键词检索（TF-IDF）
+    FUSION = "fusion"  # F: 三路并行融合（向量+BM25+实体匹配）
 
 
 class RetrievalStrategy(str, Enum):
-    TAU_FIRST = "tau_first"         # τ 值优先
-    VECTOR_FIRST = "vector_first"   # 向量相似度优先
-    HYBRID = "hybrid"               # 混合加权
+    TAU_FIRST = "tau_first"  # τ 值优先
+    VECTOR_FIRST = "vector_first"  # 向量相似度优先
+    HYBRID = "hybrid"  # 混合加权
+    FUSION = "fusion"  # 三路并行融合加权
 
 
 class FAISSUnavailable(Exception):
     """FAISS 不可用异常，触发降级到 KEYWORD"""
+
     pass
 
 
 @dataclass
 class QueryRouterConfig:
     """查询路由配置"""
-    tau_weight: float = 0.4         # τ 值权重（混合模式）
-    vector_weight: float = 0.6      # 向量相似度权重（混合模式）
-    top_k_l1: int = 5               # L1 FAISS 检索 top-K (直接查 EpisodeNode)
-    top_k_vector: int = 20          # L2 向量检索 top-K
-    top_k_keyword: int = 20         # L3 关键词检索 top-K
+
+    tau_weight: float = 0.4  # τ 值权重（混合模式）
+    vector_weight: float = 0.6  # 向量相似度权重（混合模式）
+    top_k_l1: int = 5  # L1 FAISS 检索 top-K (直接查 EpisodeNode)
+    top_k_vector: int = 20  # L2 向量检索 top-K
+    top_k_keyword: int = 20  # L3 关键词检索 top-K
+    # 融合模式权重
+    weight_fusion_vector: float = 0.5  # 向量检索权重
+    weight_fusion_bm25: float = 0.3  # BM25 关键词权重
+    weight_fusion_entity: float = 0.2  # 实体匹配权重
+    # BM25 参数
+    bm25_k1: float = 1.5  # BM25 k1 参数
+    bm25_b: float = 0.75  # BM25 b 参数
+    top_k_fusion: int = 30  # 融合检索总 top-K
 
 
 class QueryRouter:
     """
-    查询路由。
+    查询路由 — 多信号检索融合引擎。
 
-    支持三级降级链：
-    - 超图检索 (HYPERGRAPH): Kuzu + FAISS 联合检索
-    - 向量检索 (VECTOR): FAISS-only 降级
-    - 关键词检索 (KEYWORD): TF-IDF 最终兜底
+    融合模式（FUSION）— 三路并行融合（向量+BM25+实体匹配）：
+      - 向量检索 (FAISS):   权重 0.5
+      - BM25 关键词检索:     权重 0.3
+      - 实体名称匹配 (Kuzu): 权重 0.2
+
+    向后兼容降级链模式：
+      - 超图检索 (HYPERGRAPH): Kuzu + FAISS 联合检索
+      - 向量检索 (VECTOR): FAISS-only 降级
+      - 关键词检索 (KEYWORD): TF-IDF 最终兜底
 
     当 Kuzu 断路器跳闸时自动降级到 VECTOR，
     当 FAISS 不可用时自动降级到 KEYWORD。
@@ -89,10 +117,21 @@ class QueryRouter:
         self.faiss_id_map = faiss_id_map or {}
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
-            "最近", "刚刚", "刚才", "之前说的", "上一条",
-            "昨天", "今天", "几分钟前", "上一次",
-            "recent", "just now", "earlier", "last",
-            "previous", "yesterday",
+            "最近",
+            "刚刚",
+            "刚才",
+            "之前说的",
+            "上一条",
+            "昨天",
+            "今天",
+            "几分钟前",
+            "上一次",
+            "recent",
+            "just now",
+            "earlier",
+            "last",
+            "previous",
+            "yesterday",
         ]
         # 中英文技术术语映射（all-MiniLM-L6-v2 是英文优化，中文术语→英文提升对齐）
         self._zh_en_tech_map: dict[str, str] = {
@@ -137,6 +176,18 @@ class QueryRouter:
             "服务器": "server",
             "爬虫": "crawler",
         }
+        # BM25 检索索引（延迟初始化）
+        self._bm25_vectorizer = None  # TfidfVectorizer 实例
+        self._bm25_docs: list[str] = []  # 文档列表
+        self._bm25_doc_ids: list[str] = []  # 文档 ID 列表
+        self._bm25_doc_contents: list[str] = []  # 文档 content 列表
+        self._bm25_doc_tau: list[float] = []  # 文档 tau 值列表
+        self._bm25_doc_term_matrix = None  # (n_docs, n_features) sparse matrix
+        self._bm25_idf: np.ndarray = None  # (n_features,) IDF 向量
+        self._bm25_doc_lens: np.ndarray = None  # (n_docs,) 每个文档的 term 数
+        self._bm25_avgdl: float = 0.0  # 平均文档长度
+        self._bm25_ready: bool = False  # BM25 索引是否就绪
+        self._build_bm25_index()
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -145,7 +196,6 @@ class QueryRouter:
         2. 中文术语→英文（提升 all-MiniLM-L6-v2 对齐）
         3. 去除多余空格
         """
-        import re
         q = query.strip()
         # 统一标点：中文标点→英文
         q = q.replace("，", " ").replace("。", " ").replace("；", " ")
@@ -153,14 +203,344 @@ class QueryRouter:
         q = q.replace("「", " ").replace("」", " ").replace("『", " ").replace("』", " ")
         q = q.replace("（", " (").replace("）", ") ").replace("【", "").replace("】", "")
         # 统一空格
-        q = re.sub(r'\s+', ' ', q).strip()
+        q = re.sub(r"\s+", " ", q).strip()
         # 中文技术术语→英文（仅替换出现在文本中的术语）
         q_lower = q.lower()
         for zh, en in self._zh_en_tech_map.items():
             if zh in q_lower:
                 q = q.replace(zh, en)
         # 最终清理多余空格
-        return re.sub(r'\s+', ' ', q).strip()
+        return re.sub(r"\s+", " ", q).strip()
+
+    # ──────────────────────────────
+    # 三路并行融合引擎
+    # ──────────────────────────────
+
+    def _build_bm25_index(self) -> None:
+        """构建 BM25 检索索引。
+
+        从 Kuzu Store 拉取所有 EpisodeNode 内容，使用 sklearn
+        TfidfVectorizer 计算 IDF，并预计算文档长度用于 BM25 评分。
+        """
+        if self.kuzu_store is None:
+            logger.warning("BM25: kuzu_store unavailable, skipping index build")
+            return
+
+        try:
+            rows = self.kuzu_store.query_cypher(
+                "MATCH (e:EpisodeNode) "
+                "RETURN e.id AS node_id, e.content AS content, "
+                "e.tau_initial AS tau_value "
+                "ORDER BY e.created_at DESC"
+            )
+        except Exception:
+            logger.exception("BM25: failed to fetch corpus from Kuzu")
+            return
+
+        if not rows:
+            logger.warning("BM25: empty corpus from Kuzu")
+            return
+
+        self._bm25_doc_ids.clear()
+        self._bm25_doc_contents.clear()
+        self._bm25_doc_tau.clear()
+        corpus: list[str] = []
+
+        for row in rows:
+            if isinstance(row, dict):
+                nid = row.get("node_id", "") or ""
+                content = row.get("content", "") or ""
+                tau = float(row.get("tau_value", 0.0) or 0.0)
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                nid = str(row[0]) if row[0] is not None else ""
+                content = str(row[1]) if row[1] is not None else ""
+                tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+            else:
+                continue
+
+            if not nid or not content.strip():
+                continue
+            self._bm25_doc_ids.append(nid)
+            self._bm25_doc_contents.append(content)
+            self._bm25_doc_tau.append(tau)
+            corpus.append(content)
+
+        if not corpus:
+            logger.warning("BM25: no valid documents in corpus")
+            return
+
+        try:
+            vectorizer = TfidfVectorizer(
+                stop_words="english",
+                token_pattern=r"(?u)\b\w+\b",
+                lowercase=True,
+                max_features=50000,
+            )
+            tf_matrix = vectorizer.fit_transform(corpus)  # (n_docs, n_features)
+            idf = np.array(vectorizer.idf_)  # (n_features,)
+
+            # 预计算文档长度（term 数）
+            doc_lens = tf_matrix.sum(axis=1).A1  # (n_docs,)
+            avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
+
+            self._bm25_vectorizer = vectorizer
+            self._bm25_doc_term_matrix = tf_matrix
+            self._bm25_idf = idf
+            self._bm25_doc_lens = doc_lens
+            self._bm25_avgdl = avgdl
+            self._bm25_ready = True
+            logger.info(
+                "BM25 index built",
+                num_docs=len(corpus),
+                features=len(idf),
+                avgdl=round(avgdl, 2),
+            )
+        except Exception:
+            logger.exception("BM25: TfidfVectorizer failed")
+
+    def _bm25_search(self, query: str, k: int = 20) -> list[dict]:
+        """BM25 关键词检索。
+
+        使用 sklearn TfidfVectorizer 的 IDF 权重实现 BM25 评分。
+        BM25(q, d) = Σ IDF(qᵢ) * (TF(qᵢ, d) * (k1 + 1)) / (TF(qᵢ, d) + k1 * (1 - b + b * |d| / avgdl))
+
+        Args:
+            query: 查询文本
+            k: 返回 top-K 结果
+
+        Returns:
+            [{"node_id", "content", "score", "tau_value", "level": "bm25"}, ...]
+        """
+        if not self._bm25_ready or self._bm25_vectorizer is None:
+            logger.warning("BM25: index not ready")
+            return []
+
+        cfg = self.config
+        k1, b = cfg.bm25_k1, cfg.bm25_b
+
+        query_vec = self._bm25_vectorizer.transform([query])  # (1, n_features)
+        query_indices = query_vec.indices  # non-zero feature ids
+        if query_indices.size == 0:
+            return []
+
+        n_docs = self._bm25_doc_term_matrix.shape[0]
+        scores = np.zeros(n_docs, dtype=np.float64)
+
+        for qf_idx in query_indices:
+            idf = self._bm25_idf[qf_idx]
+            tf_col = self._bm25_doc_term_matrix[:, qf_idx].toarray().ravel()
+            # BM25 term score
+            numerator = tf_col * (k1 + 1.0)
+            denominator = tf_col + k1 * (1.0 - b + b * self._bm25_doc_lens / self._bm25_avgdl)
+            term_scores = idf * numerator / denominator
+            scores += term_scores
+
+        # 找出 top-k
+        top_k = min(k, n_docs)
+        if top_k == 0:
+            return []
+
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        results: list[dict] = []
+        for idx in top_indices:
+            score = float(scores[idx])
+            if score <= 0.0:
+                continue
+            results.append(
+                {
+                    "node_id": self._bm25_doc_ids[idx],
+                    "content": self._bm25_doc_contents[idx],
+                    "score": round(score, 6),
+                    "tau_value": self._bm25_doc_tau[idx],
+                    "level": "bm25",
+                }
+            )
+
+        return results
+
+    def _entity_match(self, query: str, k: int = 20) -> list[dict]:
+        """实体匹配检索。
+
+        从查询中提取候选实体名（unigram + bigram），
+        逐一匹配 Kuzu 中的 EpisodeNode 内容。
+
+        Args:
+            query: 查询文本
+            k: 每个实体的匹配上限，总结果聚合去重
+
+        Returns:
+            [{"node_id", "content", "score", "tau_value", "level": "entity_match"}, ...]
+        """
+        if self.kuzu_store is None:
+            logger.warning("Entity match: kuzu_store unavailable")
+            return []
+
+        tokens = [t.lower().strip() for t in query.split() if len(t.strip()) > 1]
+        if not tokens:
+            return []
+
+        # 生成候选实体：bigram → unigram（bigram 优先，更精准）
+        candidates: list[str] = []
+        seen_phrases: set[str] = set()
+        for i in range(len(tokens) - 1):
+            phrase = f"{tokens[i]} {tokens[i + 1]}"
+            if phrase not in seen_phrases:
+                candidates.append(phrase)
+                seen_phrases.add(phrase)
+        for t in tokens:
+            if t not in seen_phrases:
+                candidates.append(t)
+                seen_phrases.add(t)
+
+        seen_ids: set[str] = set()
+        results: list[dict] = []
+        limit_per_term = max(3, k // max(len(candidates), 1))
+
+        for term in candidates:
+            try:
+                rows = self.kuzu_store.query_cypher(
+                    "MATCH (e:EpisodeNode) "
+                    "WHERE toLower(e.content) CONTAINS $term "
+                    "RETURN e.id AS node_id, e.content AS content, "
+                    "e.tau_initial AS tau_value "
+                    f"LIMIT {limit_per_term}",
+                    {"term": term},
+                )
+            except Exception:
+                continue
+
+            for row in rows:
+                if isinstance(row, dict):
+                    nid = row.get("node_id", "") or ""
+                    content = row.get("content", "") or ""
+                    tau = float(row.get("tau_value", 0.0) or 0.0)
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    nid = str(row[0]) if row[0] is not None else ""
+                    content = str(row[1]) if row[1] is not None else ""
+                    tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+                else:
+                    continue
+
+                if not nid or nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+
+                # 评分：精确匹配 1.0，子串包含随着长度衰减
+                content_lower = content.lower()
+                if term in content_lower:
+                    # 精确匹配整个 term 的权重最高
+                    match_ratio = len(term) / max(len(content), 1)
+                    score = min(1.0, 0.3 + 0.7 * match_ratio)
+                else:
+                    # fallback: 部分词匹配
+                    term_tokens = term.split()
+                    match_count = sum(1 for t in term_tokens if t in content_lower)
+                    score = 0.1 + 0.2 * (match_count / max(len(term_tokens), 1))
+
+                results.append(
+                    {
+                        "node_id": nid,
+                        "content": content,
+                        "score": round(score, 4),
+                        "tau_value": tau,
+                        "level": "entity_match",
+                    }
+                )
+
+        # 按 score 排序，取 top-k
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:k]
+
+    @staticmethod
+    def _apply_time_decay(results: list[dict]) -> list[dict]:
+        """时序衰减加权。
+
+        对每个结果的 τ 值做时间衰减加权：
+        score = score * (1 + 1 / (1 + exp(-τ / 60)))
+
+        τ 值越高（越重要/新鲜），衰减因子的 boost 越大（1x ~ 2x）。
+        """
+        for r in results:
+            tau = float(r.get("tau_value", 0.0))
+            boost = 1.0 + 1.0 / (1.0 + np.exp(-tau / 60.0))
+            r["score"] = round(r["score"] * boost, 6)
+        return results
+
+    def _fuse_results(
+        self,
+        vector_results: list[dict],
+        bm25_results: list[dict],
+        entity_results: list[dict],
+    ) -> list[dict]:
+        """三路结果加权融合。
+
+        1. 各路内部归一化得分到 [0, 1]
+        2. 加权混合：vector * w_v + bm25 * w_b + entity * w_e
+        3. 时序衰减：基于 τ 值的时间衰减
+        4. 去重：按 content[:100] 保留最高分
+
+        Args:
+            vector_results: 向量检索结果
+            bm25_results: BM25 检索结果
+            entity_results: 实体匹配结果
+
+        Returns:
+            融合后的结果列表（按 score 降序）
+        """
+        cfg = self.config
+        w_v = cfg.weight_fusion_vector
+        w_b = cfg.weight_fusion_bm25
+        w_e = cfg.weight_fusion_entity
+
+        def _normalize_scores(items: list[dict]) -> None:
+            """就地 min-max 归一化得分到 [0, 1]"""
+            if not items:
+                return
+            scores = [r["score"] for r in items]
+            lo, hi = min(scores), max(scores)
+            if hi - lo < 1e-9:
+                for r in items:
+                    r["score"] = 1.0
+            else:
+                for r in items:
+                    r["score"] = (r["score"] - lo) / (hi - lo)
+
+        _normalize_scores(vector_results)
+        _normalize_scores(bm25_results)
+        _normalize_scores(entity_results)
+
+        # 加权融合
+        fused: dict[str, dict] = {}
+        for results, weight, source in [
+            (vector_results, w_v, "vector"),
+            (bm25_results, w_b, "bm25"),
+            (entity_results, w_e, "entity"),
+        ]:
+            for r in results:
+                key = r.get("node_id", "")
+                if not key:
+                    continue
+                weighted_score = r["score"] * weight
+                if key not in fused:
+                    r["score"] = weighted_score
+                    r["_source"] = source
+                    r["level"] = f"fusion_{source}"
+                    fused[key] = r
+                else:
+                    fused[key]["score"] += weighted_score
+                    # 合并来源标记
+                    existing_src = fused[key].get("_source", "")
+                    if source not in existing_src:
+                        fused[key]["_source"] = f"{existing_src}+{source}"
+                        fused[key]["level"] = "fusion_multi"
+
+        all_results = list(fused.values())
+
+        # 时序衰减
+        self._apply_time_decay(all_results)
+
+        # 去重 + 排序（按 content[:100]）
+        return self._deduplicate_and_sort(all_results)
 
     def retrieve(
         self,
@@ -168,32 +548,29 @@ class QueryRouter:
         query_embedding: Optional[np.ndarray] = None,
         level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
     ) -> list[dict]:
-        """
-        带三级降级链 + Kuzu Cypher 最终兜底的检索入口。
+        """多信号检索融合入口。
 
-        L1 — HYPERGRAPH: Kuzu + FAISS 联合检索
-        L2 — VECTOR:     FAISS-only
-        L3 — KEYWORD:    TF-IDF 关键词检索
-        L4 — KUZU_FALLBACK: 直接 Cypher LIKE 查询（所有上游降级后的最终兜底）
+        支持两种模式：
+          - 降级链模式（HYPERGRAPH/VECTOR/KEYWORD）— 向后兼容
+          - 融合模式（FUSION）— 三路并行融合（向量+BM25+实体匹配）
 
         Args:
             query: 查询文本
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
-            level: 起始检索级别（默认从 L1 开始）
+            level: 检索级别（默认从 L1 开始，传入 FUSION 使用并行融合）
 
         Returns:
             检索结果列表 [...]
-
-        Raises:
-            RuntimeError: 四级全部降级失败
         """
-        # 【P8】查询归一化：中文标点统一 + 中文技术术语→英文
+        # 查询归一化：中文标点统一 + 中文技术术语→英文
         query = self._normalize_query(query)
 
         strategy = self.detect_strategy(query)
-        logger.info(
-            "Retrieval started", query=query[:80], level=level.value, strategy=strategy
-        )
+        logger.info("Retrieval started", query=query[:80], level=level.value, strategy=strategy)
+
+        # F — 三路并行融合（向量 + BM25 + 实体匹配）
+        if level == RetrievalLevel.FUSION:
+            return self._fusion_retrieve(query, query_embedding)
 
         # 从指定级别开始，逐级尝试（空结果自动级联）
         results: list[dict] = []
@@ -232,6 +609,54 @@ class QueryRouter:
         logger.info("L3 empty, trying L4 Kuzu fallback")
         return self._kuzu_text_fallback(query, "L3 empty")
 
+    def _fusion_retrieve(
+        self, query: str, query_embedding: Optional[np.ndarray] = None
+    ) -> list[dict]:
+        """三路并行融合检索。
+
+        同时运行向量、BM25、实体匹配三条通道，输出加权融合结果。
+
+        Args:
+            query: 查询文本
+            query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
+
+        Returns:
+            融合检索结果列表
+        """
+        cfg = self.config
+
+        # 1. 向量通道
+        vector_results: list[dict] = []
+        try:
+            vector_results = self._vector_retrieve(query, query_embedding)
+        except FAISSUnavailable:
+            logger.warning("Fusion: vector channel unavailable, skipping")
+        except Exception:
+            logger.exception("Fusion: vector channel failed")
+
+        # 2. BM25 通道
+        bm25_results: list[dict] = []
+        try:
+            bm25_results = self._bm25_search(query, cfg.top_k_vector)
+        except Exception:
+            logger.exception("Fusion: BM25 channel failed")
+
+        # 3. 实体匹配通道
+        entity_results: list[dict] = []
+        try:
+            entity_results = self._entity_match(query, cfg.top_k_keyword)
+        except Exception:
+            logger.exception("Fusion: entity match channel failed")
+
+        logger.info(
+            "Fusion retrieval results",
+            vector=len(vector_results),
+            bm25=len(bm25_results),
+            entity=len(entity_results),
+        )
+
+        return self._fuse_results(vector_results, bm25_results, entity_results)
+
     def _hypergraph_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
     ) -> list[dict]:
@@ -253,9 +678,7 @@ class QueryRouter:
             raise FAISSUnavailable("No encoder available for query embedding")
 
         try:
-            distances, indices = self.faiss_index.search(
-                query_embedding, self.config.top_k_l1
-            )
+            distances, indices = self.faiss_index.search(query_embedding, self.config.top_k_l1)
             episode_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
@@ -298,9 +721,7 @@ class QueryRouter:
             raise FAISSUnavailable("No encoder available for query embedding")
 
         try:
-            distances, indices = self.faiss_index.search(
-                query_embedding, self.config.top_k_vector
-            )
+            distances, indices = self.faiss_index.search(query_embedding, self.config.top_k_vector)
             node_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
@@ -339,18 +760,18 @@ class QueryRouter:
             else:
                 doc_id, score = str(item), 0.0
                 content = ""
-            results.append({
-                "node_id": str(doc_id),
-                "content": str(content),
-                "score": float(score),
-                "tau_value": 0.0,
-                "level": RetrievalLevel.KEYWORD.value,
-            })
+            results.append(
+                {
+                    "node_id": str(doc_id),
+                    "content": str(content),
+                    "score": float(score),
+                    "tau_value": 0.0,
+                    "level": RetrievalLevel.KEYWORD.value,
+                }
+            )
         return results
 
-    def _kuzu_text_fallback(
-        self, query: str, error_context: str = ""
-    ) -> list[dict]:
+    def _kuzu_text_fallback(self, query: str, error_context: str = "") -> list[dict]:
         """
         L4 Kuzu Cypher 全文兜底检索。
 
@@ -388,21 +809,25 @@ class QueryRouter:
             results = []
             for row in rows:
                 if isinstance(row, dict):
-                    results.append({
-                        "node_id": row.get("node_id", ""),
-                        "content": row.get("content", ""),
-                        "score": 0.5,
-                        "tau_value": row.get("tau_value", 0.0),
-                        "level": "kuzu_fallback",
-                    })
+                    results.append(
+                        {
+                            "node_id": row.get("node_id", ""),
+                            "content": row.get("content", ""),
+                            "score": 0.5,
+                            "tau_value": row.get("tau_value", 0.0),
+                            "level": "kuzu_fallback",
+                        }
+                    )
                 elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                    results.append({
-                        "node_id": str(row[0]),
-                        "content": str(row[1]),
-                        "score": 0.5,
-                        "tau_value": float(row[2]) if len(row) > 2 else 0.0,
-                        "level": "kuzu_fallback",
-                    })
+                    results.append(
+                        {
+                            "node_id": str(row[0]),
+                            "content": str(row[1]),
+                            "score": 0.5,
+                            "tau_value": float(row[2]) if len(row) > 2 else 0.0,
+                            "level": "kuzu_fallback",
+                        }
+                    )
             logger.info("L4 fallback results", count=len(results))
             return results
         except Exception:
@@ -432,10 +857,44 @@ class QueryRouter:
 
         final_score = tau_weight * tau_score + vector_weight * vector_score
         """
-        return (
-            self.config.tau_weight * tau_score
-            + self.config.vector_weight * vector_score
-        )
+        return self.config.tau_weight * tau_score + self.config.vector_weight * vector_score
+
+    def fuse_results(
+        self,
+        results: list[dict],
+        time_field: str = "created_at",
+        score_field: str = "score",
+    ) -> list[dict]:
+        """
+        融合检索结果并应用时间衰减因子。
+
+        时间衰减公式: score = score * (1 + 1/(1 + exp(-age_hours/24)))
+        效果: 24小时内新数据权重接近翻倍, 7天前衰减到0.5左右
+
+        Args:
+            results: 检索结果列表，每项需包含 score_field 和可选的 time_field
+            time_field: 创建时间字段名（unix timestamp）
+            score_field: 得分字段名
+
+        Returns:
+            时间衰减加权后的结果列表（按新 score 降序）
+        """
+        now = time.time()
+        for r in results:
+            try:
+                created_at = r.get(time_field)
+                if created_at is None:
+                    continue
+                age_hours = (now - float(created_at)) / 3600.0
+                # 时间衰减因子: score * (1 + sigmoid(-age_hours/24))
+                decay = 1.0 + 1.0 / (1.0 + math.exp(-age_hours / 24.0))
+                r[score_field] = round(r.get(score_field, 0.0) * decay, 4)
+            except (ValueError, TypeError, KeyError):
+                continue  # 降级：异常时返回原分
+
+        # 按新 score 降序排列
+        results.sort(key=lambda x: x.get(score_field, 0.0), reverse=True)
+        return results
 
     def _encode_query(self, query: str) -> Optional[np.ndarray]:
         """编码查询文本为 2D 向量 (1, dim)，FAISS 要求 2D 输入"""
@@ -452,13 +911,13 @@ class QueryRouter:
 
     @staticmethod
     def _deduplicate_and_sort(results: list[dict]) -> list[dict]:
-        """按 node_id 去重并按 score 降序排列"""
+        """按 content[:100] 去重并按 score 降序排列"""
         seen: set[str] = set()
         unique: list[dict] = []
-        # 已按 score 排序，保留首次出现的（最高分）记录
         for r in sorted(results, key=lambda x: x["score"], reverse=True):
-            nid = r["node_id"]
-            if nid and nid not in seen:
-                seen.add(nid)
+            content = r.get("content", "")
+            key = content[:100]
+            if key and key not in seen:
+                seen.add(key)
                 unique.append(r)
         return unique

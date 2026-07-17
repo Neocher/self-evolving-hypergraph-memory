@@ -49,103 +49,27 @@ def _init_services() -> Services:
     # 2. FAISS 向量索引
     if svc.kuzu_store is not None:
         try:
-            # ── 编码器初始化（TextEncoder → 失败时降级到 TF-IDF） ──
-            _encoder = None
-            _encoder_cls = None
-            try:
-                from embedding.encoder import TextEncoder
-                _encoder_cls = TextEncoder
-            except Exception:
-                logger.warning("TextEncoder import failed (CUDA/torch not available), using TF-IDF fallback")
-
+            # ── 编码器初始化（三层降级架构） ──
+            # Tier 1: Cloud API / Tier 2: Local sentence-transformers / Tier 3: TF-IDF
             import os
-            _cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-            _model_cache_name = f"models--sentence-transformers--{cfg.embedding.model_name.replace('/', '--')}"
-            _model_cached = os.path.isdir(os.path.join(_cache_dir, _model_cache_name))
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE"] = "1"
 
-            # 尝试加载 TextEncoder（本地缓存 + 非 CUDA）
-            if _model_cached and _encoder_cls is not None:
-                try:
-                    logger.info("Encoder model found in local cache", model=cfg.embedding.model_name)
-                    svc.encoder = _encoder_cls(
-                        model_name=cfg.embedding.model_name,
-                        device=cfg.embedding.device,
-                    )
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    svc.encoder.load()
-                    logger.info("TextEncoder initialized from local cache", model=cfg.embedding.model_name)
-                    _encoder_ok = True
-                except Exception as load_err:
-                    logger.warning("TextEncoder load failed (no CUDA), falling back to TF-IDF: %s", load_err)
-                    _encoder_ok = False
-            else:
-                _encoder_ok = False
+            from embedding.encoder import create_encoder, TfidfEncoder
 
-            # TextEncoder 不可用时降级到 TF-IDF 本地编码器
-            if not _encoder_ok:
-                logger.info("Using sklearn TF-IDF fallback encoder (384-dim)")
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.random_projection import SparseRandomProjection
-                import numpy as _np
-
-                class LocalFallbackEncoder:
-                    def __init__(self):
-                        self._model = "local_fallback"
-                        self._vectorizer = TfidfVectorizer(max_features=1024, analyzer="char_wb", ngram_range=(2, 4))
-                        self._projector = None
-                        self._fitted = False
-
-                    def load(self):
-                        pass
-
-                    def embed(self, text: str) -> _np.ndarray:
-                        if not self._fitted:
-                            self._vectorizer.fit([text])
-                            self._projector = SparseRandomProjection(n_components=384, random_state=42)
-                            sample = self._vectorizer.transform(["", text])
-                            self._projector.fit(sample)
-                            self._fitted = True
-                        vec = self._vectorizer.transform([text])
-                        projected = self._projector.transform(vec)
-                        return projected.toarray().astype(_np.float32).flatten()
-
-                    def embed_batch(self, texts: list) -> _np.ndarray:
-                        if not self._fitted:
-                            self._vectorizer.fit(texts)
-                            self._projector = SparseRandomProjection(n_components=384, random_state=42)
-                            sample = self._vectorizer.transform(texts)
-                            self._projector.fit(sample)
-                            self._fitted = True
-                        vec = self._vectorizer.transform(texts)
-                        projected = self._projector.transform(vec)
-                        return projected.toarray().astype(_np.float32)
-
-                    @property
-                    def dimension(self) -> int:
-                        return 384
-
-                    def track_indexed_node(self, node_id: str) -> None:
-                        pass
-                    def remove_pruned_nodes(self, pruned_node_ids: list) -> None:
-                        pass
-                    def should_rebuild_index(self) -> bool:
-                        return False
-                    def on_dream_cycle_complete(self) -> None:
-                        pass
-                    @property
-                    def needs_rebuild(self) -> bool:
-                        return False
-                    @needs_rebuild.setter
-                    def needs_rebuild(self, value: bool) -> None:
-                        pass
-                    @property
-                    def indexed_count(self) -> int:
-                        return 0
-
-                svc.encoder = LocalFallbackEncoder()
+            try:
+                logger.info("Attempting Tier 2 encoder: create_encoder()")
+                svc.encoder = create_encoder(
+                    model_name=cfg.embedding.model_name,
+                    device=cfg.embedding.device,
+                )
                 svc.encoder.load()
-                logger.info("TextEncoder initialized (local TF-IDF fallback, 384-dim)")
+                logger.info("TextEncoder (Tier 2) initialized", model=cfg.embedding.model_name)
+            except Exception:
+                logger.warning("Tier 2 encoder failed, falling back to Tier 3 (TF-IDF)", exc_info=True)
+                svc.encoder = TfidfEncoder()
+                svc.encoder.load()
+                logger.info("TfidfEncoder (Tier 3) initialized as fallback")
 
         except Exception as e:
             errors.append(f"TextEncoder: {e}")
@@ -414,7 +338,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     cleanup_task = asyncio.create_task(_cleanup_dream_candidates())
 
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
-    DREAM_POLL_INTERVAL = 300.0
+    DREAM_POLL_INTERVAL = 60.0
 
     async def _dream_poll_loop() -> None:
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)
@@ -445,9 +369,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     # 自动 apply 梦境候选
                     if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
                         try:
-                            applied, communities = svc.dream_candidate_store.auto_apply_candidates(svc.kuzu_store)
+                            applied, communities, deleted = svc.dream_candidate_store.auto_apply_candidates(svc.kuzu_store)
                             if applied > 0:
-                                logger.info("Auto-applied %d dreams: %d communities created", applied, communities)
+                                logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
                         except Exception:
                             logger.exception("Auto-apply error (non-fatal)")
             except asyncio.CancelledError:
