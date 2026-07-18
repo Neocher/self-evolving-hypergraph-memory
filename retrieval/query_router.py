@@ -65,9 +65,9 @@ class QueryRouterConfig:
     top_k_vector: int = 20  # L2 向量检索 top-K
     top_k_keyword: int = 20  # L3 关键词检索 top-K
     # 融合模式权重
-    weight_fusion_vector: float = 0.5  # 向量检索权重
-    weight_fusion_bm25: float = 0.3  # BM25 关键词权重
-    weight_fusion_entity: float = 0.2  # 实体匹配权重
+    weight_fusion_vector: float = 0.35  # 向量检索权重（降权，短查询区分度不足）
+    weight_fusion_bm25: float = 0.40  # BM25 关键词权重（提权，适合短关键字查询）
+    weight_fusion_entity: float = 0.25  # 实体匹配权重（提权，专名精确匹配）
     # BM25 参数
     bm25_k1: float = 1.5  # BM25 k1 参数
     bm25_b: float = 0.75  # BM25 b 参数
