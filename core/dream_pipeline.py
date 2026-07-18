@@ -127,7 +127,7 @@ class DreamPipeline:
         logger.info("Dream %s: CLUSTER — %d communities", dream_id, len(communities))
 
         # Step 3: SYNTHESIZE — 生成社区摘要
-        communities = self._synthesize_step(communities)
+        communities = await self._synthesize_step(communities)
         logger.info("Dream %s: SYNTHESIZE — %d reports generated", dream_id, len(communities))
 
         # Step 4: COMPRESS — TF-IDF 压缩 + 预算控制
@@ -441,7 +441,7 @@ class DreamPipeline:
 
     # ─── Step 3: SYNTHESIZE ───────────────────────────────
 
-    def _synthesize_step(self, communities: list[dict]) -> list[dict]:
+    async def _synthesize_step(self, communities: list[dict]) -> list[dict]:
         """为每个社区生成摘要。
 
         如果有 LLMClient，用模型生成语义摘要；
@@ -453,7 +453,7 @@ class DreamPipeline:
             if self.llm_client and len(nodes) >= 2 and i < 20:
                 # LLM 语义摘要
                 contents = [n.get("content", "") for n in nodes]
-                llm_result = self.llm_client.summarize_community(contents)
+                llm_result = await self.llm_client.summarize_community(contents)
                 community["report"] = llm_result["summary"]
                 community["keywords"] = llm_result["keywords"]
                 community["llm_patterns"] = llm_result["patterns"]
@@ -473,7 +473,7 @@ class DreamPipeline:
             ]
             community["topics"] = self._extract_topics(nodes)
             # 实体链接：提取命名实体并在社区节点间交叉匹配
-            community["entity_links"] = self._entity_linking_step(nodes)
+            community["entity_links"] = await self._entity_linking_step(nodes)
         return communities
 
     def _generate_community_report(self, nodes: list[dict]) -> str:
@@ -498,7 +498,7 @@ class DreamPipeline:
 
     # ─── 实体链接 ──────────────────────────────────────────
 
-    def _entity_linking_step(self, nodes: list[dict]) -> list[dict]:
+    async def _entity_linking_step(self, nodes: list[dict]) -> list[dict]:
         """
         实体链接：提取命名实体并在社区节点间交叉匹配。
 
@@ -515,7 +515,7 @@ class DreamPipeline:
         """
         try:
             # Step 1: 提取实体 — 统一入口，优先 LLM 降级到正则
-            entity_map = self._extract_entities_from_nodes(nodes)
+            entity_map = await self._extract_entities_from_nodes(nodes)
             if not entity_map:
                 return []
 
@@ -539,7 +539,7 @@ class DreamPipeline:
             logger.exception("Entity linking failed, skipping")
             return []  # 降级：异常时返回空列表
 
-    def _extract_entities_from_nodes(self, nodes: list[dict]) -> dict[str, list[str]]:
+    async def _extract_entities_from_nodes(self, nodes: list[dict]) -> dict[str, list[str]]:
         """
         统一实体提取入口。
 
@@ -547,7 +547,7 @@ class DreamPipeline:
         返回 {node_id: [entity_name, ...], ...}
         """
         # 先尝试 LLM
-        llm_result = self._ner_with_llm(nodes)
+        llm_result = await self._ner_with_llm(nodes)
         if llm_result:
             return llm_result
 
@@ -602,7 +602,7 @@ class DreamPipeline:
 
         return sorted(entities)
 
-    def _ner_with_llm(self, nodes: list[dict]) -> dict[str, list[str]]:
+    async def _ner_with_llm(self, nodes: list[dict]) -> dict[str, list[str]]:
         """
         用 LLM 从节点内容中提取命名实体。
 
@@ -650,7 +650,7 @@ Text:
 {content[:500]}"""
 
             try:
-                response = llm.chat(
+                response = await llm.chat(
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
                     max_tokens=256,

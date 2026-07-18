@@ -46,7 +46,7 @@ class LLMClient:
         if not self.api_key:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=self._build_headers(),
             timeout=timeout,
@@ -105,7 +105,7 @@ class LLMClient:
             return True
         return False
 
-    def chat(
+    async def chat(
         self,
         messages: list[dict],
         temperature: float = 0.3,
@@ -139,7 +139,7 @@ class LLMClient:
         last_error = None
         for attempt in range(1 + _MAX_RETRIES):
             try:
-                resp = self._client.post("/chat/completions", json=body)
+                resp = await self._client.post("/chat/completions", json=body)
                 resp.raise_for_status()
                 data = resp.json()
                 choice = data["choices"][0]
@@ -165,7 +165,7 @@ class LLMClient:
         logger.error("LLMClient: all %d attempts failed: %s", 1 + _MAX_RETRIES, last_error)
         return None
 
-    def summarize_community(
+    async def summarize_community(
         self,
         node_contents: list[str],
         max_nodes: int = 20,
@@ -206,7 +206,7 @@ Respond in JSON format with exactly these fields:
 
 Focus on factual content and meaningful connections. Be concise."""
 
-        result = self.chat(
+        result = await self.chat(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1024,
@@ -260,9 +260,9 @@ Focus on factual content and meaningful connections. Be concise."""
                     word_freq[word] = word_freq.get(word, 0) + 1
         return [w for w, _ in sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:max_features]]
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """释放 httpx 连接。"""
         try:
-            self._client.close()
+            await self._client.aclose()
         except Exception:
             pass

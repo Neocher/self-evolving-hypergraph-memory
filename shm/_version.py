@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.5.0"
-__version_info__ = (5, 5, 0)
-__version_name__ = "三层Embedding · 多信号检索 · Dream自动应用"
+__version__ = "5.5.1"
+__version_info__ = (5, 5, 1)
+__version_name__ = "LLM异步化 · 事件循环修复"
 __release_date__ = "2026-07-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})

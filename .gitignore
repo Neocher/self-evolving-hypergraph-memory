@@ -36,3 +36,4 @@ Thumbs.db
 graphify-out/
 graphify-out/
 .shm_env
+data.bak.*/

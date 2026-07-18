@@ -987,5 +987,5 @@ if __name__ == "__main__":
     )
     report.print_report()
 
-    exit_code = 0 if overall_f1 >= 0.45 else 1
+    exit_code = 0 if overall_f1 >= 0.80 else 1
     exit(exit_code)
