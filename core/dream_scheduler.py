@@ -272,6 +272,11 @@ class DreamScheduler:
     def is_running(self) -> bool:
         return self._is_running
 
+    def force_stop(self) -> None:
+        """强制停止当前梦境（设置为空闲状态）"""
+        self._is_running = False
+        logger.info("Dream pipeline force-stopped")
+
     @property
     def accumulated_count(self) -> int:
         return self._new_node_count

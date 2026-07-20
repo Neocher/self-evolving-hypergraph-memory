@@ -1040,6 +1040,23 @@ async def trigger_dream(
         return DreamTriggerResponse(accepted=False, message="Dream already running")
 
 
+@router.post("/dream/reset", summary="强制重启梦境（停止当前 → 重新触发）")
+async def reset_dream(
+    deps: Services = Depends(get_services),
+) -> DreamTriggerResponse:
+    """强制停止当前梦境，在后台重新触发一次全量梦境（异步，不阻塞）"""
+    if deps.dream_scheduler is None:
+        raise HTTPException(status_code=503, detail="Dream scheduler not available")
+    # 强制停止
+    deps.dream_scheduler.force_stop()
+    # 在后台任务中触发，不阻塞返回
+    import asyncio
+    asyncio.create_task(deps.dream_scheduler.trigger_explicit())
+    return DreamTriggerResponse(
+        accepted=True,
+        message="Dream reset accepted, running in background. Check /dream/candidates for progress."
+    )
+
 @router.post("/dream/notify", summary="通知调度器有新节点创建")
 async def dream_notify(
     deps: Services = Depends(get_services),

@@ -101,7 +101,7 @@ TYPE_HINTS: Dict[str, List[str]] = {
         "技术", "框架", "引擎", "语言", "工具",
     ],
     "Location": [
-        "位于", "地处", "省", "市", "区", "县",
+        "位于", "地处", "省",
         "Mountain View", "California", "Beijing",
     ],
     "Event": [
@@ -136,6 +136,120 @@ STOP_WORDS: Set[str] = {
 # 单字符大写缩写（保留）
 SINGLE_CHAR_UPPER = re.compile(r'\b[A-Z]\b')
 
+# 常见的非实体全大写缩写（不应被归为 Organization）
+COMMON_ACRONYMS: Set[str] = {
+    "AI", "RMB", "USD", "EUR", "GBP", "JPY", "CNY", "HKD",
+    "API", "CPU", "GPU", "TPU", "RAM", "ROM", "SSD", "HDD",
+    "URL", "HTML", "CSS", "JSON", "XML", "YAML", "SQL",
+    "PDF", "PNG", "JPEG", "GIF", "SVG", "MP3", "MP4",
+    "HTTP", "HTTPS", "FTP", "SSH", "DNS", "DHCP", "TCP", "UDP",
+    "OSA", "CAGR", "ECG", "CPAP", "GT", "GTIN", "EAN", "UPC",
+    "GDP", "NLP", "ML", "DL", "RL", "CV", "ASR", "TTS",
+    "CEO", "CTO", "CFO", "COO", "CIO", "VP", "SVP", "EVP",
+    "HR", "PR", "QA", "QC", "R&D",
+    "ID", "UUID", "GUID",
+    "P0", "P1", "P2", "P3", "P4",
+    "v1", "v2", "v3", "v4", "v5",
+}
+
+# 常见产品关键词（用于区分 "Product" vs "Person" 中的双词大写匹配）
+PRODUCT_KEYWORDS: Set[str] = {
+    "Band", "Watch", "Phone", "Pro", "Max", "Mini", "Air", "Ultra",
+    "Series", "Edition", "Device", "Model", "Version", "一代", "二代",
+    "版", "型", "号", "系列",
+}
+
+# 双大写词但明显不是人名的模式（形容词+名词/语言/地区）
+NOT_PERSON_TWO_WORD: Set[str] = {
+    # 方向词
+    "North", "South", "East", "West", "Northern", "Southern", "Eastern", "Western",
+    # 颜色
+    "Red", "Blue", "Green", "Yellow", "White", "Black", "Dark", "Light",
+    # 大小/范围
+    "Major", "Minor", "Large", "Small", "Mini", "Micro", "Macro", "Ultra",
+    "Global", "Local", "Regional", "National", "International",
+    # 通用形容词
+    "Smart", "Home", "Open", "Close", "Fast", "Slow", "High", "Low",
+    "New", "Old", "Big", "Little", "Great", "Best", "Top", "Key",
+    # 中文拼音（常为产品名）
+    "Huawei", "Xiaomi", "Honor", "Redmi", "Realme", "Vivo", "Oppo",
+    # 数字+词
+    "V2", "V3", "V4", "V5", "X2", "X3", "Pro", "Max", "Air",
+    # 地区修饰
+    "Chinese", "Japanese", "Korean", "European", "American", "British",
+    "Asian", "African", "Indian", "Russian",
+}
+
+# 中文财经概念关键词（不应被识别为位置）
+CN_FINANCE_CONCEPT: Set[str] = {
+    "刚需", "市场", "需求", "供应", "供给", "消费", "经济",
+    "行业", "产业", "领域", "赛道", "风口", "红利",
+    "价值", "价格", "规模", "增速", "增长", "下降",
+    "占比", "份额", "渗透", "装机", "存量", "增量",
+}
+
+# ─── 上下文消歧关键词映射 ──────────────────────────────────────
+# 每种类型对应的上下文关键词（出现在实体名前后 N 个字内）
+# 匹配越多 → 该类型置信度越高
+
+CONTEXT_HINTS: Dict[str, List[str]] = {
+    "Person": [
+        # 英文
+        "founded", "is the", "CEO of", "CTO of", "CFO of", "founder of",
+        "president of", "chairman of", "director of", "manager of",
+        "born in", "said", "says", "announced", "tweeted", "posted",
+        "works at", "joined", "left", "resigned from",
+        # 中文
+        "担任", "先生", "女士", "博士", "教授", "老师",
+        "表示", "认为", "指出", "说", "宣布",
+        "创始人", "CEO", "总裁", "董事长", "总经理",
+        "毕业于", "出生于",
+    ],
+    "Organization": [
+        # 英文
+        "Inc", "Corp", "Ltd", "LLC", "Company", "company",
+        "headquartered", "based in", "acquired", "released",
+        "announced", "launched", "founded",
+        "subsidiary of", "division of", "partnered with",
+        # 中文
+        "公司", "集团", "有限", "科技", "银行",
+        "总部", "位于", "成立于", "发布", "推出",
+        "收购了", "投资", "合作",
+    ],
+    "Product": [
+        # 英文
+        "released", "launched", "announced", "introduced",
+        "model", "version", "series", "edition",
+        "priced at", "costs", "buy", "purchase", "download",
+        # 中文
+        "发布", "推出", "售价", "价格", "购买",
+        "产品", "新款", "升级", "版本", "系列",
+    ],
+    "Technology": [
+        # 英文
+        "framework", "library", "tool", "platform", "engine",
+        "language", "database", "protocol", "standard",
+        "open-source", "built with", "written in",
+        # 中文
+        "框架", "引擎", "平台", "技术", "工具",
+        "语言", "库", "协议", "标准",
+    ],
+    "Location": [
+        # 英文
+        "located in", "based in", "headquartered in",
+        "city of", "in the", "near", "visit",
+        # 中文
+        "位于", "地处", "坐落", "省", "市", "区", "县",
+    ],
+    "Event": [
+        # 英文
+        "conference", "summit", "meeting", "convention",
+        "held in", "took place", "organized",
+        # 中文
+        "会议", "大会", "峰会", "论坛", "展览",
+    ],
+}
+
 
 # ─── 实体发现引擎 ───────────────────────────────────────────
 
@@ -164,9 +278,9 @@ class EntityDiscoveryEngine:
         clusters = self._cluster_entities(raw_entities)
         logger.info("Clustered into %d candidate entities", len(clusters))
 
-        # 3. 评分排序
+        # 3. 评分排序（带上下文投票）
         proposals = []
-        for canonical, aliases, count in clusters:
+        for canonical, aliases, count, contexts in clusters:
             if count < min_occurrences:
                 continue
             # 排除停用词
@@ -175,8 +289,8 @@ class EntityDiscoveryEngine:
             # 排除单字符
             if len(canonical) <= 1:
                 continue
-            # 推断类型
-            inferred = self._infer_type(canonical, aliases)
+            # 上下文投票推断类型
+            inferred = self._infer_type(canonical, aliases, contexts)
             props = EntityProposal(
                 canonical_name=canonical,
                 aliases=sorted(aliases - {canonical}),
@@ -205,69 +319,88 @@ class EntityDiscoveryEngine:
     # 候选实体提取
     # ═══════════════════════════════════════════════════════════
 
-    def _extract_all(self, contents: List[str]) -> List[Tuple[str, str]]:
-        """从文本列表中提取所有候选实体，返回 [(实体名, 推断类型), ...]"""
-        entities: List[Tuple[str, str]] = []
+    def _extract_all(self, contents: List[str]) -> List[Tuple[str, str, str]]:
+        """从文本列表中提取所有候选实体，返回 [(实体名, 推断类型, 上下文), ...]"""
+        entities: List[Tuple[str, str, str]] = []
 
         for text in contents:
             if not text or len(text) < 4:
                 continue
 
+            text_lower = text.lower()
+
             # ---- 英文实体 ----
             # 人名（双大写词）
             for m in EN_PERSON.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Person"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Person", ctx))
 
             # 公司名（Inc/Corp/Ltd）
             for m in EN_ORG.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Organization"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Organization", ctx))
 
             # 技术品牌（GPT-4, BERT 等）
             for m in EN_TECH.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Technology"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Technology", ctx))
 
             # 编程语言
             for m in EN_PROGRAMMING.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Technology"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Technology", ctx))
 
             # 大写字首字母缩写（多字母）
             acronyms = re.findall(r'\b(?:[A-Z][a-z]?[A-Z][a-z]?|[A-Z]{3,})\b', text)
             for ac in acronyms:
                 if len(ac) >= 2 and ac not in {"The", "This", "That", "With", "From"}:
-                    entities.append((ac, "Organization"))
+                    pos = text_lower.find(ac.lower())
+                    ctx = self._extract_context(text, pos, pos + len(ac)) if pos >= 0 else ""
+                    entities.append((ac, "Concept", ctx))
 
             # ---- 中文实体 ----
             for m in CN_ORG.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Organization"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Organization", ctx))
 
             for m in CN_PERSON_PATTERN.finditer(text):
-                # 提取称谓前的名字
                 name = m.group().strip()
                 base = re.sub(r'(?:先生|女士|博士|教授|同学|经理|老师|同志)$', '', name)
                 if base and len(base) >= 2:
-                    entities.append((base, "Person"))
+                    ctx = self._extract_context(text, m.start(), m.end())
+                    entities.append((base, "Person", ctx))
 
             for m in CN_LOCATION.finditer(text):
                 name = m.group().strip()
-                entities.append((name, "Location"))
+                ctx = self._extract_context(text, m.start(), m.end())
+                entities.append((name, "Location", ctx))
 
             for m in CN_REPORTED.finditer(text):
                 name = re.sub(r'(?:表示|指出|认为)$', '', m.group())
                 if name and len(name) >= 2:
-                    entities.append((name, "Person"))
+                    ctx = self._extract_context(text, m.start(), m.end())
+                    entities.append((name, "Person", ctx))
 
             # ---- 通用标签 ----
             for m in EN_HASHTAG.finditer(text):
                 tag = m.group().strip("#")
                 if tag and len(tag) > 2:
-                    entities.append((tag, "Concept"))
+                    ctx = self._extract_context(text, m.start(), m.end())
+                    entities.append((tag, "Concept", ctx))
 
         return entities
+
+    @staticmethod
+    def _extract_context(text: str, start: int, end: int, window: int = 40) -> str:
+        """提取实体周围的上下文片段（前后各 window 个字符）"""
+        ctx_start = max(0, start - window)
+        ctx_end = min(len(text), end + window)
+        return text[ctx_start:ctx_end].strip()
 
     # ═══════════════════════════════════════════════════════════
     # 实体聚类消歧
@@ -307,14 +440,17 @@ class EntityDiscoveryEngine:
         return dp[n]
 
     def _cluster_entities(
-        self, entities: List[Tuple[str, str]]
-    ) -> List[Tuple[str, Set[str], int]]:
-        """对候选实体做聚类消歧，返回 [(规范名, 别名集合, 总次数), ...]"""
+        self, entities: List[Tuple[str, str, str]]
+    ) -> List[Tuple[str, Set[str], int, List[str]]]:
+        """对候选实体做聚类消歧，返回 [(规范名, 别名集合, 总次数, 上下文列表), ...]"""
         # 第一步：按规范化名分组
         groups: Dict[str, Counter] = defaultdict(Counter)
-        for name, etype in entities:
+        contexts: Dict[str, List[str]] = defaultdict(list)  # norm → context list
+        for name, etype, ctx in entities:
             norm = self._normalize_name(name)
             groups[norm][name] += 1
+            if ctx:
+                contexts[norm].append(ctx)
 
         # 第二步：合并相似实体（编辑距离 <= 2 视为同一实体）
         norm_names = list(groups.keys())
@@ -347,19 +483,21 @@ class EntityDiscoveryEngine:
                         merged = True
             clusters = [c for c in clusters if c]
 
-        # 第四步：选择规范名（最高频的原始实体名）
+        # 第四步：选择规范名（最高频的原始实体名） + 收集上下文
         result = []
         for cluster in clusters:
             all_names = set()
             total_count = 0
             name_freq: Counter = Counter()
+            cluster_contexts: List[str] = []
             for norm_name in cluster:
                 for raw_name, cnt in groups[norm_name].items():
                     all_names.add(raw_name)
                     name_freq[raw_name] += cnt
                     total_count += cnt
+                cluster_contexts.extend(contexts.get(norm_name, []))
             canonical = name_freq.most_common(1)[0][0] if name_freq else list(cluster)[0]
-            result.append((canonical, all_names, total_count))
+            result.append((canonical, all_names, total_count, cluster_contexts[:20]))
 
         result.sort(key=lambda x: -x[2])
         return result
@@ -368,36 +506,84 @@ class EntityDiscoveryEngine:
     # 类型推断
     # ═══════════════════════════════════════════════════════════
 
-    def _infer_type(self, name: str, aliases: Set[str]) -> str:
-        """根据名称推断实体类型"""
+    def _infer_type(self, name: str, aliases: Set[str],
+                    contexts: List[str] = None) -> str:
+        """根据名称 + 上下文投票推断实体类型
+
+        策略：
+          1. 名称启发式规则（针对明显特征）
+          2. 上下文关键词投票（每个上下文片段对 CONTEXT_HINTS 投票）
+          3. 按投票数加权，最高票类型胜出
+          4. 如无上下文 → 回退到旧规则
+        """
         name_lower = name.lower()
         all_names = {name_lower} | {a.lower() for a in aliases}
+        ctx_list = contexts or []
+
+        # ── 第一关：名称启发式规则（高优先级） ──
+
+        # 全大写缩写 → Concept（除非明确匹配 Organization 关键词）
+        if re.match(r'^[A-Z][A-Z\d]+$', name) and name in COMMON_ACRONYMS:
+            return "Concept"
 
         for etype, keywords in TYPE_HINTS.items():
             for n in all_names:
                 if any(kw.lower() in n for kw in keywords):
                     return etype
 
-        # 启发式规则
-        # 中文×公司 → Organization
+        # 中文启发式
         if re.search(r'[\u4e00-\u9fff]', name):
             if re.search(r'(?:公司|集团|大学|银行|科技|有限)', name):
                 return "Organization"
             if re.search(r'(?:先生|女士|博士|教授|老师)', name):
                 return "Person"
-            if re.search(r'(?:省|市|区|县|路|街道)', name):
+            if re.search(r'(?:省|区|县|路|街道)', name):
+                return "Location"
+            if re.search(r'(?:市|大厦|广场)', name):
+                if any(kw in name for kw in CN_FINANCE_CONCEPT):
+                    return "Concept"
+                if re.search(r'[\u4e00-\u9fff]{3,6}市', name):
+                    return "Concept"
                 return "Location"
             return "Concept"
 
-        # 英文
+        # 英文启发式
         if EN_PROGRAMMING.search(name) or EN_TECH.search(name):
             return "Technology"
-        if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+$', name):
-            return "Person"
         if re.match(r'^[A-Z][a-zA-Z\d]+(?:Inc|Corp|Ltd|Co)$', name, re.IGNORECASE):
             return "Organization"
-        if re.match(r'^[A-Z]{2,}$', name):  # 全大写缩写
-            return "Organization"
+        if re.match(r'^[A-Z]{2,}$', name):
+            return "Concept"
+
+        # ── 第二关：上下文关键词投票（核心改进） ──
+        if ctx_list:
+            votes: Dict[str, int] = defaultdict(int)
+            ctx_combined = " ".join(ctx_list).lower()
+
+            for etype, keywords in CONTEXT_HINTS.items():
+                for kw in keywords:
+                    if kw.lower() in ctx_combined:
+                        votes[etype] += 1
+
+            # 如果有投票结果，选最高票
+            if votes:
+                best_type = max(votes, key=votes.get)
+                best_score = votes[best_type]
+                # 至少需要 2 票才可信
+                if best_score >= 2:
+                    return best_type
+                # 1 票时，只有不是 Person 才采用
+                if best_type != "Person":
+                    return best_type
+
+        # ── 第三关：双大写词降级处理（最后把关） ──
+        if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+$', name):
+            parts = name.split()
+            if any(p in PRODUCT_KEYWORDS for p in parts):
+                return "Product"
+            if any(p in NOT_PERSON_TWO_WORD for p in parts):
+                return "Concept"
+            return "Person"
 
         return "Concept"
 
