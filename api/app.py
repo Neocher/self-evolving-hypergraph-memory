@@ -153,6 +153,16 @@ def _init_services() -> Services:
             errors.append(f"OntologyValidator: {e}")
             logger.warning("OntologyValidator init failed (fallback: no ontology validation)", error=str(e))
 
+    # 7c. 本体 v2（动态类型系统）
+    try:
+        from core.ontology_v2 import OntologyService
+        svc.ontology_v2 = OntologyService()
+        logger.info("Ontology v2 initialized", entity_types=len(svc.ontology_v2.entity_types),
+                    edge_types=len(svc.ontology_v2.edge_types))
+    except Exception as e:
+        errors.append(f"OntologyV2: {e}")
+        logger.warning("Ontology v2 init failed", error=str(e))
+
     # 8. 溯源链（【FIX】移到了前面，确保dream_pipeline能接收audit_chain）
     try:
         from core.audit_chain import AuditChain

@@ -345,3 +345,60 @@ class HebbianConfig(BaseModel):
     learning_rate: float = Field(default=0.1, gt=0.0, le=1.0)
     decay_constant: float = Field(default=0.01, gt=0.0, le=1.0)
     activation_threshold: float = Field(default=0.3, gt=0.0, le=1.0)
+
+
+# ─── Ontology v2 ─────────────────────────────────────────────
+
+class AttributeDefModel(BaseModel):
+    """属性定义"""
+    name: str = Field(..., description="属性名")
+    type: str = Field(default="string", description="属性类型: string|integer|float|boolean|date|datetime|string[]|text_embedding|entity_ref")
+    required: bool = Field(default=False, description="是否必填")
+    indexed: bool = Field(default=False, description="是否建索引")
+    description: str = Field(default="", description="属性描述")
+    default: Any = Field(default=None, description="默认值")
+    min_value: Optional[float] = Field(default=None, description="数值最小值")
+    max_value: Optional[float] = Field(default=None, description="数值最大值")
+    enum_values: Optional[List[str]] = Field(default=None, description="枚举值列表")
+
+
+class EntityTypeDefModel(BaseModel):
+    """实体类型定义"""
+    name: str = Field(..., description="类型名")
+    description: str = Field(default="", description="描述")
+    parent: Optional[str] = Field(default=None, description="父类型")
+    attributes: List[AttributeDefModel] = Field(default_factory=list, description="属性列表")
+
+
+class EdgeAttributeDefModel(BaseModel):
+    """边属性定义"""
+    name: str = Field(..., description="属性名")
+    type: str = Field(default="string", description="属性类型")
+    required: bool = Field(default=False)
+    description: str = Field(default="")
+
+
+class EdgeTypeDefModel(BaseModel):
+    """边类型定义"""
+    name: str = Field(..., description="边类型名")
+    description: str = Field(default="")
+    source_types: List[str] = Field(default_factory=list, description="允许的源实体类型（空=全部）")
+    target_types: List[str] = Field(default_factory=list, description="允许的目标实体类型（空=全部）")
+    attributes: List[EdgeAttributeDefModel] = Field(default_factory=list)
+    symmetry: bool = Field(default=False, description="是否对称")
+
+
+class EntityTypeListResponse(BaseModel):
+    entity_types: List[EntityTypeDefModel] = Field(default_factory=list)
+    total: int = Field(default=0)
+
+
+class EdgeTypeListResponse(BaseModel):
+    edge_types: List[EdgeTypeDefModel] = Field(default_factory=list)
+    total: int = Field(default=0)
+
+
+class OntologyStatsResponse(BaseModel):
+    entity_type_count: int = Field(default=0)
+    edge_type_count: int = Field(default=0)
+    baseline_loaded: bool = Field(default=True)

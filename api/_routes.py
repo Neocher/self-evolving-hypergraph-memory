@@ -44,6 +44,13 @@ from api.models import (
     SearchVectorResponse,
     SensoryRecord,
     SensoryResponse,
+    # Ontology v2
+    EntityTypeDefModel,
+    EntityTypeListResponse,
+    AttributeDefModel,
+    EdgeTypeDefModel,
+    EdgeTypeListResponse,
+    OntologyStatsResponse,
 )
 from graph.hyperedge import HyperedgeManager, HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker, HealthCheckResult
@@ -79,6 +86,8 @@ class Services:
     encoder: Any = None
     hyperedge_manager: Any = None
     ontology_validator: Any = None
+    # 本体 v2（动态类型系统）
+    ontology_v2: Any = None
     # FAISS 批量写入缓冲区
     _faiss_buffer: list[tuple] = field(default_factory=list)
     _faiss_buffer_lock: Any = None
@@ -314,7 +323,7 @@ async def create_episode(
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
                                    content=req.content, source=req.source)
 
-    # [Ontology] 写时验证
+    # [Ontology] 写时验证（v1 — 冲突检测）
     ontology_note = None
     if deps.ontology_validator is not None:
         val_result = deps.ontology_validator.write_validate(req.content, episode_id)
@@ -352,6 +361,16 @@ async def create_episode(
     if req.namespace:
         deps.kuzu_store.ensure_session(req.namespace)
         deps.kuzu_store.link_to_session(req.namespace, episode_id)
+
+    # [Ontology v2] 写时类型验证
+    if deps.ontology_v2 is not None:
+        try:
+            v2_result = deps.ontology_v2.validate_write(req.content)
+            if not v2_result.passed and v2_result.errors:
+                for err in v2_result.errors:
+                    logger.warning("Ontology v2 validation: %s → %s", err.field, err.message)
+        except Exception:
+            logger.exception("Ontology v2 write validation error (non-fatal)")
 
     # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边
     if deps.ontology_validator is not None:
@@ -1728,6 +1747,172 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
     except Exception as e:
         logger.warning("Auto-hyperedge creation failed (non-fatal): %s", e)
         return 0
+
+
+# ─── Ontology v2 CRUD ────────────────────────────────────────
+
+
+@router.post("/ontology/types", summary="注册实体类型")
+async def register_entity_type(
+    req: EntityTypeDefModel,
+    deps: Services = Depends(get_services),
+) -> EntityTypeDefModel:
+    """注册新的实体类型定义"""
+    from core.ontology_v2 import OntologyService, EntityTypeDef, AttributeDef, AttrType
+    svc: OntologyService = deps.ontology_v2
+    attr_defs = [AttributeDef(
+        name=a.name,
+        type=AttrType(a.type) if a.type in AttrType._value2member_map_ else AttrType.STRING,
+        required=a.required,
+        indexed=a.indexed,
+        description=a.description,
+        default=a.default,
+        min_value=a.min_value,
+        max_value=a.max_value,
+        enum_values=a.enum_values,
+    ) for a in req.attributes]
+    edef = EntityTypeDef(name=req.name, description=req.description,
+                         parent=req.parent, attributes=attr_defs)
+    result = svc.register_entity_type(edef)
+    return EntityTypeDefModel(name=result.name, description=result.description,
+                               parent=result.parent, attributes=req.attributes)
+
+
+@router.get("/ontology/types", summary="列出所有实体类型")
+async def list_entity_types(
+    request: Request,
+    deps: Services = Depends(get_services),
+) -> EntityTypeListResponse:
+    """列出所有已注册的实体类型"""
+    from core.ontology_v2 import OntologyService
+    try:
+        svc: OntologyService = deps.ontology_v2
+        types = svc.list_entity_types()
+        items = []
+        for t in types:
+            attrs = [
+                AttributeDefModel(
+                    name=a.name,
+                    type=a.type.value if hasattr(a.type, 'value') else str(a.type),
+                    required=a.required,
+                    indexed=a.indexed,
+                    description=a.description,
+                )
+                for a in (t.attributes or [])
+            ]
+            items.append(EntityTypeDefModel(
+                name=t.name,
+                description=t.description or "",
+                parent=t.parent,
+                attributes=attrs,
+            ))
+        return EntityTypeListResponse(entity_types=items, total=len(items))
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ontology/types/{name}", summary="查询实体类型详情")
+async def get_entity_type(
+    name: str,
+    deps: Services = Depends(get_services),
+) -> EntityTypeDefModel:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    t = svc.get_entity_type(name)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"Entity type '{name}' not found")
+    return EntityTypeDefModel(
+        name=t.name, description=t.description, parent=t.parent,
+        attributes=[AttributeDefModel(name=a.name, type=a.type.value, required=a.required,
+                                       indexed=a.indexed, description=a.description)
+                    for a in t.attributes],
+    )
+
+
+@router.delete("/ontology/types/{name}", summary="删除实体类型")
+async def delete_entity_type(
+    name: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    try:
+        deleted = svc.delete_entity_type(name)
+        return {"deleted": deleted, "name": name}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/ontology/edges", summary="注册边类型")
+async def register_edge_type(
+    req: EdgeTypeDefModel,
+    deps: Services = Depends(get_services),
+) -> EdgeTypeDefModel:
+    from core.ontology_v2 import OntologyService, EdgeTypeDef, EdgeAttributeDef, AttrType
+    svc: OntologyService = deps.ontology_v2
+    attrs = [EdgeAttributeDef(name=a.name, type=AttrType(a.type), required=a.required, description=a.description)
+             for a in req.attributes]
+    edef = EdgeTypeDef(name=req.name, description=req.description,
+                       source_types=req.source_types, target_types=req.target_types,
+                       attributes=attrs, symmetry=req.symmetry)
+    result = svc.register_edge_type(edef)
+    return EdgeTypeDefModel(name=result.name, description=result.description,
+                             source_types=result.source_types, target_types=result.target_types,
+                             symmetry=result.symmetry)
+
+
+@router.get("/ontology/edges", summary="列出所有边类型")
+async def list_edge_types(
+    deps: Services = Depends(get_services),
+) -> EdgeTypeListResponse:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    types = svc.list_edge_types()
+    items = [EdgeTypeDefModel(name=t.name, description=t.description,
+                               source_types=t.source_types, target_types=t.target_types,
+                               symmetry=t.symmetry)
+             for t in types]
+    return EdgeTypeListResponse(edge_types=items, total=len(items))
+
+
+@router.get("/ontology/edges/{name}", summary="查询边类型详情")
+async def get_edge_type(
+    name: str,
+    deps: Services = Depends(get_services),
+) -> EdgeTypeDefModel:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    t = svc.get_edge_type(name)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"Edge type '{name}' not found")
+    return EdgeTypeDefModel(name=t.name, description=t.description,
+                             source_types=t.source_types, target_types=t.target_types,
+                             symmetry=t.symmetry)
+
+
+@router.delete("/ontology/edges/{name}", summary="删除边类型")
+async def delete_edge_type(
+    name: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    deleted = svc.delete_edge_type(name)
+    return {"deleted": deleted, "name": name}
+
+
+@router.get("/ontology/stats", summary="本体系统统计")
+async def ontology_stats(
+    deps: Services = Depends(get_services),
+) -> OntologyStatsResponse:
+    from core.ontology_v2 import OntologyService
+    svc: OntologyService = deps.ontology_v2
+    return OntologyStatsResponse(
+        entity_type_count=len(svc.entity_types),
+        edge_type_count=len(svc.edge_types),
+        baseline_loaded=True,
+    )
 
 
 # ─── 【FIX】FAISS 索引重建 ─────────────────────────────────
