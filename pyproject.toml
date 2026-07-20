@@ -4,8 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "4.2.0"
-description = "Self-evolving Hypergraph Memory v4.0 — Stability Release"
+version = "5.7.0"
+description = "SHM — 自演化超图记忆系统 (Self-evolving Hypergraph Memory)"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["memory", "knowledge-graph", "llm", "rag", "hypergraph", "vector-search"]
+authors = [
+    {name = "Neocher"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+]
+
 requires-python = ">=3.10"
 dependencies = [
     "kuzu>=0.7.0",
@@ -22,9 +36,17 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Neocher/self-evolving-hypergraph-memory"
+Repository = "https://github.com/Neocher/self-evolving-hypergraph-memory"
+Documentation = "https://github.com/Neocher/self-evolving-hypergraph-memory#readme"
+
+[project.scripts]
+shm-server = "run_server:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["shm*"]
+include = ["shm*", "api*", "core*", "graph*", "embedding*", "retrieval*", "config*", "observability*"]
 
 [tool.ruff]
 line-length = 100

@@ -1,272 +1,275 @@
-# SHM v4 — 自演化超图记忆系统
+# SHM — 自演化超图记忆系统
 
-**Self-evolving Hypergraph Memory v4.0**
+**Self-evolving Hypergraph Memory v5.7.0**
 
 > 让 AI Agent 拥有像人一样的记忆——会遗忘、会强化、会做梦、会溯源。
 >
 > 不只是存储，而是**演化**。
 
----
-
-## 📖 项目缘起
-
-### 为什么做这个项目？
-
-2025年末，我们在构建 Hermes Agent 的过程中发现一个根本性问题：**所有现有的记忆系统都是"存储-检索"模式**——存入什么就取出什么，没有遗忘、没有整合、没有自我演化。
-
-人的记忆不是这样的。人脑会：
-- **遗忘** — 很久没用的事自然淡去
-- **强化** — 反复出现的模式越来越牢固
-- **做梦** — 睡眠中整合碎片化的记忆
-- **溯源** — 记得"从哪里知道这件事"
-
-灵感来自一个简单的追问：**如果 AI Agent 的记忆像人一样会自演化，会是什么样？**
-
-### 从 v1 到 v4 的演化之路
-
-- **SHM v1** 雏形验证 — 简单的 SQLite + TF-IDF 检索
-- **SHM v2** 向量化升级 — 加入 FAISS 语义搜索
-- **SHM v3** 图记忆结构 — 引入 Kuzu 图数据库 + 超边概念
-- **SHM v4** 自演化引擎 — τ-Hebbian-梦境三核心 + SSM门控 + BLAKE3溯源链
-
-每一版都是对前一版的**根本反思**——不只是加功能，而是推翻重来。
-
-v4 的核心理念是：**记忆不是存储介质，而是一个自演化的动力系统。**
-
-### 设计哲学
-
-```
-记忆 ≠ 存储
-记忆 = 时间衰减 × 共现强化 × 门控过滤 × 离线整合 × 完整性溯源
-```
-
-每个记忆片段都经过这个五重流水线的处理，而非简单地"存进去就完了"。
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-ready-orange)](https://modelcontextprotocol.io)
 
 ---
 
-## 🏗 架构总览
+## ✨ 快速开始
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Memory Store Layer                        │
-│  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐   │
-│  │  Episodic       │  │  Semantic      │  │  Sensory     │   │
-│  │  Buffer (情节)   │  │  Graph (语义)  │  │  Buffer (感) │   │
-│  └────────────────┘  └────────────────┘  └──────────────┘   │
-├──────────────────────────────────────────────────────────────┤
-│                     Core Engine Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  τ-Decay     │  │  Hebbian     │  │  SSM Gate        │   │
-│  │  遗忘引擎     │  │  强化引擎     │  │  状态空间门控     │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  Dream       │  │  Audit       │  │  BLAKE3          │   │
-│  │  Pipeline    │  │  Chain       │  │  溯源完整性链     │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-├──────────────────────────────────────────────────────────────┤
-│                  Retrieval & Query Layer                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  TF-IDF      │  │  FAISS       │  │  Coarse-to-Fine  │   │
-│  │  关键词检索   │  │  语义检索    │  │  二级精排        │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-│  ┌──────────────┐  ┌──────────────┐                          │
-│  │  Query       │  │  Community   │                          │
-│  │  Router      │  │  Report      │                          │
-│  └──────────────┘  └──────────────┘                          │
-├──────────────────────────────────────────────────────────────┤
-│                   API & Service Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  FastAPI     │  │  Prometheus  │  │  Health          │   │
-│  │  REST API    │  │  指标监控    │  │  Check + Readiness│  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🧠 核心原理
-
-### 1. τ-Decay（τ衰减遗忘）
-
-借鉴了艾宾浩斯遗忘曲线，每条记忆都有一个随时间衰减的权重值。
-
-```
-权重(t) = 初始权重 × e^(-τ × Δt)
-```
-
-- 刚存入的记忆权重最高
-- 未被访问的记忆权重指数衰减
-- 被检索到的记忆自动"刷新"权重
-- τ 参数可配置，控制遗忘速度
-
-### 2. Hebbian（稀疏Hebbian学习）
-
-"Neurons that fire together, wire together."（一起激发的神经元会连接在一起。）
-
-当用户检索某个记忆时，与它**同时出现**的其他记忆的连接强度会增强。这模拟了人脑的联想记忆——"提到 A 就想起 B"。
-
-实现上是稀疏矩阵的共现计数 + 可塑性突触权重更新。
-
-### 3. SSM Gate（状态空间模型门控）
-
-控制信息在记忆系统中的**流入、留存、流出**。
-
-基于线性状态空间模型，在每个时间步决定：
-- `输入门` — 这条信息值得存入吗？
-- `遗忘门` — 这条旧信息可以丢弃吗？
-- `输出门` — 现在应该输出哪些记忆？
-
-### 4. Dream Pipeline（梦境重放）
-
-最有趣的组件。灵感来自人脑的睡眠记忆巩固机制。
-
-在系统空闲时，Dream Scheduler 自动启动重放流程：
-1. 从 episodic buffer 中采样最近记忆
-2. 随机组合、交叉、"做梦"
-3. 发现碎片记忆之间的隐含关联
-4. 生成新的 semantic 连接（"梦到的知识"）
-5. 写入知识图谱
-
-### 5. BLAKE3 溯源链
-
-每一条记忆都有完整的**从哪里来、如何演化**的溯源记录。使用 BLAKE3 哈希链确保：
-
-- 记忆不可篡改
-- 修改可追溯
-- 来源可验证
-
----
-
-## 📊 测评结果（2026-05-06）
-
-与上一代 Holographic Memory 的对比测试：
-
-| 维度 | SHM v4 | Holo v3 | 优势 |
-|:-----|:------:|:-------:|:----|
-| **综合评分** | **55.9** | 44.6 | +25% |
-| 中文搜索 | 🏆 更快 | — | SHM 显著领先 |
-| 写入速度 | 🏆 **快 4x** | — | 吞吐量大 |
-| 智能引擎 | 🏆 有 | 无 | 自演化能力 |
-| 响应延迟 | 13-20ms | **13ms** | Holo 略快（轻量） |
-| 纯英文速度 | — | **快 0.57ms** | 差距极小 |
-
----
-
-## 🔧 技术栈
-
-| 组件 | 技术选型 | 理由 |
-|:-----|:---------|:-----|
-| 图数据库 | **KuzuDB** | 嵌入式、零配置、Cypher查询 |
-| 语义检索 | **FAISS** | 高效向量相似度搜索 |
-| 哈希链 | **BLAKE3** | 极快、安全、流式验证 |
-| API 框架 | **FastAPI** | 异步、自动文档、高性能 |
-| 门控机制 | **SSM (Mamba)** | 线性状态空间，优于LSTM门控 |
-| 配置 | **Pydantic v2** | 类型安全、验证自动 |
-| 日志 | **structlog** | 结构化、可查询 |
-| 指标 | **Prometheus** | 标准可观测性 |
-
----
-
-## ⚙ 快速开始
+### 方式一：Docker（推荐）
 
 ```bash
-# 1. 克隆代码
 git clone https://github.com/Neocher/self-evolving-hypergraph-memory.git
 cd self-evolving-hypergraph-memory
+docker compose up -d
+# SHM 运行在 http://localhost:8000
+```
 
-# 2. 安装依赖
+### 方式二：Python 原生
+
+```bash
 pip install -r requirements.txt
-
-# 3. 启动服务
 python run_server.py
-
-# 4. 验证
-curl http://localhost:8000/health
 ```
 
-### 核心配置 (`config/defaults.yaml`)
-
-```yaml
-memory:
-  tau_decay: 0.1         # 遗忘系数（越大忘得越快）
-  hebbian_lr: 0.01       # Hebbian 学习率
-  dream_interval: 3600   # 梦境周期（秒）
-  ssm_hidden: 64         # SSM 状态维度
-```
-
----
-
-## 🔌 Hermes Agent 集成
-
-作为 Hermes Agent 的记忆后端，通过 HTTP 桥接方式工作：
+### 方式三：Python SDK
 
 ```python
-# 写入记忆
-POST /memories/episodes
-{"content": "...", "source": "user", "tags": ["conversation"]}
+from shm.client import SHMClient
 
-# 查询记忆
-POST /query
-{"query": "MATCH (e:episode) RETURN e ORDER BY e.weight DESC"}
+client = SHMClient()
+# 写入记忆
+client.add_episode("Elon Musk founded SpaceX in 2002.", source="user")
+# 检索
+results = client.search("Who founded SpaceX?")
+for r in results:
+    print(f"  [{r['score']:.2f}] {r['content']}")
+# 查看状态
+print(client.stats())
+```
+
+---
+
+## 🏗 架构
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        API Layer (FastAPI)                       │
+│  POST /memories/sensory    POST /memories/episodes               │
+│  POST /memories/retrieve   POST /memories/visual                 │
+│  POST /ontology/types      POST /ontology/edges                  │
+│  POST /hyperedges          POST /index/rebuild                   │
+│                       ... 43 个端点                              │
+├──────────────────────────────────────────────────────────────────┤
+│                        Core Engine                               │
+│  ┌────────────┐  ┌────────────┐  ┌──────────┐  ┌────────────┐   │
+│  │ τ-Decay    │  │ Hebbian    │  │ SSM Gate │  │ Dream      │   │
+│  │ 遗忘引擎   │  │ 强化引擎   │  │ 门控过滤 │  │ 自演化引擎 │   │
+│  └────────────┘  └────────────┘  └──────────┘  └────────────┘   │
+├──────────────────────────────────────────────────────────────────┤
+│                        Memory Layers (5层)                        │
+│  Layer1: Sensory Buffer (环缓冲区)                                │
+│  Layer2: Episodic Nodes (Kuzu EpisodeNode + τ衰减)               │
+│  Layer3: Communities (Leiden社区聚类 + 摘要+关键词)               │
+│  Layer4: Hyperedges (episode/semantic/temporal 超边)             │
+│  Layer5: Dream Integration (社区发现+剪枝+冲突消解+压缩)         │
+├──────────────────────────────────────────────────────────────────┤
+│                    Storage Backends                                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │ Kuzu DB  │  │ FAISS    │  │ BM25     │  │ BLAKE3 AuditChain│ │
+│  │ 图数据库 │  │ 向量索引 │  │ 关键词   │  │ 区块链溯源      │ │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🌟 核心能力
+
+### 🔍 三级融合检索
+| 信号 | 算法 | 权重 |
+|:----|:-----|:----|
+| 语义向量 | FAISS 384维 (IVFFlat) | 0.5 |
+| 关键词 | BM25 (自定义实现) | 0.3 |
+| 实体匹配 | LLM NER + 正则 | 0.2 |
+
+**自动降级链:** FAISS不可用 → BM25 → 关键词（永不空返回）
+
+### 🔗 图能力
+- **Kuzu 嵌入式图数据库** — 零运维，单进程启动
+- **超边 (Hyperedge)** — 3种类型：episode/semantic/temporal
+- **社区发现** — Leiden算法，自动聚类
+- **命名空间隔离** — SessionNode + SESSION_MEMBER（v5.6）
+
+### 🧬 本体系统 (v5.7)
+| 能力 | 实现 |
+|:----|:------|
+| 动态类型注册 | `POST /ontology/types` API热注册，无需重启 |
+| 属性类型系统 | 8种: string/int/float/boolean/date/string[]/text_embedding/entity_ref |
+| 边约束 | 源/目标实体类型白名单 |
+| 类型继承 | Person ← Agent |
+| 写时验证 | 属性类型+必填+范围校验 |
+| 预载基线 | 11实体类型 + 7边类型 |
+
+### 🔄 自演化（梦境管道）
+SHM 独有的记忆自演化机制—10步管道：
+```
+Gather → Cluster(Leiden) → Synthesize(LLM摘要) → Entity Link(NER)
+→ Compress → Prune(剪枝) → Resolve(冲突消解) → Persist
+```
+其他记忆系统（Mem0/Zep/MemGPT）无此能力。
+
+### 🕒 时序感知
+- **τ 指数衰减** — 半衰期30分钟，旧记忆自动降权
+- **访问刷新** — 检索到即刷新生效时间
+- **24h 权重加倍** — 近期记忆在检索中权重更高
+
+### 🔐 区块链溯源
+- BLAKE3 哈希链记录所有写入操作
+- `GET /memories/audit/{id}` 查完整溯源链
+- 链完整性验证 + 区块回滚
+
+### 🧠 SSM 状态空间门控
+- 低价值内容自动过滤（不持久化）
+- 基于 hidden_state + feature_vector 的决策
+
+---
+
+## 🚀 MCP 集成
+
+SHM 内置 MCP Server，可直接作为 Claude Desktop / Cursor 的记忆后端：
+
+### Claude Desktop 配置
+
+编辑 `claude_desktop_config.json`：
+
+```json
+{
+  "mcpServers": {
+    "shm": {
+      "command": "python3",
+      "args": ["-m", "shm.mcp_server"],
+      "env": {
+        "SHM_BASE_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}
+```
+
+### MCP 工具
+
+| 工具名 | 功能 |
+|:-------|:-----|
+| `shm_add` | 添加记忆 |
+| `shm_search` | 搜索记忆 |
+| `shm_stats` | 系统状态 |
+| `shm_health` | 健康检查 |
+
+---
+
+## 📡 API 总览（43 个端点）
+
+| 分类 | 端点 | 功能 |
+|:----|:-----|:-----|
+| **写入** | `POST /memories/sensory` | 感觉缓冲区写入 |
+| | `POST /memories/episodes` | 直接创建情节节点 |
+| | `POST /memories/visual` | 创建视觉记忆 |
+| **检索** | `POST /memories/retrieve` | 三级融合检索 |
+| | `POST /search/vector` | 纯向量检索 |
+| | `POST /query` | Cypher 查询 |
+| **本体** | `POST/GET/DELETE /ontology/types` | 实体类型 CRUD |
+| | `POST/GET/DELETE /ontology/edges` | 边类型 CRUD |
+| | `GET /ontology/stats` | 本体统计 |
+| **图** | `POST/GET /hyperedges` | 超边 CRUD |
+| | `GET /hyperedges/by-node/{id}` | 查询节点超边 |
+| | `GET /communities` | 社区列表 |
+| **梦境** | `POST /memories/dream/trigger` | 触发梦境 |
+| | `GET /dream/candidates` | 梦境候选列表 |
+| **运维** | `GET /health` | 健康检查 |
+| | `GET /metrics` | Prometheus 指标 |
+| | `POST /index/rebuild` | 重建 FAISS 索引 |
+| **命名空间** | `DELETE /memories/namespace/{name}` | 批量删除 |
+
+完整 OpenAPI 规范：启动服务后访问 `http://localhost:8000/openapi.json`
+
+---
+
+## 📦 Python SDK
+
+```python
+from shm.client import SHMClient
+
+client = SHMClient(base_url="http://localhost:8000")
+
+# 写入 & 检索
+client.add_episode("今天讨论的项目架构需要重构", source="user", namespace="meeting_01")
+results = client.search("项目重构", top_k=3, namespace="meeting_01")
+
+# 本体管理
+client.register_entity_type("Meeting", attributes=[
+    {"name": "topic", "type": "text_embedding", "required": True},
+    {"name": "attendees", "type": "integer", "min_value": 1},
+])
+
+# 系统管理
+stats = client.stats()
+client.trigger_dream()
+client.rebuild_index()
+```
+
+---
+
+## 🐳 Docker 部署
+
+```bash
+# 构建并启动
+docker compose build
+docker compose up -d
+
+# 查看日志
+docker compose logs -f
 
 # 健康检查
-GET /health
+curl http://localhost:8000/health
+
+# 停止
+docker compose down
 ```
 
 ---
 
-## 🗺 模块地图
+## 📊 竞品对比
 
-```
-shm/
-├── api/               # FastAPI REST API 端点
-│   ├── app.py         # 应用入口
-│   ├── routes.py      # 路由定义
-│   └── models.py      # 请求/响应模型
-├── core/              # 核心引擎
-│   ├── tau_decay.py       # τ 衰减遗忘引擎
-│   ├── hebbian.py         # Hebbian 学习强化
-│   ├── ssm_gate.py        # SSM 状态空间门控
-│   ├── dream_pipeline.py  # 梦境整合管道
-│   ├── dream_scheduler.py # 梦境调度器
-│   ├── audit_chain.py     # BLAKE3 溯源链
-│   └── retry.py           # 重试策略
-├── graph/             # 图数据库层
-│   ├── kuzu_store.py      # KuzuDB 持久化
-│   └── hyperedge.py       # 超边模型
-├── embedding/         # 嵌入层
-│   └── encoder.py         # 向量编码器
-├── retrieval/         # 检索层
-│   ├── coarse_to_fine.py  # 粗排+精排
-│   ├── query_router.py    # 查询路由
-│   └── community_report.py# 社区报告
-├── config/            # 配置
-│   ├── settings.py        # Pydantic 配置模型
-│   └── defaults.yaml      # 默认配置
-├── observability/     # 可观测性
-│   ├── logger.py          # 结构化日志
-│   ├── metrics.py         # Prometheus 指标
-│   └── health.py          # 健康检查
-├── run_server.py      # 启动入口
-├── benchmark.py       # 性能基准测试
-├── pyproject.toml     # 项目元数据
-├── requirements.txt   # 依赖清单
-└── Makefile           # 常用命令
-```
+| 能力 | SHM v5.7 | Mem0 | Zep | Neo4j+Vec |
+|:----|:---------|:-----|:----|:----------|
+| 检索融合 | ⭐ 三信号+降级 | 向量+元数据 | 图+向量 | Cypher+向量 |
+| 自演化 | ⭐ 独有梦境管道 | ❌ | ❌ | ❌ |
+| 区块链溯源 | ⭐ 独有 | ❌ | ❌ | ❌ |
+| 超边 | ⭐ 3种 | ❌ | 仅二元边 | ❌ |
+| 本体系统 | ✅ 8种属性 | ❌ | 1种 | ❌ |
+| 社区发现 | ✅ Leiden | ❌ | ❌ | Louvain |
+| 时序衰减 | ✅ τ指数 | ❌ | ❌ | ❌ |
+| 部署 | 单进程+嵌入式 | SDK | 云端 | 独立服务 |
 
 ---
 
-## 📜 许可证
+## 🗺 版本历史
 
-MIT License — 自由使用、修改、分享。
+| 版本 | 亮点 |
+|:----|:------|
+| **v5.7.0** | Ontology v2 动态类型系统 · 8种属性 · 边约束 · 写时验证 |
+| **v5.6.0** | 命名空间图隔离 · SessionNode + SESSION_MEMBER |
+| **v5.5.0** | 三层Embedding降级 · 多信号检索 · Dream自动应用 |
+| **v5.0.0** | 热同步API Key · 多provider轮询 |
+| **v4.x** | τ-Hebbian-梦境三核心 · SSM门控 · BLAKE3溯源链 |
 
 ---
 
-## 🤝 贡献者
+## 📝 License
 
-- **刘白衣** — 概念设计、架构决策、迭代指挥
-- **Hermes Agent** — 代码生成、反复调试、systemd 部署
+MIT License
 
-> 这个项目是人与 AI Agent 协作开发的实践产物——人类提出构想和方向，AI Agent 生成和迭代代码，来回数十轮打磨而成。
->
-> 最有价值的不是代码，而是**迭代过程本身**——每一次失败都变成了 next step 的经验。
+---
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 PR！
