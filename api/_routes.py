@@ -88,6 +88,8 @@ class Services:
     ontology_validator: Any = None
     # 本体 v2（动态类型系统）
     ontology_v2: Any = None
+    # 置信度追踪（Step 2）
+    evidence_tracker: Any = None
     # FAISS 批量写入缓冲区
     _faiss_buffer: list[tuple] = field(default_factory=list)
     _faiss_buffer_lock: Any = None
@@ -372,12 +374,71 @@ async def create_episode(
         except Exception:
             logger.exception("Ontology v2 write validation error (non-fatal)")
 
-    # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边
-    if deps.ontology_validator is not None:
+    # [Step 1] 关系抽取细化：共现边 → 语义精确的谓词边
+    triples = None
+    if deps.kuzu_store is not None:
+        try:
+            from core.relation_extractor import RelationExtractor
+            rext = RelationExtractor()
+            triples = rext.extract(req.content)
+            for t in triples:
+                try:
+                    # 先确保实体节点存在
+                    deps.kuzu_store.execute_cypher(
+                        "MERGE (a:OntologyEntity {name: $subj}) "
+                        "ON CREATE SET a.type = $stype",
+                        {"subj": t.subject, "stype": "discovered"},
+                    )
+                    deps.kuzu_store.execute_cypher(
+                        "MERGE (b:OntologyEntity {name: $obj}) "
+                        "ON CREATE SET b.type = $otype",
+                        {"obj": t.obj, "otype": "discovered"},
+                    )
+                    # 再建关系边
+                    deps.kuzu_store.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $subj}) "
+                        "MATCH (b:OntologyEntity {name: $obj}) "
+                        "MERGE (a)-[r:RELATES_TO {relation: $rel}]->(b)",
+                        {"subj": t.subject, "obj": t.obj, "rel": t.relation},
+                    )
+                except Exception as e:
+                    logger.debug("Relation edge skip: %s →%s→ %s (%s)",
+                                 t.subject, t.relation, t.obj, e)
+            if triples:
+                logger.info("Relation extraction: %d typed edges", len(triples))
+        except Exception:
+            logger.exception("Relation extraction error (non-fatal)")
+
+    # [Step 2] 置信度累积
+    if deps.evidence_tracker is not None:
+        try:
+            evidence_count = deps.evidence_tracker.record(
+                req.content, source=req.source.value,
+                metadata={"episode_id": episode_id},
+            )
+            if evidence_count > 1:
+                logger.info("Evidence tracker: count=%d for %s", evidence_count, req.content[:40])
+        except Exception:
+            logger.exception("Evidence tracker error (non-fatal)")
+
+    # [Step 3] 实体消歧 + 指代消解
+    if deps.kuzu_store is not None:
+        try:
+            from core.entity_resolver import EntityResolver
+            resolver = EntityResolver(kuzu_store=deps.kuzu_store)
+            result = resolver.process(req.content)
+            if result.get("alias_count", 0) > 0:
+                logger.info("Entity resolver: %d alias edges, %d entities",
+                            result["alias_count"], len(result.get("entities", [])))
+        except Exception:
+            logger.exception("Entity resolver error (non-fatal)")
+
+    # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边（保留旧逻辑作为fallback）
+    if deps.ontology_validator is not None and triples is None:
         try:
             rel_count = deps.ontology_validator.extract_and_relate(req.content)
             if rel_count > 0:
-                logger.info("Write-time entity relations: %d edges", rel_count)
+                logger.info("Write-time entity relations: %d edges (fallback)", rel_count)
         except Exception:
             pass
 
@@ -1912,6 +1973,129 @@ async def ontology_stats(
         entity_type_count=len(svc.entity_types),
         edge_type_count=len(svc.edge_types),
         baseline_loaded=True,
+    )
+
+
+@router.get("/evidence/stats", summary="置信度统计")
+async def evidence_stats(
+    deps: Services = Depends(get_services),
+) -> Dict[str, Any]:
+    """返回置信度追踪器的统计信息"""
+    if deps.evidence_tracker is None:
+        return {"status": "disabled", "message": "Evidence tracker not initialized"}
+    return deps.evidence_tracker.stats()
+
+
+# ─── 实体自动发现 ─────────────────────────────────────────────
+
+
+class DiscoverResponse(BaseModel):
+    status: str = ""
+    total_nodes_scanned: int = 0
+    candidate_count: int = 0
+    proposed_types: List[Dict[str, Any]] = []
+    scan_time_ms: float = 0.0
+    entities: List[Dict[str, Any]] = []
+
+
+class DiscoverApplyResponse(BaseModel):
+    status: str = ""
+    types_registered: int = 0
+    skipped_existing: int = 0
+    total_candidates: int = 0
+
+
+@router.post("/ontology/discover", summary="自动发现候选实体和类型")
+async def ontology_discover(
+    req: Request,
+    deps: Services = Depends(get_services),
+) -> DiscoverResponse:
+    """扫描已有数据，自动发现候选实体和类型定义"""
+    from core.entity_discovery import EntityDiscoveryEngine
+    from core.ontology_v2 import OntologyService
+
+    engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
+
+    # 从 Kuzu 获取内容样本
+    contents = []
+    if deps.kuzu_store:
+        try:
+            rows = deps.kuzu_store.query_cypher(
+                "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
+            )
+            for r in rows:
+                if isinstance(r, (list, tuple)) and len(r) > 0:
+                    contents.append(str(r[0]))
+                elif isinstance(r, dict):
+                    contents.append(str(r.get("e.content", r.get("content", ""))))
+        except Exception:
+            pass
+
+    result = engine.scan(contents, min_occurrences=2, max_candidates=50)
+
+    entities_out = []
+    for e in result.candidate_entities[:20]:
+        entities_out.append({
+            "name": e.canonical_name,
+            "type": e.inferred_type,
+            "occurrences": e.occurrences,
+            "confidence": round(e.confidence, 2),
+            "aliases": e.aliases[:5],
+        })
+
+    types_out = []
+    for t in result.proposed_types:
+        types_out.append({
+            "name": t.name,
+            "description": t.description,
+            "entity_count": t.entity_count,
+            "sample_entities": t.sample_entities[:5],
+        })
+
+    return DiscoverResponse(
+        status="ok",
+        total_nodes_scanned=result.total_nodes_scanned,
+        candidate_count=len(result.candidate_entities),
+        proposed_types=types_out,
+        scan_time_ms=result.scan_time_ms,
+        entities=entities_out,
+    )
+
+
+@router.post("/ontology/discover/apply", summary="应用发现的候选到本体系统")
+async def ontology_discover_apply(
+    req: Request,
+    deps: Services = Depends(get_services),
+) -> DiscoverApplyResponse:
+    """将自动发现的候选类型注册到 Ontology v2"""
+    from core.entity_discovery import EntityDiscoveryEngine
+    from core.ontology_v2 import OntologyService
+
+    engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
+
+    # 与 discover 同样的扫描逻辑
+    contents = []
+    if deps.kuzu_store:
+        try:
+            rows = deps.kuzu_store.query_cypher(
+                "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
+            )
+            for r in rows:
+                if isinstance(r, (list, tuple)) and len(r) > 0:
+                    contents.append(str(r[0]))
+                elif isinstance(r, dict):
+                    contents.append(str(r.get("e.content", r.get("content", ""))))
+        except Exception:
+            pass
+
+    result = engine.scan(contents, min_occurrences=2, max_candidates=50)
+    apply_result = engine.apply_to_ontology(result, auto_register=True)
+
+    return DiscoverApplyResponse(
+        status=apply_result.get("status", "ok"),
+        types_registered=apply_result.get("types_registered", 0),
+        skipped_existing=apply_result.get("skipped_existing", 0),
+        total_candidates=apply_result.get("total_candidates", 0),
     )
 
 

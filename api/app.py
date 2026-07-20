@@ -163,6 +163,15 @@ def _init_services() -> Services:
         errors.append(f"OntologyV2: {e}")
         logger.warning("Ontology v2 init failed", error=str(e))
 
+    # 7d. 置信度追踪器 (Step 2)
+    try:
+        from core.evidence_tracker import EvidenceTracker
+        svc.evidence_tracker = EvidenceTracker()
+        logger.info("Evidence tracker initialized")
+    except Exception as e:
+        errors.append(f"EvidenceTracker: {e}")
+        logger.warning("Evidence tracker init failed", error=str(e))
+
     # 8. 溯源链（【FIX】移到了前面，确保dream_pipeline能接收audit_chain）
     try:
         from core.audit_chain import AuditChain
