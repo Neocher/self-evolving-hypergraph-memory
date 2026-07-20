@@ -590,6 +590,65 @@ class KuzuStore:
             logger.exception("execute_cypher failed")
             return []
 
+    # ─── 命名空间/会话隔离 ────────────────────────────────────
+    
+    def ensure_session(self, namespace: str) -> str:
+        """确保 SessionNode 存在，返回 session_id。"""
+        def _do_ensure():
+            session_id = f"ns_{namespace}"
+            self.conn.execute(
+                "MERGE (s:SessionNode {id: $id}) "
+                "ON CREATE SET s.session_id = $ns, "
+                "s.created_at = $t, s.metadata = 'namespace'",
+                {"id": session_id, "ns": namespace, "t": time.time()}
+            )
+            return session_id
+        return self._execute_with_circuit_breaker(_do_ensure)
+    
+    def link_to_session(self, namespace: str, episode_id: str) -> None:
+        """通过 SESSION_MEMBER 边将 EpisodeNode 关联到命名空间。"""
+        def _do_link():
+            session_id = f"ns_{namespace}"
+            self.conn.execute(
+                "MERGE (s:SessionNode {id: $sid}) "
+                "MERGE (e:EpisodeNode {id: $eid}) "
+                "MERGE (s)-[:SESSION_MEMBER]->(e)",
+                {"sid": session_id, "eid": episode_id}
+            )
+        self._execute_with_circuit_breaker(_do_link)
+    
+    def delete_namespace(self, namespace: str) -> int:
+        """删除命名空间下所有节点 + 关联边，返回删除的 episode 数。"""
+        def _do_delete():
+            session_id = f"ns_{namespace}"
+            # 收集该空间下所有 episode ID
+            result = self.conn.execute(
+                "MATCH (s:SessionNode {id: $sid})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                "RETURN collect(e.id) AS ids",
+                {"sid": session_id}
+            )
+            dicts = result.get_as_pl().to_dicts()
+            ids = dicts[0]["ids"] if dicts and dicts[0].get("ids") else []
+            count = len(ids)
+            if not ids:
+                return 0
+            # 分批 DETACH DELETE（自动处理所有入边/出边）
+            for i in range(0, len(ids), 50):
+                batch = ids[i:i+50]
+                params = {"ids": batch}
+                self.conn.execute(
+                    "MATCH (e:EpisodeNode) WHERE e.id IN $ids "
+                    "DETACH DELETE e",
+                    params
+                )
+            # 删除 SessionNode 自身
+            self.conn.execute(
+                "MATCH (s:SessionNode {id: $sid}) DELETE s",
+                {"sid": session_id}
+            )
+            return count
+        return self._execute_with_circuit_breaker(_do_delete)
+
     def close(self) -> None:
         """关闭所有数据库连接"""
         for c in self._connections:

@@ -42,6 +42,7 @@ class EpisodeCreate(BaseModel):
     source: SourceTag = Field(default=SourceTag.USER, description="来源标签")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
     force_promote: bool = Field(default=False, description="是否绕过 τ 阈值强制提升")
+    namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离，如 mirofish_xxx）")
 
     @field_validator("content")
     @classmethod
@@ -108,6 +109,7 @@ class SensoryRecord(BaseModel):
                          description="原始文本内容")
     source: SourceTag = Field(default=SourceTag.USER, description="来源标签")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
+    namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离）")
 
     @field_validator("content")
     @classmethod
@@ -147,6 +149,7 @@ class RetrieveRequest(BaseModel):
     top_k: int = Field(default=20, ge=1, le=200, description="返回结果数上限")
     strategy: Optional[str] = Field(default="auto", description="检索策略: auto|tau_first|vector_first|hybrid")
     include_audit: bool = Field(default=False, description="是否附带溯源信息")
+    namespace: Optional[str] = Field(default=None, description="限定检索的命名空间")
 
 
 class EpisodicResult(BaseModel):

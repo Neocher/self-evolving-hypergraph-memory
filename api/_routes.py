@@ -246,7 +246,8 @@ async def write_sensory(
 
     if buf is not None:
         buf.append({"id": record_id, "content": record.content,
-                     "source": record.source.value, "created_at": start})
+                     "source": record.source.value, "created_at": start,
+                     "namespace": record.namespace})
         buffer_usage = len(buf)
         if hasattr(buf, "is_full") and buf.is_full():
             evicted = buf.evict_oldest()
@@ -261,6 +262,10 @@ async def write_sensory(
             "created_at": start,
             "tau_initial": 1.0,
         })
+        # 命名空间链接
+        if record.namespace:
+            deps.kuzu_store.ensure_session(record.namespace)
+            deps.kuzu_store.link_to_session(record.namespace, record_id)
         if deps.dream_scheduler:
             await deps.dream_scheduler.on_node_created()
 
@@ -342,6 +347,11 @@ async def create_episode(
         "created_at": created_at,
         "tau_initial": tau_initial,
     })
+
+    # 命名空间链接
+    if req.namespace:
+        deps.kuzu_store.ensure_session(req.namespace)
+        deps.kuzu_store.link_to_session(req.namespace, episode_id)
 
     # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边
     if deps.ontology_validator is not None:
@@ -518,13 +528,28 @@ async def retrieve(
         except Exception:
             logger.exception("Cypher fallback failed")
 
-    # 【P2】结果去重：按 content 去重，保留最高分
+    # 【P2】结果去重 + 命名空间过滤：按 content 去重，保留最高分
     if results_raw:
         seen = set()
         deduped = []
+        # 如果指定了命名空间，预取该空间下的所有 node_id
+        ns_set: set[str] | None = None
+        if req.namespace and deps.kuzu_store is not None:
+            try:
+                ns_rows = deps.kuzu_store.query_cypher(
+                    "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                    "RETURN e.id",
+                    {"ns": req.namespace}
+                )
+                ns_set = {row[0] for row in ns_rows} if ns_rows else set()
+            except Exception:
+                pass
         for r in results_raw:
             key = r.get("content", "")[:100]
             if key and key not in seen:
+                # 命名空间过滤
+                if ns_set is not None and r.get("node_id", "") not in ns_set:
+                    continue
                 seen.add(key)
                 deduped.append(r)
         if len(deduped) < len(results_raw):
@@ -596,6 +621,21 @@ async def retrieve(
         latency_ms=round(latency, 2),
         degraded=degraded,
     )
+
+
+@router.delete("/memories/namespace/{namespace}", summary="按命名空间批量删除节点")
+async def delete_namespace(
+    namespace: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """删除指定命名空间下的所有 EpisodeNode + SessionNode。"""
+    if deps.kuzu_store is None:
+        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    try:
+        count = deps.kuzu_store.delete_namespace(namespace)
+        return {"deleted": count, "namespace": namespace, "status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/search/vector", summary="纯向量检索（直通 FAISS）")
