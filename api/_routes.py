@@ -2115,8 +2115,61 @@ async def ontology_discover_apply(
         total_candidates=apply_result.get("total_candidates", 0),
     )
 
+from pydantic import BaseModel, Field
+from typing import Optional, List as PyList
 
-# ─── 【FIX】FAISS 索引重建 ─────────────────────────────────
+
+class BatchRelationInput(BaseModel):
+    """批量写入关系边的输入"""
+    relations: PyList[dict] = Field(..., description="关系三元组列表")
+    source: str = Field("system", description="数据来源")
+
+
+@router.post("/batch/relations", summary="批量写入关系边")
+async def batch_relations(
+    input_data: BatchRelationInput,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """批量将抽取的三元组写入 RELATES_TO 边（不创建 EpisodeNode）"""
+    results = {"total": len(input_data.relations), "created": 0, "errors": 0, "error_details": []}
+    start = _now()
+
+    for item in input_data.relations:
+        subj = item.get("subject", "").strip()
+        rel = item.get("relation", "").strip()
+        obj = item.get("object", "").strip()
+        if not subj or not rel or not obj:
+            results["errors"] += 1
+            continue
+
+        try:
+            # 确保实体存在
+            deps.kuzu_store.query_cypher(
+                "MERGE (a:OntologyEntity {name: $name})",
+                {"name": subj}
+            )
+            deps.kuzu_store.query_cypher(
+                "MERGE (a:OntologyEntity {name: $name})",
+                {"name": obj}
+            )
+
+            # 尝试语义化边类型
+            rel_type = item.get("edge_type", "RELATES_TO")
+            deps.kuzu_store.query_cypher(
+                f"MATCH (a:OntologyEntity {{name: $subj}}), "
+                f"(b:OntologyEntity {{name: $obj}}) "
+                f"MERGE (a)-[r:{rel_type} {{relation: $rel}}]->(b)",
+                {"subj": subj, "obj": obj, "rel": rel}
+            )
+            results["created"] += 1
+        except Exception as e:
+            results["errors"] += 1
+            if len(results["error_details"]) < 3:
+                results["error_details"].append(str(e)[:80])
+
+    set_trace_id()
+    record_request("POST", "/batch/relations", "200", _now() - start)
+    return results
 
 
 @router.post("/index/rebuild", summary="重建 FAISS 索引")

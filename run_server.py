@@ -20,7 +20,7 @@ for _env_file in [
                 if k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
                          "ANTHROPIC_API_KEY", "KIMI_API_KEY",
                          "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
-                    os.environ.setdefault(k, v)
+                    os.environ[k] = v  # SHM .env 优先，覆盖已有值
 
 from api.app import create_app
 
