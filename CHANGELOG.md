@@ -1,5 +1,39 @@
 # Changelog
 
+## v5.8.2 (2026-07-20) — 批量关系写入 · OSINT关系抽取
+
+### 🆕 新增
+- **POST /batch/relations**: 批量写入语义边端点，支持大量关系一次性注入
+- **OSINT结构化关系抽取**: `scripts/batch_osint_relations.py` 自动从域名/IP/URL字段推断关系类型
+- **语义边增长**: 6→294 条，覆盖 OSINT 域全量关系
+
+### 🔧 修复
+- API Key热加载: `run_server.py` 中 `setdefault`→`os.environ[k]=v` 直接赋值，解决 Hermes 已有 Key 被跳过的问题
+- Kuzu RELATES_TO schema 仅保留 `relation STRING`，兼容写入
+
+## v5.8.1 (2026-07-20) — 实体发现准确率100%
+
+### 🆕 新增
+- **上下文投票消歧**: 实体发现增加共识投票机制，去伪存真
+- **实体覆盖率**: 26/26 实体类型 100% 准确识别
+
+### 🔧 修复
+- 实体发现伪阳性: 上下文投票过滤单次偶然匹配
+- Dream Scheduler 稳定性: 候选积压检测阈值调优
+
+## v5.8.0 (2026-07-19) — 本体自发现 · 关系抽取 · 置信度累积 · 实体消歧
+
+### 🆕 新增
+- **实体自动发现**: 从文本输入中自动识别并注册新实体类型，无需预定义
+- **关系抽取管道**: 10 种谓词类型，基于 LLM 的语义关系自动抽取
+- **置信度累积**: BLAKE3 证据追踪 + 出现次数加权，置信度递增加密可审计
+- **实体消歧管道**: 同义合并 + 指代消解 + 别名归并，三步清洗
+- **write-time pipeline**:
+  1. ontology validate — 类型校验
+  2. relation extract — 10 predicate types
+  3. evidence track — BLAKE3 hash + count
+  4. entity resolve — disambiguation + coreference + alias
+
 ## v5.7.0 (2026-07-19) — Ontology v2 动态类型系统
 
 ### 🆕 新增
