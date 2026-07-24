@@ -1,3 +1,6 @@
+# SHM + 依赖一键部署
+# docker compose up -d
+
 version: "3.9"
 
 services:
@@ -6,17 +9,24 @@ services:
     container_name: shm
     ports:
       - "8000:8000"
+      - "8222:8222"       # MCP v2 HTTP
     volumes:
       - shm_data:/app/data
     environment:
-      - SHM_BASE_URL=http://127.0.0.1:8000
+      - SHM_KUZU__DATABASE_PATH=/app/data/shm_kuzu_db
+      - SHM_LLM__ENDPOINT=${SHM_LLM_ENDPOINT:-http://127.0.0.1:11434/v1/chat/completions}
+      - SHM_LLM__MODEL=${SHM_LLM_MODEL:-llama3}
+      - SHM_API__LOG_LEVEL=${SHM_LOG_LEVEL:-WARNING}
+      # Secrets — inject from host .env or Docker secrets
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      test: ["CMD", "python3", "-c", "exit(__import__('urllib.request').urlopen('http://localhost:8000/health').getcode()!=200)"]
       interval: 30s
-      timeout: 3s
+      timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 45s
 
 volumes:
   shm_data:
+    driver: local

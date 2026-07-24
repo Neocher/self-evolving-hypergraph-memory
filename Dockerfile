@@ -1,36 +1,34 @@
-# SHM — Self-evolving Hypergraph Memory
-# 多阶段构建: 最小化最终镜像体积
-
-FROM python:3.11-slim AS builder
-
-WORKDIR /app
-RUN pip install --no-cache-dir setuptools wheel
-
-COPY pyproject.toml .
-RUN pip wheel --no-cache-dir --wheel-dir /wheels -e .
+# ─── SHM Dockerfile ───
+# docker build -t shm:latest .
+# docker run -d -p 8000:8000 -v ./data:/app/data --name shm shm:latest
 
 FROM python:3.11-slim
 
+LABEL org.opencontainers.image.title="SHM — Self-evolving Hypergraph Memory"
+LABEL org.opencontainers.image.version="5.8.4"
+
 WORKDIR /app
 
-# 运行时依赖（只安装必要的系统库）
+# System deps (Kuzu/FAISS need these)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    libstdc++6 libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
 
-# 从 builder 复制 wheel
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制源码
+# Application
 COPY . .
 
-# 数据目录
-VOLUME /app/data
+# Create data directory (will be volume-mounted in production)
+RUN mkdir -p /app/data/shm_kuzu_db
+
+# Health check: query health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python3 -c "import urllib.request;d=__import__('json').load(urllib.request.urlopen('http://localhost:8000/health'));exit(0 if d.get('status')=='ok' else 1)"
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()" || exit 1
-
+# Run migration on startup, then start server
 CMD ["python3", "run_server.py"]

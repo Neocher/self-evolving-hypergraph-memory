@@ -22,9 +22,16 @@ from urllib.error import HTTPError
 class SHMClient:
     """SHM REST API 客户端"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8000", timeout: int = 30):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+    def __init__(self, base_url: Optional[str] = None, timeout: Optional[int] = None):
+        # Config 自动注入（P2-2）
+        try:
+            from config.settings import get_settings
+            cfg = get_settings().shm_client
+            self.base_url = (base_url or cfg.base_url).rstrip("/")
+            self.timeout = timeout or int(cfg.timeout)
+        except Exception:
+            self.base_url = (base_url or "http://127.0.0.1:8000").rstrip("/")
+            self.timeout = timeout or 30
 
     # ─── 内部 HTTP 方法 ─────────────────────────────────────
 

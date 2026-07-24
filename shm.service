@@ -1,0 +1,25 @@
+[Unit]
+Description=SHM — Self-evolving Hypergraph Memory v5.8
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/shm
+Environment="PATH=/home/admin/shm/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/admin/shm/.env
+ExecStart=/home/admin/shm/.venv/bin/python run_server.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryHigh=2G
+MemoryMax=3G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
