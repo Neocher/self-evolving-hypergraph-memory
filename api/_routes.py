@@ -133,6 +133,11 @@ _embed_queue_lock: threading.Lock = threading.Lock()
 _embed_cache: dict[str, Any] = {}  # query_text → numpy vector
 _embed_cache_max: int = 256
 
+# 【Perf】检索结果缓存（相同query+top_k直接返回）
+_result_cache: dict[str, Any] = {}  # f"{query}:{top_k}" → RetrieveResponse
+_result_cache_max: int = 128
+_result_cache_lock: threading.Lock = threading.Lock()
+
 
 def _process_embed_queue(deps: Services) -> int:
     """消费 embedding 队列：异步编码并加入 FAISS 缓冲。"""
@@ -570,10 +575,20 @@ async def retrieve(
     req: RetrieveRequest,
     deps: Services = Depends(get_services),
 ) -> RetrieveResponse:
-    """执行粗到精三级检索，Kuzu 断路器跳闸时自动降级到向量/关键词检索。"""
+    """执行粗到精三级检索，结果缓存 128 条。"""
     start = _now()
     set_trace_id()
     degraded = False
+
+    # 【Perf】结果缓存命中
+    cache_key = f"{req.query}:{req.top_k}"
+    with _result_cache_lock:
+        if cache_key in _result_cache:
+            latency = (_now() - start) * 1000
+            record_request("POST", "/memories/retrieve", "200", _now() - start)
+            cached = _result_cache[cache_key]
+            cached.latency_ms = round(latency, 2)
+            return cached
 
     if deps.query_router is None:
         raise HTTPException(status_code=503, detail="Query router not available")
@@ -699,8 +714,8 @@ async def retrieve(
             ))
 
     latency = (_now() - start) * 1000
-    record_request("POST", "/memories/retrieve", "200", _now() - start)
-    return RetrieveResponse(
+    # 【Perf】存入结果缓存
+    response = RetrieveResponse(
         query=req.query,
         strategy_used=req.strategy or "auto",
         results=results,
