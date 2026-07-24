@@ -36,7 +36,7 @@ EXPORT_DIR = DATA_DIR / "migration_export"
 # 如果旧 DB 不包含这些列，需要迁移
 EXPECTED_EPISODE_COLUMNS = [
     "id", "content", "embedding", "created_at",
-    "tau_initial", "tau_value", "trust_score", "ontology_type", "source",
+    "tau_initial", "tau_value", "trust_score", "ontology_type", "source", "visibility",
 ]
 
 
@@ -55,7 +55,7 @@ def check_compatibility() -> tuple[bool, str]:
         return False, "kuzu package not installed"
 
     try:
-        db = kuzu.Database(str(DB_PATH), read_only=True)
+        db = kuzu.Database(str(DB_PATH))
         conn = kuzu.Connection(db)
 
         # Test ALTER TABLE compatibility
@@ -76,6 +76,8 @@ def check_compatibility() -> tuple[bool, str]:
                 "add column" in err and "not supported" in err
             ) and not (
                 "invalid input" in err and "add column" in err
+            ) and not (
+                "parser exception" in err and "add column" in err
             )
 
         # Check if EpisodeNode has all expected columns
@@ -188,7 +190,7 @@ def import_data() -> tuple[int, int]:
         "OntologyEntity":  ("name", ["type", "category"]),
         "EpisodeNode":     ("id", ["content", "embedding", "created_at",
                                    "tau_initial", "tau_value", "trust_score",
-                                   "ontology_type", "source"]),
+                                   "ontology_type", "source", "visibility"]),
         "HyperedgeNode":   ("id", ["type", "created_at", "gate_value", "metadata"]),
         "CommunityNode":   ("id", ["name", "summary", "leiden_score", "created_at"]),
         "SessionNode":     ("id", ["session_id", "created_at", "metadata"]),
@@ -204,6 +206,7 @@ def import_data() -> tuple[int, int]:
         "id STRING, content STRING, embedding FLOAT[384], "
         "created_at DOUBLE, tau_initial DOUBLE, tau_value DOUBLE, "
         "trust_score DOUBLE, ontology_type STRING, source STRING, "
+        "visibility STRING, "
         "PRIMARY KEY (id))"
     )
     conn.execute(

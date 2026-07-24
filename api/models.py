@@ -15,10 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 # ─── 枚举 ──────────────────────────────────────────────────
 
-class SourceTag(str, Enum):
-    USER = "user"
-    SYSTEM = "system"
-    FUNCTION = "function"
+# SourceTag → 废弃 (v5.8.3 relaxed to str for multi-agent support)
 
 
 class HyperedgeType(str, Enum):
@@ -39,10 +36,11 @@ class EpisodeCreate(BaseModel):
     """创建情节节点请求（Layer2）。"""
     content: str = Field(..., min_length=1, max_length=100_000,
                          description="情节内容文本")
-    source: SourceTag = Field(default=SourceTag.USER, description="来源标签")
+    source: str = Field(default="user", description="来源标识（agent名称，如 hermes/codex/claude）")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
     force_promote: bool = Field(default=False, description="是否绕过 τ 阈值强制提升")
     namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离，如 mirofish_xxx）")
+    visibility: str = Field(default="private", description="可见性: private(仅当前namespace) / shared(所有Agent可检索)")
 
     @field_validator("content")
     @classmethod
@@ -107,9 +105,10 @@ class SensoryRecord(BaseModel):
     """Layer1 感觉缓冲区写入请求。"""
     content: str = Field(..., min_length=1, max_length=100_000,
                          description="原始文本内容")
-    source: SourceTag = Field(default=SourceTag.USER, description="来源标签")
+    source: str = Field(default="user", description="来源标识（agent名称，如 hermes/codex/claude）")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
     namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离）")
+    visibility: str = Field(default="private", description="可见性: private(仅当前namespace) / shared(所有Agent可检索)")
 
     @field_validator("content")
     @classmethod
@@ -150,6 +149,7 @@ class RetrieveRequest(BaseModel):
     strategy: Optional[str] = Field(default="auto", description="检索策略: auto|tau_first|vector_first|hybrid")
     include_audit: bool = Field(default=False, description="是否附带溯源信息")
     namespace: Optional[str] = Field(default=None, description="限定检索的命名空间")
+    include_shared: bool = Field(default=True, description="是否同时检索 visibility=shared 的记忆")
 
 
 class EpisodicResult(BaseModel):

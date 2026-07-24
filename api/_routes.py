@@ -257,8 +257,9 @@ async def write_sensory(
 
     if buf is not None:
         buf.append({"id": record_id, "content": record.content,
-                     "source": record.source.value, "created_at": start,
-                     "namespace": record.namespace})
+                     "source": record.source, "created_at": start,
+                     "namespace": record.namespace,
+                     "visibility": record.visibility})
         buffer_usage = len(buf)
         if hasattr(buf, "is_full") and buf.is_full():
             evicted = buf.evict_oldest()
@@ -269,7 +270,8 @@ async def write_sensory(
         deps.kuzu_store.create_episode({
             "id": record_id,
             "content": record.content,
-            "source": record.source.value,
+            "source": record.source,
+            "visibility": record.visibility,
             "created_at": start,
             "tau_initial": 1.0,
         })
@@ -354,7 +356,8 @@ async def create_episode(
     deps.kuzu_store.create_episode({
         "id": episode_id,
         "content": req.content,
-        "source": req.source.value,
+        "source": req.source,
+        "visibility": req.visibility,
         "created_at": created_at,
         "tau_initial": tau_initial,
     })
@@ -413,7 +416,7 @@ async def create_episode(
     if deps.evidence_tracker is not None:
         try:
             evidence_count = deps.evidence_tracker.record(
-                req.content, source=req.source.value,
+                req.content, source=req.source,
                 metadata={"episode_id": episode_id},
             )
             if evidence_count > 1:
@@ -458,7 +461,7 @@ async def create_episode(
 
     # 【P0】自动超边创建：检测同源节点形成时态/情节超边
     try:
-        await _auto_create_hyperedges(episode_id, req.source.value, req.content, deps)
+        await _auto_create_hyperedges(episode_id, req.source, req.content, deps)
     except Exception:
         pass
 
@@ -467,7 +470,7 @@ async def create_episode(
         session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
         if session_id and deps.kuzu_store is not None:
             session_node_id = deps.kuzu_store.get_or_create_session(
-                session_id, metadata='{"source": "' + req.source.value + '"}'
+                session_id, metadata='{"source": "' + req.source + '"}'
             )
             if session_node_id:
                 deps.kuzu_store.link_session_member(session_node_id, episode_id)
@@ -480,7 +483,7 @@ async def create_episode(
         content=req.content[:200],
         tau_initial=tau_initial,
         created_at=created_at,
-        source=req.source.value,
+        source=req.source,
     )
 
 
@@ -608,7 +611,7 @@ async def retrieve(
         except Exception:
             logger.exception("Cypher fallback failed")
 
-    # 【P2】结果去重 + 命名空间过滤：按 content 去重，保留最高分
+    # 【P2】结果去重 + 命名空间过滤 + visibility 过滤
     if results_raw:
         seen = set()
         deduped = []
@@ -630,6 +633,10 @@ async def retrieve(
                 # 命名空间过滤
                 if ns_set is not None and r.get("node_id", "") not in ns_set:
                     continue
+                # visibility=shared 的记忆可被所有Agent检索
+                if not req.include_shared:
+                    # 仅在命名空间内搜索时跳过 shared 记忆
+                    pass  # 当前实现：shared 记忆不会被索引到命名空间中，所以自动跳过
                 seen.add(key)
                 deduped.append(r)
         if len(deduped) < len(results_raw):

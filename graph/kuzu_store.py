@@ -197,6 +197,7 @@ class KuzuStore:
             "id STRING, content STRING, embedding FLOAT[384], "
             "created_at DOUBLE, tau_initial DOUBLE, tau_value DOUBLE, "
             "trust_score DOUBLE, ontology_type STRING, source STRING, "
+            "visibility STRING, "
             "PRIMARY KEY (id))"
         )
         self.conn.execute(
@@ -327,7 +328,8 @@ class KuzuStore:
         def _do_create():
             self.conn.execute(
                 "CREATE (e:EpisodeNode {id: $id, content: $content, "
-                "created_at: $created_at, tau_initial: $tau_initial, source: $source})",
+                "created_at: $created_at, tau_initial: $tau_initial, "
+                "source: $source, visibility: $visibility})",
                 episode
             )
             return episode['id']
