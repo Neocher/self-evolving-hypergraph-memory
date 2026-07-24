@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "5.7.0"
+version = "5.8.4"
 description = "SHM — 自演化超图记忆系统 (Self-evolving Hypergraph Memory)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -29,6 +29,8 @@ dependencies = [
     "structlog>=23.0.0",
     "prometheus-client>=0.17.0",
     "fastapi>=0.104.0",
+    "httpx>=0.27.0",
+    "mcp>=1.0.0",
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.5.0",
     "scikit-learn>=1.3.0",
