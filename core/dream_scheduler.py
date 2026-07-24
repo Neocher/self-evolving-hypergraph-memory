@@ -280,3 +280,24 @@ class DreamScheduler:
     @property
     def accumulated_count(self) -> int:
         return self._new_node_count
+
+    # ─── 状态持久化 (P1-3) ──────────────────────────────────
+
+    def save_state(self) -> dict:
+        """导出调度器运行时状态（供持久化到 Kuzu SystemNode）。"""
+        return {
+            "last_run_time": self._last_run_time,
+            "dream_run_count": self._dream_run_count,
+            "new_node_count": self._new_node_count,
+            "unresolved_conflict_count": self._unresolved_conflict_count,
+            "last_activity_time": self._last_activity_time,
+            "saved_at": time.time(),
+        }
+
+    def load_state(self, state: dict) -> None:
+        """从持久化状态恢复调度器运行时状态。"""
+        self._last_run_time = state.get("last_run_time", 0.0)
+        self._dream_run_count = state.get("dream_run_count", 0)
+        self._new_node_count = state.get("new_node_count", 0)
+        self._unresolved_conflict_count = state.get("unresolved_conflict_count", 0)
+        self._last_activity_time = state.get("last_activity_time", time.time())

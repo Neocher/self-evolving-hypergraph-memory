@@ -360,6 +360,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
     DREAM_POLL_INTERVAL = 60.0
 
+    # 【P1-3】从 Kuzu SystemNode 恢复梦境调度器状态
+    if svc.kuzu_store is not None and svc.dream_scheduler is not None:
+        try:
+            rows = svc.kuzu_store.query_cypher(
+                "MATCH (s:SystemNode) WHERE s.id = 'dream_scheduler_state' "
+                "RETURN s.payload"
+            )
+            if rows and len(rows) > 0:
+                import json as _json
+                row = rows[0]
+                payload_str = ""
+                if isinstance(row, dict):
+                    payload_str = str(row.get("payload", ""))
+                elif isinstance(row, (list, tuple)):
+                    payload_str = str(row[0]) if len(row) > 0 else ""
+                if payload_str:
+                    state = _json.loads(payload_str)
+                    svc.dream_scheduler.load_state(state)
+                    logger.info("Dream scheduler state restored: %s", {
+                        k: v for k, v in state.items() if k != "saved_at"})
+        except Exception as e:
+            logger.debug("Dream scheduler state restore skipped: %s", e)
+
     async def _dream_poll_loop() -> None:
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)
         while True:
@@ -386,6 +409,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     triggered = await svc.dream_scheduler.check_and_trigger()
                     if triggered:
                         logger.info("Dream triggered by poll loop")
+                        # 【P1-3】梦境完成后保存状态
+                        try:
+                            if svc.kuzu_store is not None:
+                                import json as _json
+                                state_json = _json.dumps(svc.dream_scheduler.save_state())
+                                svc.kuzu_store.query_cypher(
+                                    "MERGE (s:SystemNode {id: 'dream_scheduler_state'}) "
+                                    "SET s.payload = $payload",
+                                    {"payload": state_json},
+                                )
+                        except Exception:
+                            pass
                     # 自动 apply 梦境候选
                     if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
                         try:
