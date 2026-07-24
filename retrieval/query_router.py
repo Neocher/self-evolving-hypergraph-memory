@@ -100,6 +100,7 @@ class QueryRouter:
         encoder=None,
         config: Optional[QueryRouterConfig] = None,
         faiss_id_map: Optional[dict] = None,
+        episode_cache: Optional[dict] = None,
     ) -> None:
         """
         Args:
@@ -115,6 +116,7 @@ class QueryRouter:
         self.tfidf_index = tfidf_index
         self.encoder = encoder
         self.faiss_id_map = faiss_id_map if faiss_id_map is not None else {}
+        self._episode_cache = episode_cache or {}  # 【Perf】共享 Services._episode_cache
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
             "最近",
@@ -683,24 +685,57 @@ class QueryRouter:
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
+        # 【Perf】episode_cache 优先 → Kuzu batch miss → 逐条 fallback
+        valid_pairs = [
+            (ep_id, score) for ep_id, score in episode_scores if ep_id >= 0
+        ]
+        uuid_map = {
+            ep_id: self.faiss_id_map.get(ep_id, str(ep_id))
+            for ep_id, _ in valid_pairs
+        }
+
         results: list[dict] = []
-        for ep_id, score in episode_scores:
-            if ep_id < 0:
+        kuzu_miss_ids: list[str] = []
+
+        for ep_id, score in valid_pairs:
+            node_uuid = uuid_map[ep_id]
+            # 优先级 1: episode_cache（写入时预填充，零查询开销）
+            if node_uuid in self._episode_cache:
+                episode = dict(self._episode_cache[node_uuid])
+                episode["id"] = node_uuid
+            else:
+                kuzu_miss_ids.append(node_uuid)
                 continue
-            try:
-                # 【修复】通过 faiss_id_map 将 FAISS int id 转为 Kuzu UUID string
-                node_uuid = self.faiss_id_map.get(ep_id, str(ep_id))
-                episode = self.kuzu_store.get_episode(node_uuid)
-            except CircuitBreakerOpen:
-                raise
-            except Exception:
-                continue
+
             if episode:
                 episode["score"] = round(1.0 / (1.0 + float(score)), 4)
                 episode["level"] = "l1_faiss"
                 episode["_source"] = "faiss"
                 episode["node_id"] = episode.pop("id", "")
                 results.append(episode)
+
+        # 优先级 2: 批量 Kuzu 查询（仅对 cache miss 的 IDs）
+        if kuzu_miss_ids and hasattr(self.kuzu_store, 'get_episodes_batch'):
+            try:
+                episodes_dict = {
+                    ep["id"]: ep
+                    for ep in self.kuzu_store.get_episodes_batch(kuzu_miss_ids)
+                }
+            except Exception:
+                episodes_dict = {}
+
+            for ep_id, score in valid_pairs:
+                node_uuid = uuid_map[ep_id]
+                if node_uuid in self._episode_cache:
+                    continue  # already processed
+                if node_uuid in episodes_dict:
+                    episode = episodes_dict[node_uuid]
+                    if episode:
+                        episode["score"] = round(1.0 / (1.0 + float(score)), 4)
+                        episode["level"] = "l1_faiss"
+                        episode["_source"] = "faiss"
+                        episode["node_id"] = episode.pop("id", "")
+                        results.append(episode)
 
         return self._deduplicate_and_sort(results)
 

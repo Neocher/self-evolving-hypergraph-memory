@@ -275,7 +275,8 @@ def _init_services() -> Services:
             "tfidf_index": tfidf_index,
             "encoder": svc.encoder,
             # 【修复】query_router 和 _routes 共享同一个 faiss_id_map 对象
-            "faiss_id_map": svc.faiss_id_map,  # 引用传递，flush_faiss_buffer 的修改对 query_router 可见
+            "faiss_id_map": svc.faiss_id_map,  # 引用传递
+            "episode_cache": getattr(svc, "_episode_cache", {}),  # 【Perf】共享缓存，flush_faiss_buffer 的修改对 query_router 可见
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(

@@ -351,6 +351,21 @@ class KuzuStore:
 
         return self._execute_with_circuit_breaker(_do_get)
 
+    def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
+        """批量按ID查询情节节点。一次查询替代N次 get_episode。"""
+        if not node_ids:
+            return []
+
+        def _do_batch():
+            result = self.conn.execute(
+                "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.*",
+                {"ids": node_ids}
+            )
+            rows = result.get_as_pl()
+            return [_clean_kuzu_row(d) for d in rows.to_dicts()]
+
+        return self._execute_with_circuit_breaker(_do_batch)
+
     def query_cypher(self, query: str, params: Optional[dict] = None) -> list:
         """
         执行任意 Cypher 查询（带断路器保护）。
