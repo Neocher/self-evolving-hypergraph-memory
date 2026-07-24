@@ -100,6 +100,7 @@ class TextEncoder:
     封装 sentence-transformers，提供文本到向量的转换，
     集成 FAISS 索引过期管理。
     支持 CPU (device='cpu') 和 GPU (device='cuda')。
+    自动检测 ONNX INT8 模型（./data/all-MiniLM-L6-v2-int8）并优先使用。
     """
 
     def __init__(
@@ -108,6 +109,7 @@ class TextEncoder:
         self.model_name = model_name
         self.device = device
         self._model = None
+        self._onnx_model = None
         self._indexed_node_ids: Set[str] = set()
         self._dream_cycle_count: int = 0
         self._needs_rebuild: bool = False
@@ -133,9 +135,23 @@ class TextEncoder:
         return vec
 
     def load(self) -> None:
-        """加载 sentence-transformers 模型。"""
-        from sentence_transformers import SentenceTransformer
+        """加载模型。优先 ONNX INT8，其次 sentence-transformers。"""
+        import os as _os
 
+        onnx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                   "..", "data", "all-MiniLM-L6-v2-int8")
+        if _os.path.isdir(onnx_path) and _os.path.exists(_os.path.join(onnx_path, "model.onnx")):
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(onnx_path)
+            self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
+                onnx_path, provider="CPUExecutionProvider"
+            )
+            logger.info("ONNX INT8 model loaded from %s", onnx_path)
+            return
+
+        from sentence_transformers import SentenceTransformer
         logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
         self._model = SentenceTransformer(self.model_name, device=self.device)
         logger.info("Local embedding model loaded: dim=%d", self.dimension)
@@ -155,7 +171,14 @@ class TextEncoder:
                 self._cloud_available = False
                 logger.info("Cloud API degraded, falling back to local model")
 
-        # Tier 2: Local model
+        # Tier 2: Local model (ONNX preferred)
+        if self._onnx_model is not None:
+            inputs = self._tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            outputs = self._onnx_model(**inputs)
+            # Mean pooling over token dimension
+            vec = outputs.last_hidden_state.mean(dim=1).squeeze().detach().numpy()
+            return vec.astype(np.float32)
+
         if self._model is None:
             self.load()
         return self._model.encode(text)
