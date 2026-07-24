@@ -62,6 +62,7 @@ def _init_services() -> Services:
                 svc.encoder = create_encoder(
                     model_name=cfg.embedding.model_name,
                     device=cfg.embedding.device,
+                    prefer_cloud=False,  # ONNX优先，跳过云端API阻塞
                 )
                 svc.encoder.load()
                 logger.info("TextEncoder (Tier 2) initialized", model=cfg.embedding.model_name)
