@@ -114,7 +114,7 @@ class QueryRouter:
         self.faiss_index = faiss_index
         self.tfidf_index = tfidf_index
         self.encoder = encoder
-        self.faiss_id_map = faiss_id_map or {}
+        self.faiss_id_map = faiss_id_map if faiss_id_map is not None else {}
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
             "最近",

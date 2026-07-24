@@ -274,7 +274,8 @@ def _init_services() -> Services:
             "faiss_index": svc.faiss_index,
             "tfidf_index": tfidf_index,
             "encoder": svc.encoder,
-            "faiss_id_map": getattr(svc, "faiss_id_map", {}),
+            # 【修复】query_router 和 _routes 共享同一个 faiss_id_map 对象
+            "faiss_id_map": svc.faiss_id_map,  # 引用传递，flush_faiss_buffer 的修改对 query_router 可见
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(
@@ -460,6 +461,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     poll_task = asyncio.create_task(_dream_poll_loop())
     hyperedge_task = asyncio.create_task(_hyperedge_sweep())
+
+    # 【Perf】嵌入队列消费 loop — 每 5 秒 flush FAISS
+    async def _embed_poll_loop() -> None:
+        logger.info("Embed poll loop started (interval=5s)")
+        while True:
+            try:
+                # 导入 consumer 函数
+                from api._routes import _process_embed_queue
+                _process_embed_queue(svc)
+            except Exception:
+                logger.exception("Embed poll error (non-fatal)")
+            await asyncio.sleep(5)
+    embed_task = asyncio.create_task(_embed_poll_loop())
 
     yield
     # shutdown
