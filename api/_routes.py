@@ -714,7 +714,6 @@ async def retrieve(
             ))
 
     latency = (_now() - start) * 1000
-    # 【Perf】存入结果缓存
     response = RetrieveResponse(
         query=req.query,
         strategy_used=req.strategy or "auto",
@@ -723,6 +722,15 @@ async def retrieve(
         latency_ms=round(latency, 2),
         degraded=degraded,
     )
+    # 【Perf】存入结果缓存
+    with _result_cache_lock:
+        if len(_result_cache) >= _result_cache_max:
+            keys = list(_result_cache.keys())
+            for k in keys[:_result_cache_max // 2]:
+                del _result_cache[k]
+        _result_cache[cache_key] = response
+    record_request("POST", "/memories/retrieve", "200", _now() - start)
+    return response
 
 
 @router.delete("/memories/namespace/{namespace}", summary="按命名空间批量删除节点")
