@@ -188,8 +188,9 @@ def _init_services() -> Services:
         llm_client = None
         try:
             from core.llm_client import LLMClient
-            llm_client = LLMClient()
-            logger.info("LLMClient initialized for dream synthesis")
+            llm_client = LLMClient()  # 自动从 config/settings.py 读取 llm 段
+            logger.info("LLMClient initialized for dream synthesis (endpoint=%s, model=%s)",
+                       llm_client.base_url, llm_client.model)
         except Exception as e:
             logger.warning("LLMClient init skipped (dreams will use TF-IDF fallback): %s", e)
 

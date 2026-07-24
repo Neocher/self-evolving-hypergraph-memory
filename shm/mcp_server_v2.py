@@ -31,7 +31,9 @@ from typing import Any, Dict, List, Optional
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 logger = logging.getLogger("shm-mcp-v2")
 
-SHM_BASE_URL = os.environ.get("SHM_BASE_URL", "http://127.0.0.1:8000")
+from config.settings import get_settings
+
+SHM_BASE_URL = get_settings().shm_client.base_url
 
 # ─── SHM HTTP Client (async with httpx) ──────────────────────
 

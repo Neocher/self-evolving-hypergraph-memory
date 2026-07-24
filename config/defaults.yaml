@@ -85,3 +85,16 @@ community:
   template_threshold: 5          # ≤5 节点用模板，>5 用 LLM
   jaccard_threshold: 0.8         # 冲突检测 Jaccard 相似度阈值
   max_keywords: 10               # 模板报告最大关键词数
+
+llm:
+  endpoint: "http://127.0.0.1:11434/v1/chat/completions"  # LLM API 端点（Ollama 默认）
+  model: "llama3"                # 默认模型名
+  api_key: ""                    # API Key（空 = 无需认证）
+  timeout: 60.0                  # 超时秒数
+  max_retries: 3                 # 最大重试次数
+  fallback_endpoints: []         # 备用端点列表（按顺序尝试）
+
+shm_client:
+  base_url: "http://127.0.0.1:8000"  # SHM 服务地址（MCP/CLI/SDK 连接用）
+  timeout: 15.0                     # 客户端超时
+  mcp_http_port: 8222               # MCP HTTP 服务器端口

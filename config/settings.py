@@ -147,6 +147,25 @@ class OntologyConfig:
 
 
 @dataclass
+class LLMConfig:
+    """LLM 客户端配置（梦境·本体·关系抽取）"""
+    endpoint: str = "http://127.0.0.1:11434/v1/chat/completions"
+    model: str = "llama3"
+    api_key: str = ""
+    timeout: float = 60.0
+    max_retries: int = 3
+    fallback_endpoints: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SHMClientConfig:
+    """SHM 服务端点（供 MCP/CLI/SDK 客户端连接）"""
+    base_url: str = "http://127.0.0.1:8000"
+    timeout: float = 15.0
+    mcp_http_port: int = 8222
+
+
+@dataclass
 class Settings:
     """SHM v4.0 全局配置聚合。"""
 
@@ -163,6 +182,8 @@ class Settings:
     retry: RetryConfig = field(default_factory=RetryConfig)
     community: CommunityConfig = field(default_factory=CommunityConfig)
     ontology: OntologyConfig = field(default_factory=OntologyConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    shm_client: SHMClientConfig = field(default_factory=SHMClientConfig)
 
 
 def _env_override(raw: dict[str, Any], prefix: str = "SHM") -> dict[str, Any]:
@@ -223,6 +244,8 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "retry": RetryConfig,
         "community": CommunityConfig,
         "ontology": OntologyConfig,
+        "llm": LLMConfig,
+        "shm_client": SHMClientConfig,
     }
     kwargs: dict[str, Any] = {}
     for section, cls in section_map.items():

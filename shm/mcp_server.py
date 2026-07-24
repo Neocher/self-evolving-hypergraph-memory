@@ -23,7 +23,10 @@ from typing import Any
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 logger = logging.getLogger("shm-mcp")
 
-SHM_BASE_URL = os.environ.get("SHM_BASE_URL", "http://127.0.0.1:8000")
+from config.settings import get_settings
+
+SHM_BASE_URL = get_settings().shm_client.base_url
+SHM_MCP_HTTP_PORT = get_settings().shm_client.mcp_http_port
 
 
 # ─── MCP JSON-RPC 工具函数 ──────────────────────────────────

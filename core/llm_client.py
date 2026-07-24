@@ -25,21 +25,45 @@ _MAX_RETRIES = 2
 
 
 class LLMClient:
-    """轻量 LLM 客户端，支持 OpenAI 兼容 API。
+    """轻量 LLM 客户端，支持 OpenAI 兼容 API + fallback 端点链。
 
-    支持从环境变量读取 API Key，也可在构造时传入。
+    支持多端点 fallback：主端点失败时自动尝试备用端点。
+    API Key 优先级：构造参数 > 环境变量 > config/settings.py。
+    环境变量名会按 base_url 自动推断（DeepSeek → DEEPSEEK_API_KEY 等）。
     """
+
+    _DEFAULT_FALLBACK_ENDPOINTS = [
+        "https://api.deepseek.com",
+        "https://api.openai.com",
+        "https://api.moonshot.cn",
+        "https://openrouter.ai/api",
+    ]
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = _DEFAULT_BASE_URL,
-        model: str = _DEFAULT_MODEL,
-        timeout: float = _DEFAULT_TIMEOUT,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        fallback_endpoints: Optional[list[str]] = None,
     ) -> None:
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        # 从 config 加载默认值（可被构造参数覆盖）
+        try:
+            from config.settings import get_settings
+            cfg = get_settings().llm
+        except Exception:
+            cfg = None
+
+        self.base_url = (base_url or (cfg.endpoint if cfg else _DEFAULT_BASE_URL))
+        self.model = model or (cfg.model if cfg else _DEFAULT_MODEL)
+        self.timeout = timeout or (cfg.timeout if cfg else _DEFAULT_TIMEOUT)
+        self.fallback_endpoints = fallback_endpoints or (
+            cfg.fallback_endpoints if cfg and cfg.fallback_endpoints
+            else self._DEFAULT_FALLBACK_ENDPOINTS
+        )
+        self._base_urls = [self.base_url] + [
+            ep for ep in self.fallback_endpoints if ep != self.base_url
+        ]
 
         # API Key 优先级：构造参数 > 环境变量
         self.api_key = api_key or self._load_key_from_env()
@@ -47,9 +71,9 @@ class LLMClient:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 
         self._client = httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=self.base_url.rstrip("/"),
             headers=self._build_headers(),
-            timeout=timeout,
+            timeout=timeout or self.timeout,
         )
 
     _HERMES_ENV = os.path.expanduser("~/.hermes/.env")
@@ -137,7 +161,24 @@ class LLMClient:
             body["response_format"] = response_format
 
         last_error = None
-        for attempt in range(1 + _MAX_RETRIES):
+        # 先尝试主端点，再逐个尝试 fallback 端点
+        for attempt in range(1 + (_MAX_RETRIES * len(self._base_urls))):
+            url_idx = attempt // (1 + _MAX_RETRIES)
+            if url_idx < len(self._base_urls):
+                endpoint = self._base_urls[url_idx]
+            else:
+                endpoint = self._base_urls[-1]
+
+            # 如果切换了端点，重建 client
+            if endpoint != self._client.base_url:
+                await self._client.aclose()
+                self._client = httpx.AsyncClient(
+                    base_url=endpoint.rstrip("/"),
+                    headers=self._build_headers(),
+                    timeout=self.timeout,
+                )
+                logger.info("LLMClient: switched to fallback endpoint %s", endpoint)
+
             try:
                 resp = await self._client.post("/chat/completions", json=body)
                 resp.raise_for_status()
