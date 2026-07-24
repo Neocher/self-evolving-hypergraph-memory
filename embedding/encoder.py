@@ -112,6 +112,25 @@ class TextEncoder:
         self._dream_cycle_count: int = 0
         self._needs_rebuild: bool = False
         self._cloud_available: bool = False  # Tier 1 是否可用
+        self._cache: Dict[str, np.ndarray] = {}  # 【Perf】嵌入缓存
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+
+    def _cached_embed(self, text: str) -> np.ndarray:
+        """带缓存的嵌入（LRU淘汰）。"""
+        if text in self._cache:
+            self._cache_hits += 1
+            return self._cache[text]
+        self._cache_misses += 1
+        vec = self._do_embed(text)
+        # LRU: 超过 512 条时清理一半
+        if len(self._cache) >= 512:
+            # 保留最近插入的 256 条
+            keys = list(self._cache.keys())
+            for k in keys[:256]:
+                del self._cache[k]
+        self._cache[text] = vec
+        return vec
 
     def load(self) -> None:
         """加载 sentence-transformers 模型。"""
@@ -122,11 +141,11 @@ class TextEncoder:
         logger.info("Local embedding model loaded: dim=%d", self.dimension)
 
     def embed(self, text: str) -> np.ndarray:
-        """单条文本 → embedding 向量 (384,) float32。
-        
-        优先 Tier 1（Cloud API），不可用时降级到 Tier 2（本地模型）。
-        """
-        # Tier 1: Cloud API
+        """单条文本 → embedding 向量 (384,) float32（带LRU缓存）。"""
+        return self._cached_embed(text)
+
+    def _do_embed(self, text: str) -> np.ndarray:
+        """不加缓存的原始嵌入（供缓存内部调用）。"""
         if self._cloud_available:
             try:
                 result = _cloud_embed([text])

@@ -44,9 +44,9 @@ kuzu:
 
 faiss:
   dimension: 384                 # 向量维度（匹配 all-MiniLM-L6-v2）
-  index_type: "IVFFlat"          # FAISS 索引类型
+  index_type: "FlatL2"           # FAISS 索引类型（<10K向量用FlatL2最快）
   nlist: 100                     # IVF 聚类中心数（IVFFlat 专用）
-  nprobe: 10                     # 搜索时探测的聚类数
+  nprobe: 3                      # 搜索时探测的聚类数（降低=更快）
 
 retrieval:
   top_k_l1: 5                    # L1 FAISS 检索 top-K (直接查 EpisodeNode)

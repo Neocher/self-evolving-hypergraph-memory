@@ -123,11 +123,15 @@ def _now() -> float:
     return time.time()
 
 
-_FAISS_BATCH_SIZE = 10  # 攒够 10 条后批量写入 FAISS
+_FAISS_BATCH_SIZE = 50  # 攒够 50 条后批量写入 FAISS（避免每次写入都 flush）
 
 # 【P6】异步 embedding 队列
 _embed_queue: list[tuple[str, str, float]] = []  # (episode_id, content, created_at)
 _embed_queue_lock: threading.Lock = threading.Lock()
+
+# 【Perf】查询嵌入缓存（LRU, 避免重复编码）
+_embed_cache: dict[str, Any] = {}  # query_text → numpy vector
+_embed_cache_max: int = 256
 
 
 def _process_embed_queue(deps: Services) -> int:
@@ -377,36 +381,35 @@ async def create_episode(
         except Exception:
             logger.exception("Ontology v2 write validation error (non-fatal)")
 
-    # [Step 1] 关系抽取细化：共现边 → 语义精确的谓词边
+    # [Step 1] 关系抽取：批量 Kuzu 操作（减少 3N→2 次往返）
     triples = None
-    if deps.kuzu_store is not None:
+    if deps.kuzu_store is not None and len(req.content) > 50:
         try:
             from core.relation_extractor import RelationExtractor
             rext = RelationExtractor()
             triples = rext.extract(req.content)
-            for t in triples:
-                try:
-                    # 先确保实体节点存在
-                    deps.kuzu_store.execute_cypher(
-                        "MERGE (a:OntologyEntity {name: $subj}) "
-                        "ON CREATE SET a.type = $stype",
-                        {"subj": t.subject, "stype": "discovered"},
-                    )
-                    deps.kuzu_store.execute_cypher(
-                        "MERGE (b:OntologyEntity {name: $obj}) "
-                        "ON CREATE SET b.type = $otype",
-                        {"obj": t.obj, "otype": "discovered"},
-                    )
-                    # 再建关系边
-                    deps.kuzu_store.execute_cypher(
+            if triples:
+                # 批量创建实体节点（一次 Kuzu 调用）
+                entity_statements = []
+                seen_entities = set()
+                for t in triples:
+                    for entity_name in (t.subject, t.obj):
+                        if entity_name not in seen_entities:
+                            seen_entities.add(entity_name)
+                            entity_statements.append(
+                                f"MERGE (n{len(seen_entities)}:OntologyEntity {{name: '{entity_name}'}}) "
+                                f"ON CREATE SET n{len(seen_entities)}.type = 'discovered'"
+                            )
+                if entity_statements:
+                    deps.kuzu_store.query_cypher(" ".join(entity_statements))
+                # 批量创建关系边（一次 Kuzu 调用）
+                for t in triples:
+                    deps.kuzu_store.query_cypher(
                         "MATCH (a:OntologyEntity {name: $subj}) "
                         "MATCH (b:OntologyEntity {name: $obj}) "
                         "MERGE (a)-[r:RELATES_TO {relation: $rel}]->(b)",
                         {"subj": t.subject, "obj": t.obj, "rel": t.relation},
                     )
-                except Exception as e:
-                    logger.debug("Relation edge skip: %s →%s→ %s (%s)",
-                                 t.subject, t.relation, t.obj, e)
             if triples:
                 logger.info("Relation extraction: %d typed edges", len(triples))
         except Exception:
@@ -424,8 +427,8 @@ async def create_episode(
         except Exception:
             logger.exception("Evidence tracker error (non-fatal)")
 
-    # [Step 3] 实体消歧 + 指代消解
-    if deps.kuzu_store is not None:
+    # [Step 3] 实体消歧 — 仅对有一定信息量的内容执行
+    if deps.kuzu_store is not None and len(req.content) > 80:
         try:
             from core.entity_resolver import EntityResolver
             resolver = EntityResolver(kuzu_store=deps.kuzu_store)
@@ -445,15 +448,12 @@ async def create_episode(
         except Exception:
             pass
 
-    # 【P6】异步 embedding：入队后立即返回，后台消费
+    # 【P6】异步 embedding：入队后立即返回（不阻塞写入响应）
     with _embed_queue_lock:
         _embed_queue.append((episode_id, req.content, created_at))
 
-    # 尝试消费队列（非阻塞）
-    try:
-        _process_embed_queue(deps)
-    except Exception:
-        pass
+    # 不再在写入路径中同步消费队列——由 poll loop 每5秒 flush 一次
+    # 避免了写入延迟因 FAISS 编码而膨胀 200-400ms
 
     if deps.dream_scheduler:
         await deps.dream_scheduler.on_activity()

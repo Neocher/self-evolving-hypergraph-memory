@@ -397,12 +397,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                                 logger.info("API Key hot-reloaded from ~/.hermes/.env")
                 except Exception:
                     pass
-                # 定期 flush FAISS 缓冲区
+                # 定期 flush FAISS 缓冲区（每 5 秒，因为写入路径不再同步 flush）
                 try:
                     from api.routes import flush_faiss_buffer
                     flushed = flush_faiss_buffer(svc)
                     if flushed:
-                        logger.info("Periodic FAISS buffer flush: %d vectors", flushed)
+                        logger.debug("Periodic FAISS buffer flush: %d vectors", flushed)
                 except Exception:
                     pass
                 if svc.dream_scheduler is not None and hasattr(svc.dream_scheduler, "check_and_trigger"):
