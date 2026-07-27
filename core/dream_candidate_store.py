@@ -121,8 +121,13 @@ class DreamCandidateStore:
         )
 
         filepath = self._candidate_path(dream_id)
-        with open(filepath, "w", encoding="utf-8") as f:
+        # 原子写入：先写 .tmp 再 rename，防止写入中断导致文件损坏
+        tmp_path = filepath + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(candidate.to_dict(), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
         logger.info("Dream candidate saved: %s (%d communities, %d prunes, %d merges)",
                      filepath, len(community_summaries), len(prune_summary), len(merge_summary))
         return filepath

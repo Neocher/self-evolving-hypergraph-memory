@@ -48,7 +48,7 @@
 
 ## 项目概述
 
-SHM v5.9 — 自演化超图记忆系统 (Self-evolving Hypergraph Memory v5.9)
+SHM v5.10 — 自演化超图记忆系统 (Self-evolving Hypergraph Memory v5.10)
 基于 τ-Hebbian-梦境三核心 + 60+调研项目融合的五层记忆架构
 
 ## 技术规范

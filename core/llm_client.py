@@ -9,6 +9,7 @@ LLM 客户端
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -75,6 +76,7 @@ class LLMClient:
             headers=self._build_headers(),
             timeout=timeout or self.timeout,
         )
+        self._client_lock = asyncio.Lock()
 
     _HERMES_ENV = os.path.expanduser("~/.hermes/.env")
     _HERMES_ENV_MTIME: float = 0.0
@@ -169,15 +171,18 @@ class LLMClient:
             else:
                 endpoint = self._base_urls[-1]
 
-            # 如果切换了端点，重建 client
+            # 如果切换了端点，重建 client（使用锁防止竞态条件）
             if endpoint != self._client.base_url:
-                await self._client.aclose()
-                self._client = httpx.AsyncClient(
-                    base_url=endpoint.rstrip("/"),
-                    headers=self._build_headers(),
-                    timeout=self.timeout,
-                )
-                logger.info("LLMClient: switched to fallback endpoint %s", endpoint)
+                async with self._client_lock:
+                    # 双重检查：可能其他协程已经重建了 client
+                    if endpoint != self._client.base_url:
+                        await self._client.aclose()
+                        self._client = httpx.AsyncClient(
+                            base_url=endpoint.rstrip("/"),
+                            headers=self._build_headers(),
+                            timeout=self.timeout,
+                        )
+                        logger.info("LLMClient: switched to fallback endpoint %s", endpoint)
 
             try:
                 resp = await self._client.post("/chat/completions", json=body)

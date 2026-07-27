@@ -51,6 +51,7 @@ class TestEmbedCache:
         # 只测试 TextEncoder 的缓存逻辑
         from embedding.encoder import TextEncoder as TE
         te = TE.__new__(TE)
+        te._onnx_model = None
         te._cache = {}
         te._cache_hits = 0
         te._cache_misses = 0
@@ -76,6 +77,7 @@ class TestEmbedCache:
         """缓存超过 512 条时淘汰旧条目"""
         from embedding.encoder import TextEncoder as TE
         te = TE.__new__(TE)
+        te._onnx_model = None
         te._cache = {}
         te._cache_hits = 0
         te._cache_misses = 0

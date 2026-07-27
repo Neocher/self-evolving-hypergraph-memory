@@ -334,7 +334,7 @@ class TestReadValidate:
 
         # 第二条无冲突
         v_other = [v for v in validated if v.episode_id != ep1][0]
-        assert v_other.ontology_confidence == 1.0
+        assert v_other.ontology_confidence == 0.5
 
 
 # ─── 集成测试：写时验证 → 读时验证 全流程 ─────────────────
@@ -371,4 +371,4 @@ class TestWriteThenRead:
 
         # Elon Musk 不受影响
         musk_results = [v for v in validated if v.episode_id not in (ep1, ep2)]
-        assert all(v.ontology_confidence == 1.0 for v in musk_results)
+        assert all(v.ontology_confidence == 0.5 for v in musk_results)

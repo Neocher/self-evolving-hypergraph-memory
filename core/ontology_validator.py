@@ -1194,7 +1194,7 @@ class OntologyValidator:
 
             # 【P4】查询无实体类型→无法做本体判断→返回原始分
             if not query_types:
-                adjusted = score
+                adjusted = score * ontology_conf
             # 高置信度阈值：实体类型全匹配 + 拓扑有路径 → 直接给满分
             elif confidence_bonus >= 0.95 and self.kuzu is not None:
                 adjusted = min(0.9999, score + 0.3)

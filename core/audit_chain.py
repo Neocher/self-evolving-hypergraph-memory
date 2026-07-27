@@ -89,7 +89,7 @@ class AuditChain:
     def _compute_hash(self, block: AuditBlock) -> str:
         """
         计算区块哈希。
-        hash = blake3(prev_hash + blake3(operations) + timestamp)
+        hash = blake3(prev_hash + blake3(operations) + stats + timestamp)
         """
         import blake3
 
@@ -98,8 +98,10 @@ class AuditChain:
             sort_keys=True,
             ensure_ascii=False,
         )
+        stats_json = json.dumps(block.stats, sort_keys=True)
         ops_hash = blake3.blake3(ops_json.encode()).hexdigest()
-        data = block.prev_hash + ops_hash + block.timestamp
+        stats_hash = blake3.blake3(stats_json.encode()).hexdigest()
+        data = block.prev_hash + ops_hash + stats_hash + block.timestamp
         return blake3.blake3(data.encode()).hexdigest()
 
     def append_block(

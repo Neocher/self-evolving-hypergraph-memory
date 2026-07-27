@@ -10,6 +10,7 @@ GATHER → CLUSTER → SYNTHESIZE → COMPRESS → PRUNE → RESOLVE → AUDIT
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -182,12 +183,15 @@ class DreamPipeline:
             logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
         elif kuzu_store is not None:
             # 直接模式（原行为）：直接修改生产数据
-            persist_deleted, pruned_ids = self._persist_prune(kuzu_store, prune_ops)
+            persist_deleted, pruned_ids = await asyncio.to_thread(
+                self._persist_prune, kuzu_store, prune_ops)
             all_removed_ids.extend(pruned_ids)
-            persist_created = self._persist_communities(kuzu_store, communities, dream_id)
+            persist_created = await asyncio.to_thread(
+                self._persist_communities, kuzu_store, communities, dream_id)
             all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-            self._persist_merge(kuzu_store, merge_ops)
-            self._persist_hyperedges(kuzu_store, communities, dream_id)
+            await asyncio.to_thread(self._persist_merge, kuzu_store, merge_ops)
+            await asyncio.to_thread(
+                self._persist_hyperedges, kuzu_store, communities, dream_id)
             logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup",
                         dream_id, persist_created, persist_deleted, len(all_removed_ids))
         stats["created"] += persist_created

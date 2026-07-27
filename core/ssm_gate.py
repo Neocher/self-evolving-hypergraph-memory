@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,11 +77,15 @@ class SSMGate:
             gate_value 在 (0, 1) 之间，> threshold 时保留超边
         """
         try:
-            h_t = self.A @ hidden_state + self.B @ input_features
-            g_t = 1.0 / (1.0 + np.exp(-(self.W_g @ h_t + self.b_g)))
+            h_t = np.tanh(self.A @ hidden_state + self.B @ input_features)
+            # 使用 np.clip 防止 sigmoid 溢出
+            z = np.clip(self.W_g @ h_t + self.b_g, -100, 100)
+            g_t = 1.0 / (1.0 + np.exp(-z))
             return h_t, float(g_t[0, 0])
         except Exception:
             # 门控计算失败时默认放行（gate_value=1.0）
+            logger.warning("SSM gate step failed, defaulting to gate=1.0",
+                         exc_info=True)
             return hidden_state, 1.0
 
     def should_keep(self, gate_value: float) -> bool:
