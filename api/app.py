@@ -33,18 +33,18 @@ def _init_services() -> Services:
 
     # 1. Kuzu 图数据库
     try:
-        from graph.kuzu_store import KuzuStore, KuzuConfig as KuzuStoreConfig
-        kuzu_cfg = KuzuStoreConfig(
+        from graph.ryu_store import RyuStore, RyuConfig
+        kuzu_cfg = RyuConfig(
             database_path=str(cfg.kuzu.database_path),
             buffer_pool_size_mb=cfg.kuzu.buffer_pool_size_mb,
             max_threads=cfg.kuzu.max_threads,
         )
-        svc.kuzu_store = KuzuStore(config=kuzu_cfg)
+        svc.kuzu_store = RyuStore(config=kuzu_cfg)
         svc.kuzu_store.connect()
-        logger.info("KuzuStore initialized", path=cfg.kuzu.database_path)
+        logger.info("RyuStore initialized", path=cfg.kuzu.database_path)
     except Exception as e:
-        errors.append(f"KuzuStore: {e}")
-        logger.warning("KuzuStore init failed", error=str(e))
+        errors.append(f"RyuStore: {e}")
+        logger.warning("RyuStore init failed", error=str(e))
 
     # 2. FAISS 向量索引
     if svc.kuzu_store is not None:

@@ -402,3 +402,29 @@ class OntologyStatsResponse(BaseModel):
     entity_type_count: int = Field(default=0)
     edge_type_count: int = Field(default=0)
     baseline_loaded: bool = Field(default=True)
+
+
+# ─── v2.0: 工作记忆（Session Memory）──────────────────────
+
+
+class SessionMemoryCreate(BaseModel):
+    """工作记忆写入请求"""
+    content: str = Field(..., min_length=1, max_length=50_000,
+                         description="记忆内容")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="元数据（如agent_id, round_num）")
+
+
+class SessionMemoryItem(BaseModel):
+    """单条工作记忆"""
+    id: str = Field(..., description="记忆ID")
+    session_id: str = Field(..., description="会话ID")
+    content: str = Field(..., description="记忆内容")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="元数据")
+    created_at: float = Field(..., description="创建时间戳")
+
+
+class SessionMemoryListResponse(BaseModel):
+    """工作记忆列表响应"""
+    session_id: str = Field(..., description="会话ID")
+    results: List[SessionMemoryItem] = Field(default_factory=list, description="记忆列表")
+    total: int = Field(default=0, description="总数")

@@ -51,6 +51,10 @@ from api.models import (
     EdgeTypeDefModel,
     EdgeTypeListResponse,
     OntologyStatsResponse,
+    # v2.0: 工作记忆
+    SessionMemoryCreate,
+    SessionMemoryItem,
+    SessionMemoryListResponse,
 )
 from graph.hyperedge import HyperedgeManager, HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker, HealthCheckResult
@@ -93,6 +97,16 @@ class Services:
     # FAISS 批量写入缓冲区
     _faiss_buffer: list[tuple] = field(default_factory=list)
     _faiss_buffer_lock: Any = None
+    # v2.0: 工作记忆存储（会话级临时上下文）
+    _session_memory: dict = field(default_factory=dict)
+    _session_memory_lock: Any = None
+    # v2.0: 自适应τ衰减配置
+    _tau_adaptive_config: dict = field(default_factory=lambda: {
+        "enable_adaptive": True,
+        "importance_decay_modulator": 0.5,
+        "tau_decay_min": 300,
+        "tau_decay_max": 7200,
+    })
 
 
 _services: Optional[Services] = None
@@ -103,6 +117,7 @@ def init_services(svc: Services) -> None:
     global _services
     import threading
     svc._faiss_buffer_lock = threading.Lock()
+    svc._session_memory_lock = threading.Lock()
     _services = svc
 
 
@@ -2348,3 +2363,147 @@ async def rebuild_index(
         "dimension": dim,
         "hebbian_connections": hebbian_count,
     }
+
+
+# ====================================================================
+# v2.0: 工作记忆（Session Memory）路由
+# ====================================================================
+
+import uuid as _uuid
+
+
+@router.post("/sessions/{session_id}/working-memory",
+             summary="写入工作记忆（会话级临时上下文，不持久化到Kuzu）")
+async def write_session_memory(
+    session_id: str,
+    body: SessionMemoryCreate,
+    svc: Services = Depends(get_services),
+):
+    """写入一条工作记忆。工作记忆是会话级临时上下文，不持久化到Kuzu图数据库。
+    
+    用于追踪当前任务中的Agent状态、正在处理的上下文。
+    类比 Human-Inspired Memory Architecture 的「工作记忆」层。
+    """
+    if svc._session_memory_lock is None:
+        svc._session_memory_lock = __import__("threading").Lock()
+    
+    item = {
+        "id": str(_uuid.uuid4()),
+        "session_id": session_id,
+        "content": body.content,
+        "metadata": body.metadata or {},
+        "created_at": _now(),
+    }
+    
+    with svc._session_memory_lock:
+        if session_id not in svc._session_memory:
+            svc._session_memory[session_id] = []
+        svc._session_memory[session_id].append(item)
+        # 最多保留100条工作记忆
+        if len(svc._session_memory[session_id]) > 100:
+            svc._session_memory[session_id] = svc._session_memory[session_id][-100:]
+    
+    return {"id": item["id"], "session_id": session_id, "status": "created"}
+
+
+@router.get("/sessions/{session_id}/working-memory",
+            summary="查询工作记忆（最近N条，按时间倒序）")
+async def read_session_memory(
+    session_id: str,
+    limit: int = 20,
+    svc: Services = Depends(get_services),
+):
+    """查询工作记忆。返回最近N条记忆，按时间倒序。"""
+    with svc._session_memory_lock:
+        memories = svc._session_memory.get(session_id, [])
+        recent = list(reversed(memories))[:limit]
+    
+    return SessionMemoryListResponse(
+        session_id=session_id,
+        results=[SessionMemoryItem(**m) for m in recent],
+        total=len(memories),
+    )
+
+
+@router.delete("/sessions/{session_id}/working-memory",
+               summary="清除工作记忆（指定memory_id则清除单条）")
+async def delete_session_memory(
+    session_id: str,
+    memory_id: str = None,
+    svc: Services = Depends(get_services),
+):
+    """清除工作记忆。指定memory_id只清除单条，否则清除整个会话。"""
+    with svc._session_memory_lock:
+        if memory_id:
+            if session_id in svc._session_memory:
+                svc._session_memory[session_id] = [
+                    m for m in svc._session_memory[session_id]
+                    if m["id"] != memory_id
+                ]
+            return {"status": "deleted", "session_id": session_id, "memory_id": memory_id}
+        else:
+            svc._session_memory.pop(session_id, None)
+            return {"status": "cleared", "session_id": session_id}
+
+
+# ====================================================================
+# Phase 2: 程序记忆路由
+# ====================================================================
+
+@router.get("/procedural/patterns",
+            summary="查询程序模式（重复行动模式）")
+async def list_procedural_patterns(
+    min_confidence: float = 0.3,
+    svc: Services = Depends(get_services),
+):
+    """查询高频重复行动模式——程序记忆层。"""
+    from core.procedural_memory import ProceduralMemoryEngine
+    engine = ProceduralMemoryEngine(kuzu_store=svc.kuzu_store)
+    patterns = engine.query_patterns(min_confidence=min_confidence)
+    return {"patterns": patterns, "total": len(patterns)}
+
+
+# ====================================================================
+# Phase 2: 概念记忆路由
+# ====================================================================
+
+@router.get("/conceptual/concepts",
+            summary="查询跨社区概念（最高抽象层）")
+async def list_concepts(
+    abstraction_level: str = None,
+    svc: Services = Depends(get_services),
+):
+    """查询跨社区的抽象概念——概念记忆层。"""
+    from core.conceptual_memory import ConceptualMemoryEngine
+    engine = ConceptualMemoryEngine(kuzu_store=svc.kuzu_store)
+    concepts = engine.get_concepts(level=abstraction_level)
+    return {"concepts": concepts, "total": len(concepts)}
+
+
+@router.post("/conceptual/analyze",
+             summary="分析社区并生成概念")
+async def analyze_concepts(
+    svc: Services = Depends(get_services),
+):
+    """分析现有社区，自动发现跨社区概念。"""
+    from core.conceptual_memory import ConceptualMemoryEngine
+    # 获取所有社区
+    result = svc.kuzu_store.conn.execute(
+        "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC"
+    )
+    rows = result.get_as_pl()
+    dicts = rows.to_dicts() if rows else []
+    communities = []
+    for r in dicts:
+        r = _clean_kuzu_row(r)
+        communities.append({
+            "id": r.get("id", ""),
+            "name": r.get("name", ""),
+            "summary": r.get("summary", ""),
+            "keywords": json.loads(r.get("keywords", "[]")) if isinstance(r.get("keywords"), str) else [],
+            "nodes": [],
+        })
+    
+    engine = ConceptualMemoryEngine(kuzu_store=svc.kuzu_store)
+    concepts = engine.analyze_communities(communities)
+    return {"concepts_found": len(concepts), "concepts": concepts}
