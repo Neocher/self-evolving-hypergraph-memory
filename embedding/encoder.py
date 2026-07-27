@@ -144,9 +144,9 @@ class TextEncoder:
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(onnx_path)
+            self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
             self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
-                onnx_path, provider="CPUExecutionProvider"
+                onnx_path, provider="CPUExecutionProvider", local_files_only=True
             )
             logger.info("ONNX INT8 model loaded from %s", onnx_path)
             return
@@ -198,7 +198,14 @@ class TextEncoder:
                 self._cloud_available = False
                 logger.info("Cloud API degraded, falling back to local model")
 
-        # Tier 2: Local model
+        # Tier 2: ONNX batch (preferred)
+        if self._onnx_model is not None:
+            inputs = self._tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+            outputs = self._onnx_model(**inputs)
+            vecs = outputs.last_hidden_state.mean(dim=1).detach().numpy()
+            return np.array([v.astype(np.float32) for v in vecs])
+
+        # Tier 3: Local sentence-transformers
         if self._model is None:
             self.load()
         return self._model.encode(texts)
