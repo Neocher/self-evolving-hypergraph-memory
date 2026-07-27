@@ -11,7 +11,8 @@ Kuzu 嵌入式列式图数据库，Cypher 查询引擎。
 
 from __future__ import annotations
 
-import kuzu
+# 替换为 RyuGraph（Kuzu 社区活跃 fork，drop-in 兼容）
+import ryugraph as kuzu
 import logging
 import time
 from pathlib import Path
