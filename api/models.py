@@ -428,3 +428,32 @@ class SessionMemoryListResponse(BaseModel):
     session_id: str = Field(..., description="会话ID")
     results: List[SessionMemoryItem] = Field(default_factory=list, description="记忆列表")
     total: int = Field(default=0, description="总数")
+
+
+# ─── 多模态 ──────────────────────────────────────────────
+
+
+class MultimodalRecord(BaseModel):
+    """多模态记忆写入请求。
+
+    至少提供 text / image / audio / video 中的一项。
+    媒体文件以 Base64 字节流形式传入（而非文件路径），
+    由服务端解码存储后嵌入路径到 episode metadata。
+    """
+    text: Optional[str] = Field(default=None, description="文本描述（可选，用于索引和检索）")
+    images: List[str] = Field(default_factory=list, description="Base64 编码的图像字节列表")
+    audio: List[str] = Field(default_factory=list, description="Base64 编码的音频字节列表")
+    video: List[str] = Field(default_factory=list, description="Base64 编码的视频字节列表")
+    source: str = Field(default="user", description="来源标识")
+    namespace: Optional[str] = Field(default=None, description="命名空间")
+    visibility: str = Field(default="private", description="可见性")
+
+
+class MultimodalResponse(BaseModel):
+    """多模态记忆写入响应。"""
+    episode_id: str = Field(..., description="关联的情节节点 ID")
+    visual_node_id: Optional[str] = Field(default=None, description="视觉节点 ID（有图像时）")
+    text: Optional[str] = Field(default=None, description="文本内容（裁剪后）")
+    media_paths: List[str] = Field(default_factory=list, description="存储的媒体文件路径列表")
+    transcription: Optional[str] = Field(default=None, description="音频转录文本")
+    created_at: float = Field(..., description="创建时间戳")

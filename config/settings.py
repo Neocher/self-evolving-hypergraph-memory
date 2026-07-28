@@ -126,6 +126,25 @@ class RetryConfig:
 
 
 @dataclass
+class DefenseConfig:
+    """记忆投毒防御配置"""
+    enabled: bool = True
+    silent: bool = True
+    max_writes_per_window: int = 20
+    write_window_seconds: float = 60.0
+    drift_cosine_threshold: float = 0.65
+    drift_reference_window: int = 10
+    max_entity_cooccurrence: int = 15
+    max_repeat_exact: int = 5
+    repeat_dedup_window: float = 300.0
+    trust_decay_per_block: float = 0.2
+    trust_recovery_writes: int = 20
+    initial_trust: float = 1.0
+    block_trust_threshold: float = 0.3
+    quarantine_trust_threshold: float = 0.5
+
+
+@dataclass
 class CommunityConfig:
     template_threshold: int = 5
     jaccard_threshold: float = 0.8
@@ -183,6 +202,7 @@ class Settings:
     community: CommunityConfig = field(default_factory=CommunityConfig)
     ontology: OntologyConfig = field(default_factory=OntologyConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    defense: DefenseConfig = field(default_factory=DefenseConfig)
     shm_client: SHMClientConfig = field(default_factory=SHMClientConfig)
 
 
@@ -246,6 +266,7 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "ontology": OntologyConfig,
         "llm": LLMConfig,
         "shm_client": SHMClientConfig,
+        "defense": DefenseConfig,
     }
     kwargs: dict[str, Any] = {}
     for section, cls in section_map.items():

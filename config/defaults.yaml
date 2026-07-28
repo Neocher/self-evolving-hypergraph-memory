@@ -94,6 +94,22 @@ llm:
   max_retries: 3                 # 最大重试次数
   fallback_endpoints: []         # 备用端点列表（按顺序尝试）
 
+defense:
+  enabled: true                    # 防御引擎开关
+  silent: true                     # 静默模式（true=只隔离不阻断）
+  max_writes_per_window: 20        # R1: 时间窗口内最大写入次数
+  write_window_seconds: 60         # R1: 时间窗口（秒）
+  drift_cosine_threshold: 0.65     # R2: 余弦相似度阈值
+  drift_reference_window: 10       # R2: 参考历史窗口数
+  max_entity_cooccurrence: 15      # R3: 单次写入最大实体数
+  max_repeat_exact: 5              # R4: 去重窗口内最大精确重复数
+  repeat_dedup_window: 300         # R4: 去重时间窗口（秒）
+  trust_decay_per_block: 0.2       # R5: 每次阻断信任衰减量
+  trust_recovery_writes: 20        # R5: 完全恢复需要的正常写入数
+  initial_trust: 1.0               # R5: 新来源初始信任值
+  block_trust_threshold: 0.3       # R5: 阻断信任阈值
+  quarantine_trust_threshold: 0.5  # R5: 隔离信任阈值
+
 shm_client:
   base_url: "http://127.0.0.1:8000"  # SHM 服务地址（MCP/CLI/SDK 连接用）
   timeout: 15.0                     # 客户端超时
