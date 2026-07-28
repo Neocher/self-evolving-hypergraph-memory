@@ -1,9 +1,9 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.9.0"
-__version_info__ = (5, 9, 0)
-__version_name__ = "架构升级 · 性能提升 · 生产就绪"
-__release_date__ = "2026-07-24"
+__version__ = "5.12.1"
+__version_info__ = (5, 12, 1)
+__version_name__ = "三体协奏首秀 — _step_count 双重计数修复"
+__release_date__ = "2026-07-28"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

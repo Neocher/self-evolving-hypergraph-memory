@@ -133,7 +133,7 @@ def _init_services() -> Services:
 
     # 6. SSM 门控
     try:
-        from core.ssm_gate import DualAdaptiveGate
+        from core.dual_gate import DualAdaptiveGate
         svc.ssm_gate = DualAdaptiveGate(config=cfg.ssm)
         logger.info("AdaptiveGate initialized")
     except Exception as e:

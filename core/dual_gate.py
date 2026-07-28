@@ -37,6 +37,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# SSM initialization scale factor for HiPPO matrix
+HIPPO_INIT_SCALE = 0.1
+ZOH_STEPS = 100
+W_SSM_INIT_SCALE = 0.05
+
 
 # ═══════════════════════════════════════════════════════════════
 # 配置
@@ -136,17 +141,17 @@ class SSMEngine:
 
         # B 矩阵: 随机投影
         M = self.config.input_dim
-        top = rng.randn(N, M) * 0.1
+        top = rng.randn(N, M) * HIPPO_INIT_SCALE
         bottom = np.zeros((D - N, M))
         self.B = np.vstack([top, bottom]) * 0.1
 
         # 预计算离散化系数 (ZOH: exp(A·Δt), 取 Δt=1)
-        self.A_bar = np.linalg.matrix_power(np.eye(D) + self.A / 100, 100)
+        self.A_bar = np.linalg.matrix_power(np.eye(D) + self.A / ZOH_STEPS, ZOH_STEPS)
         # B_bar ≈ A^{-1}(exp(A) - I)·B ≈ (I + A/2)·B  (一阶近似)
         self.B_bar = (np.eye(D) + self.A / 2.0) @ self.B
 
         # SSM 专用门控读取头
-        self.W_ssm = rng.randn(1, D) * 0.05
+        self.W_ssm = rng.randn(1, D) * W_SSM_INIT_SCALE
         self.b_ssm = np.zeros((1, 1))
 
     def step(self, hidden_state: np.ndarray, input_features: np.ndarray) -> tuple[np.ndarray, float]:
@@ -171,7 +176,7 @@ class SSMEngine:
             g_ssm = 1.0 / (1.0 + np.exp(-z_ssm))
 
             return new_h, float(g_ssm[0, 0])
-        except Exception as e:
+        except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
             logger.error("SSM step failed: %s", e, exc_info=True)
             return hidden_state, 0.5  # 失败时中性值
 
@@ -222,7 +227,6 @@ class MLPGate:
         h = np.tanh(self.W_h @ ssm_state + self.b_h)
         z = np.clip(self.W_g @ h + self.b_g, -100, 100)
         g = 1.0 / (1.0 + np.exp(-z))
-        self._step_count += 1
         return float(g[0, 0])
 
     def learn(self, gate_value: float, outcome: float, ssm_state: np.ndarray) -> float:
@@ -266,6 +270,7 @@ class MLPGate:
 # 双门控融合引擎
 # ═══════════════════════════════════════════════════════════════
 
+# DualAdaptiveGate v3.1 — SSM + MLP via ACP
 class DualAdaptiveGate:
     """
     SSM + MLP 双门控引擎 v3.0
@@ -319,6 +324,7 @@ class DualAdaptiveGate:
 
         # 2. MLP 基于 SSM 新状态做门控决策
         g_mlp = self.mlp.forward(new_h)
+        self.mlp._step_count += 1  # 手动计数，避免 forward + learn 双重计数
 
         # 3. α 融合
         g = self.alpha * g_ssm + (1.0 - self.alpha) * g_mlp
@@ -405,3 +411,4 @@ class DualAdaptiveGate:
             "ssm_hippo_order": self.config.ssm_hippo_order,
             "online_learning": self.config.mlp_enable_online_learning,
         }
+

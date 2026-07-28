@@ -13,7 +13,7 @@ import numpy as np
 
 from core.tau_decay import TauDecayEngine, TauDecayConfig
 from core.hebbian import SparseHebbianUpdater, HebbianConfig
-from core.ssm_gate import DualAdaptiveGate, DualGateConfig
+from core.dual_gate import DualAdaptiveGate, DualGateConfig
 
 
 # ══════════════════════════════════════════════════════════

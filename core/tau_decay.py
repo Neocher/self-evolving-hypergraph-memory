@@ -9,8 +9,14 @@ v2.0 新特性：
 - [重要性评分] 写入时记录 importance，影响衰减速度
 - [再巩固增强] 多次访问形成渐进式强化
 """
-
 from __future__ import annotations
+
+# —— 重要性平滑参数 ——
+IMP_SMOOTH_ALPHA = 0.7
+IMP_BOOST_FACTOR = 2.0
+HIGH_IMPORTANCE_THRESHOLD = 0.7
+ACCESS_FREQ_DIVISOR = 50
+ACCESS_COUNT_THRESHOLD = 5
 
 import math
 import time
@@ -89,7 +95,7 @@ class TauDecayEngine:
         if node_id in self._node_info:
             # 平滑更新，防止单次异常值剧烈波动
             old = self._node_info[node_id].importance
-            self._node_info[node_id].importance = 0.7 * old + 0.3 * max(0.0, min(1.0, importance))
+            self._node_info[node_id].importance = IMP_SMOOTH_ALPHA * old + (1 - IMP_SMOOTH_ALPHA) * max(0.0, min(1.0, importance))
 
     def set_custom_decay(self, node_id: str, tau_decay: float) -> None:
         """设置自定义衰减常数（v2.0）
@@ -125,12 +131,12 @@ class TauDecayEngine:
         m = self.config.importance_decay_modulator
         base = self.config.tau_decay_seconds
         # 高重要性 → 增加 τ_decay（衰减更慢，记忆更持久）
-        boost = 1.0 + I * m * 2.0  # I=1.0 → 2x, I=0.5 → 1.5x, I=0 → 1x
+        boost = 1.0 + I * m * IMP_BOOST_FACTOR  # I=1.0 → 2x, I=0.5 → 1.5x, I=0 → 1x
         effective = base * boost
         
         # 访问次数增强：经常访问的节点衰减更慢
-        if info.access_count > 5:
-            freq_boost = 1.0 + min(1.0, info.access_count / 50)
+        if info.access_count > ACCESS_COUNT_THRESHOLD:
+            freq_boost = 1.0 + min(1.0, info.access_count / ACCESS_FREQ_DIVISOR)
             effective *= freq_boost
         
         return max(self.config.tau_decay_min, 
@@ -166,7 +172,7 @@ class TauDecayEngine:
         
         # v2.0: 高重要性节点即使 τ 低也推迟修剪
         info = self._node_info.get(node_id)
-        if info and info.importance > 0.7 and tau >= self.config.decay_threshold * 0.5:
+        if info and info.importance > HIGH_IMPORTANCE_THRESHOLD and tau >= self.config.decay_threshold * 0.5:
             return False
         
         # 有连接且连接数 > 3 的节点保留
