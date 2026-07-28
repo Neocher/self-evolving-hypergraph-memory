@@ -7,48 +7,62 @@ __release_date__ = "2026-07-28"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-P0 — 架构骨架重构:
-  • 路由模块化: api/_routes.py 2327行单体 → api/routes/ 8域独立文件
-  • 配置统一: LLMConfig + SHMClientConfig 进入 config/settings.py
-  • LLM fallback链: 4端点自动切换 (DeepSeek→OpenAI→Moonshot→OpenRouter)
+全局研究闭环 (2026-07-28, 30+论文, 4份报告):
+  参考论文: EvolveMem·Retain or Consolidate?·MemTX·
+           Manufactured Confidence·Language Models Need Sleep·
+           AdaMem·MemClaw
 
-P1 — 质量保障:
-  • 核心单元测试: 22/22 ✅ (τ衰减·Hebbian·SSM门控·FAISS)
-  • 嵌入模型可配置: config/settings.py → defaults.yaml 三明治函数链
-  • 梦境状态持久化: save_state()/load_state() → Kuzu SystemNode
+P0 — 检索自演化 (SelfEvolvingRetrieval):
+  • FailureLogger → DiagnosisEngine → EvolutionGuard
+  • 7个可演化参数: 融合权重/BM25/top-K/策略
+  • 自动回滚(>15%退化) + 停滞探索(6x无变化)
+  • 零侵入集成到 QueryRouter
 
-P2 — 生产部署:
-  • Dockerfile (Python 3.11-slim, HEALTHCHECK)
-  • docker-compose.yml (单服务 + 数据卷持久化)
-  • shm.service → systemd (Restart=on-failure, MemoryHigh=2G)
-  • install.sh 一键安装脚本
-  • 硬编码常量消除: SHMClient/MCP 自动从 config 读取
+P1 — 预算感知门控 (Budget-Aware Gating):
+  • α = f(budget_ratio): 预算充足→consolidate(SSM↑), 紧张→retain(MLP↓)
+  • spend_budget(): consolidate 操作消耗预算
+  • 参考: Retain or Consolidate? (arXiv:2607.17545)
 
-⚡ 性能优化 (10.6x 写入提升):
-  • 异步嵌入: 写入路径去除同步 _process_embed_queue (421ms→40ms)
-  • 批量 Kuzu 操作: 关系抽取 3N次→2次
-  • FAISS 调优: IVFFlat→FlatL2, nprobe 10→3, batch buffer 10→50
-  • 短内容跳过: <50字不跑关系抽取, <80字不跑实体消歧
-  • 嵌入 LRU 缓存: TextEncoder._cached_embed (max 512)
-  • 检索结果缓存: 相同 query+top_k 命中 470ms→10ms (43x)
-  • 并发 QPS: 2.5→25 (10x)
+P1 — 过度巩固防护 (Confidence Calibrator):
+  • 复合信心 = 源权重 × exp(-γ×consolidation_count)
+  • 源类型: direct=1.0 / inferred=0.7 / hearsay=0.4
+  • 自动标记审查: 信心<0.1 或 整合>10次
+  • 集成到 DreamPipeline Step 3b
+  • 参考: Manufactured Confidence (arXiv:2606.29279)
+
+P1 — 事务性记忆写入 (Transaction Manager):
+  • 两阶段提交: 暂存→commit/rollback
+  • 上下文管理器: with transaction() as tx
+  • 异常自动回滚
+  • 参考: MemTX (arXiv:2607.13157)
+
+P2 — 可学习遗忘 (AdaptiveDecayLearner):
+  • 为每条记忆学习个性化 τ decay_rate
+  • SGD: L = (τ_pred - τ_desired)²
+  • 反馈来源: 访问频率↑→τ_desired↑, 门控遗忘→τ_desired↓
+
+P2 — 多Agent共享记忆 (MemClaw):
+  • agent_scope: 'global' | agent_id | list[agent_id]
+  • provenance: source_agent_id + source_timestamp
+  • get_visible_hyperedges(agent_id) scope过滤
+
+P2 — SSM梦境深度升级 (SSMDreamWrapper):
+  • N轮SSM循环巩固: N轮 step() 使隐状态收敛到稳定表示
+  • 收敛检测: |h_{{t-1}} - h_t| < threshold 提前停止
+  • reset(): 清空KV cache式重置
+  • 参考: Language Models Need Sleep (arXiv:2605.26099)
 
 📊 测试覆盖:
-  • 总计 212/214 ✅ (2个既有 ontology 已知问题)
-  • 新增 38 测试: core(22) + retrieval(7) + routes(9)
-  • 覆盖: τ衰减·Hebbian·SSM·FAISS·缓存·嵌入·路由
+  • 总计 239/243 ✅ (4个kuzu存量问题)
+  • 新增: 7 calibrator + 16 self_evolving = 23测试
+  • 三体协奏管道已验证3轮 (CC→OpenCode→Codex)
 
-性能基准 (v5.9.0, 1660节点, 1150 FAISS):
-  写入 P50:     421ms →  39ms (10.6x)
-  搜索 (缓存):  884ms →  10ms (88x)
-  搜索 (冷启动): 884ms → 470ms (1.9x)
-  写入 QPS:       2.5 →  25  (10x)
-  并发写入:    1360ms → 147ms (9.2x)
-  内存 RSS:                   5.1 MB
+⚙️ 部署:
+  • D+F 研究节点: Python3.11+Go1.25+LibreOffice
+  • Arxiv追踪: 每日08:00, 5组搜索词, 推送到所有频道
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-从 v5.8.4 (MCP v2) 升级 — 10 次提交, +1500/-160 行
-架构评分: 5.7 → 7.8/10 (+2.1)
 Private repository — Neocher/self-evolving-hypergraph-memory
+tag: v5.14.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
