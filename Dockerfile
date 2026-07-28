@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application
 COPY . .
 
+# Model warmup: download + cache sentence transformer at build time
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Create data directory (will be volume-mounted in production)
 RUN mkdir -p /app/data/shm_kuzu_db
 
