@@ -170,8 +170,9 @@ class ConfidenceCalibrator:
         }.get(source_type, self.config.source_weight_inferred)
 
     def _current_confidence(self, rec: ConsolidationRecord) -> float:
-        return rec.base_confidence * self._source_weight(rec.source_type) * \
+        val = rec.base_confidence * self._source_weight(rec.source_type) * \
             math.exp(-self.config.decay_rate * rec.consolidation_count)
+        return max(0.01, min(1.0, val))
 
     def _should_flag(self, rec: ConsolidationRecord,
                      calibrated: float) -> bool:

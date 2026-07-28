@@ -68,6 +68,7 @@ class DualGateConfig:
 
     # α 融合参数
     alpha_initial: float = 0.5    # SSM 初始权重 (0=纯MLP, 1=纯SSM)
+    alpha_max: float = 1.0         # SSM 最大权重（防止α突破1.0使MLP权重变负）
     alpha_min: float = 0.2         # 最小 SSM 权重
     alpha_learning_decay: float = 0.01  # 每次 learn() 后 α 衰减量
     alpha_entropy_boost: float = 0.3    # 熵低时 α 提升幅度
@@ -310,7 +311,6 @@ class DualAdaptiveGate:
 
         # 学习状态
         self._total_reward: float = 0.0
-        self._gate_history: list[float] = []  # 最近的 gate 值记录
 
     def step(
         self, hidden_state: np.ndarray, input_features: np.ndarray
@@ -334,10 +334,6 @@ class DualAdaptiveGate:
 
         # 3. α 融合
         g = self.alpha * g_ssm + (1.0 - self.alpha) * g_mlp
-
-        self._gate_history.append(g)
-        if len(self._gate_history) > 100:
-            self._gate_history.pop(0)
 
         return new_h, float(g)
 
@@ -416,17 +412,10 @@ class DualAdaptiveGate:
         """预算感知操作选择: 'retain' | 'consolidate'
         
         基于 Retain or Consolidate? (arXiv:2607.17545):
-        - 预算充足 + α 高 → consolidate (调用 SSM 整合)
-        - 预算紧张 + α 低 → retain (仅 MLP 门控)
+        - α ≥ 0.5 → consolidate (SSM 主导融合)
+        - α < 0.5 → retain (MLP 主导门控)
         """
-        budget_ratio = self._budget / max(self.config.budget_capacity, 1)
-        # α 偏向 SSM 且预算充足 → consolidate
-        if self.alpha >= 0.5 and budget_ratio > 0.5:
-            return "consolidate"
-        # α 偏向 MLP 且预算不足 → retain
-        if self.alpha < 0.5 and budget_ratio < 0.5:
-            return "retain"
-        # 混合信号: 用 alpha 做 tiebreaker
+        # 预算比值对前两个分支无实际影响，tiebreaker 已用 α 完全决定
         return "consolidate" if self.alpha >= 0.5 else "retain"
 
     def spend_budget(self) -> str:

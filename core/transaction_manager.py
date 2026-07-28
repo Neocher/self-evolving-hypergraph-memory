@@ -68,7 +68,7 @@ class MemoryTransaction:
     status: TransactionStatus = TransactionStatus.PENDING
     created_at: float = 0.0
     metadata: dict = field(default_factory=dict)
-    _mgr: Any = None  # 父管理器引用
+    _mgr: Optional["TransactionManager"] = None  # 父管理器引用
 
     def __post_init__(self):
         if not self.created_at:
@@ -109,7 +109,7 @@ class TransactionManager:
 
     def __init__(self):
         self._active: dict[str, MemoryTransaction] = {}
-        self._history: list[MemoryTransaction] = []  # 已完成的事务日志
+        self._history: list[MemoryTransaction] = []  # 已完成的事务日志（ring buffer, max=1000）
 
     def begin(self, metadata: Optional[dict] = None) -> MemoryTransaction:
         """开启新事务"""
@@ -126,8 +126,10 @@ class TransactionManager:
         return self._active.get(tx_id)
 
     def _record(self, tx: MemoryTransaction):
-        """由 MemoryTransaction.commit/rollback 回调记录"""
+        """由 MemoryTransaction.commit/rollback 回调记录（ring buffer, max 1000）"""
         self._history.append(tx)
+        if len(self._history) > 1000:
+            self._history = self._history[-1000:]
         self._active.pop(tx.tx_id, None)
 
     def commit(self, tx: MemoryTransaction) -> dict:
@@ -169,10 +171,11 @@ class _TransactionContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.transaction is None:
             return
-        if exc_type is not None or self.transaction.status != TransactionStatus.PENDING:
-            # 异常退出 → 自动回滚
+        if exc_type is not None:
+            # 异常退出 → 自动回滚（仅当事务仍活跃）
             if self.transaction.is_active():
                 self._mgr.rollback(self.transaction)
-        # 正常退出但未显式 commit/rollback → 自动提交
         elif self.transaction.is_active():
+            # 正常退出但未显式 commit/rollback → 自动提交
             self._mgr.commit(self.transaction)
+        # 已显式 commit/rollback → 无操作

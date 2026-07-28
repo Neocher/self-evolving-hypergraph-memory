@@ -147,13 +147,13 @@ class DreamPipeline:
                 report_text = comm.get("report", "") or ""
                 if not report_text:
                     continue
-                # 校准每条社区报告的信心
-                source = comm.get("source_type", "inferred")
+                # 先记录整合再校准（确保首次校准也有衰减）
+                source = self._get_source_type(comm)
+                self.confidence_calibrator.record_consolidation(report_text, source)
                 cal_conf, flagged = self.confidence_calibrator.calibrate(
                     report_text, comm.get("confidence", 0.7), source
                 )
                 comm["confidence"] = round(cal_conf, 3)
-                self.confidence_calibrator.record_consolidation(report_text, source)
                 if flagged:
                     calibrator_flagged += 1
                     logger.info("Dream %s: CALIBRATOR flagged community (conf=%.2f)",
@@ -515,6 +515,16 @@ class DreamPipeline:
             # 实体链接：提取命名实体并在社区节点间交叉匹配
             community["entity_links"] = await self._entity_linking_step(nodes)
         return communities
+
+    def _get_source_type(self, community: dict) -> str:
+        """从社区成员节点推断源类型。"""
+        nodes = community.get("nodes", [])
+        source_types: dict[str, int] = {}
+        for node in nodes:
+            st = node.get("source_type", node.get("source", ""))
+            if st:
+                source_types[st] = source_types.get(st, 0) + 1
+        return max(source_types, key=source_types.get) if source_types else "inferred"
 
     def _generate_community_report(self, nodes: list[dict]) -> str:
         """生成社区报告——基于模板的方法。"""
