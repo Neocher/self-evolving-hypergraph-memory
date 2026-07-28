@@ -301,6 +301,55 @@ def _init_services() -> Services:
         errors.append(f"QueryRouter: {e}")
         logger.warning("QueryRouter init failed", error=str(e))
 
+    # 10. 记忆投毒防御引擎（可独立于 Kuzu 运行）
+    try:
+        from core.defense import MemoryDefenseEngine, DefenseConfig as CoreDefenseConfig
+        _dcfg = cfg.defense
+        svc.defense_engine = MemoryDefenseEngine(
+            config=CoreDefenseConfig(
+                enabled=_dcfg.enabled,
+                silent=_dcfg.silent,
+                max_writes_per_window=_dcfg.max_writes_per_window,
+                write_window_seconds=_dcfg.write_window_seconds,
+                drift_cosine_threshold=_dcfg.drift_cosine_threshold,
+                drift_reference_window=_dcfg.drift_reference_window,
+                max_entity_cooccurrence=_dcfg.max_entity_cooccurrence,
+                max_repeat_exact=_dcfg.max_repeat_exact,
+                repeat_dedup_window=_dcfg.repeat_dedup_window,
+                trust_decay_per_block=_dcfg.trust_decay_per_block,
+                trust_recovery_writes=_dcfg.trust_recovery_writes,
+                initial_trust=_dcfg.initial_trust,
+                block_trust_threshold=_dcfg.block_trust_threshold,
+                quarantine_trust_threshold=_dcfg.quarantine_trust_threshold,
+            ),
+            encoder=svc.encoder,
+        )
+        logger.info("DefenseEngine initialized",
+                     enabled=_dcfg.enabled, silent=_dcfg.silent)
+    except Exception as e:
+        errors.append(f"DefenseEngine: {e}")
+        logger.warning("DefenseEngine init failed (fallback: no defense)", error=str(e))
+
+    # 11. 隔离存储（依赖 Kuzu）
+    if svc.kuzu_store is not None:
+        try:
+            from core.quarantine_store import QuarantineStore
+            svc.quarantine_store = QuarantineStore(kuzu_store=svc.kuzu_store)
+            # 启动时从 Kuzu 同步已有隔离节点
+            q_count = svc.quarantine_store.refresh()
+            logger.info("QuarantineStore initialized", quarantined_count=q_count)
+        except Exception as e:
+            errors.append(f"QuarantineStore: {e}")
+            logger.warning("QuarantineStore init failed (fallback: in-memory only)", error=str(e))
+    else:
+        # 无 Kuzu 时使用纯内存模式
+        try:
+            from core.quarantine_store import QuarantineStore
+            svc.quarantine_store = QuarantineStore()
+            logger.info("QuarantineStore initialized (memory-only, no Kuzu)")
+        except Exception as e:
+            errors.append(f"QuarantineStore: {e}")
+
     if errors:
         logger.warning("Services initialized with errors", count=len(errors), errors=errors)
     else:
@@ -510,6 +559,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # 认证 + 速率限制（在 observe_request 之前）
+    from gateway.auth import create_auth_middleware, is_dev_mode
+    dev_mode = is_dev_mode()
+    if not dev_mode:
+        app.middleware("http")(create_auth_middleware(dev_mode=dev_mode))
 
     # 请求级中间件：trace_id + 性能监控
     @app.middleware("http")
