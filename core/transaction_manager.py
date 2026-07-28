@@ -23,6 +23,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -105,11 +106,12 @@ class MemoryTransaction:
 
 
 class TransactionManager:
-    """事务管理器 — 管理所有活跃事务"""
+    """事务管理器 — 管理所有活跃事务 + OCC 版本检查 + 冲突日志"""
 
     def __init__(self):
         self._active: dict[str, MemoryTransaction] = {}
         self._history: list[MemoryTransaction] = []  # 已完成的事务日志（ring buffer, max=1000）
+        self._conflict_log: deque[dict] = deque(maxlen=1000)  # 写入冲突日志
 
     def begin(self, metadata: Optional[dict] = None) -> MemoryTransaction:
         """开启新事务"""
@@ -144,10 +146,84 @@ class TransactionManager:
         """上下文管理器 — with tx_manager.transaction() as tx:"""
         return _TransactionContext(self, metadata)
 
+    def version_check(
+        self,
+        expected_version: int,
+        current_version: int,
+        node_id: str = "",
+    ) -> bool:
+        """
+        OCC 版本检查 — 在 prepare 阶段调用。
+
+        Args:
+            expected_version: 事务开始时读取的版本号。
+            current_version: 数据库中当前的版本号。
+            node_id: 节点 ID（仅用于日志）。
+
+        Returns:
+            True 如果版本一致，允许提交。
+            False 如果版本不一致，需要消解或回滚。
+        """
+        ok = expected_version == current_version
+        if not ok:
+            logger.warning(
+                "Version mismatch on %s: expected v%d, current v%d",
+                node_id[:12] if node_id else "?", expected_version, current_version,
+            )
+        return ok
+
+    def record_conflict(
+        self,
+        node_id: str,
+        expected_version: int,
+        current_version: int,
+        strategy: str = "",
+        resolved: bool = False,
+        detail: str = "",
+    ) -> dict:
+        """
+        记录写入冲突到 conflict_log ring buffer。
+
+        Args:
+            node_id: 冲突涉及的节点 ID。
+            expected_version: 写入方预期版本。
+            current_version: 数据库当前版本。
+            strategy: 使用的消解策略（lww/merge/additive）。
+            resolved: 是否已消解。
+            detail: 补充说明。
+
+        Returns:
+            记录的冲突条目。
+        """
+        entry = {
+            "node_id": node_id,
+            "expected_version": expected_version,
+            "current_version": current_version,
+            "strategy": strategy,
+            "resolved": resolved,
+            "timestamp": time.time(),
+            "detail": detail,
+        }
+        self._conflict_log.append(entry)
+        logger.info(
+            "Conflict recorded: %s v%d->v%d strategy=%s resolved=%s",
+            node_id[:12], expected_version, current_version,
+            strategy, resolved,
+        )
+        return entry
+
+    def get_conflict_log(self, limit: int = 50) -> list[dict]:
+        """查询最近的冲突日志（按时间倒序）。"""
+        return list(reversed(self._conflict_log))[:limit]
+
     def state(self) -> dict:
         return {
             "active_count": len(self._active),
             "history_count": len(self._history),
+            "conflict_count": len(self._conflict_log),
+            "unresolved_conflicts": sum(
+                1 for c in self._conflict_log if not c["resolved"]
+            ),
             "committed": sum(1 for t in self._history
                              if t.status == TransactionStatus.COMMITTED),
             "rolled_back": sum(1 for t in self._history

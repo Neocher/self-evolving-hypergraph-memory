@@ -200,6 +200,7 @@ class RyuStore:
             "created_at DOUBLE, tau_initial DOUBLE, tau_value DOUBLE, "
             "trust_score DOUBLE, ontology_type STRING, source STRING, "
             "visibility STRING, "
+            "version INT64, "
             "PRIMARY KEY (id))"
         )
         self.conn.execute(
@@ -361,13 +362,15 @@ class RyuStore:
             raise
 
     def create_episode(self, episode: dict) -> str:
-        """创建情节节点。"""
+        """创建情节节点（默认 version=1）。"""
         def _do_create():
+            params = dict(episode)
+            params.setdefault("version", 1)
             self.conn.execute(
                 "CREATE (e:EpisodeNode {id: $id, content: $content, "
                 "created_at: $created_at, tau_initial: $tau_initial, "
-                "source: $source, visibility: $visibility})",
-                episode
+                "source: $source, visibility: $visibility, version: $version})",
+                params
             )
             return episode['id']
 
@@ -387,6 +390,96 @@ class RyuStore:
             return None
 
         return self._execute_with_circuit_breaker(_do_get)
+
+    def update_with_version(
+        self,
+        node_id: str,
+        data: dict,
+        expected_version: Optional[int] = None,
+    ) -> dict:
+        """
+        OCC 安全写入：仅当 version 匹配时才更新节点。
+
+        如果 expected_version 为 None，跳过版本检查（强制写入）。
+        否则执行条件 SET，更新后 version 自动递增。
+
+        Args:
+            node_id: 目标节点 ID。
+            data: 待更新的字段 dict（可包含 content, source, visibility 等）。
+            expected_version: 预期版本号。None 表示不检查版本。
+
+        Returns:
+            {
+                "success": bool,
+                "updated": bool,       # True 如果实际更新了数据
+                "version_conflict": bool,  # True 如果版本不匹配
+                "current_version": Optional[int],
+            }
+        """
+        def _do_update():
+            if expected_version is None:
+                # 强制写入 — 不检查版本
+                set_clauses = ", ".join(
+                    f"e.{k} = ${k}" for k in data if k != "id"
+                )
+                if not set_clauses:
+                    return {"success": True, "updated": False,
+                            "version_conflict": False, "current_version": None}
+                params = {k: v for k, v in data.items() if k != "id"}
+                params["id"] = node_id
+                # version 递增
+                set_clauses += ", e.version = COALESCE(e.version, 1) + 1"
+                self.conn.execute(
+                    f"MATCH (e:EpisodeNode {{id: $id}}) "
+                    f"SET {set_clauses}",
+                    params,
+                )
+                # 回读确认
+                node = self.get_episode(node_id)
+                return {
+                    "success": True,
+                    "updated": True,
+                    "version_conflict": False,
+                    "current_version": node.get("version", 1) if node else None,
+                }
+
+            # OCC 条件更新：version 必须匹配
+            set_clauses = ", ".join(
+                f"e.{k} = ${k}" for k in data if k != "id"
+            )
+            if not set_clauses:
+                return {"success": True, "updated": False,
+                        "version_conflict": False, "current_version": None}
+            params = {k: v for k, v in data.items() if k != "id"}
+            params["id"] = node_id
+            params["expected_version"] = expected_version
+            # version 递增
+            set_clauses += ", e.version = COALESCE(e.version, 1) + 1"
+
+            self.conn.execute(
+                f"MATCH (e:EpisodeNode {{id: $id}}) "
+                f"WHERE e.version = $expected_version "
+                f"SET {set_clauses}",
+                params,
+            )
+
+            # 回读验证：如果 version 没变，说明 WHERE 条件未匹配
+            node = self.get_episode(node_id)
+            if node is None:
+                return {"success": False, "updated": False,
+                        "version_conflict": False, "current_version": None}
+
+            current_version = node.get("version", 1)
+            version_changed = current_version != expected_version
+
+            return {
+                "success": version_changed,
+                "updated": version_changed,
+                "version_conflict": not version_changed,
+                "current_version": current_version,
+            }
+
+        return self._execute_with_circuit_breaker(_do_update)
 
     def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
         """批量按ID查询情节节点。一次查询替代N次 get_episode。"""

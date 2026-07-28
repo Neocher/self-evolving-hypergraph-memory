@@ -21,6 +21,7 @@ from api.models import (
     HealthStatus,
     HyperedgeListResponse,
     HyperedgeResponse,
+    MultimodalResponse,
     RetrieveResponse,
     EpisodicResult,
     SearchVectorResponse,
@@ -177,6 +178,164 @@ class GatewayAPI:
             tau_initial=tau_initial,
             created_at=created_at,
             source=source,
+        )
+
+    async def store_multimodal(
+        self,
+        text: Optional[str] = None,
+        images: Optional[list[bytes]] = None,
+        audio: Optional[list[bytes]] = None,
+        video: Optional[list[bytes]] = None,
+        source: str = "api",
+        namespace: Optional[str] = None,
+        visibility: str = "private",
+    ) -> MultimodalResponse:
+        """写入多模态记忆（CLIP 嵌入 + 媒体文件存储 + 文本索引）。
+
+        Args:
+            text: 可选文本描述。
+            images: Base64 编码的图像字节列表。
+            audio: Base64 编码的音频字节列表。
+            video: Base64 编码的视频字节列表。
+            source: 来源标识。
+            namespace: 命名空间。
+            visibility: 可见性。
+
+        Returns:
+            MultimodalResponse 包含 episode_id、media_paths 等。
+        """
+        import base64
+        import time
+        import uuid
+        import numpy as np
+
+        episode_id = str(uuid.uuid4())
+        created_at = time.time()
+        media_paths: list[str] = []
+        transcription: Optional[str] = None
+        visual_node_id: Optional[str] = None
+
+        # 懒加载多模态组件
+        clip = getattr(self._svc, "_clip_embedder", None)
+        if clip is None:
+            try:
+                from multimodal.embedders import ClipEmbedder
+                clip = ClipEmbedder()
+                self._svc._clip_embedder = clip
+            except Exception:
+                clip = None
+        whisper = getattr(self._svc, "_whisper_embedder", None)
+        if whisper is None:
+            try:
+                from multimodal.embedders import WhisperEmbedder
+                whisper = WhisperEmbedder()
+                self._svc._whisper_embedder = whisper
+            except Exception:
+                whisper = None
+        store = getattr(self._svc, "_media_store", None)
+        if store is None:
+            try:
+                from multimodal.store import MediaStore
+                store = MediaStore()
+                self._svc._media_store = store
+            except Exception:
+                store = None
+
+        # 处理图像
+        image_embs: list[np.ndarray] = []
+        for img_bytes in (images or []):
+            try:
+                data = base64.b64decode(img_bytes) if isinstance(img_bytes, str) else img_bytes
+            except Exception:
+                continue
+            if store is not None:
+                media_paths.append(store.save_image(data))
+            if clip is not None:
+                emb = clip.embed_image(data)
+                if emb is not None:
+                    image_embs.append(emb)
+
+        # 处理音频
+        audio_texts: list[str] = []
+        for aud_bytes in (audio or []):
+            try:
+                data = base64.b64decode(aud_bytes) if isinstance(aud_bytes, str) else aud_bytes
+            except Exception:
+                continue
+            if store is not None:
+                media_paths.append(store.save_audio(data))
+            if whisper is not None:
+                seg = whisper.transcribe(data)
+                if seg:
+                    audio_texts.append(seg)
+
+        # 处理视频
+        for vid_bytes in (video or []):
+            try:
+                data = base64.b64decode(vid_bytes) if isinstance(vid_bytes, str) else vid_bytes
+            except Exception:
+                continue
+            if store is not None:
+                media_paths.append(store.save_video(data))
+
+        # 合并文本
+        text_parts: list[str] = []
+        if text:
+            text_parts.append(text)
+        if audio_texts:
+            transcription = " ".join(audio_texts)
+            text_parts.append(f"[audio transcription]: {transcription}")
+        merged_text = "\n".join(text_parts) if text_parts else ""
+
+        # 写入 VisualNode（有图像时）
+        if image_embs and clip is not None:
+            visual_emb = np.mean(image_embs, axis=0).astype(np.float32)
+            try:
+                proj = getattr(self._svc, "_clip_projection", None)
+                if proj is None:
+                    rng = np.random.default_rng(42)
+                    proj = rng.standard_normal((512, 384), dtype=np.float32)
+                    proj /= np.linalg.norm(proj, axis=0, keepdims=True)
+                    self._svc._clip_projection = proj
+                emb_384 = visual_emb @ proj
+
+                visual_node_id = str(uuid.uuid4())
+                if self._svc.kuzu_store is not None:
+                    self._svc.kuzu_store.create_visual_node({
+                        "id": visual_node_id,
+                        "image_path": media_paths[0] if media_paths else "",
+                        "caption": merged_text[:1024],
+                        "embedding": emb_384.tolist(),
+                        "source": source,
+                        "created_at": created_at,
+                    })
+            except Exception:
+                self._logger.exception("VisualNode creation failed (non-fatal)")
+
+        # 写入 EpisodeNode（文本索引）
+        if merged_text and self._svc.kuzu_store is not None:
+            self._svc.kuzu_store.create_episode({
+                "id": episode_id,
+                "content": merged_text,
+                "source": source,
+                "visibility": visibility,
+                "created_at": created_at,
+                "tau_initial": 1.0,
+            })
+            if namespace:
+                self._svc.kuzu_store.ensure_session(namespace)
+                self._svc.kuzu_store.link_to_session(namespace, episode_id)
+            if self._svc.dream_scheduler:
+                await self._svc.dream_scheduler.on_activity()
+                await self._svc.dream_scheduler.on_node_created()
+
+        return MultimodalResponse(
+            episode_id=episode_id,
+            visual_node_id=visual_node_id,
+            text=merged_text[:200] if merged_text else None,
+            media_paths=media_paths,
+            transcription=transcription,
+            created_at=created_at,
         )
 
     # ─── 检索 ────────────────────────────────────────────────────────────
