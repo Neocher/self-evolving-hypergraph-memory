@@ -1,10 +1,10 @@
 """
 隔离存储
 ========
-管理 Kuzu 图中记忆节点的隔离状态。
+管理 RyuGraph 图中记忆节点的隔离状态。
 
 隔离方案: SET e.quarantine = true, e.quarantine_reason = reason
-（使用 Kuzu 节点属性标记，无需额外表结构）
+（使用图节点属性标记，无需额外表结构）
 
 隔离节点的行为:
 - 不加入 FAISS 索引
@@ -25,33 +25,33 @@ class QuarantineStore:
     """
     隔离存储 —— 标记/查询/恢复隔离节点。
 
-    维护内存中的隔离 ID 集合，避免每次检查都查询 Kuzu。
+    维护内存中的隔离 ID 集合，避免每次检查都查询图数据库。
     """
 
-    def __init__(self, kuzu_store=None):
-        self._kuzu_store = kuzu_store
+    def __init__(self, graph_store=None):
+        self._graph_store = graph_store
         self._quarantined_ids: set[str] = set()
 
-    # ── Kuzu 访问 ─────────────────────────────────────────
+    # ── 图数据库访问 ──────────────────────────────────────
 
     @property
-    def kuzu_store(self):
-        return self._kuzu_store
+    def graph_store(self):
+        return self._graph_store
 
-    @kuzu_store.setter
-    def kuzu_store(self, store):
-        self._kuzu_store = store
+    @graph_store.setter
+    def graph_store(self, store):
+        self._graph_store = store
 
     # ── 核心操作 ─────────────────────────────────────────
 
     def quarantine(self, episode_id: str, reason: str, source: str = "defense") -> bool:
         """标记节点为隔离状态。"""
-        if self._kuzu_store is None:
-            logger.warning("QuarantineStore: no Kuzu store available; using in-memory only")
+        if self._graph_store is None:
+            logger.warning("QuarantineStore: no graph store available; using in-memory only")
             self._quarantined_ids.add(episode_id)
             return True
         try:
-            self._kuzu_store.query_cypher(
+            self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode {id: $id}) "
                 "SET e.quarantine = true, "
                 "e.quarantine_reason = $reason, "
@@ -69,10 +69,10 @@ class QuarantineStore:
     def promote(self, episode_id: str) -> bool:
         """解除节点的隔离状态。"""
         self._quarantined_ids.discard(episode_id)
-        if self._kuzu_store is None:
+        if self._graph_store is None:
             return True
         try:
-            self._kuzu_store.query_cypher(
+            self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode {id: $id}) "
                 "SET e.quarantine = false, "
                 "e.quarantine_reason = null, "
@@ -98,13 +98,13 @@ class QuarantineStore:
 
     def list_quarantined(self, limit: int = 100) -> list[dict]:
         """列出隔离节点详情。"""
-        if self._kuzu_store is None:
+        if self._graph_store is None:
             return [
                 {"id": eid, "reason": "", "source": "", "quarantined_at": 0.0}
                 for eid in list(self._quarantined_ids)[:limit]
             ]
         try:
-            rows = self._kuzu_store.query_cypher(
+            rows = self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.quarantine = true "
                 "RETURN e.id, e.content, e.quarantine_reason, "
                 "e.quarantine_source, e.quarantined_at "
@@ -139,14 +139,14 @@ class QuarantineStore:
         return len(self._quarantined_ids)
 
     def refresh(self) -> int:
-        """从 Kuzu 同步隔离节点 ID 到内存集合。
+        """从 RyuGraph 同步隔离节点 ID 到内存集合。
 
         在服务启动或怀疑内存集合不同步时调用。
         """
-        if self._kuzu_store is None:
+        if self._graph_store is None:
             return len(self._quarantined_ids)
         try:
-            rows = self._kuzu_store.query_cypher(
+            rows = self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.quarantine = true RETURN e.id",
             )
             fresh_ids: set[str] = set()
