@@ -352,13 +352,17 @@ class DreamPipeline:
         """
         收集活跃节点并计算 τ 值。
         过滤掉 τ 值过低且无连接的"死亡"节点。
+        过滤掉被隔离（quarantine=true）的节点。
         """
         gathered: list[dict] = []
         for node in nodes:
+            # 跳过隔离节点（记忆投毒防御）
+            if node.get("quarantine") in (True, "true", 1):
+                continue
             node_copy = dict(node)
             if self.tau_engine:
                 created_at = node.get("created_at", time.time())
-                tau = self.tau_engine.compute_tau(created_at)
+                tau = self.tau_engine.compute_strength(created_at)
                 node_copy["tau_value"] = tau
             else:
                 node_copy["tau_value"] = node.get("tau_value", 1.0)

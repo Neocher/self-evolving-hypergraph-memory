@@ -19,6 +19,8 @@ from shm._version import __version__, __version_name__
 import numpy as np
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse
 
 from api.models import (
     AuditOperation,
@@ -59,6 +61,8 @@ from api.models import (
 from graph.hyperedge import HyperedgeManager, HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker, HealthCheckResult
 from observability.logger import get_logger, set_trace_id
+from core.defense import MemoryDefenseEngine, DefenseConfig, MemoryDefenseVerdict
+from core.quarantine_store import QuarantineStore
 from observability.metrics import (
     get_metrics,
     record_circuit_breaker,
@@ -107,6 +111,9 @@ class Services:
         "tau_decay_min": 300,
         "tau_decay_max": 7200,
     })
+    # 记忆投毒防御系统
+    defense_engine: Any = None
+    quarantine_store: Any = None
 
 
 _services: Optional[Services] = None
@@ -118,6 +125,15 @@ def init_services(svc: Services) -> None:
     import threading
     svc._faiss_buffer_lock = threading.Lock()
     svc._session_memory_lock = threading.Lock()
+    # 初始化记忆投毒防御引擎 + 隔离存储
+    try:
+        svc.defense_engine = MemoryDefenseEngine(config=DefenseConfig(), encoder=svc.encoder)
+    except Exception:
+        logger.warning("DefenseEngine init failed (non-fatal)")
+    try:
+        svc.quarantine_store = QuarantineStore(kuzu_store=svc.kuzu_store)
+    except Exception:
+        logger.warning("QuarantineStore init failed (non-fatal)")
     _services = svc
 
 
@@ -165,7 +181,16 @@ def _process_embed_queue(deps: Services) -> int:
     if not batch:
         return 0
     count = 0
+    # 【Defense】预先获取隔离节点 ID 集合用于快速排除
+    quarantined_set: set[str] = set()
+    if deps.quarantine_store is not None:
+        quarantined_set = deps.quarantine_store.get_quarantined_ids()
+
     for episode_id, content, created_at in batch:
+        # 隔离节点不加入 FAISS
+        if episode_id in quarantined_set:
+            logger.debug("Embed queue: skip quarantined node %s", episode_id[:12])
+            continue
         try:
             emb = deps.encoder.embed(content)
             if emb is not None and deps.faiss_index is not None:
@@ -326,7 +351,7 @@ async def create_episode(
 
     # τ 值计算
     if deps.tau_engine:
-        tau_initial = deps.tau_engine.compute_tau(created_at)
+        tau_initial = deps.tau_engine.compute_strength(created_at)
         if tau_initial < deps.tau_engine.config.decay_threshold and not req.force_promote:
             raise HTTPException(status_code=400, detail="τ below threshold; use force_promote=true")
 
@@ -350,6 +375,25 @@ async def create_episode(
             logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
                                    content=req.content, source=req.source)
+
+    # [Defense] 记忆投毒预检（在 Kuzu 写入前执行）
+    defense_verdict = None
+    defense_reason = ""
+    if deps.defense_engine and deps.defense_engine.config.enabled:
+        verdict, reason = deps.defense_engine.pre_check(
+            content=req.content, source=req.source, created_at=created_at,
+        )
+        defense_verdict = verdict
+        defense_reason = reason
+        if verdict.value == "block":
+            logger.warning("Defense BLOCKED write", source=req.source, reason=reason)
+            record_request("POST", "/memories/episodes", "403", _now() - start)
+            return JSONResponse(
+                status_code=403,
+                content={"error": "blocked_by_defense", "reason": reason},
+            )
+        elif verdict.value == "quarantine":
+            logger.warning("Defense QUARANTINE write", source=req.source, reason=reason)
 
     # [Ontology] 写时验证（v1 — 冲突检测）
     ontology_note = None
@@ -385,6 +429,12 @@ async def create_episode(
         "created_at": created_at,
         "tau_initial": tau_initial,
     })
+
+    # [Defense] 隔离标记：QUARANTINE 判定的节点写入后标记隔离
+    if defense_verdict is not None and defense_verdict.value == "quarantine":
+        if deps.quarantine_store is not None:
+            deps.quarantine_store.quarantine(episode_id, defense_reason, req.source)
+            logger.info("Node %s quarantined after write: %s", episode_id[:12], defense_reason[:80])
 
     # 命名空间链接
     if req.namespace:
@@ -548,7 +598,7 @@ async def promote_to_episode(
     tau = 1.0
 
     if deps.tau_engine:
-        tau = deps.tau_engine.compute_tau(created_at)
+        tau = deps.tau_engine.compute_strength(created_at)
 
     # 尝试从 Kuzu 查找原始记录内容
     content = ""
@@ -621,7 +671,9 @@ async def retrieve(
             if words:
                 params = {f"w{i}": w for i, w in enumerate(words[:5])}
                 conditions = " OR ".join(f"toLower(e.content) CONTAINS $w{i}" for i in range(len(words[:5])))
-                cypher = f"MATCH (e:EpisodeNode) WHERE {conditions} RETURN e.id AS node_id, e.content AS content LIMIT 10"
+                cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
+                          "AND (e.quarantine IS NULL OR e.quarantine = false) "
+                          f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
                 fallback_rows = deps.kuzu_store.query_cypher(cypher, params)
                 degraded = True
                 for row in fallback_rows:
@@ -640,6 +692,18 @@ async def retrieve(
                 logger.info("Cypher fallback provided %d results", len(results_raw))
         except Exception:
             logger.exception("Cypher fallback failed")
+
+    # 【Defense】隔离节点排除
+    if results_raw and deps.quarantine_store is not None:
+        quarantined_ids = deps.quarantine_store.get_quarantined_ids()
+        if quarantined_ids:
+            before = len(results_raw)
+            results_raw = [
+                r for r in results_raw
+                if r.get("node_id", "") not in quarantined_ids
+            ]
+            if len(results_raw) < before:
+                logger.debug("Retrieval: filtered %d quarantined results", before - len(results_raw))
 
     # 【P2】结果去重 + 命名空间过滤 + visibility 过滤
     if results_raw:
