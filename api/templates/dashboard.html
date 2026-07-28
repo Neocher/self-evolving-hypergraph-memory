@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SHM Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: #1c2333;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --accent: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-yellow: #d29922;
+    --accent-red: #f85149;
+    --accent-purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+  }
+  .header {
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .header .version {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-left: 8px;
+  }
+  .header .timestamp {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  .tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+  .tab-btn {
+    padding: 10px 20px;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 14px;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+  }
+  .tab-btn:hover { color: var(--text-primary); }
+  .tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-card .label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .stat-card .value {
+    font-size: 28px;
+    font-weight: 700;
+    margin-top: 4px;
+  }
+  .stat-card .value.green { color: var(--accent-green); }
+  .stat-card .value.blue { color: var(--accent); }
+  .stat-card .value.yellow { color: var(--accent-yellow); }
+  .stat-card .value.purple { color: var(--accent-purple); }
+  .stat-card .value.red { color: var(--accent-red); }
+  .chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 24px;
+  }
+  .chart-container h3 {
+    font-size: 14px;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+  }
+  .chart-container canvas { max-height: 280px; }
+  .table-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th {
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tr:hover td { background: rgba(88,166,255,0.05); }
+  .log-area {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    max-height: 600px;
+    overflow-y: auto;
+    color: var(--text-secondary);
+  }
+  .log-area .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-area .log-line:hover { color: var(--text-primary); }
+  .status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .status-badge.running { background: rgba(63,185,80,0.15); color: var(--accent-green); }
+  .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--text-secondary); }
+  .loading { text-align: center; padding: 40px; color: var(--text-secondary); }
+  .error { color: var(--accent-red); }
+  @media (max-width: 768px) {
+    .container { padding: 12px; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .header { flex-direction: column; gap: 8px; text-align: center; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>SHM Dashboard <span class="version" id="version">v5.14</span></h1>
+  </div>
+  <div class="timestamp" id="headerTimestamp">--</div>
+</div>
+
+<div class="container">
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="overview">概览</button>
+    <button class="tab-btn" data-tab="memories">记忆</button>
+    <button class="tab-btn" data-tab="dreams">梦境</button>
+    <button class="tab-btn" data-tab="logs">日志</button>
+  </div>
+
+  <!-- ═══ 概览 ═══ -->
+  <div class="tab-content active" id="tab-overview">
+    <div class="stats-grid" id="statsGrid">
+      <div class="stat-card"><div class="label">记忆总数</div><div class="value blue" id="statMemoryCount">--</div></div>
+      <div class="stat-card"><div class="label">FAISS 向量数</div><div class="value green" id="statFaissSize">--</div></div>
+      <div class="stat-card"><div class="label">梦境状态</div><div class="value" id="statDreamStatus">--</div></div>
+      <div class="stat-card"><div class="label">梦境运行次数</div><div class="value purple" id="statDreamCount">--</div></div>
+      <div class="stat-card"><div class="label">超边数</div><div class="value yellow" id="statHyperedgeCount">--</div></div>
+      <div class="stat-card"><div class="label">社区数</div><div class="value" id="statCommunityCount">--</div></div>
+    </div>
+
+    <div class="chart-container">
+      <h3>检索成功率趋势</h3>
+      <canvas id="retrievalTrendChart"></canvas>
+    </div>
+  </div>
+
+  <!-- ═══ 记忆 ═══ -->
+  <div class="tab-content" id="tab-memories">
+    <div class="table-container">
+      <table>
+        <thead><tr><th>ID</th><th>内容</th><th>来源</th><th>创建时间</th><th>τ 值</th></tr></thead>
+        <tbody id="memoriesTableBody">
+          <tr><td colspan="5" class="loading">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══ 梦境 ═══ -->
+  <div class="tab-content" id="tab-dreams">
+    <div class="stats-grid" id="dreamStatsGrid">
+      <div class="stat-card"><div class="label">梦境运行中</div><div class="value" id="dreamRunning">--</div></div>
+      <div class="stat-card"><div class="label">总运行次数</div><div class="value purple" id="dreamTotalCount">--</div></div>
+    </div>
+    <div class="table-container">
+      <table>
+        <thead><tr><th>梦境 ID</th><th>触发模式</th><th>时间</th><th>社区</th><th>剪枝</th><th>冲突</th></tr></thead>
+        <tbody id="dreamsTableBody">
+          <tr><td colspan="6" class="loading">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══ 日志 ═══ -->
+  <div class="tab-content" id="tab-logs">
+    <div class="log-area" id="logArea">
+      <div class="loading">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Tab 切换 ───
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+// ─── 工具 ───
+function fmtTime(ts) {
+  if (!ts || ts <= 0) return '--';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+function truncate(str, len) {
+  if (!str) return '--';
+  return str.length > len ? str.slice(0, len) + '...' : str;
+}
+
+// ─── 概览 ───
+async function loadOverview() {
+  try {
+    const res = await fetch('/dashboard/api/overview');
+    const data = await res.json();
+
+    document.getElementById('statMemoryCount').textContent = data.memory_count ?? '--';
+    document.getElementById('statFaissSize').textContent = data.faiss_size ?? '--';
+
+    const dreamEl = document.getElementById('statDreamStatus');
+    if (data.dream_status === 'running') {
+      dreamEl.textContent = '运行中';
+      dreamEl.className = 'value green';
+    } else {
+      dreamEl.textContent = '空闲';
+      dreamEl.className = 'value';
+    }
+
+    document.getElementById('statDreamCount').textContent = data.dream_run_count ?? '--';
+    document.getElementById('statHyperedgeCount').textContent = data.hyperedge_count ?? '--';
+    document.getElementById('statCommunityCount').textContent = data.community_count ?? '--';
+    document.getElementById('headerTimestamp').textContent = fmtTime(data.timestamp);
+
+    return data;
+  } catch (e) {
+    console.error('loadOverview:', e);
+  }
+}
+
+// ─── 检索趋势图 ───
+let trendChart = null;
+
+function initTrendChart() {
+  const ctx = document.getElementById('retrievalTrendChart').getContext('2d');
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: ['最近', '', '', '', '', '', '', ''],
+      datasets: [{
+        label: '检索成功率',
+        data: [0.92, 0.88, 0.94, 0.91, 0.95, 0.93, 0.96, 0.94],
+        borderColor: '#58a6ff',
+        backgroundColor: 'rgba(88,166,255,0.1)',
+        fill: true,
+        tension: 0.4,
+        pointRadius: 3,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { color: '#8b949e' },
+        },
+        y: {
+          min: 0.7,
+          max: 1.0,
+          grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { color: '#8b949e', callback: v => (v * 100).toFixed(0) + '%' },
+        },
+      },
+    },
+  });
+}
+
+// ─── 记忆列表 ───
+async function loadMemories() {
+  const tbody = document.getElementById('memoriesTableBody');
+  tbody.innerHTML = '<tr><td colspan="5" class="loading">加载中...</td></tr>';
+  try {
+    const res = await fetch('/dashboard/api/memories?limit=50');
+    const data = await res.json();
+    if (!data.items || data.items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="loading">暂无记忆</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.items.map(item => `
+      <tr>
+        <td title="${item.id}">${truncate(item.id, 12)}</td>
+        <td title="${item.content}">${truncate(item.content, 80)}</td>
+        <td>${item.source || '--'}</td>
+        <td>${fmtTime(item.created_at)}</td>
+        <td>${item.tau != null ? item.tau.toFixed(3) : '--'}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="5" class="error">加载失败</td></tr>';
+    console.error('loadMemories:', e);
+  }
+}
+
+// ─── 梦境列表 ───
+async function loadDreams() {
+  const tbody = document.getElementById('dreamsTableBody');
+  tbody.innerHTML = '<tr><td colspan="6" class="loading">加载中...</td></tr>';
+  try {
+    const res = await fetch('/dashboard/api/dreams?limit=20');
+    const data = await res.json();
+
+    // 当前状态
+    if (data.current) {
+      const runningEl = document.getElementById('dreamRunning');
+      runningEl.textContent = data.current.running ? '是' : '否';
+      runningEl.className = 'value ' + (data.current.running ? 'green' : '');
+      document.getElementById('dreamTotalCount').textContent = data.current.run_count ?? '--';
+    }
+
+    if (!data.candidates || data.candidates.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="loading">暂无梦境记录</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.candidates.map(item => `
+      <tr>
+        <td title="${item.dream_id}">${truncate(item.dream_id, 12)}</td>
+        <td>${item.trigger_mode || '--'}</td>
+        <td>${fmtTime(item.created_at)}</td>
+        <td>${item.community_count ?? 0}</td>
+        <td>${item.prune_count ?? 0}</td>
+        <td>${item.conflict_count ?? 0}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="6" class="error">加载失败</td></tr>';
+    console.error('loadDreams:', e);
+  }
+}
+
+// ─── 日志 ───
+async function loadLogs() {
+  const area = document.getElementById('logArea');
+  area.innerHTML = '<div class="loading">加载中...</div>';
+  try {
+    const res = await fetch('/dashboard/api/logs?lines=100');
+    const data = await res.json();
+    if (!data.logs || data.logs.length === 0) {
+      area.innerHTML = '<div class="loading">暂无日志</div>';
+      return;
+    }
+    area.innerHTML = data.logs.map(log =>
+      `<div class="log-line">${escapeHtml(log.message)}</div>`
+    ).join('');
+    area.scrollTop = area.scrollHeight;
+  } catch (e) {
+    area.innerHTML = '<div class="error">加载失败</div>';
+    console.error('loadLogs:', e);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// ─── 自动刷新 ───
+let refreshInterval = null;
+
+async function refreshAll() {
+  await loadOverview();
+  // 只在可见 tab 加载对应数据，减少请求
+  const active = document.querySelector('.tab-btn.active');
+  if (active) {
+    const tab = active.dataset.tab;
+    if (tab === 'memories') loadMemories();
+    else if (tab === 'dreams') loadDreams();
+    else if (tab === 'logs') loadLogs();
+  }
+}
+
+// Tab 切换时懒加载
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    clearInterval(refreshInterval);
+    const tab = btn.dataset.tab;
+    if (tab === 'overview') loadOverview();
+    else if (tab === 'memories') loadMemories();
+    else if (tab === 'dreams') loadDreams();
+    else if (tab === 'logs') loadLogs();
+    // 概览每15秒刷新，其他不自动刷
+    if (tab === 'overview') {
+      refreshInterval = setInterval(loadOverview, 15000);
+    }
+  });
+});
+
+// ─── 初始化 ───
+document.addEventListener('DOMContentLoaded', () => {
+  initTrendChart();
+  refreshAll();
+  refreshInterval = setInterval(loadOverview, 15000);
+});
+</script>
+</body>
+</html>

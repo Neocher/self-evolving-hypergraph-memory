@@ -21,6 +21,7 @@ from config.settings import load_settings, get_settings
 from api.routes import router, init_services, Services
 from observability.metrics import record_request
 from observability.logger import get_logger, configure_logging
+from api.dashboard import dashboard_router
 
 logger = get_logger(__name__)
 
@@ -78,20 +79,20 @@ def _init_services() -> Services:
             logger.warning("TextEncoder init failed (fallback: embedding disabled)", error=str(e))
 
         try:
-            import faiss
-            import numpy as np
+            from retrieval.vector_store import VectorStoreFactory
             dim = cfg.faiss.dimension
-            # 启动时始终用 FlatL2（不需要训练，立即可用）
-            # IVFFlat 在 POST /index/rebuild 时有真实数据才切换
-            base_index = faiss.IndexFlatL2(dim)
-            svc.faiss_index = faiss.IndexIDMap(base_index)
+            store = VectorStoreFactory.create(
+                dimension=dim,
+                index_type=cfg.faiss.index_type,
+                nlist=cfg.faiss.nlist,
+            )
+            svc.vector_store = store
+            svc.faiss_index = store.index      # 保持向后兼容
             svc.faiss_dim = dim
-            svc.faiss_index_type = cfg.faiss.index_type
-            svc.faiss_nlist = cfg.faiss.nlist
-
-            # 存 faiss_id → node_id 逆向映射
-            svc.faiss_id_map: dict[int, str] = {}
-            logger.info("FAISS index initialized", type="FlatL2", dim=dim)
+            svc.faiss_index_type = store.index_type
+            svc.faiss_nlist = store.nlist
+            svc.faiss_id_map = store.id_map
+            logger.info("VectorStore initialized", engine="faiss", dim=dim)
         except Exception as e:
             errors.append(f"FAISS: {e}")
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))
@@ -579,4 +580,5 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(router)
+    app.include_router(dashboard_router)
     return app
