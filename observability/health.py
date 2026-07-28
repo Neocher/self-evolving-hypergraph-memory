@@ -21,7 +21,7 @@ class HealthCheckResult:
     """健康检查结果（避免与 api/models.py 中的 HealthStatus 命名冲突）。"""
 
     status: str  # 'ok' | 'degraded' | 'error'
-    kuzu_connected: bool
+    graph_connected: bool
     faiss_loaded: bool
     faiss_index_size: int = 0
     chain_verified: bool = True
@@ -77,7 +77,7 @@ class HealthChecker:
         """执行完整的深度健康检查。"""
         result = HealthCheckResult(
             status="ok",
-            kuzu_connected=self._check_kuzu(),
+            graph_connected=self._check_kuzu(),
             faiss_loaded=self._check_faiss(),
             uptime_seconds=time.time() - self._start_time,
         )
@@ -130,7 +130,7 @@ class HealthChecker:
             # 【FIX】读取梦境运行次数
             result.dream_run_count = getattr(self.dream_scheduler, "_dream_run_count", 0)
 
-        if not result.kuzu_connected:
+        if not result.graph_connected:
             result.status = "error"
         elif not result.chain_verified or not result.faiss_loaded:
             result.status = "degraded"

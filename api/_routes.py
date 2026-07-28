@@ -1290,7 +1290,7 @@ async def health_check(
     if cb is not None:
         state_map = {"closed": 0, "half_open": 1, "open": 2}
         cb_state = cb.state.value if hasattr(cb.state, "value") else str(cb.state)
-        record_circuit_breaker("kuzu", state_map.get(cb_state, 0))
+        record_circuit_breaker("ryu", state_map.get(cb_state, 0))
 
     stats: Dict[str, Any] = {
         "version": __version__,
@@ -1309,7 +1309,7 @@ async def health_check(
     record_request("GET", "/health", "200", _now() - start)
     return HealthStatus(
         status=health.status,
-        kuzu_connected=health.kuzu_connected,
+        graph_connected=health.graph_connected,
         faiss_loaded=health.faiss_loaded,
         dream_scheduler_running=health.dream_scheduler_running,
         stats=stats,

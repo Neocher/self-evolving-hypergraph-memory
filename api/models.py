@@ -278,7 +278,7 @@ class HealthStatus(BaseModel):
     """深度健康检查响应。"""
     status: str = Field(..., pattern="^(ok|degraded|error)$",
                         description="服务整体状态")
-    kuzu_connected: bool = Field(..., description="Kuzu 数据库连接状态")
+    graph_connected: bool = Field(..., description="图数据库连接状态 (RyuGraph)")
     faiss_loaded: bool = Field(..., description="FAISS 索引加载状态")
     dream_scheduler_running: bool = Field(default=False, description="梦境调度器运行状态")
     stats: Dict[str, Any] = Field(default_factory=dict, description="详细统计数据")
