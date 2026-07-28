@@ -19,9 +19,63 @@ ACCESS_FREQ_DIVISOR = 50
 ACCESS_COUNT_THRESHOLD = 5
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+
+# —— RoMem 时序相位旋转常量 ——
+_UNIT_TO_SECONDS: dict[str, float] = {
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
+
+ROEM_ALPHA: float = float(os.environ.get("ROEM_ALPHA", "1.0"))
+
+ROEM_PERIODS: list[float] = [
+    30 * 60,      # 30 minutes
+    3600,         # 1 hour
+    7200,         # 2 hours
+    14400,        # 4 hours
+    28800,        # 8 hours
+    86400,        # 24 hours
+]
+
+
+def _parse_roem_periods() -> list[float]:
+    """从 ROEM_PERIODS 环境变量解析周期列表（逗号分隔，支持 s/m/h/d 后缀）。"""
+    raw = os.environ.get("ROEM_PERIODS", "")
+    if not raw:
+        return ROEM_PERIODS
+    periods: list[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token[-1] in _UNIT_TO_SECONDS:
+            unit = token[-1]
+            num = float(token[:-1])
+            periods.append(num * _UNIT_TO_SECONDS[unit])
+        else:
+            periods.append(float(token))
+    return periods
+
+
+def _phase_similarity(age_seconds: float, periods: list[float]) -> float:
+    """傅里叶相位相似度 — RoMem 时序相位旋转核心。
+
+    对给定时间间隔，计算各周期通道的余弦响应均值。
+    Returns: [-1, 1]
+    """
+    if not periods:
+        return 0.0
+    similarity = 0.0
+    for period in periods:
+        angle = 2.0 * math.pi * age_seconds / period
+        similarity += math.cos(angle)
+    return similarity / len(periods)
 
 
 @dataclass
@@ -210,6 +264,19 @@ class TauDecayEngine:
         dt = max(0, now - created)
         tau_decay = self._get_effective_tau_decay(node_id)
         return self.config.tau_initial * math.exp(-dt / tau_decay)
+
+    def compute_strength(self, created_at: float) -> float:
+        """Compute RoMem temporal phase strength.
+
+        结合 τ 衰减与傅里叶相位相似度，产生周期性记忆强度。
+        S = alpha * tau(t) + (1-alpha) * (phase_sim + 1) / 2
+
+        ROEM_ALPHA=1.0 时行为与 compute_tau() 完全一致（向后兼容）。
+        """
+        age = max(0.0, time.time() - created_at)
+        tau_val = self.compute_tau(node_id="", created_at=created_at)
+        phase_sim = _phase_similarity(age, ROEM_PERIODS)
+        return ROEM_ALPHA * tau_val + (1.0 - ROEM_ALPHA) * (phase_sim + 1.0) / 2.0
 
     def is_decay_candidate(self, node_id: str, created_at: Optional[float] = None,
                           connections: Optional[dict] = None) -> bool:
