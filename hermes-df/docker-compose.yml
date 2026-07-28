@@ -1,0 +1,64 @@
+version: '3.8'
+
+networks:
+  hermes-df:
+    external: true
+
+volumes:
+  hermes-home:
+    driver: local
+    driver_opts:
+      type: none
+      device: /home/admin/.hermes
+      o: bind
+  hermes-skills:
+    driver: local
+    driver_opts:
+      type: none
+      device: /home/admin/.hermes/skills
+      o: bind
+  hermes-scripts:
+    driver: local
+    driver_opts:
+      type: none
+      device: /home/admin/shm
+      o: bind
+  go-cache:
+    driver: local
+
+services:
+  # ===== D+F Core Research Agent =====
+  hermes-df:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hermes-df:latest
+    container_name: hermes-df
+    hostname: hermes-df
+    networks:
+      - hermes-df
+    environment:
+      SOCKS5_PROXY: "overseas-gateway:1080"
+      HTTP_PROXY_HOST: "overseas-gateway"
+      HTTP_PROXY_PORT: "8080"
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - hermes-home:/home/hermes/.hermes:ro
+      - hermes-skills:/home/hermes/.hermes/skills
+      - hermes-scripts:/home/admin/shm
+      - go-cache:/root/go/pkg/mod
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    mem_limit: 8g
+    cpus: '4'
+    healthcheck:
+      test: ["CMD-SHELL", "libreoffice --headless --version > /dev/null 2>&1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
