@@ -46,6 +46,11 @@ class TauDecayConfig:
     refresh_boost: float = 0.3  # 每次再巩固的时间提升比例
     max_refresh_boost: float = 2.0  # 再巩固累积上限
     
+    # v2.5 AdaMem 可学习遗忘 (P2)
+    enable_learnable: bool = False
+    decay_learning_rate: float = 0.01
+    decay_target_window: int = 10
+    
     def validate(self) -> None:
         """校验配置合理性"""
         assert 0 < self.tau_initial <= 1.0, "tau_initial must be in (0, 1]"
@@ -64,18 +69,64 @@ class NodeMemoryInfo:
     tau_decay_custom: Optional[float] = None  # 自定义衰减常数，v2.0
 
 
+class AdaptiveDecayLearner:
+    """
+    AdaMem 可学习遗忘 — 在线 SGD 反馈学习器 (P2)
+
+    通过外部反馈信号（访问频率、门控标记）累积窗口后，
+    执行一步 SGD 更新对应节点的 tau_decay_custom。
+    """
+
+    def __init__(self, config: TauDecayConfig) -> None:
+        self.config = config
+        # {node_id: [(tau_desired, timestamp), ...]}
+        self._feedback_buffer: dict[str, list[tuple[float, float]]] = {}
+
+    def record_feedback(self, node_id: str, tau_desired: float) -> None:
+        """记录一次反馈信号：访问↑→τ_desired↑, 遗忘↓→τ_desired↓"""
+        if node_id not in self._feedback_buffer:
+            self._feedback_buffer[node_id] = []
+        self._feedback_buffer[node_id].append((tau_desired, time.time()))
+
+    def update_decay(self, engine: TauDecayEngine) -> dict[str, float]:
+        """
+        积累反馈满窗口后 SGD 更新 tau_decay_custom。
+
+        Returns:
+            {node_id: new_tau_decay, ...} 被更新的节点映射
+        """
+        updates: dict[str, float] = {}
+        for node_id, feedbacks in list(self._feedback_buffer.items()):
+            if len(feedbacks) < self.config.decay_target_window:
+                continue
+            tau_target = sum(f[0] for f in feedbacks) / len(feedbacks)
+            self._feedback_buffer[node_id] = []
+            info = engine._node_info.get(node_id)
+            if info is None:
+                continue
+            current = info.tau_decay_custom or self.config.tau_decay_seconds
+            lr = self.config.decay_learning_rate
+            updated = current + lr * (tau_target - current)
+            engine.set_custom_decay(node_id, updated)
+            updates[node_id] = updated
+        return updates
+
+
 class TauDecayEngine:
     """
     τ 衰减引擎 v2.0
     管理所有节点的 τ 值计算、自适应衰减、重要性调制和再巩固。
     """
 
-    def __init__(self, config: Optional[TauDecayConfig] = None) -> None:
+    def __init__(self, config: Optional[TauDecayConfig] = None,
+                 learner: Optional[AdaptiveDecayLearner] = None) -> None:
         self.config = config or TauDecayConfig()
         self.config.validate()
         self._tau_cache: dict[str, tuple[float, float]] = {}
         # v2.0: 节点记忆信息缓存
         self._node_info: dict[str, NodeMemoryInfo] = {}
+        # v2.5 AdaMem 可学习遗忘
+        self.learner: Optional[AdaptiveDecayLearner] = learner
 
     def register_node(self, node_id: str, created_at: Optional[float] = None,
                       importance: float = 0.5) -> None:

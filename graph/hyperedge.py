@@ -37,6 +37,11 @@ class Hyperedge:
     # 以下由 DualAdaptiveGate 维护 (SSM+MLP双门控)
     hidden_state: Optional[list] = None
     gate_value: float = 1.0
+    # P2 MemClaw 多Agent共享记忆
+    agent_scope: str | list[str] = 'global'
+    source_agent_id: str = 'system'
+    source_timestamp: float = 0.0
+    supersession_of: Optional[str] = None
 
     @staticmethod
     def ensure_member_ids_valid(member_ids: List[str]) -> None:
@@ -83,10 +88,18 @@ class HyperedgeManager:
         return edge
 
     def create_semantic_hyperedge(self,
-                                   member_ids: List[str],
-                                   conclusion: str) -> Hyperedge:
+                                    member_ids: List[str],
+                                    conclusion: str,
+                                    agent_id: str = 'system',
+                                    agent_scope: str | list[str] = 'global',
+                                    supersession_of: Optional[str] = None) -> Hyperedge:
         """
         创建语义超边，连接多个概念节点指向一个抽象结论。
+
+        Args:
+            agent_id: 创建该超边的 agent 标识
+            agent_scope: 可见范围 ('global' / agent_id / list of agent_ids)
+            supersession_of: 被此超边取代的旧超边 ID（超车机制）
 
         Raises:
             ValueError: 如果 member_ids 少于 2 个
@@ -98,6 +111,10 @@ class HyperedgeManager:
             member_ids=list(member_ids),
             created_at=time.time(),
             metadata={"conclusion": conclusion},
+            agent_scope=agent_scope,
+            source_agent_id=agent_id,
+            source_timestamp=time.time(),
+            supersession_of=supersession_of,
         )
         self._persist_hyperedge(edge)
         return edge
@@ -132,6 +149,10 @@ class HyperedgeManager:
             "created_at": edge.created_at,
             "gate_value": edge.gate_value,
             "metadata": json.dumps(edge.metadata, ensure_ascii=False),
+            "agent_scope": json.dumps(edge.agent_scope, ensure_ascii=False),
+            "source_agent_id": edge.source_agent_id,
+            "source_timestamp": edge.source_timestamp,
+            "supersession_of": edge.supersession_of,
         })
         for member_id in edge.member_ids:
             self.store.link_hyperedge_member(edge.id, member_id)
@@ -153,6 +174,10 @@ class HyperedgeManager:
                 created_at=row.get("created_at", 0.0),
                 metadata=metadata,
                 gate_value=row.get("gate_value", 1.0),
+                agent_scope=self._deserialize_agent_scope(row.get("agent_scope")),
+                source_agent_id=row.get("source_agent_id", "system"),
+                source_timestamp=row.get("source_timestamp", 0.0),
+                supersession_of=row.get("supersession_of", None),
             ))
         return result
 
@@ -182,4 +207,79 @@ class HyperedgeManager:
             created_at=row.get("created_at", 0.0),
             metadata=metadata,
             gate_value=row.get("gate_value", 1.0),
+            agent_scope=self._deserialize_agent_scope(row.get("agent_scope")),
+            source_agent_id=row.get("source_agent_id", "system"),
+            source_timestamp=row.get("source_timestamp", 0.0),
+            supersession_of=row.get("supersession_of", None),
         )
+
+    # ─── P2 MemClaw: 多Agent共享记忆 ─────────────────────────
+
+    @staticmethod
+    def _deserialize_agent_scope(raw) -> str | list[str]:
+        if raw is None:
+            return 'global'
+        if isinstance(raw, str):
+            try:
+                import json
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, (str, list)) else 'global'
+            except (json.JSONDecodeError, TypeError):
+                return raw
+        if isinstance(raw, list):
+            return raw
+        return 'global'
+
+    def get_visible_hyperedges(self, agent_id: str) -> List[Hyperedge]:
+        """获取该 agent 可见的所有超边（global 或 scope 包含该 agent）。"""
+        all_rows = self.store.query_cypher("MATCH (h:HyperedgeNode) RETURN h.*", {})
+        import json
+        result: List[Hyperedge] = []
+        for row in all_rows:
+            try:
+                md = json.loads(row.get("metadata", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                md = {}
+            scope = self._deserialize_agent_scope(row.get("agent_scope"))
+            if scope != 'global':
+                if isinstance(scope, list) and agent_id not in scope:
+                    continue
+                elif isinstance(scope, str) and scope != agent_id:
+                    continue
+            result.append(Hyperedge(
+                id=row["id"],
+                type=HyperedgeType(row["type"]),
+                member_ids=self._resolve_member_ids(row["id"]),
+                created_at=row.get("created_at", 0.0),
+                metadata=md,
+                gate_value=row.get("gate_value", 1.0),
+                agent_scope=scope,
+                source_agent_id=row.get("source_agent_id", "system"),
+                source_timestamp=row.get("source_timestamp", 0.0),
+                supersession_of=row.get("supersession_of", None),
+            ))
+        return result
+
+    def create_multi_agent_hyperedge(self,
+                                      member_ids: List[str],
+                                      agent_ids: List[str],
+                                      conclusion: str = '',
+                                      topic: Optional[str] = None) -> Hyperedge:
+        """
+        创建多Agent共享超边。
+
+        agent_ids 中的每个 agent 对该超边可见。
+        """
+        Hyperedge.ensure_member_ids_valid(member_ids)
+        edge = Hyperedge(
+            id=str(uuid.uuid4()),
+            type=HyperedgeType.SEMANTIC,
+            member_ids=list(member_ids),
+            created_at=time.time(),
+            metadata={"conclusion": conclusion, "topic": topic or ""},
+            agent_scope=list(agent_ids),
+            source_agent_id='system',
+            source_timestamp=time.time(),
+        )
+        self._persist_hyperedge(edge)
+        return edge

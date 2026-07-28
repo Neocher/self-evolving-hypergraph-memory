@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
 from core.audit_chain import AuditOperation
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,71 @@ class DreamReport:
     calibrator_tracked: int = 0
 
 
+# ─── P2 SSM 梦境深度升级 ──────────────────────────────
+
+
+@dataclass
+class SSMDreamConfig:
+    """SSM 梦境深度升级配置"""
+    dream_rounds: int = 3
+    state_reset_threshold: float = 0.95
+
+
+class SSMDreamWrapper:
+    """
+    SSM 梦境深度升级包装器 (P2)
+
+    不修改 SSMEngine，通过在社区特征向量上运行多轮 SSM step
+    来模拟"梦境巩固"过程。对 gate_value 持续高于阈值的社区提升 confidence，
+    低于阈值的则降低 confidence。
+    """
+
+    def __init__(self, ssm_engine, config: Optional[SSMDreamConfig] = None):
+        self.ssm = ssm_engine
+        self.config = config or SSMDreamConfig()
+        self._state: Optional[np.ndarray] = None
+
+    def init(self) -> np.ndarray:
+        """初始化 SSM 隐状态为零向量。"""
+        dim = self.ssm.config.hidden_dim
+        self._state = np.zeros(dim)
+        return self._state
+
+    def reset(self) -> Optional[np.ndarray]:
+        """重置 SSM 隐状态。"""
+        if self._state is not None:
+            self._state.fill(0.0)
+        return self._state
+
+    def dream_consolidate(self, feature_vector: np.ndarray,
+                          current_confidence: float) -> tuple[float, np.ndarray]:
+        """
+        对社区特征向量运行 N 轮 SSM step，返回调整后的 confidence。
+
+        Returns:
+            (adjusted_confidence, final_hidden_state)
+        """
+        rounds = self.config.dream_rounds
+        if self._state is None:
+            self._state = np.zeros(feature_vector.shape[0])
+
+        gate_values = []
+        for _ in range(rounds):
+            self._state, g = self.ssm.step(self._state, feature_vector)
+            gate_values.append(g)
+
+        avg_gate = sum(gate_values) / len(gate_values)
+        th = self.config.state_reset_threshold
+        if avg_gate > th:
+            adjusted = min(1.0, current_confidence * (1.0 + 0.1 * avg_gate))
+        elif avg_gate < (1.0 - th):
+            adjusted = max(0.0, current_confidence * (1.0 - 0.1 * (1.0 - avg_gate)))
+        else:
+            adjusted = current_confidence
+
+        return adjusted, self._state
+
+
 class DreamPipeline:
     """
     梦境八步管道。
@@ -76,6 +142,7 @@ class DreamPipeline:
         llm_client=None,
         ontology_validator=None,
         confidence_calibrator=None,
+        ssm_engine=None,
     ) -> None:
         """
         Args:
@@ -85,6 +152,7 @@ class DreamPipeline:
             llm_client: LLMClient 实例（可选，提供时启用 LLM 语义摘要）
             ontology_validator: OntologyValidator 实例（可选，P1 本体约束社区检测）
             confidence_calibrator: ConfidenceCalibrator 实例（可选，P1 过度巩固防护）
+            ssm_engine: SSMEngine 实例（可选，P2 SSM 梦境深度巩固）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
@@ -92,6 +160,7 @@ class DreamPipeline:
         self.llm_client = llm_client
         self.ontology_validator = ontology_validator
         self.confidence_calibrator = confidence_calibrator
+        self.ssm_engine = ssm_engine
 
     async def run(
         self,
@@ -137,6 +206,18 @@ class DreamPipeline:
         # Step 3: SYNTHESIZE — 生成社区摘要
         communities = await self._synthesize_step(communities)
         logger.info("Dream %s: SYNTHESIZE — %d reports generated", dream_id, len(communities))
+
+        # Step 3a: SSM 梦境深度巩固 (P2)
+        if self.ssm_engine is not None:
+            ssm_wrapper = SSMDreamWrapper(self.ssm_engine)
+            ssm_wrapper.init()
+            for comm in communities:
+                feature = self._build_community_feature(comm)
+                current_conf = comm.get("confidence", 0.7)
+                adjusted_conf, _ = ssm_wrapper.dream_consolidate(feature, current_conf)
+                comm["confidence"] = round(adjusted_conf, 3)
+            logger.info("Dream %s: SSM CONSOLIDATE — %d communities processed",
+                        dream_id, len(communities))
 
         # Step 3b: CALIBRATE — 信心校准 (Manufactured Confidence, P1)
         calibrator_flagged = 0
@@ -515,6 +596,25 @@ class DreamPipeline:
             # 实体链接：提取命名实体并在社区节点间交叉匹配
             community["entity_links"] = await self._entity_linking_step(nodes)
         return communities
+
+    def _build_community_feature(self, community: dict) -> np.ndarray:
+        """从社区数据构建 9 维 SSM 输入特征向量。"""
+        nodes = community.get("nodes", [])
+        members = community.get("members", [])
+        f = np.zeros(9)
+        f[0] = sum(n.get("importance", 0.5) for n in nodes) / max(len(nodes), 1)
+        now_t = time.time()
+        ages = [now_t - n.get("created_at", now_t) for n in nodes if n.get("created_at")]
+        f[1] = (sum(ages) / max(len(ages), 1)) / 3600.0 if ages else 0.0
+        f[2] = sum(n.get("access_count", 0) for n in nodes) / max(len(nodes), 1)
+        f[3] = min(len(members) / 100.0, 1.0)
+        f[4] = 0.0
+        taus = [n.get("tau_value", n.get("tau_initial", 0.5)) for n in nodes]
+        f[5] = sum(taus) / max(len(taus), 1)
+        f[6] = float(np.var(taus)) if len(taus) > 1 else 0.0
+        f[7] = 0.0
+        f[8] = community.get("confidence", 0.7)
+        return f
 
     def _get_source_type(self, community: dict) -> str:
         """从社区成员节点推断源类型。"""
