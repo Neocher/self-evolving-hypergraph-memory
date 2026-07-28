@@ -72,6 +72,11 @@ class DualGateConfig:
     alpha_learning_decay: float = 0.01  # 每次 learn() 后 α 衰减量
     alpha_entropy_boost: float = 0.3    # 熵低时 α 提升幅度
 
+    # 预算感知门控 (Retain or Consolidate? arXiv:2607.17545)
+    budget_capacity: int = 100        # 预算容量（学习步数周期）
+    budget_restore_rate: float = 0.1  # 每步预算恢复率
+    budget_consolidate_cost: int = 30  # 整合操作消耗的预算
+
     # 随机种子
     seed: int = 42
 
@@ -299,8 +304,9 @@ class DualAdaptiveGate:
         self.ssm = SSMEngine(self.config, self._rng)
         self.mlp = MLPGate(self.config, self._rng)
 
-        # α 融合系数
+        # α 融合系数 + 预算
         self.alpha: float = self.config.alpha_initial
+        self._budget: float = self.config.budget_capacity  # 当前可用预算
 
         # 学习状态
         self._total_reward: float = 0.0
@@ -372,20 +378,30 @@ class DualAdaptiveGate:
         gate_mlp = self.mlp.forward(prev_h)  # 重放 MLP 门控值
         reward = self.mlp.learn(gate_mlp, outcome, prev_h)
 
-        # 2. α 自适应调整
+        # 2. α 自适应调整 + 预算感知 (Retain or Consolidate?)
 
-        # 2a. MLP 学习推进 → α 衰减
+        # 2a. 预算更新：每次学习恢复一点预算，上限容量
+        self._budget = min(self.config.budget_capacity, self._budget + self.config.budget_restore_rate)
+
+        # 2b. 预算感知 α 调节：预算充足→可整合(α↑SSM)，预算紧张→只保留(α↓MLP)
+        budget_ratio = self._budget / max(self.config.budget_capacity, 1)
+        budget_alpha_shift = (budget_ratio - 0.5) * 0.1  # [-0.05, +0.05]
+
+        # 2c. MLP 学习推进 → α 衰减
         if reward > 0:
             self.alpha = max(self.config.alpha_min, self.alpha - self.config.alpha_learning_decay)
 
-        # 2b. SSM 熵校准
+        # 2d. 预算感知偏移
+        self.alpha += budget_alpha_shift
+
+        # 2e. SSM 熵校准
         # 计算 SSM 状态熵: 高绝对值 → 低熵(确定) → 提权
         state_norm = np.linalg.norm(prev_h) / math.sqrt(len(prev_h))
         if state_norm > 1.0:
-            self.alpha = min(self.config.alpha_initial, self.alpha + self.config.alpha_entropy_boost * 0.1)
+            self.alpha += self.config.alpha_entropy_boost * 0.1
 
-        # 限制 α 范围
-        self.alpha = max(self.config.alpha_min, min(self.config.alpha_initial, self.alpha))
+        # 限制 α 范围 [alpha_min, alpha_max)
+        self.alpha = max(self.config.alpha_min, self.alpha)
 
         self._total_reward = self.config.mlp_reward_decay * self._total_reward + reward
         return reward
@@ -396,15 +412,42 @@ class DualAdaptiveGate:
         self.config.gate_threshold = max(0.3, min(0.8, new_threshold))
         return self.config.gate_threshold
 
+    def operator_selection(self) -> str:
+        """预算感知操作选择: 'retain' | 'consolidate'
+        
+        基于 Retain or Consolidate? (arXiv:2607.17545):
+        - 预算充足 + α 高 → consolidate (调用 SSM 整合)
+        - 预算紧张 + α 低 → retain (仅 MLP 门控)
+        """
+        budget_ratio = self._budget / max(self.config.budget_capacity, 1)
+        # α 偏向 SSM 且预算充足 → consolidate
+        if self.alpha >= 0.5 and budget_ratio > 0.5:
+            return "consolidate"
+        # α 偏向 MLP 且预算不足 → retain
+        if self.alpha < 0.5 and budget_ratio < 0.5:
+            return "retain"
+        # 混合信号: 用 alpha 做 tiebreaker
+        return "consolidate" if self.alpha >= 0.5 else "retain"
+
+    def spend_budget(self) -> str:
+        """执行操作并消耗预算。返回实际执行的操作。"""
+        op = self.operator_selection()
+        if op == "consolidate":
+            self._budget = max(0.0, self._budget - self.config.budget_consolidate_cost)
+        return op
+
     def reset_state(self) -> np.ndarray:
         """重置 SSM 隐状态为零向量"""
         return np.zeros(self.config.hidden_dim)
 
     def get_stats(self) -> dict:
         """获取双门控统计"""
+        op = self.operator_selection()
         return {
             "type": "dual_ssm_mlp",
             "alpha": round(self.alpha, 3),
+            "budget": round(self._budget, 1),
+            "operator": op,
             "total_steps": self.mlp._step_count,
             "total_reward": round(self._total_reward, 3),
             "current_threshold": round(self.config.gate_threshold, 3),
