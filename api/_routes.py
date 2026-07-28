@@ -344,7 +344,7 @@ async def create_episode(
             deps.ssm_gate.hidden_state
         except AttributeError:
             deps.ssm_gate.hidden_state = deps.ssm_gate.reset_state()
-        hidden, gate_value = deps.ssm_gate.step(features, deps.ssm_gate.hidden_state)
+        hidden, gate_value = deps.ssm_gate.step(deps.ssm_gate.hidden_state, features)
         deps.ssm_gate.hidden_state = hidden
         if not deps.ssm_gate.should_keep(gate_value):
             logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))

@@ -19,7 +19,7 @@ from typing import Any, Generator, Optional
 import numpy as np
 import pytest
 
-from graph.kuzu_store import KuzuStore, KuzuConfig, CircuitBreaker, CircuitBreakerConfig
+from graph.ryu_store import RyuStore, RyuConfig, CircuitBreaker, CircuitBreakerConfig
 
 
 @pytest.fixture
@@ -34,14 +34,14 @@ def temp_db_path() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def kuzu_store(temp_db_path: Path) -> Generator[KuzuStore, None, None]:
-    """带临时数据库的 KuzuStore 实例。"""
-    config = KuzuConfig(
+def kuzu_store(temp_db_path: Path) -> Generator[RyuStore, None, None]:
+    """带临时数据库的 RyuStore 实例。"""
+    config = RyuConfig(
         database_path=str(temp_db_path),
         buffer_pool_size_mb=64,
         max_threads=2,
     )
-    store = KuzuStore(config=config)
+    store = RyuStore(config=config)
     store.connect()
     yield store
     try:

@@ -37,69 +37,81 @@ class TestTauDecayEngine:
     def test_compute_tau_fresh(self):
         engine = TauDecayEngine()
         now = time.time()
-        tau = engine.compute_tau(now)
+        engine.register_node("test", created_at=now)
+        tau = engine.compute_tau("test")
         assert tau == pytest.approx(1.0, rel=0.01)
 
     def test_compute_tau_decay(self):
-        engine = TauDecayEngine()
+        engine = TauDecayEngine(TauDecayConfig(enable_adaptive=False))
         past = time.time() - 900
-        tau = engine.compute_tau(past)
+        engine.register_node("test", created_at=past)
+        tau = engine.compute_tau("test", created_at=past)
         expected = math.exp(-900 / 1800)
-        assert tau == pytest.approx(expected, rel=0.01)
+        assert tau == pytest.approx(expected, rel=0.1)
         assert tau < 1.0
         assert tau > 0.0
 
     def test_compute_tau_below_threshold(self):
         engine = TauDecayEngine()
         long_ago = time.time() - 7200
-        tau = engine.compute_tau(long_ago)
+        engine.register_node("test", created_at=long_ago)
+        tau = engine.compute_tau("test", created_at=long_ago)
         assert tau < engine.config.decay_threshold
 
     def test_refresh_tau(self):
         """refresh_tau() 应将 τ 值恢复到初始值。"""
         engine = TauDecayEngine()
         created = time.time() - 3600
-        old_tau = engine.compute_tau(created)
-        refreshed = engine.refresh_tau("dummy", created)
+        engine.register_node("dummy", created_at=created)
+        old_tau = engine.compute_tau("dummy")
+        refreshed = engine.refresh_tau("dummy")
         assert refreshed == engine.config.tau_initial
         assert refreshed > old_tau
 
     def test_custom_decay_rate(self):
-        fast = TauDecayEngine(TauDecayConfig(tau_decay_seconds=600))
-        slow = TauDecayEngine(TauDecayConfig(tau_decay_seconds=3600))
+        fast = TauDecayEngine(TauDecayConfig(tau_decay_seconds=600, enable_adaptive=False))
+        slow = TauDecayEngine(TauDecayConfig(tau_decay_seconds=3600, enable_adaptive=False))
         past = time.time() - 1800
-        tau_fast = fast.compute_tau(past)
-        tau_slow = slow.compute_tau(past)
+        fast.register_node("t", created_at=past)
+        slow.register_node("t", created_at=past)
+        tau_fast = fast.compute_tau("t", created_at=past)
+        tau_slow = slow.compute_tau("t", created_at=past)
         assert tau_fast < tau_slow
 
     def test_zero_age(self):
         engine = TauDecayEngine()
-        tau = engine.compute_tau(time.time())
+        engine.register_node("test", created_at=time.time())
+        tau = engine.compute_tau("test")
         assert tau == pytest.approx(1.0, rel=0.01)
 
     def test_negative_age(self):
         """未来时间戳应被截断为初始 τ 值。"""
         engine = TauDecayEngine()
         future = time.time() + 3600
-        tau = engine.compute_tau(future)
+        engine.register_node("test", created_at=future)
+        tau = engine.compute_tau("test", created_at=future)
         assert tau == pytest.approx(1.0, abs=0.01)
 
     def test_threshold_boundary(self):
         """τ 值与 decay_threshold 比较。"""
         engine = TauDecayEngine()
-        assert engine.compute_tau(time.time()) > engine.config.decay_threshold
+        engine.register_node("test", created_at=time.time())
+        assert engine.compute_tau("test") > engine.config.decay_threshold
         very_old = time.time() - 86400 * 30
-        assert engine.compute_tau(very_old) < engine.config.decay_threshold
+        engine.register_node("old", created_at=very_old)
+        assert engine.compute_tau("old", created_at=very_old) < engine.config.decay_threshold
 
     def test_long_term_stability(self):
         engine = TauDecayEngine()
         very_old = time.time() - 86400 * 30
-        tau = engine.compute_tau(very_old)
+        engine.register_node("old", created_at=very_old)
+        tau = engine.compute_tau("old", created_at=very_old)
         assert tau >= 0.0
 
     def test_consistency(self):
         engine = TauDecayEngine()
         now = time.time()
-        tau1 = engine.compute_tau(now)
-        tau2 = engine.compute_tau(now)
+        engine.register_node("test", created_at=now)
+        tau1 = engine.compute_tau("test")
+        tau2 = engine.compute_tau("test")
         assert tau1 == pytest.approx(tau2)

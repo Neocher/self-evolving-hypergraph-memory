@@ -1,23 +1,35 @@
 """
-SSM 选择性门控 v2.0
-=============
-来自 HMTE 论文的 State Space Model 门控机制。
-每个超边维护一个隐状态 h_t，决定该超边的保留/遗忘。
+SSM + MLP 双门控引擎 v3.0 (Dual Adaptive Gate)
+=============================================
+SSM提供结构化状态空间原理门控 + MLP提供经验学习门控 的相互优化配合。
 
-v2.0 新特性：
-- [在线学习] 根据结果反馈微调 SSM 权重（简单 REINFORCE 风格更新）
-- [重要性输入] 增加 importance 特征维度
-- [自适应阈值] 阈值随系统负载动态调整
+架构:
+  x_t → [SSM Engine] → h_t (principled state space evolution)
+                              ↓
+                       [MLP Gate] → g_mlp (learned gating policy)
+                              ↓
+              g = α · g_ssm_gate · (1-α) · g_mlp
 
-门控值: g_t = sigmoid(W_g · h_t + b_g)
-状态转移: h_t = A · h_{t-1} + B · x_t
+SSM Engine: 真正的结构化状态空间模型
+- 基于 HiPPO (Legendre) 矩阵初始化 (Gu et al., 2020)
+- 结构化 A 矩阵确保长程记忆传播
+- ZOH (Zero-Order Hold) 离散化
 
-实现为 2 层 MLP（128 维隐层），CPU 微秒级推理。
+MLP Gate: 现有学习型门控 v2.1
+- 读取 SSM 隐状态做门控决策
+- 在线策略梯度学习
+- 随学习进展自动增加 α 权重
+
+α 动态融合:
+- 初始 α=0.5（SSM 和 MLP 等权）
+- 随着 MLP 学习积累，α 渐降至 0.2（MLP 占主导）
+- 置信度校准：SSM 熵低时自动提升其权重
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -26,14 +38,37 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SSMGateConfig:
-    """SSM 门控配置 v2.0"""
+# ═══════════════════════════════════════════════════════════════
+# 配置
+# ═══════════════════════════════════════════════════════════════
 
-    hidden_dim: int = 128  # 隐层维度
-    input_dim: int = 9  # v2.0: 增加 importance 维度
+@dataclass
+class DualGateConfig:
+    """SSM+MLP 双门控配置 v3.0"""
+
+    # 通用
+    hidden_dim: int = 128       # SSM 状态维度 / MLP 隐层维度
+    input_dim: int = 9           # 输入特征维度 (8 + importance)
     gate_threshold: float = 0.5  # 保留/遗忘阈值
-    state_decay: float = 0.9  # 状态衰减系数
+
+    # SSM 参数
+    ssm_state_decay: float = 0.9      # 状态衰减系数
+    ssm_hippo_order: int = 64         # HiPPO 阶数（≤ hidden_dim）
+    ssm_discretization: str = "zoh"   # 离散化方式: "zoh" | "bilinear"
+
+    # MLP 参数
+    mlp_learning_rate: float = 0.001
+    mlp_enable_online_learning: bool = True
+    mlp_reward_decay: float = 0.95
+
+    # α 融合参数
+    alpha_initial: float = 0.5    # SSM 初始权重 (0=纯MLP, 1=纯SSM)
+    alpha_min: float = 0.2         # 最小 SSM 权重
+    alpha_learning_decay: float = 0.01  # 每次 learn() 后 α 衰减量
+    alpha_entropy_boost: float = 0.3    # 熵低时 α 提升幅度
+
+    # 随机种子
+    seed: int = 42
 
     # 输入特征索引
     feat_mean_activation: int = 0
@@ -44,67 +79,261 @@ class SSMGateConfig:
     feat_tau_mean: int = 5
     feat_tau_variance: int = 6
     feat_connection_entropy: int = 7
-    feat_importance: int = 8  # v2.0: 超边平均重要性
-
-    # v2.0: 在线学习参数
-    learning_rate: float = 0.001  # SSM 权重学习率
-    enable_online_learning: bool = True  # 是否启用在线学习
-    reward_decay: float = 0.95  # 奖励折扣因子
+    feat_importance: int = 8
 
 
-class SSMGate:
+# ═══════════════════════════════════════════════════════════════
+# SSM 引擎 — 真正的结构化状态空间模型
+# ═══════════════════════════════════════════════════════════════
+
+class SSMEngine:
     """
-    SSM 选择性门控 v2.0
-    决定哪些超边值得保留，哪些应该被遗忘。
+    SSM 引擎 v1.0 — 结构化状态空间模型。
+
+    基于 HiPPO 矩阵初始化（Legendre 多项式投影），提供
+    有理论保证的长期记忆传播能力。
+
+    核心公式 (连续时间):
+      h'(t) = A · h(t) + B · x(t)
+
+    离散化 (ZOH):
+      h_t = exp(Δt · A) · h_{t-1} + (∫₀^{Δt} exp(τ·A) dτ · B) · x_t
     """
 
-    def __init__(self, config: Optional[SSMGateConfig] = None) -> None:
-        self.config = config or SSMGateConfig()
+    def __init__(self, config: DualGateConfig, rng: np.random.RandomState) -> None:
+        self.config = config
+        self._init_hippo(rng)
+
+    def _init_hippo(self, rng: np.random.RandomState) -> None:
+        """
+        初始化 HiPPO 矩阵 (Legendre 多项式投影)。
+
+        HiPPO 矩阵 A 的结构:
+          A_{nk} = - (2n+1)^{1/2} · (2k+1)^{1/2},  n > k
+          A_{nn} = - (n+1)
+          A_{nk} = 0,  n < k
+
+        这是 normalized Legendre (LegT) 的无穷维限制。
+        对于有限维 N，这是一个下三角矩阵。
+        """
+        N = min(self.config.ssm_hippo_order, self.config.hidden_dim)
+        D = self.config.hidden_dim
+
+        # 构建 HiPPO 矩阵 (Legendre)
+        self.A_hippo = np.zeros((N, N), dtype=np.float64)
+        for n in range(N):
+            for k in range(N):
+                if n > k:
+                    self.A_hippo[n, k] = -math.sqrt((2 * n + 1) * (2 * k + 1))
+                elif n == k:
+                    self.A_hippo[n, k] = -(n + 1)
+                # n < k: 保持不变 0
+
+        # 扩展到全 hidden_dim
+        # 前 N 维用 HiPPO，剩余维度用单位衰减
+        self.A = np.eye(D, dtype=np.float64) * (-1.0)
+        self.A[:N, :N] = self.A_hippo[:N, :N]
+
+        # B 矩阵: 随机投影
+        M = self.config.input_dim
+        top = rng.randn(N, M) * 0.1
+        bottom = np.zeros((D - N, M))
+        self.B = np.vstack([top, bottom]) * 0.1
+
+        # 预计算离散化系数 (ZOH: exp(A·Δt), 取 Δt=1)
+        self.A_bar = np.linalg.matrix_power(np.eye(D) + self.A / 100, 100)
+        # B_bar ≈ A^{-1}(exp(A) - I)·B ≈ (I + A/2)·B  (一阶近似)
+        self.B_bar = (np.eye(D) + self.A / 2.0) @ self.B
+
+        # SSM 专用门控读取头
+        self.W_ssm = rng.randn(1, D) * 0.05
+        self.b_ssm = np.zeros((1, 1))
+
+    def step(self, hidden_state: np.ndarray, input_features: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        SSM 单步状态转移。
+
+        Args:
+            hidden_state: 上一时间步隐状态 (hidden_dim,)
+            input_features: 当前输入 (input_dim,)
+
+        Returns:
+            (new_hidden_state, ssm_gate_value)
+            ssm_gate_value ∈ (0, 1) — 基于 SSM 动力学的原理门控
+        """
+        try:
+            # 离散状态转移: h_t = A_bar @ h_{t-1} + B_bar @ x_t
+            new_h = self.A_bar @ hidden_state + self.B_bar @ input_features
+            new_h = np.tanh(new_h)  # 非线性稳定化
+
+            # SSM 门控: 基于当前状态的"活化能"
+            z_ssm = np.clip(self.W_ssm @ new_h + self.b_ssm, -50, 50)
+            g_ssm = 1.0 / (1.0 + np.exp(-z_ssm))
+
+            return new_h, float(g_ssm[0, 0])
+        except Exception as e:
+            logger.error("SSM step failed: %s", e, exc_info=True)
+            return hidden_state, 0.5  # 失败时中性值
+
+
+# ═══════════════════════════════════════════════════════════════
+# MLP 门控 — 经验学习型门控
+# ═══════════════════════════════════════════════════════════════
+
+class MLPGate:
+    """
+    MLP 门控 v2.1 — 基于 2 层 MLP 的经验学习门控。
+
+    读取 SSM 引擎的隐状态，通过策略梯度在线学习
+    最优的门控决策。
+
+    核心公式:
+      g_mlp = sigmoid(W_g · tanh(W_h · h_ssm + b_h) + b_g)
+    """
+
+    def __init__(self, config: DualGateConfig, rng: np.random.RandomState) -> None:
+        self.config = config
+        self.rng = rng
         self._init_weights()
-        # v2.0: 学习状态
         self._step_count: int = 0
         self._total_reward: float = 0.0
 
     def _init_weights(self) -> None:
-        """初始化 SSM 权重矩阵"""
         D = self.config.hidden_dim
-        M = self.config.input_dim
-        self.A = np.eye(D) * self.config.state_decay + np.random.randn(D, D) * 0.01
-        self.B = np.random.randn(D, M) * 0.1
-        self.W_g = np.random.randn(1, D) * 0.1
+        rng = self.rng
+        # MLP 隐层 (hidden_dim → hidden_dim)
+        self.W_h = rng.randn(D, D) * 0.05
+        self.b_h = np.zeros(D)
+        # 输出层 (hidden_dim → 1)
+        self.W_g = rng.randn(1, D) * 0.1
         self.b_g = np.zeros((1, 1))
+
+    def forward(self, ssm_state: np.ndarray) -> float:
+        """
+        基于 SSM 隐状态计算 MLP 门控值。
+
+        Args:
+            ssm_state: SSM 引擎产生的隐状态 (hidden_dim,)
+
+        Returns:
+            g_mlp ∈ (0, 1)
+        """
+        # 2 层 MLP
+        h = np.tanh(self.W_h @ ssm_state + self.b_h)
+        z = np.clip(self.W_g @ h + self.b_g, -100, 100)
+        g = 1.0 / (1.0 + np.exp(-z))
+        self._step_count += 1
+        return float(g[0, 0])
+
+    def learn(self, gate_value: float, outcome: float, ssm_state: np.ndarray) -> float:
+        """
+        策略梯度在线学习。
+
+        梯度: ∇ ∝ R · (g - outcome) · h_ssm
+
+        Args:
+            gate_value: MLP 当时输出的门控值
+            outcome: 实际结果 (0 或 1)
+            ssm_state: 决策时的 SSM 隐状态
+
+        Returns:
+            reward
+        """
+        if not self.config.mlp_enable_online_learning:
+            return 0.0
+
+        decision = 1.0 if gate_value > self.config.gate_threshold else 0.0
+        reward = 1.0 if abs(decision - outcome) < 0.5 else -1.0
+
+        self._total_reward = self.config.mlp_reward_decay * self._total_reward + reward
+
+        # 策略梯度 (经过隐层传播)
+        lr = self.config.mlp_learning_rate
+        grad_signal = reward * (gate_value - outcome)
+
+        h = np.tanh(self.W_h @ ssm_state + self.b_h)
+        h_2d = h.reshape(-1, 1)
+
+        self.W_g += lr * grad_signal * h_2d.T
+        self.b_g += lr * grad_signal * 0.01
+        np.clip(self.W_g, -5, 5, out=self.W_g)
+        np.clip(self.b_g, -5, 5, out=self.b_g)
+
+        return reward
+
+
+# ═══════════════════════════════════════════════════════════════
+# 双门控融合引擎
+# ═══════════════════════════════════════════════════════════════
+
+class DualAdaptiveGate:
+    """
+    SSM + MLP 双门控引擎 v3.0
+
+    相互优化配合模式:
+      SSM 提供理论保证的状态演化 (HiPPO 矩阵)
+      → MLP 学习从 SSM 状态到门控决策的映射
+      → α 融合两者输出
+      → 反馈同时调整 MLP 权重和 α 融合系数
+
+    门控值:
+      g = α · g_ssm + (1-α) · g_mlp
+
+    α 动力学:
+      - 初始 α₀ = 0.5 (等权)
+      - 每学习一步 α -= learning_decay (MLP 逐渐主导)
+      - 当 SSM 状态熵低(高确定性)时 α += entropy_boost
+    """
+
+    def __init__(self, config: Optional[DualGateConfig] = None) -> None:
+        self.config = config or DualGateConfig()
+        self._base_threshold: float = self.config.gate_threshold
+        self._rng = np.random.RandomState(self.config.seed if self.config.seed else 0)
+
+        # SSM + MLP 组件
+        self.ssm = SSMEngine(self.config, self._rng)
+        self.mlp = MLPGate(self.config, self._rng)
+
+        # α 融合系数
+        self.alpha: float = self.config.alpha_initial
+
+        # 学习状态
+        self._total_reward: float = 0.0
+        self._gate_history: list[float] = []  # 最近的 gate 值记录
 
     def step(
         self, hidden_state: np.ndarray, input_features: np.ndarray
     ) -> tuple[np.ndarray, float]:
         """
-        单步状态转移。
+        双门控单步推理。
 
         Args:
-            hidden_state: 上一时间步的隐状态 (hidden_dim,)
-            input_features: 当前时间步的输入特征 (input_dim,)
+            hidden_state: SSM 上一时间步隐状态 (hidden_dim,)
+            input_features: 当前输入特征 (input_dim,)
 
         Returns:
-            (new_hidden_state, gate_value)
-            gate_value 在 (0, 1) 之间，> threshold 时保留超边
+            (new_hidden_state, fused_gate_value)
         """
-        try:
-            h_t = np.tanh(self.A @ hidden_state + self.B @ input_features)
-            z = np.clip(self.W_g @ h_t + self.b_g, -100, 100)
-            g_t = 1.0 / (1.0 + np.exp(-z))
-            self._step_count += 1
-            return h_t, float(g_t[0, 0])
-        except Exception:
-            logger.warning("SSM gate step failed, defaulting to gate=1.0",
-                         exc_info=True)
-            return hidden_state, 1.0
+        # 1. SSM 步进（真正的结构化状态演化）
+        new_h, g_ssm = self.ssm.step(hidden_state, input_features)
+
+        # 2. MLP 基于 SSM 新状态做门控决策
+        g_mlp = self.mlp.forward(new_h)
+
+        # 3. α 融合
+        g = self.alpha * g_ssm + (1.0 - self.alpha) * g_mlp
+
+        self._gate_history.append(g)
+        if len(self._gate_history) > 100:
+            self._gate_history.pop(0)
+
+        return new_h, float(g)
 
     def should_keep(self, gate_value: float) -> bool:
-        """根据门控值判断是否保留超边。"""
         return gate_value > self.config.gate_threshold
 
     def compute_input_features(self, hyperedge_data: dict) -> np.ndarray:
-        """从超边数据计算输入特征向量（v2.0: 增加 importance）"""
+        """从超边数据计算输入特征向量"""
         features = np.zeros(self.config.input_dim)
         features[self.config.feat_mean_activation] = hyperedge_data.get("mean_activation", 0.0)
         features[self.config.feat_age_hours] = hyperedge_data.get("age_hours", 0.0)
@@ -114,81 +343,65 @@ class SSMGate:
         features[self.config.feat_tau_mean] = hyperedge_data.get("tau_mean", 0.0)
         features[self.config.feat_tau_variance] = hyperedge_data.get("tau_variance", 0.0)
         features[self.config.feat_connection_entropy] = hyperedge_data.get("connection_entropy", 0.0)
-        # v2.0: importance 特征
         features[self.config.feat_importance] = hyperedge_data.get("importance", 0.5)
         return features
 
-    # ======================== v2.0 新增 ========================
-
     def learn(self, gate_value: float, outcome: float, prev_h: np.ndarray) -> float:
-        """在线学习：根据实际结果调整门控权重
-        
-        简单 REINFORCE 风格更新：
-        如果 gate_value > threshold（决定保留）但 outcome 差（不应保留），
-        或者 gate_value < threshold（决定遗忘）但 outcome 好（应保留），
-        则调整 W_g 使下次决策更准。
-        
-        Args:
-            gate_value: 当时的门控值
-            outcome: 实际结果 [0, 1]，1=保留正确，0=遗忘正确
-            prev_h: 决策时的隐状态
-            
-        Returns:
-            reward: 本次更新的奖励值
         """
-        if not self.config.enable_online_learning:
-            return 0.0
-        
-        # 计算奖励
-        decision = 1.0 if gate_value > self.config.gate_threshold else 0.0
-        # reward = +1 决策正确，-1 错误
-        reward = 1.0 if abs(decision - outcome) < 0.5 else -1.0
-        
-        # 折扣累积奖励
-        self._total_reward = self.config.reward_decay * self._total_reward + reward
-        
-        # REINFORCE: ∇J ∝ reward · ∇log π(a|s)
-        # 简化：reward > 0 则强化当前决策方向，reward < 0 则反转
-        lr = self.config.learning_rate
-        grad_dir = 1.0 if reward > 0 else -1.0
-        
-        # 更新门控权重
-        h_2d = prev_h.reshape(-1, 1)  # (D, 1)
-        self.W_g += lr * grad_dir * h_2d.T  # (1, D)
-        self.b_g += lr * grad_dir * 0.01
-        
-        # 限制权重范围防止发散
-        np.clip(self.W_g, -5, 5, out=self.W_g)
-        np.clip(self.b_g, -5, 5, out=self.b_g)
-        
+        双门控联合学习。
+
+        不仅学习 MLP 权重，还动态调整 α 融合系数：
+        - 如果 MLP 决策正确，α 倾向 MLP (减小)
+        - 如果 SSM 状态熵低(确定性强)，α 倾向 SSM (增大)
+
+        Args:
+            gate_value: 双门控融合后的门控值
+            outcome: 实际结果 (0 或 1)
+            prev_h: 决策时的 SSM 隐状态
+
+        Returns:
+            reward
+        """
+        # 1. MLP 策略梯度学习
+        gate_mlp = self.mlp.forward(prev_h)  # 重放 MLP 门控值
+        reward = self.mlp.learn(gate_mlp, outcome, prev_h)
+
+        # 2. α 自适应调整
+
+        # 2a. MLP 学习推进 → α 衰减
+        if reward > 0:
+            self.alpha = max(self.config.alpha_min, self.alpha - self.config.alpha_learning_decay)
+
+        # 2b. SSM 熵校准
+        # 计算 SSM 状态熵: 高绝对值 → 低熵(确定) → 提权
+        state_norm = np.linalg.norm(prev_h) / math.sqrt(len(prev_h))
+        if state_norm > 1.0:
+            self.alpha = min(self.config.alpha_initial, self.alpha + self.config.alpha_entropy_boost * 0.1)
+
+        # 限制 α 范围
+        self.alpha = max(self.config.alpha_min, min(self.config.alpha_initial, self.alpha))
+
+        self._total_reward = self.config.mlp_reward_decay * self._total_reward + reward
         return reward
 
     def adapt_threshold(self, system_load: float = 0.5) -> float:
-        """自适应调整门控阈值
-        
-        系统负载高（节点多）时提高阈值，更激进地遗忘。
-        系统负载低时降低阈值，更保守地保留。
-        
-        Args:
-            system_load: [0, 1]，接近 1 表示高负载
-            
-        Returns:
-            新的阈值
-        """
-        # 基础阈值 ± 20% 范围
-        new_threshold = self.config.gate_threshold * (0.8 + 0.4 * system_load)
+        """自适应调整门控阈值"""
+        new_threshold = self._base_threshold * (0.8 + 0.4 * system_load)
         self.config.gate_threshold = max(0.3, min(0.8, new_threshold))
         return self.config.gate_threshold
 
     def reset_state(self) -> np.ndarray:
-        """重置隐状态为零向量"""
+        """重置 SSM 隐状态为零向量"""
         return np.zeros(self.config.hidden_dim)
 
     def get_stats(self) -> dict:
-        """获取门控统计（v2.0）"""
+        """获取双门控统计"""
         return {
-            "total_steps": self._step_count,
+            "type": "dual_ssm_mlp",
+            "alpha": round(self.alpha, 3),
+            "total_steps": self.mlp._step_count,
             "total_reward": round(self._total_reward, 3),
             "current_threshold": round(self.config.gate_threshold, 3),
-            "online_learning": self.config.enable_online_learning,
+            "ssm_hippo_order": self.config.ssm_hippo_order,
+            "online_learning": self.config.mlp_enable_online_learning,
         }

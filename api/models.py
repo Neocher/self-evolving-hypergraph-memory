@@ -260,8 +260,8 @@ class AuditOperation(BaseModel):
     node_id: str = Field(..., description="受影响的节点 ID")
     old_value: Optional[str] = Field(default=None, description="变更前值")
     new_value: Optional[str] = Field(default=None, description="变更后值")
-    reason: str = Field(default="explicit", description="操作原因: tau_decay|hebbian_prune|ssm_gate|community_merge|explicit")
-
+    reason: str = Field(default="explicit", description="操作原因: tau_decay|hebbian_prune|adaptive_gate|community_merge|explicit")
+reason: str = ""  # 'tau_decay' | 'hebbian_prune' | 'adaptive_gate' | 'community_merge' | 'explicit'
 
 class AuditTrace(BaseModel):
     """节点溯源链响应。"""

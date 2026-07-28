@@ -133,12 +133,12 @@ def _init_services() -> Services:
 
     # 6. SSM 门控
     try:
-        from core.ssm_gate import SSMGate
-        svc.ssm_gate = SSMGate(config=cfg.ssm)
-        logger.info("SSMGate initialized")
+        from core.ssm_gate import DualAdaptiveGate
+        svc.ssm_gate = DualAdaptiveGate(config=cfg.ssm)
+        logger.info("AdaptiveGate initialized")
     except Exception as e:
-        errors.append(f"SSMGate: {e}")
-        logger.warning("SSMGate init failed", error=str(e))
+        errors.append(f"AdaptiveGate: {e}")
+        logger.warning("AdaptiveGate init failed", error=str(e))
 
     # 7b. 本体验证器（[Ontology] 写时+读时验证层）
     if svc.kuzu_store is not None:

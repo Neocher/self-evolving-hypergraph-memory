@@ -29,7 +29,7 @@ class AuditOperation:
     node_id: str
     old_value: Optional[str] = None
     new_value: Optional[str] = None
-    reason: str = ""  # 'tau_decay' | 'hebbian_prune' | 'ssm_gate' | 'community_merge' | 'explicit'
+    reason: str = ""  # 'tau_decay' | 'hebbian_prune' | 'adaptive_gate' | 'community_merge' | 'explicit'
 
 
 @dataclass

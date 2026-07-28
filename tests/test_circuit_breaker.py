@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from graph.kuzu_store import (
+from graph.ryu_store import (
     CircuitBreaker,
     CircuitBreakerConfig,
     CircuitBreakerConfig as CBC,

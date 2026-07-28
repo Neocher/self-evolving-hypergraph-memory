@@ -28,13 +28,13 @@ class HyperedgeType(str, Enum):
 
 @dataclass
 class Hyperedge:
-    """超边数据模型"""
+    """自适应门控数据模型"""
     id: str
     type: HyperedgeType
     member_ids: List[str]       # [Harness Fix] 调用前需 ensure_member_ids_valid()
     created_at: float
     metadata: dict = field(default_factory=dict)
-    # 以下由 SSMGate 维护
+    # 以下由 DualAdaptiveGate 维护 (SSM+MLP双门控)
     hidden_state: Optional[list] = None
     gate_value: float = 1.0
 

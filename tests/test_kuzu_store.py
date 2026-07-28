@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from graph.kuzu_store import KuzuStore, CircuitBreakerOpen, CircuitBreakerConfig
+from graph.ryu_store import RyuStore as KuzuStore, CircuitBreakerOpen, CircuitBreakerConfig
 
 
 class TestKuzuStore:
