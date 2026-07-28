@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.14.0"
-__version_info__ = (5, 14, 0)
-__version_name__ = "完整差距闭环 — P0检索自演化 + P1预算/校准/事务 + P2遗忘/共享/梦境"
+__version__ = "5.14.1"
+__version_info__ = (5, 14, 1)
+__version_name__ = "多协议网关 — GatewayAPI + MCP + A2A + ACP + CLI + 一键部署"
 __release_date__ = "2026-07-28"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
