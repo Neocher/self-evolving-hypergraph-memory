@@ -289,6 +289,14 @@ def _init_services() -> Services:
         )
         svc.query_router = QueryRouter(**qr_kwargs)
         logger.info("QueryRouter initialized")
+
+        # 【自演化】包装检索层，实现检索配置自演化
+        try:
+            from retrieval.self_evolving import SelfEvolvingRetrieval
+            svc.query_router = SelfEvolvingRetrieval(svc.query_router)
+            logger.info("SelfEvolvingRetrieval wrapped")
+        except Exception as evo_e:
+            logger.warning("SelfEvolvingRetrieval init failed", error=str(evo_e))
     except Exception as e:
         errors.append(f"QueryRouter: {e}")
         logger.warning("QueryRouter init failed", error=str(e))
