@@ -44,6 +44,10 @@ class DreamReport:
     keywords_extracted: int = 0
     pruned_node_ids: list[str] = field(default_factory=list)
     new_episode_ids: list[str] = field(default_factory=list)
+    # 信心校准 (Manufactured Confidence, P1)
+    calibrator_flagged: int = 0
+    calibrator_high_consolidation: int = 0
+    calibrator_tracked: int = 0
 
 
 class DreamPipeline:
@@ -71,6 +75,7 @@ class DreamPipeline:
         audit_chain=None,
         llm_client=None,
         ontology_validator=None,
+        confidence_calibrator=None,
     ) -> None:
         """
         Args:
@@ -79,12 +84,14 @@ class DreamPipeline:
             audit_chain: AuditChain 实例
             llm_client: LLMClient 实例（可选，提供时启用 LLM 语义摘要）
             ontology_validator: OntologyValidator 实例（可选，P1 本体约束社区检测）
+            confidence_calibrator: ConfidenceCalibrator 实例（可选，P1 过度巩固防护）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
         self.audit_chain = audit_chain
         self.llm_client = llm_client
         self.ontology_validator = ontology_validator
+        self.confidence_calibrator = confidence_calibrator
 
     async def run(
         self,
@@ -130,6 +137,32 @@ class DreamPipeline:
         # Step 3: SYNTHESIZE — 生成社区摘要
         communities = await self._synthesize_step(communities)
         logger.info("Dream %s: SYNTHESIZE — %d reports generated", dream_id, len(communities))
+
+        # Step 3b: CALIBRATE — 信心校准 (Manufactured Confidence, P1)
+        calibrator_flagged = 0
+        calibrator_high = 0
+        calibrator_tracked = 0
+        if self.confidence_calibrator is not None:
+            for comm in communities:
+                report_text = comm.get("report", "") or ""
+                if not report_text:
+                    continue
+                # 校准每条社区报告的信心
+                source = comm.get("source_type", "inferred")
+                cal_conf, flagged = self.confidence_calibrator.calibrate(
+                    report_text, comm.get("confidence", 0.7), source
+                )
+                comm["confidence"] = round(cal_conf, 3)
+                self.confidence_calibrator.record_consolidation(report_text, source)
+                if flagged:
+                    calibrator_flagged += 1
+                    logger.info("Dream %s: CALIBRATOR flagged community (conf=%.2f)",
+                                dream_id, cal_conf)
+            s = self.confidence_calibrator.state()
+            calibrator_high = s["high_consolidation"]
+            calibrator_tracked = s["total_tracked"]
+            logger.info("Dream %s: CALIBRATE — %d flagged, %d high-consolidation",
+                        dream_id, calibrator_flagged, calibrator_high)
 
         # Step 4: COMPRESS — TF-IDF 压缩 + 预算控制
         communities, kw_count = self._compress_step(communities)
@@ -227,6 +260,9 @@ class DreamPipeline:
             compressed_facts=fact_count,
             keywords_extracted=kw_count,
             pruned_node_ids=all_removed_ids,
+            calibrator_flagged=calibrator_flagged,
+            calibrator_high_consolidation=calibrator_high,
+            calibrator_tracked=calibrator_tracked,
         )
 
     # ─── Step 1: GATHER ───────────────────────────────────
