@@ -96,9 +96,11 @@ class TestDualAdaptiveGate:
         assert not np.allclose(w_before, gate.mlp.W_g)
 
     def test_learn_reduces_alpha(self, gate: DualAdaptiveGate):
-        """正奖励学习后 α 应减小（MLP 逐渐主导）。"""
+        """正奖励学习后 α 应减小（MLP 逐渐主导）。预算感知门控下需先消耗预算。"""
         h = np.zeros(gate.config.hidden_dim)
         f = np.ones(gate.config.input_dim) * 0.5
+        # 先消耗预算使 budget_ratio < 0.5，避免预算偏移干扰 α 衰减
+        gate._budget = 10.0
         new_h, gv = gate.step(h, f)
         alpha_before = gate.alpha
         gate.learn(gv, 1.0, new_h)
