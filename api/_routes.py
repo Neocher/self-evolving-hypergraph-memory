@@ -1654,6 +1654,31 @@ async def list_conflicts(
         {"limit": limit}
     )
     conflicts = []
+    # 收集所有 episode ID 批量查询
+    all_episode_ids = set()
+    for r in rows:
+        e_a = r.get("c.episode_a", "")
+        e_b = r.get("c.episode_b", "")
+        if e_a:
+            all_episode_ids.add(e_a)
+        if e_b:
+            all_episode_ids.add(e_b)
+
+    episode_map = {}
+    if all_episode_ids and deps.kuzu_store is not None:
+        id_list = "', '".join(all_episode_ids)
+        try:
+            ep_rows = deps.kuzu_store.query_cypher(
+                f"MATCH (e:EpisodeNode) WHERE e.id IN ['{id_list}'] RETURN e.id, e.version"
+            )
+            for er in ep_rows:
+                if isinstance(er, (list, tuple)):
+                    episode_map[str(er[0])] = int(er[1]) if len(er) > 1 else 1
+                elif isinstance(er, dict):
+                    episode_map[str(er.get("e.id", ""))] = int(er.get("e.version", 1))
+        except Exception:
+            pass
+
     for r in rows:
         conflict_entry = {
             "id": r.get("c.id", ""),
@@ -1663,13 +1688,8 @@ async def list_conflicts(
             "detected_at": r.get("c.detected_at", 0.0),
             "resolved": r.get("c.resolved", False),
         }
-        # 附带 OCC 版本信息（如果冲突节点有 version 信息）
-        episode_a = deps.kuzu_store.get_episode(conflict_entry["episode_a"]) if conflict_entry["episode_a"] else None
-        episode_b = deps.kuzu_store.get_episode(conflict_entry["episode_b"]) if conflict_entry["episode_b"] else None
-        if episode_a:
-            conflict_entry["episode_a_version"] = episode_a.get("version", 1)
-        if episode_b:
-            conflict_entry["episode_b_version"] = episode_b.get("version", 1)
+        conflict_entry["episode_a_version"] = episode_map.get(conflict_entry["episode_a"], 1)
+        conflict_entry["episode_b_version"] = episode_map.get(conflict_entry["episode_b"], 1)
         conflicts.append(conflict_entry)
 
     # OCC 冲突日志统计
