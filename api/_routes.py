@@ -138,7 +138,7 @@ def init_services(svc: Services) -> None:
     except Exception:
         logger.warning("DefenseEngine init failed (non-fatal)")
     try:
-        svc.quarantine_store = QuarantineStore(kuzu_store=svc.kuzu_store)
+        svc.quarantine_store = QuarantineStore(graph_store=svc.kuzu_store)
     except Exception:
         logger.warning("QuarantineStore init failed (non-fatal)")
     _services = svc

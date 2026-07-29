@@ -335,7 +335,7 @@ def _init_services() -> Services:
     if svc.kuzu_store is not None:
         try:
             from core.quarantine_store import QuarantineStore
-            svc.quarantine_store = QuarantineStore(kuzu_store=svc.kuzu_store)
+            svc.quarantine_store = QuarantineStore(graph_store=svc.kuzu_store)
             # 启动时从 Kuzu 同步已有隔离节点
             q_count = svc.quarantine_store.refresh()
             logger.info("QuarantineStore initialized", quarantined_count=q_count)
