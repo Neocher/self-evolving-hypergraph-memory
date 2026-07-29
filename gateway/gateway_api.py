@@ -537,7 +537,7 @@ class GatewayAPI:
         """深度健康检查，覆盖所有核心组件。"""
         start = time.time()
         checker = HealthChecker(
-            kuzu_store=self._svc.kuzu_store,
+            graph_store=self._svc.kuzu_store,
             faiss_index=self._svc.faiss_index,
             audit_chain=self._svc.audit_chain,
             dream_scheduler=self._svc.dream_scheduler,

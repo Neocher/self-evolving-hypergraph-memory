@@ -1517,7 +1517,7 @@ async def health_check(
     set_trace_id()
 
     checker = HealthChecker(
-        kuzu_store=deps.kuzu_store,
+        graph_store=deps.kuzu_store,
         faiss_index=deps.faiss_index,
         audit_chain=deps.audit_chain,
         dream_scheduler=deps.dream_scheduler,

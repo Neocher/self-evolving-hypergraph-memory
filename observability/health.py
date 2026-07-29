@@ -2,7 +2,7 @@
 深度健康检查
 ===========
 提供系统各组件可用性和完整性检测：
-- Kuzu 连接状态 + 断路器状态
+- RyuGraph 连接状态 + 断路器状态
 - FAISS 索引状态（大小、可搜索）
 - BLAKE3 溯源链完整性
 - 梦境调度器状态
@@ -62,12 +62,12 @@ class HealthChecker:
 
     def __init__(
         self,
-        kuzu_store=None,
+        graph_store=None,
         faiss_index=None,
         audit_chain=None,
         dream_scheduler=None,
     ) -> None:
-        self.kuzu_store = kuzu_store
+        self.kuzu_store = graph_store  # kuzu_store 作为属性名保持向后兼容
         self.faiss_index = faiss_index
         self.audit_chain = audit_chain
         self.dream_scheduler = dream_scheduler
@@ -77,7 +77,7 @@ class HealthChecker:
         """执行完整的深度健康检查。"""
         result = HealthCheckResult(
             status="ok",
-            graph_connected=self._check_kuzu(),
+            graph_connected=self._check_graph(),
             faiss_loaded=self._check_faiss(),
             uptime_seconds=time.time() - self._start_time,
         )
@@ -95,7 +95,7 @@ class HealthChecker:
                     "MATCH (n) RETURN count(*) AS cnt"
                 )
                 if node_rows and len(node_rows) > 0:
-                    # Kuzu returns [[298]] not [{"cnt": 298}]
+                    # RyuGraph returns [[298]] not [{"cnt": 298}]
                     row = node_rows[0]
                     if isinstance(row, (list, tuple)):
                         result.node_count = int(row[0])
@@ -142,8 +142,8 @@ class HealthChecker:
 
         return result
 
-    def _check_kuzu(self) -> bool:
-        """检查 Kuzu 连接状态。"""
+    def _check_graph(self) -> bool:
+        """检查 RyuGraph 连接状态。"""
         if self.kuzu_store is None:
             return False
         try:
