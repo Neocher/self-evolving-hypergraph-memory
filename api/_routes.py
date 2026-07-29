@@ -2067,29 +2067,23 @@ async def list_hyperedges(
 
     try:
         rows = deps.kuzu_store.query_cypher(
-            "MATCH (h:HyperedgeNode) RETURN h.* ORDER BY h.created_at DESC LIMIT $limit",
+            "MATCH (h:HyperedgeNode) "
+            "OPTIONAL MATCH (h)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) "
+            "WITH h, collect(e.id) AS member_ids "
+            "RETURN h.*, member_ids ORDER BY h.created_at DESC LIMIT $limit",
             {"limit": limit},
         )
         results = []
+        import json as _j
         for row in rows:
             if isinstance(row, (list, tuple)):
                 h = {"id": row[0], "type": row[1], "created_at": row[2], "gate_value": row[3], "metadata": row[4]}
+                member_ids = list(row[5]) if len(row) > 5 else []
             elif isinstance(row, dict):
                 h = {k.split(".")[-1]: v for k, v in row.items()}
+                member_ids = list(h.pop("member_ids", []) or [])
             else:
                 continue
-            # 解析成员
-            member_rows = deps.kuzu_store.query_cypher(
-                "MATCH (h:HyperedgeNode {id: $id})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id",
-                {"id": h["id"]},
-            )
-            member_ids = []
-            for mr in member_rows:
-                if isinstance(mr, (list, tuple)):
-                    member_ids.append(str(mr[0]))
-                elif isinstance(mr, dict):
-                    member_ids.append(str(mr.get("id", "")))
-            import json as _j
             try:
                 metadata = _j.loads(h.get("metadata", "{}")) if isinstance(h.get("metadata"), str) else h.get("metadata", {})
             except Exception:
