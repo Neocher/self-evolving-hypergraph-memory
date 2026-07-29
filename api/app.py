@@ -15,8 +15,10 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config.settings import load_settings, get_settings
 from api.routes import router, init_services, Services
@@ -566,6 +568,16 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # 请求体大小限制（防止 DoS）
+    max_body = int(os.environ.get("SHM_MAX_BODY", str(8 * 1024 * 1024)))  # 默认 8MB
+    @app.middleware("http")
+    async def limit_body_size(request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > max_body:
+            return JSONResponse(status_code=413, content={"error": "request_too_large",
+                "detail": f"Max body size: {max_body} bytes"})
+        return await call_next(request)
 
     # 认证 + 速率限制（在 observe_request 之前）
     from gateway.auth import create_auth_middleware, is_dev_mode
