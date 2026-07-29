@@ -18,7 +18,9 @@ DEFAULT_TOKEN_DIR = os.path.expanduser("~/.shm")
 
 
 class TokenManager:
-    """基于文件的 Token 认证管理器。"""
+    """基于文件的 Token 认证管理器。支持 TTL 和 scope。"""
+
+    DEFAULT_TTL = 30 * 24 * 3600  # 默认 30 天
 
     def __init__(self, token_path: Optional[str] = None):
         self._path = token_path or os.path.join(DEFAULT_TOKEN_DIR, "auth.tokens")
@@ -27,18 +29,30 @@ class TokenManager:
 
     def validate(self, token: str) -> Optional[dict]:
         """验证 token 有效性，返回 token 信息或 None。"""
+        now = time.time()
         for name, info in self._tokens.items():
             if info.get("token") == token:
+                expires_at = info.get("expires_at", 0)
+                if expires_at and now > expires_at:
+                    self.revoke_key(name)
+                    return None
                 return {"name": name, **info}
         return None
 
-    def create_key(self, name: str) -> str:
-        """创建新 token。"""
+    def create_key(self, name: str, ttl: int = DEFAULT_TTL, scope: str = "admin") -> str:
+        """创建新 token。
+        Args:
+            name: token 名称标识
+            ttl: 过期时间（秒），默认 30 天
+            scope: 权限范围（admin/readonly）
+        """
         token = "shm_" + secrets.token_hex(16)
         self._tokens[name] = {
             "token": token,
             "created_at": time.time(),
+            "expires_at": time.time() + ttl,
             "name": name,
+            "scope": scope,
         }
         self._save()
         return token
@@ -54,7 +68,8 @@ class TokenManager:
     def list_keys(self) -> list[dict]:
         """列出所有 token（不含 token 值）。"""
         return [
-            {"name": k, "created_at": v["created_at"]}
+            {"name": k, "created_at": v["created_at"],
+             "expires_at": v.get("expires_at", 0), "scope": v.get("scope", "")}
             for k, v in self._tokens.items()
         ]
 
@@ -67,6 +82,14 @@ class TokenManager:
                 with open(self._path) as f:
                     data = json.load(f)
                 self._tokens = data.get("tokens", {})
+                # 清理过期 token
+                now = time.time()
+                expired = [k for k, v in self._tokens.items()
+                           if v.get("expires_at", 0) and now > v.get("expires_at", 0)]
+                for k in expired:
+                    del self._tokens[k]
+                if expired:
+                    self._save()
             else:
                 self._tokens = {}
         except (json.JSONDecodeError, OSError):
