@@ -633,17 +633,20 @@ async def create_episode(
             if triples:
                 # 批量创建实体节点（一次 Kuzu 调用）
                 entity_statements = []
+                entity_params = {}
                 seen_entities = set()
                 for t in triples:
                     for entity_name in (t.subject, t.obj):
                         if entity_name not in seen_entities:
                             seen_entities.add(entity_name)
+                            idx = len(seen_entities)
                             entity_statements.append(
-                                f"MERGE (n{len(seen_entities)}:OntologyEntity {{name: '{entity_name}'}}) "
-                                f"ON CREATE SET n{len(seen_entities)}.type = 'discovered'"
+                                f"MERGE (n{idx}:OntologyEntity {{name: $n{idx}_name}}) "
+                                f"ON CREATE SET n{idx}.type = 'discovered'"
                             )
+                            entity_params[f"n{idx}_name"] = entity_name
                 if entity_statements:
-                    deps.kuzu_store.query_cypher(" ".join(entity_statements))
+                    deps.kuzu_store.query_cypher(" ".join(entity_statements), entity_params)
                 # 批量创建关系边（一次 Kuzu 调用）
                 for t in triples:
                     deps.kuzu_store.query_cypher(
