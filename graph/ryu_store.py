@@ -344,6 +344,14 @@ class RyuStore:
                 "If you are migrating from an older database, delete the DB file and restart."
             )
 
+        # 查询索引 — 加速按时间/来源的过滤和排序
+        try:
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_created_at ON (EpisodeNode.created_at)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_source ON (EpisodeNode.source)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_hyperedge_created_at ON (HyperedgeNode.created_at)")
+        except RuntimeError:
+            pass  # 旧版本 RyuGraph 可能不支持 CREATE INDEX
+
     def _execute_with_circuit_breaker(self, query_func, *args, **kwargs):
         """
         [Harness Fix] 带断路器的查询执行封装。
