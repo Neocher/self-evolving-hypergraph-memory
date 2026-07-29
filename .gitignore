@@ -1,39 +1,34 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
+
 build/
-
-# Virtual Environment
-.venv/
-venv/
-
-# Data & Cache
-data/
-*.log
-*.wal
-.huggingface/
 .cache/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
+data/
+data.bak.*/
+# Data & Cache
+dist/
 .DS_Store
-Thumbs.db
-
-# Environment
+*.egg-info/
 .env
+# Environment
 *.env.local
-
-# Reports
-*.html
 *.excalidraw
 graphify-out/
-graphify-out/
+*.html
+.huggingface/
+# IDE
+.idea/
+*.log
+.omo/
+# OS
+__pycache__/
+*.py[cod]
+# Python
+# Reports
 .shm_env
-data.bak.*/
+*.swo
+*.swp
+Thumbs.db
+.venv/
+venv/
+# Virtual Environment
+.vscode/
+*.wal
