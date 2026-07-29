@@ -32,3 +32,4 @@ venv/
 # Virtual Environment
 .vscode/
 *.wal
+smart-router-solution.tar.gz
