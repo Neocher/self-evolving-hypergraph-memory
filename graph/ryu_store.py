@@ -374,12 +374,21 @@ class RyuStore:
         def _do_create():
             params = dict(episode)
             params.setdefault("version", 1)
-            self.conn.execute(
-                "CREATE (e:EpisodeNode {id: $id, content: $content, "
-                "created_at: $created_at, tau_initial: $tau_initial, "
-                "source: $source, visibility: $visibility, version: $version})",
-                params
-            )
+            # visibility 可选列（向后兼容旧版本 RyuGraph）
+            if "visibility" in params:
+                self.conn.execute(
+                    "CREATE (e:EpisodeNode {id: $id, content: $content, "
+                    "created_at: $created_at, tau_initial: $tau_initial, "
+                    "source: $source, visibility: $visibility, version: $version})",
+                    params
+                )
+            else:
+                self.conn.execute(
+                    "CREATE (e:EpisodeNode {id: $id, content: $content, "
+                    "created_at: $created_at, tau_initial: $tau_initial, "
+                    "source: $source, version: $version})",
+                    params
+                )
             return episode['id']
 
         return self._execute_with_circuit_breaker(_do_create)
