@@ -2053,54 +2053,6 @@ async def visualize_attention(
     }
 
 
-# ═══════════════════════════════════════════════════════════
-# 超边 (Hyperedge) 端点
-# ═══════════════════════════════════════════════════════════
-
-
-@router.post("/hyperedges", summary="手动创建超边")
-async def create_hyperedge(
-    req: HyperedgeCreate,
-    deps: Services = Depends(get_services),
-) -> HyperedgeResponse:
-    """手动创建超边（有 member_ids 自动校验 ≥2）。"""
-    start = _now()
-    set_trace_id()
-
-    if deps.hyperedge_manager is None:
-        raise HTTPException(status_code=503, detail="HyperedgeManager not available")
-
-    try:
-        if req.type == APIHyperedgeType.EPISODE:
-            edge = deps.hyperedge_manager.create_episode_hyperedge(
-                member_ids=req.member_ids, topic=req.topic
-            )
-        elif req.type == APIHyperedgeType.SEMANTIC:
-            edge = deps.hyperedge_manager.create_semantic_hyperedge(
-                member_ids=req.member_ids, conclusion=req.conclusion or ""
-            )
-        elif req.type == APIHyperedgeType.TEMPORAL:
-            edge = deps.hyperedge_manager.create_temporal_hyperedge(
-                member_ids=req.member_ids,
-                start_time=req.start_time or start,
-                end_time=req.end_time or start,
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown hyperedge type: {req.type}")
-
-        record_request("POST", "/hyperedges", "200", _now() - start)
-        return HyperedgeResponse(
-            id=edge.id,
-            type=APIHyperedgeType(edge.type.value),
-            member_ids=edge.member_ids,
-            created_at=edge.created_at,
-            gate_value=edge.gate_value,
-            metadata=edge.metadata,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.get("/hyperedges", summary="列出所有超边")
 async def list_hyperedges(
     limit: int = Query(default=50, ge=1, le=500),
@@ -2156,33 +2108,6 @@ async def list_hyperedges(
     except Exception as e:
         logger.exception("Failed to list hyperedges")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/hyperedges/{hyperedge_id}", summary="查询单个超边")
-async def get_hyperedge(
-    hyperedge_id: str,
-    deps: Services = Depends(get_services),
-) -> HyperedgeResponse:
-    """按 ID 查询超边详情（含成员节点列表）。"""
-    start = _now()
-    set_trace_id()
-
-    if deps.hyperedge_manager is None:
-        raise HTTPException(status_code=503, detail="HyperedgeManager not available")
-
-    edge = deps.hyperedge_manager.get_hyperedge(hyperedge_id)
-    if edge is None:
-        raise HTTPException(status_code=404, detail=f"Hyperedge {hyperedge_id} not found")
-
-    record_request("GET", f"/hyperedges/{hyperedge_id}", "200", _now() - start)
-    return HyperedgeResponse(
-        id=edge.id,
-        type=APIHyperedgeType(edge.type.value),
-        member_ids=edge.member_ids,
-        created_at=edge.created_at,
-        gate_value=edge.gate_value,
-        metadata=edge.metadata,
-    )
 
 
 @router.get("/hyperedges/by-node/{node_id}", summary="查询节点所属的所有超边")

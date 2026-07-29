@@ -9,6 +9,7 @@ FastAPI 应用工厂
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -552,11 +553,16 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS
+    # CORS — 生产环境应配置具体域名（通过 SHM_CORS_ORIGINS 环境变量）
+    origins = os.environ.get("SHM_CORS_ORIGINS", "")
+    if origins:
+        allow_origins = [o.strip() for o in origins.split(",")]
+    else:
+        allow_origins = ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=allow_origins,
+        allow_credentials=allow_origins != ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )

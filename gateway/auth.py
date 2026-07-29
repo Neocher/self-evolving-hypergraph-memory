@@ -110,4 +110,4 @@ def create_auth_middleware(dev_mode: bool = True, skip_paths: Optional[list] = N
 
 
 def is_dev_mode() -> bool:
-    return os.environ.get("DEV_MODE", "true").lower() == "true"
+    return os.environ.get("DEV_MODE", "false").lower() == "true"
