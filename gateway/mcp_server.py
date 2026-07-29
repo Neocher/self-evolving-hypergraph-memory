@@ -1,188 +1,31 @@
 """
-MCP Server — SHM 记忆网关
-=========================
-通过 Model Context Protocol (stdio 传输) 暴露 SHM 核心能力。
-供 Claude Desktop / Cursor / Windsurf 等 MCP 客户端使用。
+MCP Server — SHM 记忆网关 + 三体协奏管道
+===========================================
+通过 Model Context Protocol (SSE/stdio) 暴露 SHM 核心能力和 Agent 调度。
+对已有 SHM 服务 (:8000) 和 ACP 桥 (:8770) 通过 HTTP 访问，不创建新连接。
 
 运行方式:
-    # stdio 模式（默认，用于 Claude Desktop 等）
-    python -m gateway.mcp_server
-
-    # 或通过 SSE 运行在 :8002
+    # SSE 模式（推荐，供外部 MCP 客户端连接）
     python -m gateway.mcp_server --port 8002
 
-Claude Desktop 配置:
-    {
-        "mcpServers": {
-            "shm": {
-                "command": "python3",
-                "args": ["-m", "gateway.mcp_server"],
-                "env": {}
-            }
-        }
-    }
+    # stdio 模式
+    python -m gateway.mcp_server
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 
+import httpx
 from mcp.server.fastmcp import FastMCP
-
-from gateway.gateway_api import GatewayAPI
 
 logger = logging.getLogger("gateway.mcp")
 
-
-def _build_gateway() -> GatewayAPI:
-    """初始化 SHM 服务并返回 GatewayAPI 实例。"""
-    from api._routes import init_services
-    from api.app import _init_services
-
-    svc = _init_services()
-    init_services(svc)
-    logger.info("SHM services initialized for MCP gateway")
-    return GatewayAPI(svc)
-
-
-def register_tools(mcp: FastMCP, api: GatewayAPI) -> None:
-    """向 FastMCP 注册所有 SHM 工具。"""
-
-    @mcp.tool(
-        name="shm_write",
-        description="将原始文本写入 SHM Layer1 感觉缓冲区（环形缓冲区）。返回 record_id 和 buffer_usage。",
-    )
-    async def shm_write(
-        content: str,
-        source: str = "api",
-        namespace: str | None = None,
-    ) -> str:
-        """写入感觉缓冲区。"""
-        result = await api.write_sensory(content=content, source=source, namespace=namespace)
-        return (
-            f"Written to sensory buffer: record_id={result.record_id}, "
-            f"buffer_usage={result.buffer_usage}"
-        )
-
-    @mcp.tool(
-        name="shm_store_episode",
-        description="直接创建 Layer2 情节节点（记忆），含 τ 衰减计算、SSM 门控过滤和命名空间链接。",
-    )
-    async def shm_store_episode(
-        content: str,
-        source: str = "user",
-        namespace: str | None = None,
-        metadata: str | None = None,
-        force_promote: bool = False,
-        visibility: str = "private",
-    ) -> str:
-        """创建情节记忆节点。"""
-        import json
-        meta = json.loads(metadata) if metadata else None
-        result = await api.store_episode(
-            content=content,
-            source=source,
-            namespace=namespace,
-            metadata=meta,
-            force_promote=force_promote,
-            visibility=visibility,
-        )
-        return (
-            f"Episode created: id={result.episode_id}, status={result.status}, "
-            f"tau={result.tau_initial:.3f}"
-        )
-
-    @mcp.tool(
-        name="shm_retrieve",
-        description="三级融合检索（语义向量 + 关键词 + 图），含 Cypher 兜底和去重。返回格式化为文本的结果列表。",
-    )
-    async def shm_retrieve(
-        query: str,
-        top_k: int = 20,
-        namespace: str | None = None,
-        include_shared: bool = True,
-    ) -> str:
-        """融合检索记忆。"""
-        result = await api.retrieve(
-            query=query,
-            top_k=top_k,
-            namespace=namespace,
-            include_shared=include_shared,
-        )
-        if not result.results:
-            return f"No results found for query: {query!r} (latency={result.latency_ms:.0f}ms)"
-
-        lines = [
-            f"Retrieved {result.total_found} results for {query!r} "
-            f"(strategy={result.strategy_used}, degraded={result.degraded}, "
-            f"latency={result.latency_ms:.0f}ms):"
-        ]
-        for i, r in enumerate(result.results[:top_k], 1):
-            content = r.content[:200].replace("\n", " ")
-            lines.append(f"  {i:2d}. [{r.score:.3f}] {content}")
-        return "\n".join(lines)
-
-    @mcp.tool(
-        name="shm_search_vector",
-        description="纯向量检索（直通 FAISS），不经过三级融合管道。适合精确语义匹配。",
-    )
-    async def shm_search_vector(
-        query: str,
-        top_k: int = 10,
-    ) -> str:
-        """纯向量检索。"""
-        result = await api.search_vector(query=query, limit=top_k)
-        if not result.results:
-            return f"No vector results for query: {query!r} (latency={result.latency_ms:.0f}ms)"
-
-        lines = [
-            f"Vector search: {result.total_found} results for {query!r} "
-            f"(degraded={result.degraded}, latency={result.latency_ms:.0f}ms):"
-        ]
-        for i, r in enumerate(result.results[:top_k], 1):
-            content = r.content[:150].replace("\n", " ")
-            lines.append(f"  {i:2d}. [{r.score:.4f}] {content}")
-        return "\n".join(lines)
-
-    @mcp.tool(
-        name="shm_health",
-        description="SHM 深度健康检查 — 返回所有核心组件的运行状态：Kuzu 图库、FAISS 索引、溯源链、梦境调度器。",
-    )
-    async def shm_health() -> str:
-        """深度健康检查。"""
-        h = await api.health()
-        return (
-            f"Status: {h.status}\n"
-            f"Graph connected: {h.graph_connected}\n"
-            f"FAISS loaded: {h.faiss_loaded}\n"
-            f"Dream scheduler: {h.dream_scheduler_running}\n"
-            f"Node count: {h.stats.get('node_count', 'N/A')}\n"
-            f"Hyperedge count: {h.stats.get('hyperedge_count', 'N/A')}\n"
-            f"Chain verified: {h.stats.get('chain_verified', 'N/A')}\n"
-            f"Uptime: {h.stats.get('uptime_seconds', 0):.0f}s\n"
-            f"FAISS index size: {h.stats.get('faiss_index_size', 'N/A')}\n"
-            f"Last dream: {h.stats.get('last_dream_time', 'N/A')}\n"
-            f"Dream runs: {h.stats.get('dream_run_count', 'N/A')}"
-        )
-
-    @mcp.tool(
-        name="shm_dream_trigger",
-        description="显式触发 SHM 梦境整合管道 — 对记忆进行社区发现、压缩、剪枝、冲突消解。",
-    )
-    async def shm_dream_trigger(mode: str = "auto") -> str:
-        """显式触发 SHM 梦境整合管道 — 对记忆进行社区发现、压缩、剪枝、冲突消解。"""
-        result = await api.trigger_dream(mode=mode)
-        return f"Dream trigger: accepted={result.accepted}, message={result.message}"
-
-
-# ── Trio Concerto Pipeline 工具 ──────────────────────────────────────
-
-import asyncio
-import httpx
-
 _AC_BRIDGE = "http://127.0.0.1:8770"
+_SHM_API = "http://127.0.0.1:8000"
 _AGENT_MAP = {
     "cc": "claude-code", "claude-code": "claude-code",
     "oc": "opencode", "opencode": "opencode",
@@ -191,9 +34,9 @@ _AGENT_MAP = {
 
 
 async def _acp_dispatch(agent: str, prompt: str) -> dict:
-    """通过 ACP 桥发送任务并等待结果。"""
+    """通过 ACP 桥发送任务并轮询等待结果。"""
     target = _AGENT_MAP.get(agent, agent)
-    async with httpx.AsyncClient(timeout=600) as client:
+    async with httpx.AsyncClient(timeout=620) as client:
         r = await client.post(
             f"{_AC_BRIDGE}/dispatch",
             json={"target_agent": target, "prompt": prompt},
@@ -209,7 +52,7 @@ async def _acp_dispatch(agent: str, prompt: str) -> dict:
         return {"status": "timeout", "output": "", "error": "poll timed out"}
 
 
-def _format_result(agent: str, result: dict) -> str:
+def _fmt_result(agent: str, result: dict) -> str:
     out = f"Agent: {agent}\nStatus: {result['status']}\nElapsed: {result.get('elapsed', 'N/A')}s\n"
     if result.get("output"):
         out += f"\nOutput:\n{result['output'][:2000]}"
@@ -218,22 +61,38 @@ def _format_result(agent: str, result: dict) -> str:
     return out
 
 
-def register_pipeline_tools(mcp: FastMCP) -> None:
+def register_tools(mcp: FastMCP) -> None:
+    """向 FastMCP 注册所有工具（通过 HTTP 调用已有服务）。"""
+
+    @mcp.tool(name="shm_health", description="SHM 健康检查 — 返回核心组件状态。")
+    async def shm_health() -> str:
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                h = (await c.get(f"{_SHM_API}/health")).json()
+            s = h.get("stats", {})
+            return (
+                f"Status: {h.get('status', '?')}\n"
+                f"Graph: {h.get('graph_connected', '?')}\n"
+                f"Version: {s.get('version', '?')} — {s.get('version_name', '?')}\n"
+                f"Nodes: {s.get('node_count', '?')} | Hyperedges: {s.get('hyperedge_count', '?')}\n"
+                f"FAISS: {s.get('faiss_index_size', '?')} vectors\n"
+                f"Dream runs: {s.get('dream_run_count', '?')} | Uptime: {s.get('uptime_seconds', 0):.0f}s"
+            )
+        except Exception as e:
+            return f"SHM unavailable: {e}"
 
     @mcp.tool(
         name="pipeline_dispatch",
-        description="向指定 Agent 发送任务（CC/OpenCode/Codex），等待完成。返回执行结果。",
+        description="向指定 Agent 发任务（cc/claude-code / opencode/oc / codex），等待完成。",
     )
     async def pipeline_dispatch(agent: str, prompt: str) -> str:
-        """向指定 Agent 发送任务。"""
-        return _format_result(agent, await _acp_dispatch(agent, prompt))
+        return _fmt_result(agent, await _acp_dispatch(agent, prompt))
 
     @mcp.tool(
         name="pipeline_trio",
-        description="运行完整三体协奏管道：CC 设计 -> OpenCode 实现 -> Codex 审核。返回三段执行结果。",
+        description="完整三体协奏：CC 设计 → OpenCode 实现 → Codex 审核。返回三段结果。",
     )
     async def pipeline_trio(prompt: str) -> str:
-        """三段式编排：设计→实现→审核。"""
         parts = []
         for agent, role in [("cc", "设计"), ("opencode", "实现"), ("codex", "审核")]:
             parts.append(f"─── {role} ({agent}) ───")
@@ -248,10 +107,9 @@ def register_pipeline_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="pipeline_status",
-        description="查询 ACP 桥的所有 Agent 健康状态和当前任务数。",
+        description="查询 ACP 桥的所有 Agent 健康状态和活跃任务数。",
     )
     async def pipeline_status() -> str:
-        """查询 Agent 健康状态。"""
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{_AC_BRIDGE}/agents")
             agents = r.json()
@@ -263,8 +121,7 @@ def register_pipeline_tools(mcp: FastMCP) -> None:
                     f" degraded={'YES' if info['degraded'] else 'no'}"
                 )
             try:
-                r2 = await client.get(f"{_AC_BRIDGE}/health")
-                h = r2.json()
+                h = (await client.get(f"{_AC_BRIDGE}/health")).json()
                 lines.append(f"\nActive tasks: {h.get('tasks', '?')}")
             except Exception:
                 pass
@@ -273,14 +130,8 @@ def register_pipeline_tools(mcp: FastMCP) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SHM MCP Gateway Server")
-    parser.add_argument(
-        "--port", type=int, default=0,
-        help="HTTP SSE port (omit for stdio mode)",
-    )
-    parser.add_argument(
-        "--debug", action="store_true", default=False,
-        help="Enable debug logging",
-    )
+    parser.add_argument("--port", type=int, default=0, help="HTTP SSE port (omit for stdio mode)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -289,17 +140,14 @@ def main() -> None:
         stream=sys.stderr,
     )
 
-    api = _build_gateway()
-
     mcp = FastMCP(
-        name="SHM Memory Gateway",
-        instructions="SHM (Self-evolving Hypergraph Memory) MCP server — "
-                     "write, retrieve, search, and manage memories.",
+        name="SHM MCP Gateway",
+        instructions="SHM (Self-evolving Hypergraph Memory) MCP server. "
+                     "Access SHM memory and dispatch Trio Concerto pipeline (CC/OpenCode/Codex).",
         debug=args.debug,
+        port=args.port,
     )
-
-    register_tools(mcp, api)
-    register_pipeline_tools(mcp)
+    register_tools(mcp)
 
     if args.port:
         logger.info("Starting SHM MCP Gateway on SSE :%d", args.port)
