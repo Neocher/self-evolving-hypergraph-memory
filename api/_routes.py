@@ -2658,14 +2658,21 @@ async def rebuild_index(
     if deps.query_router is not None:
         deps.query_router.faiss_index = new_index
         deps.query_router.faiss_id_map = deps.faiss_id_map
+        # 【Fix】SelfEvolvingRetrieval 包装的内部 QueryRouter
+        if hasattr(deps.query_router, '_qr'):
+            deps.query_router._qr.faiss_index = new_index
+            deps.query_router._qr.faiss_id_map = deps.faiss_id_map
         # 同步 TF-IDF 索引
         tfidf = getattr(deps, "tfidf_index", None)
         if tfidf is not None:
             deps.query_router.tfidf_index = tfidf
-    # 同步更新查询路由的索引引用
+    # 同步更新查询路由的索引引用（下方重复块）
     if deps.query_router is not None:
         deps.query_router.faiss_index = new_index
         deps.query_router.faiss_id_map = deps.faiss_id_map
+        if hasattr(deps.query_router, '_qr'):
+            deps.query_router._qr.faiss_index = new_index
+            deps.query_router._qr.faiss_id_map = deps.faiss_id_map
         # 同步 TF-IDF 索引
         tfidf = getattr(deps, "tfidf_index", None)
         if tfidf is not None:

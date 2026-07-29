@@ -20,6 +20,7 @@ ssm:
   input_dim: 8                   # 输入特征维度
   gate_threshold: 0.5            # 保留/遗忘阈值
   state_decay: 0.9               # 状态衰减系数
+  seed: 42                       # 随机种子
   feat_mean_activation: 0        # 特征索引: 超边内节点平均激活度
   feat_age_hours: 1              # 特征索引: 超边年龄（小时）
   feat_access_freq: 2            # 特征索引: 访问频率
@@ -61,7 +62,7 @@ retrieval:
 
 embedding:
   model_name: "all-MiniLM-L6-v2" # sentence-transformers 模型名
-  device: "cpu"                  # 推理设备 (cpu/cuda)
+  device: "cuda"                 # 推理设备 (cpu/cuda)
 
 api:
   host: "0.0.0.0"               # 服务监听地址

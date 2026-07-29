@@ -200,6 +200,8 @@ class RyuStore:
             "created_at DOUBLE, tau_initial DOUBLE, tau_value DOUBLE, "
             "trust_score DOUBLE, ontology_type STRING, source STRING, "
             "visibility STRING, "
+            "quarantine BOOLEAN, quarantine_reason STRING, "
+            "quarantine_source STRING, quarantined_at DOUBLE, "
             "version INT64, "
             "PRIMARY KEY (id))"
         )
@@ -508,8 +510,41 @@ class RyuStore:
                 "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.*",
                 {"ids": node_ids}
             )
-            rows = result.get_as_pl()
-            return [_clean_kuzu_row(d) for d in rows.to_dicts()]
+            # RyuGraph 25.9: get_as_pl 可能失败，用原生遍历兜底
+            try:
+                pl = result.get_as_pl()
+                if pl is not None and hasattr(pl, 'to_dicts'):
+                    return [_clean_kuzu_row(d) for d in pl.to_dicts()]
+            except Exception:
+                pass
+            
+            # 原生方式遍历
+            # 重新执行获取 column names（第一次已被 get_as_pl 消耗）
+            r2 = self.conn.execute(
+                "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.*",
+                {"ids": node_ids}
+            )
+            try:
+                cols = r2.get_column_names()
+            except Exception:
+                cols = ['e.id', 'e.content', 'e.embedding', 'e.created_at',
+                        'e.tau_initial', 'e.tau_value', 'e.trust_score',
+                        'e.ontology_type', 'e.source', 'e.visibility',
+                        'e.quarantine', 'e.quarantine_reason',
+                        'e.quarantine_source', 'e.quarantined_at', 'e.version']
+            
+            cleaned = []
+            while r2.has_next():
+                row = r2.get_next()
+                if isinstance(row, dict):
+                    cleaned.append(_clean_kuzu_row(row))
+                elif isinstance(row, (list, tuple)):
+                    d = {}
+                    for i, val in enumerate(row):
+                        k = cols[i] if i < len(cols) else f"col_{i}"
+                        d[k] = val
+                    cleaned.append(_clean_kuzu_row(d))
+            return cleaned
 
         return self._execute_with_circuit_breaker(_do_batch)
 

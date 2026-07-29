@@ -663,16 +663,12 @@ class QueryRouter:
         self, query: str, query_embedding: Optional[np.ndarray] = None
     ) -> list[dict]:
         """
-        L1 超图检索（Kuzu + FAISS 联合）。
+        L1 超图检索 + L2 向量检索融合降级（Kuzu + FAISS 联合）。
 
         1. 编码查询为向量
-        2. FAISS 搜索最相关的超边
-        3. 通过 Kuzu 展开超边成员节点
+        2. FAISS 搜索最相关的 episode
+        3. 通过 Kuzu 回查获取节点详情
         4. τ 值加权排序
-
-        Raises:
-            CircuitBreakerOpen: Kuzu 断路器跳闸
-            FAISSUnavailable: FAISS 索引不可用
         """
         if query_embedding is None:
             query_embedding = self._encode_query(query)
@@ -685,7 +681,6 @@ class QueryRouter:
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
-        # 【Perf】episode_cache 优先 → Kuzu batch miss → 逐条 fallback
         valid_pairs = [
             (ep_id, score) for ep_id, score in episode_scores if ep_id >= 0
         ]
@@ -694,19 +689,29 @@ class QueryRouter:
             for ep_id, _ in valid_pairs
         }
 
-        results: list[dict] = []
-        kuzu_miss_ids: list[str] = []
+        # Kuzu 批量回查获取节点详情
+        node_uuids = list(uuid_map.values())
+        episodes_dict: dict[str, dict] = {}
+        if node_uuids and self.kuzu_store is not None and hasattr(self.kuzu_store, 'get_episodes_batch'):
+            try:
+                episodes_dict = {
+                    ep["id"]: ep
+                    for ep in self.kuzu_store.get_episodes_batch(node_uuids)
+                }
+            except Exception:
+                episodes_dict = {}
 
-        for ep_id, score in valid_pairs:
-            node_uuid = uuid_map[ep_id]
-            # 优先级 1: episode_cache（写入时预填充，零查询开销）
+        results: list[dict] = []
+        for faiss_id, score in valid_pairs:
+            node_uuid = uuid_map[faiss_id]
+            # episode_cache 优先
             if node_uuid in self._episode_cache:
                 episode = dict(self._episode_cache[node_uuid])
                 episode["id"] = node_uuid
+            elif node_uuid in episodes_dict:
+                episode = episodes_dict[node_uuid]
             else:
-                kuzu_miss_ids.append(node_uuid)
                 continue
-
             if episode:
                 episode["score"] = round(1.0 / (1.0 + float(score)), 4)
                 episode["level"] = "l1_faiss"
@@ -714,38 +719,16 @@ class QueryRouter:
                 episode["node_id"] = episode.pop("id", "")
                 results.append(episode)
 
-        # 优先级 2: 批量 Kuzu 查询（仅对 cache miss 的 IDs）
-        if kuzu_miss_ids and hasattr(self.kuzu_store, 'get_episodes_batch'):
-            try:
-                episodes_dict = {
-                    ep["id"]: ep
-                    for ep in self.kuzu_store.get_episodes_batch(kuzu_miss_ids)
-                }
-            except Exception:
-                episodes_dict = {}
-
-            for ep_id, score in valid_pairs:
-                node_uuid = uuid_map[ep_id]
-                if node_uuid in self._episode_cache:
-                    continue  # already processed
-                if node_uuid in episodes_dict:
-                    episode = episodes_dict[node_uuid]
-                    if episode:
-                        episode["score"] = round(1.0 / (1.0 + float(score)), 4)
-                        episode["level"] = "l1_faiss"
-                        episode["_source"] = "faiss"
-                        episode["node_id"] = episode.pop("id", "")
-                        results.append(episode)
-
         return self._deduplicate_and_sort(results)
 
     def _vector_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
     ) -> list[dict]:
         """
-        L2 纯向量检索（FAISS-only）。
+        L2 纯向量检索（FAISS + Kuzu 回查）。
 
-        直接在节点向量空间中检索，不依赖 Kuzu 超边展开。
+        在节点向量空间中检索，通过 Kuzu 回查补充节点内容、tau 值等字段。
+        参考 /search/vector 路由的实现方式。
 
         Raises:
             FAISSUnavailable: FAISS 索引不可用
@@ -761,17 +744,42 @@ class QueryRouter:
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
 
-        return [
-            {
-                "node_id": str(node_id) if node_id >= 0 else "",
-                "content": "",
+        valid_pairs = [(faiss_id, score) for faiss_id, score in node_scores if faiss_id >= 0]
+
+        # 通过 faiss_id_map 将 FAISS int ID → Kuzu UUID string
+        uuid_map: dict[int, str] = {}
+        for faiss_id, _ in valid_pairs:
+            uuid = self.faiss_id_map.get(faiss_id)
+            if uuid:
+                uuid_map[faiss_id] = uuid
+
+        # 批量回查 Kuzu 获取节点详情（content、tau_value 等）
+        episodes_dict: dict[str, dict] = {}
+        if uuid_map and self.kuzu_store is not None and hasattr(self.kuzu_store, 'get_episodes_batch'):
+            try:
+                episodes_dict = {
+                    ep["id"]: ep
+                    for ep in self.kuzu_store.get_episodes_batch(list(uuid_map.values()))
+                }
+            except Exception:
+                logger.exception(
+                    "_vector_retrieve: Kuzu batch lookup failed, results will have empty content"
+                )
+
+        # 构建结果集：优先使用 Kuzu 回查的数据，fallback 到空 content
+        results: list[dict] = []
+        for faiss_id, score in valid_pairs:
+            node_uuid = uuid_map.get(faiss_id, str(faiss_id))
+            episode = episodes_dict.get(node_uuid, {})
+            results.append({
+                "node_id": node_uuid,
+                "content": episode.get("content", ""),
                 "score": round(1.0 / (1.0 + float(score)), 4),
-                "tau_value": 0.0,
+                "tau_value": episode.get("tau_initial", 0.0),
                 "level": RetrievalLevel.VECTOR.value,
-            }
-            for node_id, score in node_scores
-            if node_id >= 0
-        ]
+            })
+
+        return results
 
     def _keyword_retrieve(self, query: str) -> list[dict]:
         """

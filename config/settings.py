@@ -47,6 +47,7 @@ class SSMConfig:
     input_dim: int = 8
     gate_threshold: float = 0.5
     state_decay: float = 0.9
+    seed: int = 42
     feat_mean_activation: int = 0
     feat_age_hours: int = 1
     feat_access_freq: int = 2

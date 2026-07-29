@@ -137,8 +137,24 @@ def _init_services() -> Services:
 
     # 6. SSM 门控
     try:
-        from core.dual_gate import DualAdaptiveGate
-        svc.ssm_gate = DualAdaptiveGate(config=cfg.ssm)
+        from core.dual_gate import DualAdaptiveGate, DualGateConfig
+        # 从 cfg.ssm 映射公共字段到 DualGateConfig
+        dg = DualGateConfig(
+            hidden_dim=cfg.ssm.hidden_dim,
+            input_dim=cfg.ssm.input_dim,
+            gate_threshold=cfg.ssm.gate_threshold,
+            ssm_state_decay=cfg.ssm.state_decay,
+            feat_mean_activation=cfg.ssm.feat_mean_activation,
+            feat_age_hours=cfg.ssm.feat_age_hours,
+            feat_access_freq=cfg.ssm.feat_access_freq,
+            feat_member_count=cfg.ssm.feat_member_count,
+            feat_community_density=cfg.ssm.feat_community_density,
+            feat_tau_mean=getattr(cfg.ssm, 'feat_tau_mean', 5),
+            feat_tau_variance=getattr(cfg.ssm, 'feat_tau_variance', 6),
+            feat_connection_entropy=getattr(cfg.ssm, 'feat_connection_entropy', 7),
+            seed=getattr(cfg.ssm, 'seed', 42),
+        )
+        svc.ssm_gate = DualAdaptiveGate(config=dg)
         logger.info("AdaptiveGate initialized")
     except Exception as e:
         errors.append(f"AdaptiveGate: {e}")
