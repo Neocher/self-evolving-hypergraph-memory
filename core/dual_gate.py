@@ -115,6 +115,8 @@ class SSMEngine:
         self.config = config
         self._init_hippo(rng)
 
+    _A_bar_cache: dict[tuple[int, int, float], np.ndarray] = {}
+
     def _init_hippo(self, rng: np.random.RandomState) -> None:
         """
         初始化 HiPPO 矩阵 (Legendre 多项式投影)。
@@ -152,7 +154,13 @@ class SSMEngine:
         self.B = np.vstack([top, bottom]) * 0.1
 
         # 预计算离散化系数 (ZOH: exp(A·Δt), 取 Δt=1)
-        self.A_bar = np.linalg.matrix_power(np.eye(D) + self.A / ZOH_STEPS, ZOH_STEPS)
+        # 使用类变量缓存避免重复计算 O(D³ log ZOH_STEPS)
+        cache_key = (D, N, ZOH_STEPS)
+        if cache_key not in SSMEngine._A_bar_cache:
+            SSMEngine._A_bar_cache[cache_key] = np.linalg.matrix_power(
+                np.eye(D) + self.A / ZOH_STEPS, ZOH_STEPS
+            )
+        self.A_bar = SSMEngine._A_bar_cache[cache_key]
         # B_bar ≈ A^{-1}(exp(A) - I)·B ≈ (I + A/2)·B  (一阶近似)
         self.B_bar = (np.eye(D) + self.A / 2.0) @ self.B
 
@@ -412,10 +420,12 @@ class DualAdaptiveGate:
         """预算感知操作选择: 'retain' | 'consolidate'
         
         基于 Retain or Consolidate? (arXiv:2607.17545):
+        - 预算不足时强制 retain
         - α ≥ 0.5 → consolidate (SSM 主导融合)
         - α < 0.5 → retain (MLP 主导门控)
         """
-        # 预算比值对前两个分支无实际影响，tiebreaker 已用 α 完全决定
+        if self._budget < self.config.budget_consolidate_cost:
+            return "retain"
         return "consolidate" if self.alpha >= 0.5 else "retain"
 
     def spend_budget(self) -> str:

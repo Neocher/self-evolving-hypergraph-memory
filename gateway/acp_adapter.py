@@ -64,16 +64,20 @@ class SHMACPAdapter:
             return {"status": "error", "message": "Missing required param: content"}
         source = params.get("source", "acp")
         namespace = params.get("namespace")
-        result = await self._gateway.write_sensory(
-            content=content,
-            source=source,
-            namespace=namespace,
-        )
-        return {
-            "status": "ok",
-            "record_id": result.record_id,
-            "buffer_usage": result.buffer_usage,
-        }
+        try:
+            result = await self._gateway.write_sensory(
+                content=content,
+                source=source,
+                namespace=namespace,
+            )
+            return {
+                "status": "ok",
+                "record_id": result.record_id,
+                "buffer_usage": result.buffer_usage,
+            }
+        except Exception as e:
+            logger.error("shm:write failed: %s", e, exc_info=True)
+            return {"status": "error", "code": "WRITE_FAILED", "message": str(e)}
 
     async def _handle_retrieve(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """处理 shm:retrieve — 三级融合检索。"""
@@ -82,36 +86,44 @@ class SHMACPAdapter:
             return {"status": "error", "message": "Missing required param: query"}
         top_k = params.get("top_k", 20)
         namespace = params.get("namespace")
-        result = await self._gateway.retrieve(
-            query=query,
-            top_k=top_k,
-            namespace=namespace,
-        )
-        return {
-            "status": "ok",
-            "query": result.query,
-            "results": [
-                {
-                    "node_id": r.node_id,
-                    "content": r.content,
-                    "score": r.score,
-                    "retrieval_level": r.retrieval_level,
-                }
-                for r in result.results
-            ],
-            "total_found": result.total_found,
-            "latency_ms": result.latency_ms,
-            "degraded": result.degraded,
-        }
+        try:
+            result = await self._gateway.retrieve(
+                query=query,
+                top_k=top_k,
+                namespace=namespace,
+            )
+            return {
+                "status": "ok",
+                "query": result.query,
+                "results": [
+                    {
+                        "node_id": r.node_id,
+                        "content": r.content,
+                        "score": r.score,
+                        "retrieval_level": r.retrieval_level,
+                    }
+                    for r in result.results
+                ],
+                "total_found": result.total_found,
+                "latency_ms": result.latency_ms,
+                "degraded": result.degraded,
+            }
+        except Exception as e:
+            logger.error("shm:retrieve failed: %s", e, exc_info=True)
+            return {"status": "error", "code": "RETRIEVE_FAILED", "message": str(e)}
 
     async def _handle_health(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """处理 shm:health — 深度健康检查。"""
-        h = await self._gateway.health()
-        return {
-            "status": "ok",
-            "health_status": h.status,
-            "graph_connected": h.graph_connected,
-            "faiss_loaded": h.faiss_loaded,
-            "dream_scheduler_running": h.dream_scheduler_running,
-            "stats": h.stats,
-        }
+        try:
+            h = await self._gateway.health()
+            return {
+                "status": "ok",
+                "health_status": h.status,
+                "graph_connected": h.graph_connected,
+                "faiss_loaded": h.faiss_loaded,
+                "dream_scheduler_running": h.dream_scheduler_running,
+                "stats": h.stats,
+            }
+        except Exception as e:
+            logger.error("shm:health failed: %s", e, exc_info=True)
+            return {"status": "error", "code": "HEALTH_FAILED", "message": str(e)}

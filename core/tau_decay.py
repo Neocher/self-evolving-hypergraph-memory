@@ -263,18 +263,28 @@ class TauDecayEngine:
         now = force_now or time.time()
         dt = max(0, now - created)
         tau_decay = self._get_effective_tau_decay(node_id)
-        return self.config.tau_initial * math.exp(-dt / tau_decay)
+        exponent = -dt / tau_decay
+        if exponent < -700:
+            return 0.0
+        return self.config.tau_initial * math.exp(exponent)
 
-    def compute_strength(self, created_at: float) -> float:
+    def compute_strength(self, created_at: float, node_id: Optional[str] = None) -> float:
         """Compute RoMem temporal phase strength.
 
         结合 τ 衰减与傅里叶相位相似度，产生周期性记忆强度。
         S = alpha * tau(t) + (1-alpha) * (phase_sim + 1) / 2
 
         ROEM_ALPHA=1.0 时行为与 compute_tau() 完全一致（向后兼容）。
+
+        注意：当 dt >> tau_decay 时 math.exp(-dt/tau_decay) 返回 0.0（underflow），
+        这是预期行为——τ 归零表示该记忆已完全衰减。
+
+        Args:
+            created_at: 节点创建时间戳
+            node_id: 节点ID（用于节点级别的自适应衰减，默认None使用全局τ_decay）
         """
         age = max(0.0, time.time() - created_at)
-        tau_val = self.compute_tau(node_id=None, created_at=created_at)
+        tau_val = self.compute_tau(node_id=node_id, created_at=created_at)
         phase_sim = _phase_similarity(age, ROEM_PERIODS)
         return ROEM_ALPHA * tau_val + (1.0 - ROEM_ALPHA) * (phase_sim + 1.0) / 2.0
 

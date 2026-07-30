@@ -70,6 +70,7 @@ class MemoryTransaction:
     created_at: float = 0.0
     metadata: dict = field(default_factory=dict)
     _mgr: Optional["TransactionManager"] = None  # 父管理器引用
+    _explicitly_closed: bool = False  # 显式标记是否已由调用方 commit/rollback
 
     def __post_init__(self):
         if not self.created_at:
@@ -79,8 +80,42 @@ class MemoryTransaction:
         self.operations.append(op)
 
     def commit(self) -> dict:
-        """提交 — 通过管理器记录"""
+        """提交 — 两阶段 OCC 版本检查（Phase 1 全量检查，Phase 2 全量写入）
+
+        Phase 1: 对所有 UPDATE/DELETE 操作执行版本检查，任一失败则整体中止
+        Phase 2: 全部通过后，统一自增版本号
+        """
+        if self._mgr is not None:
+            # Phase 1: 全量 version check（无副作用）
+            for op in self.operations:
+                node_id = op.data.get("id") or op.data.get("node_id", "")
+                if node_id and op.op in (OpType.UPDATE_NODE, OpType.DELETE_NODE):
+                    expected_ver = op.data.get("_expected_version")
+                    if expected_ver is not None:
+                        if not self._mgr.version_check(expected_ver, node_id):
+                            conflict = self._mgr.record_conflict(
+                                node_id=node_id,
+                                expected_version=expected_ver,
+                                current_version=self._mgr._kuzu_store.get_node_version(node_id)
+                                if self._mgr._kuzu_store else -1,
+                                strategy="occ_abort",
+                                resolved=False,
+                                detail=f"TX {self.tx_id[:8]} commit aborted by OCC"
+                            )
+                            raise RuntimeError(
+                                f"OCC conflict on {node_id[:12]}: "
+                                f"expected v{expected_ver}, aborting TX {self.tx_id[:8]}"
+                            )
+
+            # Phase 2: 全部检查通过后，统一自增版本号（全量写入）
+            for op in self.operations:
+                node_id = op.data.get("id") or op.data.get("node_id", "")
+                if node_id and op.op in (OpType.UPDATE_NODE, OpType.DELETE_NODE):
+                    if self._mgr._kuzu_store is not None:
+                        self._mgr._kuzu_store.increment_node_version(node_id)
+
         self.status = TransactionStatus.COMMITTED
+        self._explicitly_closed = True
         ops = [{"op": o.op.value, "type": o.node_type, "id": o.op_id}
                for o in self.operations]
         ops_str = "; ".join(f"{o['op']}({o['type']})" for o in ops)
@@ -92,8 +127,31 @@ class MemoryTransaction:
                 "ops_count": len(self.operations)}
 
     def rollback(self) -> dict:
-        """回滚 — 通过管理器记录"""
+        """回滚 — 从 Kuzu 清除暂存数据"""
         self.status = TransactionStatus.ROLLED_BACK
+        self._explicitly_closed = True
+        if self._mgr is not None and self._mgr._kuzu_store is not None:
+            try:
+                tx_tag = f"tx_{self.tx_id[:8]}"
+                for op in reversed(self.operations):
+                    node_id = op.data.get("id") or op.data.get("node_id", "")
+                    if node_id and op.op in (OpType.CREATE_NODE, OpType.UPDATE_NODE):
+                        self._mgr._kuzu_store.query_cypher(
+                            "MATCH (n {id: $id}) WHERE n.tx_tag = $tag "
+                            "REMOVE n.tx_tag",
+                            {"id": node_id, "tag": tx_tag}
+                        )
+                    elif node_id and op.op == OpType.DELETE_NODE:
+                        self._mgr._kuzu_store.query_cypher(
+                            "MATCH (n {id: $id}) WHERE n.tx_tag = $tag "
+                            "REMOVE n.tx_tag",
+                            {"id": node_id, "tag": tx_tag}
+                        )
+                logger.info("TX %s rollback: Kuzu cleanup complete for %d ops",
+                           self.tx_id[:8], len(self.operations))
+            except Exception as e:
+                logger.warning("TX %s rollback Kuzu cleanup failed: %s",
+                              self.tx_id[:8], e)
         logger.info("TX %s rolled back: %d ops discarded",
                     self.tx_id[:8], len(self.operations))
         if self._mgr is not None:
@@ -108,10 +166,11 @@ class MemoryTransaction:
 class TransactionManager:
     """事务管理器 — 管理所有活跃事务 + OCC 版本检查 + 冲突日志"""
 
-    def __init__(self):
+    def __init__(self, kuzu_store=None):
         self._active: dict[str, MemoryTransaction] = {}
         self._history: list[MemoryTransaction] = []  # 已完成的事务日志（ring buffer, max=1000）
         self._conflict_log: deque[dict] = deque(maxlen=1000)  # 写入冲突日志
+        self._kuzu_store = kuzu_store
 
     def begin(self, metadata: Optional[dict] = None) -> MemoryTransaction:
         """开启新事务"""
@@ -149,21 +208,23 @@ class TransactionManager:
     def version_check(
         self,
         expected_version: int,
-        current_version: int,
-        node_id: str = "",
+        node_id: str,
     ) -> bool:
         """
         OCC 版本检查 — 在 prepare 阶段调用。
+        内部从 Kuzu 获取实际版本，避免调用方传参不一致。
 
         Args:
             expected_version: 事务开始时读取的版本号。
-            current_version: 数据库中当前的版本号。
-            node_id: 节点 ID（仅用于日志）。
+            node_id: 节点 ID。
 
         Returns:
             True 如果版本一致，允许提交。
             False 如果版本不一致，需要消解或回滚。
         """
+        if self._kuzu_store is None:
+            return True  # 无数据库可用时跳过
+        current_version = self._kuzu_store.get_node_version(node_id)
         ok = expected_version == current_version
         if not ok:
             logger.warning(
@@ -248,10 +309,10 @@ class _TransactionContext:
         if self.transaction is None:
             return
         if exc_type is not None:
-            # 异常退出 → 自动回滚（仅当事务仍活跃）
-            if self.transaction.is_active():
+            # 异常退出 → 自动回滚（仅当事务仍活跃且未显式关闭）
+            if self.transaction.is_active() and not self.transaction._explicitly_closed:
                 self._mgr.rollback(self.transaction)
-        elif self.transaction.is_active():
+        elif self.transaction.is_active() and not self.transaction._explicitly_closed:
             # 正常退出但未显式 commit/rollback → 自动提交
             self._mgr.commit(self.transaction)
         # 已显式 commit/rollback → 无操作

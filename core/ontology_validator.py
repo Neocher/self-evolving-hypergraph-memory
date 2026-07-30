@@ -482,10 +482,10 @@ class OntologyValidator:
         text_lower = text.lower()
         found: List[Dict[str, str]] = []
 
-        # 1. 查已知实体词典
-        for entity, etype in self.ENTITY_TYPE_MAP.items():
+        # 1. 查已知实体词典（按名称降序排列，最长实体优先匹配避免短名覆盖长名）
+        sorted_entities = sorted(self.ENTITY_TYPE_MAP.items(), key=lambda x: len(x[0]), reverse=True)
+        for entity, etype in sorted_entities:
             if entity in text_lower:
-                # re.ASCII 确保 \\b 只匹配 ASCII 单词边界（CJK 字符不是 \\w）
                 try:
                     has_cjk = any(ord(c) > 0x2E80 for c in entity)
                     if has_cjk or re.search(r'\b' + re.escape(entity) + r'\b', text_lower, re.ASCII):
@@ -497,7 +497,6 @@ class OntologyValidator:
                             "matched": True,
                         })
                 except Exception:
-                    # 回退：直接子串匹配
                     category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
                     found.append({
                         "entity": entity,

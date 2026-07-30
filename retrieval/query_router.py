@@ -72,6 +72,7 @@ class QueryRouterConfig:
     bm25_k1: float = 1.5  # BM25 k1 参数
     bm25_b: float = 0.75  # BM25 b 参数
     top_k_fusion: int = 30  # 融合检索总 top-K
+    max_bm25_corpus: int = 50000  # BM25 索引最大语料数
 
 
 class QueryRouter:
@@ -189,7 +190,7 @@ class QueryRouter:
         self._bm25_doc_lens: np.ndarray = None  # (n_docs,) 每个文档的 term 数
         self._bm25_avgdl: float = 0.0  # 平均文档长度
         self._bm25_ready: bool = False  # BM25 索引是否就绪
-        self._build_bm25_index()
+        self._bm25_built: bool = False  # 标记是否已尝试构建
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -271,6 +272,16 @@ class QueryRouter:
             logger.warning("BM25: no valid documents in corpus")
             return
 
+        # 限制语料大小，防 OOM
+        max_corpus = self.config.max_bm25_corpus
+        if len(corpus) > max_corpus:
+            logger.warning("BM25: corpus too large (%d), truncating to %d",
+                           len(corpus), max_corpus)
+            corpus = corpus[:max_corpus]
+            self._bm25_doc_ids = self._bm25_doc_ids[:max_corpus]
+            self._bm25_doc_contents = self._bm25_doc_contents[:max_corpus]
+            self._bm25_doc_tau = self._bm25_doc_tau[:max_corpus]
+
         try:
             vectorizer = TfidfVectorizer(
                 stop_words="english",
@@ -313,6 +324,9 @@ class QueryRouter:
         Returns:
             [{"node_id", "content", "score", "tau_value", "level": "bm25"}, ...]
         """
+        if not self._bm25_built:
+            self._bm25_built = True
+            self._build_bm25_index()
         if not self._bm25_ready or self._bm25_vectorizer is None:
             logger.warning("BM25: index not ready")
             return []
@@ -396,62 +410,74 @@ class QueryRouter:
                 candidates.append(t)
                 seen_phrases.add(t)
 
+        if not candidates:
+            return []
+
+        # 合并所有候选词为单个 OR CONTAINS 查询，避免 N+1 模式
+        try:
+            params: dict[str, str] = {}
+            conditions: list[str] = []
+            for i, term in enumerate(candidates):
+                pkey = f"t{i}"
+                params[pkey] = term.lower()
+                conditions.append(f"toLower(e.content) CONTAINS ${pkey}")
+            where_clause = " OR ".join(conditions)
+            cypher = (
+                f"MATCH (e:EpisodeNode) WHERE {where_clause} "
+                f"RETURN e.id AS node_id, e.content AS content, "
+                f"e.tau_initial AS tau_value "
+                f"LIMIT $limit"
+            )
+            params["limit"] = k * 2
+            rows = self.kuzu_store.query_cypher(cypher, params)
+        except Exception:
+            logger.exception("Entity match OR query failed")
+            return []
+
         seen_ids: set[str] = set()
         results: list[dict] = []
-        limit_per_term = max(3, k // max(len(candidates), 1))
+        candidates_lower = set(c.lower() for c in candidates)
 
-        for term in candidates:
-            try:
-                rows = self.kuzu_store.query_cypher(
-                    "MATCH (e:EpisodeNode) "
-                    "WHERE toLower(e.content) CONTAINS $term "
-                    "RETURN e.id AS node_id, e.content AS content, "
-                    "e.tau_initial AS tau_value "
-                    "LIMIT $limit",
-                    {"term": term, "limit": limit_per_term},
-                )
-            except Exception:
+        for row in rows:
+            if isinstance(row, dict):
+                nid = row.get("node_id", "") or ""
+                content = row.get("content", "") or ""
+                tau = float(row.get("tau_value", 0.0) or 0.0)
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                nid = str(row[0]) if row[0] is not None else ""
+                content = str(row[1]) if row[1] is not None else ""
+                tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+            else:
                 continue
 
-            for row in rows:
-                if isinstance(row, dict):
-                    nid = row.get("node_id", "") or ""
-                    content = row.get("content", "") or ""
-                    tau = float(row.get("tau_value", 0.0) or 0.0)
-                elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                    nid = str(row[0]) if row[0] is not None else ""
-                    content = str(row[1]) if row[1] is not None else ""
-                    tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
-                else:
-                    continue
+            if not nid or nid in seen_ids:
+                continue
+            seen_ids.add(nid)
 
-                if not nid or nid in seen_ids:
-                    continue
-                seen_ids.add(nid)
-
-                # 评分：精确匹配 1.0，子串包含随着长度衰减
-                content_lower = content.lower()
-                if term in content_lower:
-                    # 精确匹配整个 term 的权重最高
-                    match_ratio = len(term) / max(len(content), 1)
+            # 评分：取所有匹配候选中的最高分
+            content_lower = content.lower()
+            best_score = 0.0
+            for term_lower in candidates_lower:
+                if term_lower in content_lower:
+                    match_ratio = len(term_lower) / max(len(content), 1)
                     score = min(1.0, 0.3 + 0.7 * match_ratio)
-                else:
-                    # fallback: 部分词匹配
-                    term_tokens = term.split()
-                    match_count = sum(1 for t in term_tokens if t in content_lower)
-                    score = 0.1 + 0.2 * (match_count / max(len(term_tokens), 1))
+                    if score > best_score:
+                        best_score = score
 
-                results.append(
-                    {
-                        "node_id": nid,
-                        "content": content,
-                        "score": round(score, 4),
-                        "tau_value": tau,
-                        "level": "entity_match",
-                    }
-                )
+            if best_score == 0.0:
+                # fallback: 部分词匹配
+                term_tokens = content_lower.split()
+                match_count = sum(1 for t in candidates_lower if t in content_lower)
+                best_score = 0.1 + 0.2 * (match_count / max(len(candidates_lower), 1))
 
-        # 按 score 排序，取 top-k
+            results.append({
+                "node_id": nid,
+                "content": content,
+                "score": round(best_score, 4),
+                "tau_value": tau,
+                "level": "entity_match",
+            })
+
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:k]
 
@@ -583,10 +609,14 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                self._tag_degraded(r, level="l1_circuit_breaker")
+                return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                self._tag_degraded(r, level="l1_faiss_unavailable")
+                return r
             if results:
                 return results
             logger.info("L1 empty, cascading to L2")
@@ -597,11 +627,15 @@ class QueryRouter:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                return self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+                self._tag_degraded(r, level="l2_faiss_unavailable")
+                return r
             if results:
                 return results
             logger.info("L2 empty, cascading to L3")
-            return self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+            self._tag_degraded(r, level="l2_empty")
+            return r
 
         # L3 keyword + L4 Kuzu fallback
         try:
@@ -954,6 +988,12 @@ class QueryRouter:
         except Exception:
             logger.exception("Query encoding failed")
             return None
+
+    @staticmethod
+    def _tag_degraded(results: list[dict], level: str) -> None:
+        for r in results:
+            if "_degradation_level" not in r:
+                r["_degradation_level"] = level
 
     @staticmethod
     def _deduplicate_and_sort(results: list[dict]) -> list[dict]:

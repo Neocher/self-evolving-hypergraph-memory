@@ -20,16 +20,29 @@ A2A Server — SHM Agent-to-Agent HTTP JSON RPC 网关
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
+import os
 import sys
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from gateway.gateway_api import GatewayAPI
 
 logger = logging.getLogger("gateway.a2a")
+
+# ── 认证配置 ──
+A2A_API_KEY = os.environ.get("A2A_API_KEY", "")
+if not A2A_API_KEY:
+    logger.warning(
+        "A2A_API_KEY not set — authentication disabled. "
+        "Set A2A_API_KEY environment variable to enable Bearer token auth."
+    )
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # ── Pydantic 请求／响应模型 ──────────────────────────────────────────
 
@@ -95,15 +108,53 @@ class AgentCard(BaseModel):
 # ── 服务构建 ─────────────────────────────────────────────────────────
 
 
+_gateway_instance: Optional[GatewayAPI] = None
+
+
 def _build_gateway() -> GatewayAPI:
-    """初始化 SHM 服务并返回 GatewayAPI 实例。"""
+    """初始化 SHM 服务并返回 GatewayAPI 实例（单例）。"""
+    global _gateway_instance
+    if _gateway_instance is not None:
+        return _gateway_instance
     from api._routes import init_services
     from api.app import _init_services
 
     svc = _init_services()
     init_services(svc)
+    _gateway_instance = GatewayAPI(svc)
     logger.info("SHM services initialized for A2A gateway")
-    return GatewayAPI(svc)
+    return _gateway_instance
+
+
+# ── 认证中间件 ──────────────────────────────────────────────────────
+
+
+async def _verify_auth(request: Request, call_next):
+    if A2A_API_KEY:
+        auth_header = request.headers.get("Authorization", "")
+        token = ""
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+        elif auth_header.startswith("ApiKey "):
+            token = auth_header[7:]
+        else:
+            token = request.headers.get("X-API-Key", "")
+        if token != A2A_API_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key. Set A2A_API_KEY env var or provide Authorization: Bearer <key> header."}
+            )
+    return await call_next(request)
+
+
+async def _body_size_limit(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_UPLOAD_SIZE:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body too large (max {MAX_UPLOAD_SIZE // 1024 // 1024} MB)"}
+        )
+    return await call_next(request)
 
 
 # ── 路由注册 ─────────────────────────────────────────────────────────
@@ -221,15 +272,27 @@ def register_routes(app: FastAPI, api: GatewayAPI) -> None:
 # ── 入口 ────────────────────────────────────────────────────────────
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期 — 启动时预热初始化。"""
+    _build_gateway()
+    yield
+
+
 def create_app() -> FastAPI:
     """构建并返回配置好的 FastAPI 应用（供测试或 uvicorn 使用）。"""
-    api = _build_gateway()
     app = FastAPI(
         title="SHM A2A Gateway",
         description="Agent-to-Agent HTTP JSON RPC gateway for Self-evolving Hypergraph Memory",
         version="5.10.0",
+        lifespan=lifespan,
     )
-    register_routes(app, api)
+
+    if A2A_API_KEY:
+        app.middleware("http")(_verify_auth)
+    app.middleware("http")(_body_size_limit)
+
+    register_routes(app, _build_gateway())
     return app
 
 
@@ -239,6 +302,7 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8001, help="监听端口")
     parser.add_argument("--debug", action="store_true", default=False, help="启用调试日志")
+    parser.add_argument("--api-key", type=str, default="", help="API Key（覆盖 A2A_API_KEY 环境变量）")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -247,9 +311,15 @@ def main() -> None:
         stream=sys.stderr,
     )
 
+    global A2A_API_KEY
+    if args.api_key:
+        A2A_API_KEY = args.api_key
+
     import uvicorn
     app = create_app()
     logger.info("Starting SHM A2A Gateway on %s:%d", args.host, args.port)
+    if A2A_API_KEY:
+        logger.info("A2A API key authentication enabled")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

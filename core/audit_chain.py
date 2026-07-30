@@ -16,9 +16,12 @@ BLAKE3 相比 SHA-256 快 5-10 倍，支持 AVX2 硬件加速。
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, asdict
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,6 +77,8 @@ class AuditChain:
         if self._persist_path:
             try:
                 import json
+                import os
+                os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
                 with open(self._persist_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 self._chain = []
@@ -140,6 +145,9 @@ class AuditChain:
 
     def verify_chain(self) -> bool:
         """验证整个溯源链的完整性。"""
+        if len(self._chain) == 0:
+            logger.warning("verify_chain: empty chain — no blocks to verify")
+            return False
         for i, block in enumerate(self._chain):
             expected_hash = self._compute_hash(block)
             if block.hash != expected_hash:

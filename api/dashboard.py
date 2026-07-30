@@ -11,6 +11,7 @@ Dashboard 仪表盘
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Optional
 
@@ -23,6 +24,27 @@ from api._routes import Services, get_services
 from observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 日志路径：优先从配置获取，其次 data/logs/，最后兜底
+_DASHBOARD_LOG_DIR = os.environ.get("SHM_LOG_DIR", "")
+if not _DASHBOARD_LOG_DIR:
+    _DASHBOARD_LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "logs")
+
+# Dashboard API Key 认证（从环境变量读取，空字符串时禁用）
+_DASHBOARD_API_KEY = os.environ.get("SHM_DASHBOARD_API_KEY", "")
+
+async def _dashboard_auth(request: Request) -> None:
+    """Dashboard API 认证守卫（可选，通过 SHM_DASHBOARD_API_KEY 环境变量配置）。"""
+    if not _DASHBOARD_API_KEY:
+        return
+    api_key = request.headers.get("X-API-Key", "") or request.query_params.get("api_key", "")
+    if api_key != _DASHBOARD_API_KEY:
+        from fastapi.responses import JSONResponse
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing dashboard API key. Set via SHM_DASHBOARD_API_KEY env var."
+        )
 
 dashboard_router = APIRouter()
 
@@ -42,7 +64,7 @@ def _now() -> float:
 
 
 @dashboard_router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard_page(request: Request):
+async def dashboard_page(request: Request, _auth=Depends(_dashboard_auth)):
     """仪表盘主页面 (HTML)。"""
     return templates.TemplateResponse(
         "dashboard.html",
@@ -56,6 +78,7 @@ async def dashboard_page(request: Request):
 @dashboard_router.get("/dashboard/api/overview")
 async def api_overview(
     deps: Services = Depends(get_services),
+    _auth=Depends(_dashboard_auth),
 ) -> dict[str, Any]:
     """概览统计：记忆总数 / FAISS 状态 / 梦境状态 / 系统健康。"""
     stats: dict[str, Any] = {
@@ -102,11 +125,9 @@ async def api_overview(
     if deps.dream_scheduler is not None:
         try:
             ds = deps.dream_scheduler
-            dream_status = "running" if getattr(ds, "_dream_running", False) else "idle"
-            dream_run_count = getattr(ds, "_run_count", 0)
-            # 尝试获取最后一次梦境时间
-            if hasattr(ds, "_last_dream_time"):
-                last_dream = ds._last_dream_time
+            dream_status = "running" if ds.is_running else "idle"
+            dream_run_count = ds.run_count
+            last_dream = ds.last_run_time if ds.last_run_time > 0 else None
         except Exception:
             pass
     stats["dream_status"] = dream_status
@@ -165,6 +186,7 @@ async def api_memories(
     limit: int = 50,
     offset: int = 0,
     deps: Services = Depends(get_services),
+    _auth=Depends(_dashboard_auth),
 ) -> dict[str, Any]:
     """记忆列表（按时间倒序）。"""
     items: list[dict[str, Any]] = []
@@ -212,6 +234,7 @@ async def api_memories(
 async def api_dreams(
     limit: int = 20,
     deps: Services = Depends(get_services),
+    _auth=Depends(_dashboard_auth),
 ) -> dict[str, Any]:
     """梦境报告列表（从候选存储读取）。"""
     candidates: list[dict[str, Any]] = []
@@ -241,9 +264,9 @@ async def api_dreams(
         try:
             ds = deps.dream_scheduler
             current_dream = {
-                "running": getattr(ds, "_dream_running", False),
-                "run_count": getattr(ds, "_run_count", 0),
-                "last_dream_time": getattr(ds, "_last_dream_time", None),
+                "running": ds.is_running,
+                "run_count": ds.run_count,
+                "last_dream_time": ds.last_run_time if ds.last_run_time > 0 else None,
             }
         except Exception:
             pass
@@ -254,23 +277,25 @@ async def api_dreams(
 @dashboard_router.get("/dashboard/api/logs")
 async def api_logs(
     lines: int = 100,
+    _auth=Depends(_dashboard_auth),
 ) -> dict[str, Any]:
     """近期的系统日志。"""
     log_entries: list[dict[str, Any]] = []
-    log_paths = [
-        Path("/home/admin/shm/shm.log"),
-        Path("/home/admin/shm/shm_new.log"),
-    ]
+    log_dir = Path(_DASHBOARD_LOG_DIR)
+    if log_dir.is_dir():
+        log_paths = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    else:
+        log_paths = []
 
     for log_path in log_paths:
         if not log_path.exists():
             continue
         try:
+            # tail -n 实现：使用 deque 避免全量读入
+            from collections import deque
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            # 取最后 N 行
-            tail = all_lines[-lines:]
-            for line in tail:
+                tail_lines = deque(f, maxlen=lines)
+            for line in tail_lines:
                 stripped = line.rstrip("\n")
                 if stripped:
                     log_entries.append({
@@ -280,4 +305,4 @@ async def api_logs(
         except Exception as e:
             log_entries.append({"message": f"Error reading {log_path}: {e}", "source": "error"})
 
-    return {"logs": log_entries[-lines:], "total": len(log_entries)}
+    return {"logs": log_entries[:lines], "total": len(log_entries)}

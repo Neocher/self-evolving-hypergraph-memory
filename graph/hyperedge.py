@@ -141,7 +141,7 @@ class HyperedgeManager:
         return edge
 
     def _persist_hyperedge(self, edge: Hyperedge) -> None:
-        """将超边持久化到 Kuzu（辅助节点 + HYPEREDGE_MEMBER 边）。"""
+        """将超边持久化到 Kuzu（辅助节点 + 批量 HYPEREDGE_MEMBER 边）。"""
         import json
         self.store.create_hyperedge_node({
             "id": edge.id,
@@ -154,8 +154,12 @@ class HyperedgeManager:
             "source_timestamp": edge.source_timestamp,
             "supersession_of": edge.supersession_of,
         })
-        for member_id in edge.member_ids:
-            self.store.link_hyperedge_member(edge.id, member_id)
+        self.store.query_cypher(
+            "UNWIND $member_ids AS mid "
+            "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: mid}) "
+            "CREATE (h)-[:HYPEREDGE_MEMBER]->(e)",
+            {"hid": edge.id, "member_ids": edge.member_ids},
+        )
 
     def get_hyperedges_by_node(self, node_id: str) -> List[Hyperedge]:
         """查询包含指定节点的所有超边。"""
@@ -230,9 +234,15 @@ class HyperedgeManager:
             return raw
         return 'global'
 
-    def get_visible_hyperedges(self, agent_id: str) -> List[Hyperedge]:
-        """获取该 agent 可见的所有超边（global 或 scope 包含该 agent）。"""
-        all_rows = self.store.query_cypher("MATCH (h:HyperedgeNode) RETURN h.*", {})
+    def get_visible_hyperedges(self, agent_id: str, limit: int = 1000) -> List[Hyperedge]:
+        """获取该 agent 可见的所有超边（global 或 scope 包含该 agent）。
+        
+        添加 LIMIT 防止全表扫描 OOM，同时优先返回 gate_value 高的超边。
+        """
+        all_rows = self.store.query_cypher(
+            "MATCH (h:HyperedgeNode) RETURN h.* ORDER BY h.gate_value DESC LIMIT $limit",
+            {"limit": limit},
+        )
         import json
         result: List[Hyperedge] = []
         for row in all_rows:
@@ -283,3 +293,44 @@ class HyperedgeManager:
         )
         self._persist_hyperedge(edge)
         return edge
+
+    def delete_hyperedge(self, hyperedge_id: str) -> bool:
+        """删除超边及其所有关联边（DETACH DELETE）。
+
+        使用 Kuzu 的 DETACH DELETE 确保超边节点和 HYPEREDGE_MEMBER 边被级联清理，
+        避免删除超边后孤立边残留在图数据库中。
+        """
+        try:
+            self.store.query_cypher(
+                "MATCH (h:HyperedgeNode {id: $id}) DETACH DELETE h",
+                {"id": hyperedge_id}
+            )
+            logger.info("Deleted hyperedge: %s", hyperedge_id[:8])
+            return True
+        except Exception:
+            logger.exception("Failed to DETACH DELETE hyperedge: %s", hyperedge_id)
+            return False
+
+    def purge_orphaned_hyperedges(self) -> int:
+        """删除没有任何成员节点的孤立超边。"""
+        try:
+            result = self.store.query_cypher(
+                "MATCH (h:HyperedgeNode) "
+                "WHERE NOT EXISTS { (h)-[:HYPEREDGE_MEMBER]->() } "
+                "RETURN count(h) AS cnt"
+            )
+            orphan_count = 0
+            if result:
+                row = result[0]
+                orphan_count = row[0] if isinstance(row, (list, tuple)) else row.get("cnt", 0)
+            if orphan_count > 0:
+                self.store.query_cypher(
+                    "MATCH (h:HyperedgeNode) "
+                    "WHERE NOT EXISTS { (h)-[:HYPEREDGE_MEMBER]->() } "
+                    "DETACH DELETE h"
+                )
+                logger.info("Purged %d orphaned hyperedges", orphan_count)
+            return orphan_count
+        except Exception:
+            logger.exception("Failed to purge orphaned hyperedges")
+            return 0

@@ -262,7 +262,8 @@ class OntologyService:
 
         etype = self.entity_types[etype_name]
         all_attrs = etype.get_all_attributes(self)
-        attributes = attributes or {}
+        # 拷贝副本，避免原地修改调用方传入的 dict
+        attributes = dict(attributes or {})
 
         # 2. 验证必填属性
         for attr in all_attrs:

@@ -89,10 +89,12 @@ class FaissStore(BaseVectorStore):
         nlist: int = 100,
     ):
         import faiss
+        import threading
 
         self._dim = dimension
         self._index_type = index_type
         self._nlist = nlist
+        self._lock = threading.Lock()
 
         base_index = faiss.IndexFlatL2(dimension)
         self._index = faiss.IndexIDMap(base_index)
@@ -141,16 +143,19 @@ class FaissStore(BaseVectorStore):
         return self._index.ntotal
 
     def add(self, embeddings: np.ndarray, ids: np.ndarray) -> int:
-        self._index.add_with_ids(embeddings, ids)
+        with self._lock:
+            self._index.add_with_ids(embeddings, ids)
         return len(ids)
 
     def remove(self, ids: np.ndarray) -> int:
-        return self._index.remove_ids(ids)
+        with self._lock:
+            return self._index.remove_ids(ids)
 
     def search(
         self, query: np.ndarray, k: int
     ) -> tuple[np.ndarray, np.ndarray]:
-        return self._index.search(query, k)
+        with self._lock:
+            return self._index.search(query, k)
 
 
 class VectorStoreFactory:

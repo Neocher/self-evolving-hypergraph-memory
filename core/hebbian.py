@@ -30,7 +30,7 @@ class HebbianConfig:
     max_connections_per_node: int = 64  # 绝对上限，防止异常增长
     # v2.0: 持久化配置
     persist_to_graph: bool = True  # 是否写回 Kuzu
-    persist_every_n_updates: int = 5  # 每 N 次更新批量持久化一次
+    persist_every_n_updates: int = 1  # 每次更新都持久化，防止崩溃后短期记忆丢失
 
 
 class SparseHebbianUpdater:
@@ -131,14 +131,23 @@ class SparseHebbianUpdater:
         return all_connections
 
     def _persist_batch(self, updates: list[tuple[str, str, float]]) -> None:
-        """批量持久化 Hebbian 更新到 Kuzu。"""
+        """批量持久化 Hebbian 更新到 Kuzu（使用 UNWIND 单次写入）。"""
         if not self._kuzu_store or not updates:
             return
-        for src, dst, weight in updates:
-            try:
-                self._kuzu_store.update_hebbian_connection(src, dst, weight)
-            except Exception:
-                logger.exception("Hebbian persist failed for %s→%s", src[:12], dst[:12])
+        try:
+            rows_param = [
+                {"src": s, "dst": d, "weight": w}
+                for s, d, w in updates
+            ]
+            self._kuzu_store.query_cypher(
+                "UNWIND $rows AS row "
+                "MATCH (a {id: row.src}), (b {id: row.dst}) "
+                "MERGE (a)-[r:HEBBIAN_CONNECTION]->(b) "
+                "SET r.weight = row.weight",
+                {"rows": rows_param},
+            )
+        except Exception:
+            logger.exception("Hebbian batch persist failed for %d updates", len(updates))
 
     def compute_connection_strength(
         self,

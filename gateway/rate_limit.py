@@ -53,8 +53,24 @@ class RateLimiter:
             bucket.tokens -= cost
         return True
 
+    def _validate_config(self, cfg: str) -> None:
+        """校验配置格式，无效时抛出 ValueError"""
+        if not cfg or not cfg.strip():
+            raise ValueError("Rate limit config is empty")
+        parts = [p.strip() for p in cfg.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("Rate limit config has no valid parts")
+        for part in parts:
+            m = re.match(r"^(\d+)/([smhd])$", part)
+            if not m:
+                raise ValueError(
+                    f"Invalid rate limit part: {part!r}. Expected format: <number>/<unit> "
+                    f"where unit is s/m/h/d (e.g., '1000/m')"
+                )
+
     def _parse_config(self, cfg: str) -> dict:
         """解析 '1000/m,10000/d' → {minute: {max, rate}, ...}"""
+        self._validate_config(cfg)
         limits = {}
         for part in cfg.split(","):
             part = part.strip()

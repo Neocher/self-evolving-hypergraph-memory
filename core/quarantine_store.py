@@ -51,14 +51,18 @@ class QuarantineStore:
             self._quarantined_ids.add(episode_id)
             return True
         try:
-            self._graph_store.query_cypher(
+            rows = self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode {id: $id}) "
                 "SET e.quarantine = true, "
                 "e.quarantine_reason = $reason, "
                 "e.quarantine_source = $source, "
-                "e.quarantined_at = $ts",
+                "e.quarantined_at = $ts "
+                "RETURN e.id",
                 {"id": episode_id, "reason": reason, "source": source, "ts": time.time()},
             )
+            if not rows:
+                logger.warning("Quarantine: node %s not found in Kuzu, skipping", episode_id[:12])
+                return False
             self._quarantined_ids.add(episode_id)
             logger.warning("Quarantined node %s: %s", episode_id[:12], reason[:80])
             return True
@@ -89,8 +93,22 @@ class QuarantineStore:
     # ── 查询 ─────────────────────────────────────────────
 
     def is_quarantined(self, episode_id: str) -> bool:
-        """检查节点是否被隔离（基于内存集合，O(1)）。"""
-        return episode_id in self._quarantined_ids
+        """检查节点是否被隔离（内存集合 + 数据库双校验）。"""
+        if episode_id in self._quarantined_ids:
+            return True
+        # 内存集合中不存在时，额外从数据库校验（防过期）
+        if self._graph_store is not None:
+            try:
+                rows = self._graph_store.query_cypher(
+                    "MATCH (e:EpisodeNode {id: $id}) WHERE e.quarantine = true RETURN e.id",
+                    {"id": episode_id},
+                )
+                if rows:
+                    self._quarantined_ids.add(episode_id)
+                    return True
+            except Exception:
+                pass
+        return False
 
     def get_quarantined_ids(self) -> set[str]:
         """返回所有隔离节点 ID 的副本。"""

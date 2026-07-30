@@ -40,6 +40,18 @@ class LLMClient:
         "https://openrouter.ai/api",
     ]
 
+    # 端点 → 环境变量名映射（每个 fallback 端点使用独立的 Key）
+    _ENDPOINT_KEY_MAP: dict[str, str] = {
+        "https://api.deepseek.com": "DEEPSEEK_API_KEY",
+        "https://api.openai.com": "OPENAI_API_KEY",
+        "https://api.moonshot.cn": "KIMI_API_KEY",
+        "https://openrouter.ai/api": "OPENROUTER_API_KEY",
+    }
+
+    _KEY_NAMES = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                  "ANTHROPIC_API_KEY", "KIMI_API_KEY",
+                  "OPENROUTER_API_KEY", "GEMINI_API_KEY")
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -65,12 +77,22 @@ class LLMClient:
         self.api_key = api_key or self._load_key_from_env()
         if not self.api_key:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
+
+        # 预构建每个端点的 API Key 映射
+        self._endpoint_keys: dict[str, str] = {}
+        self._endpoint_keys[self.base_url] = self.api_key
+        for ep in self.fallback_endpoints:
+            env_name = self._ENDPOINT_KEY_MAP.get(ep, "DEEPSEEK_API_KEY")
+            ep_key = self._env_keys.get(env_name) or os.environ.get(env_name, "")
+            self._endpoint_keys[ep] = ep_key or self.api_key
+
         self._client = httpx.AsyncClient(
             base_url=self.base_url.rstrip("/"),
-            headers=self._build_headers(),
+            headers=self._build_headers(self.api_key),
             timeout=timeout or self.timeout,
         )
         self._client_lock = asyncio.Lock()
+        self._closed = False
 
     def __repr__(self) -> str:
         """防止 api_key 在日志/调试输出中泄露。"""
@@ -93,9 +115,9 @@ class LLMClient:
                 return v
         return ""
 
-    def _build_headers(self) -> dict:
+    def _build_headers(self, api_key: str) -> dict:
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
@@ -118,16 +140,14 @@ class LLMClient:
                 line = line.strip()
                 if line and '=' in line and not line.startswith('#'):
                     k, v = line.split('=', 1)
-                    if k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
-                             "ANTHROPIC_API_KEY", "KIMI_API_KEY",
-                             "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+                    if k in self._KEY_NAMES:
                         if v:
                             self._env_keys[k] = v  # 存入实例变量，不广播到进程环境
         new_key = self._load_key_from_env()
         if new_key and new_key != self.api_key:
             logger.info(f"LLMClient: API Key 已热更新 (从 {self._HERMES_ENV})")
             self.api_key = new_key
-            self._client.headers.update(self._build_headers())
+            self._client.headers.update(self._build_headers(self.api_key))
             return True
         return False
 
@@ -177,9 +197,10 @@ class LLMClient:
                     # 双重检查：可能其他协程已经重建了 client
                     if endpoint != self._client.base_url:
                         await self._client.aclose()
+                        ep_key = self._endpoint_keys.get(endpoint, self.api_key)
                         self._client = httpx.AsyncClient(
                             base_url=endpoint.rstrip("/"),
-                            headers=self._build_headers(),
+                            headers=self._build_headers(ep_key),
                             timeout=self.timeout,
                         )
                         logger.info("LLMClient: switched to fallback endpoint %s", endpoint)
@@ -307,8 +328,17 @@ Focus on factual content and meaningful connections. Be concise."""
         return [w for w, _ in sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:max_features]]
 
     async def close(self) -> None:
-        """释放 httpx 连接。"""
+        """释放 httpx 连接。可多次安全调用。"""
+        if self._closed:
+            return
+        self._closed = True
         try:
             await self._client.aclose()
         except Exception:
             pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()

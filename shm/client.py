@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+
+import httpx
 
 
 class SHMClient:
@@ -37,16 +37,18 @@ class SHMClient:
 
     def _request(self, method: str, path: str, data: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
-        body = json.dumps(data).encode("utf-8") if data else None
-        req = Request(url, data=body,
-                      headers={"Content-Type": "application/json"} if data else {},
-                      method=method)
+        headers = {"Content-Type": "application/json"} if data else {}
+        body = json.dumps(data) if data else None
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode())
-        except HTTPError as e:
-            detail = e.read().decode() if e.fp else str(e)
-            raise RuntimeError(f"HTTP {e.code}: {detail}") from e
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.request(method, url, content=body, headers=headers)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            raise RuntimeError(f"HTTP {e.response.status_code}: {detail}") from e
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Request failed: {e}") from e
 
     def _get(self, path: str) -> dict:
         return self._request("GET", path)

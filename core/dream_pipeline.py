@@ -23,6 +23,12 @@ from typing import Optional
 import numpy as np
 from core.audit_chain import AuditOperation
 
+try:
+    import tiktoken
+    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,6 +149,7 @@ class DreamPipeline:
         ontology_validator=None,
         confidence_calibrator=None,
         ssm_engine=None,
+        encoder=None,
     ) -> None:
         """
         Args:
@@ -153,6 +160,7 @@ class DreamPipeline:
             ontology_validator: OntologyValidator 实例（可选，P1 本体约束社区检测）
             confidence_calibrator: ConfidenceCalibrator 实例（可选，P1 过度巩固防护）
             ssm_engine: SSMEngine 实例（可选，P2 SSM 梦境深度巩固）
+            encoder: 编码器实例（可选，用于向量余弦相似度合并 Jaccard）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
@@ -161,6 +169,9 @@ class DreamPipeline:
         self.ontology_validator = ontology_validator
         self.confidence_calibrator = confidence_calibrator
         self.ssm_engine = ssm_engine
+        self.encoder = encoder
+        self._ssm_wrapper: Optional[SSMDreamWrapper] = None
+        self._ssm_initialized = False
 
     async def run(
         self,
@@ -199,22 +210,24 @@ class DreamPipeline:
         gathered = self._gather_step(nodes)
         logger.info("Dream %s: GATHER — %d active nodes", dream_id, len(gathered))
 
-        # Step 2: CLUSTER — 社区检测
-        communities = self._cluster_step(gathered, connections)
+        # Step 2: CLUSTER — 社区检测（在独立线程中运行，避免阻塞事件循环）
+        communities = await asyncio.to_thread(self._cluster_step, gathered, connections)
         logger.info("Dream %s: CLUSTER — %d communities", dream_id, len(communities))
 
         # Step 3: SYNTHESIZE — 生成社区摘要
         communities = await self._synthesize_step(communities)
         logger.info("Dream %s: SYNTHESIZE — %d reports generated", dream_id, len(communities))
 
-        # Step 3a: SSM 梦境深度巩固 (P2)
+        # Step 3a: SSM 梦境深度巩固 (P2) — 每次 run() 开始时重置 SSM 状态
         if self.ssm_engine is not None:
-            ssm_wrapper = SSMDreamWrapper(self.ssm_engine)
-            ssm_wrapper.init()
+            if self._ssm_wrapper is None:
+                self._ssm_wrapper = SSMDreamWrapper(self.ssm_engine)
+            self._ssm_wrapper.reset()
+            self._ssm_initialized = True
             for comm in communities:
                 feature = self._build_community_feature(comm)
                 current_conf = comm.get("confidence", 0.7)
-                adjusted_conf, _ = ssm_wrapper.dream_consolidate(feature, current_conf)
+                adjusted_conf, _ = self._ssm_wrapper.dream_consolidate(feature, current_conf)
                 comm["confidence"] = round(adjusted_conf, 3)
             logger.info("Dream %s: SSM CONSOLIDATE — %d communities processed",
                         dream_id, len(communities))
@@ -362,7 +375,7 @@ class DreamPipeline:
             node_copy = dict(node)
             if self.tau_engine:
                 created_at = node.get("created_at", time.time())
-                tau = self.tau_engine.compute_strength(created_at)
+                tau = self.tau_engine.compute_strength(created_at, node_id=node.get("id"))
                 node_copy["tau_value"] = tau
             else:
                 node_copy["tau_value"] = node.get("tau_value", 1.0)
@@ -489,18 +502,20 @@ class DreamPipeline:
 
         # P1: 本体约束边 — 相同实体类型的节点间添加弱连接
         if self.ontology_validator is not None and len(nodes) > 1:
+            MAX_ONT_NODES = 2000
+            node_items = list(node_map.items())
+            if len(node_items) > MAX_ONT_NODES:
+                node_items = node_items[:MAX_ONT_NODES]
             ont_edge_count = 0
-            for i, (nid_a, node_a) in enumerate(node_map.items()):
+            for i, (nid_a, node_a) in enumerate(node_items):
                 content_a = node_a.get("content", "")
-                for nid_b, node_b in list(node_map.items())[i + 1 :]:
+                for nid_b, node_b in node_items[i + 1 :]:
                     if G.has_edge(nid_a, nid_b):
                         continue  # 已有连接，不覆盖
                     content_b = node_b.get("content", "")
-                    # 提取实体类型
                     types_a = self.ontology_validator._extract_types(content_a)
                     types_b = self.ontology_validator._extract_types(content_b)
                     if types_a and types_b:
-                        # 检查是否有共享实体类型
                         type_set_a = {t.get("type", "") for t in types_a if t.get("type")}
                         type_set_b = {t.get("type", "") for t in types_b if t.get("type")}
                         shared_types = type_set_a & type_set_b
@@ -571,24 +586,53 @@ class DreamPipeline:
 
         如果有 LLMClient，用模型生成语义摘要；
         否则用 TF-IDF 模板方法（原有回退）。
+
+        引入 fail-fast 计数器：连续 3 个 LLM 超时 → 整个 synthesize 切换到模板回退，
+        避免后续所有社区等待直到全部超时。
         """
+        sem = asyncio.Semaphore(5)
+        _llm_fail_fast_counter = 0
+        _llm_fail_fast_threshold = 3
+
+        async def _llm_summarize(community: dict, contents: list[str]) -> dict:
+            nonlocal _llm_fail_fast_counter
+            if _llm_fail_fast_counter >= _llm_fail_fast_threshold:
+                return None
+            async with sem:
+                try:
+                    return await asyncio.wait_for(
+                        self.llm_client.summarize_community(contents), timeout=15.0
+                    )
+                except Exception:
+                    _llm_fail_fast_counter += 1
+                    return None
+
+        llm_tasks: list[asyncio.Task] = []
         for i, community in enumerate(communities):
             nodes = community.get("nodes", [])
-            # 前 20 个最大社区用 LLM，其余用 TF-IDF 回退（平衡质量与速度）
             if self.llm_client and len(nodes) >= 2 and i < 20:
-                # LLM 语义摘要
                 contents = [n.get("content", "") for n in nodes]
-                llm_result = await self.llm_client.summarize_community(contents)
-                community["report"] = llm_result["summary"]
-                community["keywords"] = llm_result["keywords"]
-                community["llm_patterns"] = llm_result["patterns"]
-                community["llm_contradictions"] = llm_result["contradictions"]
+                llm_tasks.append((community, nodes, _llm_summarize(community, contents)))
             else:
-                # 原有模板方法（回退）
                 community["report"] = self._generate_community_report(nodes)
                 community["keywords"] = self._extract_keywords(
                     [n.get("content", "") for n in nodes], max_features=10
                 )
+                llm_tasks.append((community, nodes, None))
+
+        for community, nodes, task in llm_tasks:
+            if task is not None:
+                llm_result = await task
+                if llm_result:
+                    community["report"] = llm_result["summary"]
+                    community["keywords"] = llm_result["keywords"]
+                    community["llm_patterns"] = llm_result["patterns"]
+                    community["llm_contradictions"] = llm_result["contradictions"]
+                else:
+                    community["report"] = self._generate_community_report(nodes)
+                    community["keywords"] = self._extract_keywords(
+                        [n.get("content", "") for n in nodes], max_features=10
+                    )
             community["generated_at"] = time.time()
             community["episodes"] = [
                 {"id": n["id"], "content": n.get("content", "")} for n in nodes
@@ -597,7 +641,6 @@ class DreamPipeline:
                 {"id": n["id"], "content": n.get("content", "")[:200]} for n in nodes
             ]
             community["topics"] = self._extract_topics(nodes)
-            # 实体链接：提取命名实体并在社区节点间交叉匹配
             community["entity_links"] = await self._entity_linking_step(nodes)
         return communities
 
@@ -769,20 +812,9 @@ class DreamPipeline:
         Returns:
             {node_id: [entity_name, ...], ...} 或 {}（失败时）
         """
-        # 尝试使用内部 llm_client
-        llm = None
-        if self.llm_client and self.llm_client.api_key:
-            llm = self.llm_client
-        else:
-            # 尝试直接用环境变量创建临时客户端
-            key = os.environ.get("DEEPSEEK_API_KEY", "")
-            if not key:
-                return {}  # 无 API Key，降级
-            try:
-                from core.llm_client import LLMClient
-                llm = LLMClient(api_key=key)
-            except Exception:
-                return {}  # 创建失败，降级
+        if not self.llm_client or not self.llm_client.api_key:
+            return {}
+        llm = self.llm_client
 
         result: dict[str, list[str]] = {}
         for node in nodes:
@@ -857,6 +889,36 @@ Text:
 
     # ─── Step 4: COMPRESS ─────────────────────────────────
 
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        if not text:
+            return 0
+        if _TIKTOKEN_ENC is not None:
+            return len(_TIKTOKEN_ENC.encode(text))
+        has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+        if has_cjk:
+            return int(len(text) * 2.5 / 1.5)
+        return len(text.split())
+
+    @staticmethod
+    def _truncate_tokens(text: str, max_tokens: int) -> str:
+        if not text:
+            return text
+        if _TIKTOKEN_ENC is not None:
+            tokens = _TIKTOKEN_ENC.encode(text)
+            if len(tokens) <= max_tokens:
+                return text
+            return _TIKTOKEN_ENC.decode(tokens[:max_tokens])
+        words = text.split()
+        has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+        if has_cjk:
+            ratio = max_tokens / max(1, len(text) * 2.5 / 1.5)
+            cutoff = int(len(text) * min(1.0, ratio))
+            return text[:cutoff]
+        if len(words) > max_tokens:
+            return " ".join(words[:max_tokens])
+        return text
+
     def _compress_step(self, communities: list[dict]) -> tuple[list[dict], int]:
         """
         [Harness Fix] COMPRESS 步骤实现。
@@ -869,8 +931,8 @@ Text:
         total_keywords = 0
         for community in communities:
             report = community.get("report", "")
-            if len(report.split()) > 500:
-                community["report"] = " ".join(report.split()[:500])
+            if self._count_tokens(report) > 500:
+                community["report"] = self._truncate_tokens(report, 500)
 
             episodes = community.get("episodes", [])
             if episodes:
@@ -990,7 +1052,7 @@ Text:
             for j in range(i + 1, len(nodes)):
                 if nodes[j]["id"] in merged:
                     continue
-                sim = self._jaccard_similarity(
+                sim = self._combined_similarity(
                     nodes[i].get("content", ""), nodes[j].get("content", "")
                 )
                 if sim >= 0.8:
@@ -1020,21 +1082,36 @@ Text:
 
     def _persist_communities(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
         """将CLUSTER结果写回Kuzu CommunityNode。
-        
-        先清理旧社区（DETACH DELETE所有CommunityNode及其边），再创建新的。
+
+        使用 MERGE ON id 增量 upsert，避免先 DETACH DELETE 全部再重建
+        （若中途崩溃则所有社区数据永久丢失）。
+        保留的历史社区由外部周期性清理策略处理。
+
+        先清理旧 COMMUNITY_MEMBER 边再 upsert，避免竞赛条件导致
+        一个 EpisodeNode 关联到 2 个 CommunityNode。
         """
         import json
         created = 0
+        new_member_sets: dict[str, set[str]] = {}
+        # 先清理所有涉及成员的旧 COMMUNITY_MEMBER 边
         try:
-            # 【FIX】先清理旧社区，防止无限累积
-            kuzu_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c")
+            all_member_ids = set()
+            for comm in communities:
+                for member_id in comm.get("members", []):
+                    all_member_ids.add(member_id)
+            for mid in all_member_ids:
+                kuzu_store.query_cypher(
+                    "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) DELETE r",
+                    {"eid": mid}
+                )
         except Exception:
-            logger.warning("Community DETACH DELETE failed", exc_info=True)
+            logger.warning("Failed to clean before community upsert", exc_info=True)
         for comm in communities:
             try:
                 kuzu_store.query_cypher(
-                    "CREATE (c:CommunityNode {id: $id, name: $name, summary: $summary, "
-                    "leiden_score: $score, created_at: $created_at})",
+                    "MERGE (c:CommunityNode {id: $id}) "
+                    "SET c.name = $name, c.summary = $summary, "
+                    "c.leiden_score = $score, c.created_at = $created_at",
                     {
                         "id": comm["id"],
                         "name": f"dream_{dream_id[:8]}_comm_{created}",
@@ -1043,18 +1120,32 @@ Text:
                         "created_at": time.time(),
                     }
                 )
+                member_set: set[str] = set()
                 for member_id in comm.get("members", []):
+                    member_set.add(member_id)
                     try:
                         kuzu_store.query_cypher(
                             "MATCH (c:CommunityNode {id: $cid}), (e:EpisodeNode {id: $eid}) "
-                            "CREATE (c)-[:COMMUNITY_MEMBER]->(e)",
+                            "MERGE (c)-[:COMMUNITY_MEMBER]->(e)",
                             {"cid": comm["id"], "eid": member_id}
                         )
                     except Exception:
                         logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
+                new_member_sets[comm["id"]] = member_set
                 created += 1
             except Exception as e:
                 logger.warning("Community persist failed: %s", e)
+        # 清理旧社区中被新社区覆盖的成员的旧关系
+        try:
+            for cid, members in new_member_sets.items():
+                for mid in members:
+                    kuzu_store.query_cypher(
+                        "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) "
+                        "WHERE c.id <> $cid DELETE r",
+                        {"cid": cid, "eid": mid}
+                    )
+        except Exception:
+            logger.warning("Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True)
         return created
 
     def _persist_prune(self, kuzu_store, prune_ops: list) -> tuple[int, list[str]]:
@@ -1149,3 +1240,20 @@ Text:
         intersection = len(words_a & words_b)
         union = len(words_a | words_b)
         return intersection / union if union > 0 else 0.0
+
+    def _combined_similarity(self, text_a: str, text_b: str) -> float:
+        """加权合并：Jaccard 词集 + 向量余弦相似度。"""
+        jac = self._jaccard_similarity(text_a, text_b)
+        if self.encoder is not None:
+            try:
+                emb_a = self.encoder.embed(text_a)
+                emb_b = self.encoder.embed(text_b)
+                if emb_a is not None and emb_b is not None:
+                    norm_a = np.linalg.norm(emb_a)
+                    norm_b = np.linalg.norm(emb_b)
+                    if norm_a > 0 and norm_b > 0:
+                        cos = float(np.dot(emb_a, emb_b) / (norm_a * norm_b))
+                        return 0.4 * jac + 0.6 * max(0.0, cos)
+            except Exception:
+                pass
+        return jac

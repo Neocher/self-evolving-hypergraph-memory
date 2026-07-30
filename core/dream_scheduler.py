@@ -71,6 +71,10 @@ class DreamScheduler:
         self._incremental_update_fn = None  # incremental_faiss_update 引用
         # P2: 冲突驱动梦境
         self._unresolved_conflict_count: int = 0
+        # 候选目录路径（可由 app.py 注入覆盖）
+        self._candidate_dir = os.path.join(
+            os.path.dirname(__file__), "..", "data", "dream_candidates"
+        )
 
     async def on_conflict_detected(self) -> None:
         """P2: 记录一个新冲突（达到阈值时触发矛盾解析梦境）。"""
@@ -116,10 +120,19 @@ class DreamScheduler:
                 should_run = True
                 trigger_mode = TriggerMode.CONFLICT_RESOLUTION
 
+            # 兜底：距离上次梦境超过 6 小时，强制触发一次
+            FORCED_INTERVAL_HOURS = 6
+            if not should_run and self._last_run_time > 0:
+                hours_since_last = (now - self._last_run_time) / 3600.0
+                if hours_since_last >= FORCED_INTERVAL_HOURS:
+                    should_run = True
+                    trigger_mode = TriggerMode.IDLE
+                    logger.info("Forced dream trigger: %d hours since last run >= %d hours",
+                                int(hours_since_last), FORCED_INTERVAL_HOURS)
+
             # 候选文件触发：data/dream_candidates/ 目录中候选文件 > 10 时触发
             if not should_run:
-                candidate_dir = os.path.join(os.path.dirname(__file__), "..", "data", "dream_candidates")
-                candidate_dir = os.path.abspath(candidate_dir)
+                candidate_dir = getattr(self, '_candidate_dir', None)
                 try:
                     if os.path.exists(candidate_dir):
                         candidate_files = [f for f in os.listdir(candidate_dir)
@@ -271,6 +284,14 @@ class DreamScheduler:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    @property
+    def run_count(self) -> int:
+        return self._dream_run_count
+
+    @property
+    def last_run_time(self) -> float:
+        return self._last_run_time
 
     def force_stop(self) -> None:
         """强制停止当前梦境（设置为空闲状态）"""

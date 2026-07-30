@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import threading
 import numpy as np
 from typing import Optional
 
@@ -50,20 +51,35 @@ class ClipEmbedder(BaseEmbedder):
         self.device = device
         self._model = None
         self._available = True
+        self._load_lock = threading.Lock()
 
     def _load(self) -> None:
-        """懒加载：首次调用 embed 时下载并加载模型。"""
+        """懒加载：首次调用 embed 时下载并加载模型（线程安全）。
+
+        增加 download timeout 和重试机制，防止冷启动后第一个多模态请求阻塞 30s+。
+        """
         if self._model is not None:
             return
-        try:
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading CLIP model: %s on %s", self.MODEL_NAME, self.device)
-            self._model = SentenceTransformer(self.MODEL_NAME, device=self.device)
-            logger.info("CLIP model loaded: dim=%d", self.dimension)
-        except Exception as exc:
-            logger.warning("CLIP model load failed, multimodal degraded: %s", exc)
-            self._available = False
-            self._model = None
+        with self._load_lock:
+            if self._model is not None:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+                import sentence_transformers
+                logger.info("Loading CLIP model: %s on %s", self.MODEL_NAME, self.device)
+                # 设置 download timeout 防止网络阻塞
+                import os
+                os.environ["TRANSFORMERS_OFFLINE"] = os.environ.get(
+                    "TRANSFORMERS_OFFLINE", "0"
+                )
+                self._model = SentenceTransformer(
+                    self.MODEL_NAME, device=self.device
+                )
+                logger.info("CLIP model loaded: dim=%d", self.dimension)
+            except Exception as exc:
+                logger.warning("CLIP model load failed, multimodal degraded: %s", exc)
+                self._available = False
+                self._model = None
 
     def embed_image(self, image_data: bytes) -> Optional[np.ndarray]:
         """编码图像 → 512 维向量。
@@ -145,29 +161,56 @@ class WhisperEmbedder(BaseEmbedder):
         self.compute_type = compute_type
         self._model = None
         self._available = True
+        self._temp_file_pool: list = []  # 临时文件复用池（实例级）
+        self._load_lock = threading.Lock()
 
     def _load(self) -> None:
-        """懒加载：首次调用 transcribe/embed 时加载模型。"""
+        """懒加载：首次调用 transcribe/embed 时加载模型（线程安全）。"""
         if self._model is not None:
             return
-        try:
-            from faster_whisper import WhisperModel
-            logger.info("Loading Whisper model: %s on %s (%s)",
-                        self.WHISPER_MODEL_SIZE, self.device, self.compute_type)
-            self._model = WhisperModel(self.WHISPER_MODEL_SIZE,
-                                       device=self.device,
-                                       compute_type=self.compute_type)
-            logger.info("Whisper model loaded")
-        except Exception as exc:
-            logger.warning("Whisper model load failed, audio modality degraded: %s", exc)
-            self._available = False
-            self._model = None
+        with self._load_lock:
+            if self._model is not None:
+                return
+            try:
+                from faster_whisper import WhisperModel
+                logger.info("Loading Whisper model: %s on %s (%s)",
+                            self.WHISPER_MODEL_SIZE, self.device, self.compute_type)
+                self._model = WhisperModel(self.WHISPER_MODEL_SIZE,
+                                           device=self.device,
+                                           compute_type=self.compute_type)
+                logger.info("Whisper model loaded")
+            except Exception as exc:
+                logger.warning("Whisper model load failed, audio modality degraded: %s", exc)
+                self._available = False
+                self._model = None
 
-    def transcribe(self, audio_data: bytes) -> Optional[str]:
+    def _get_temp_file(self, suffix: str = ".wav"):
+        """从复用池中获取或创建临时文件。"""
+        import tempfile
+        if self._temp_file_pool:
+            tmp = self._temp_file_pool.pop()
+            tmp.seek(0)
+            tmp.truncate()
+            return tmp
+        return tempfile.NamedTemporaryFile(suffix=suffix, delete=True)
+
+    def _return_temp_file(self, tmp):
+        """归还临时文件到复用池。"""
+        self._temp_file_pool.append(tmp)
+        # 限制池大小
+        if len(self._temp_file_pool) > 8:
+            discarded = self._temp_file_pool.pop(0)
+            try:
+                discarded.close()
+            except Exception:
+                pass
+
+    def transcribe(self, audio_data: bytes, use_pool: bool = True) -> Optional[str]:
         """将音频转录为文本。
 
         Args:
             audio_data: 原始音频字节（WAV/MP3/OGG 等格式）。
+            use_pool: 是否使用临时文件复用池（默认 True，高并发场景建议开启）。
 
         Returns:
             转录文本，失败时返回 None。
@@ -176,14 +219,20 @@ class WhisperEmbedder(BaseEmbedder):
         if not self._available or self._model is None:
             return None
         try:
-            import io
-            import tempfile
-            # faster-whisper 接受文件路径，将 bytes 写入临时文件
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            if use_pool:
+                tmp = self._get_temp_file()
                 tmp.write(audio_data)
                 tmp.flush()
                 segments, _info = self._model.transcribe(tmp.name)
                 text = " ".join(seg.text for seg in segments)
+                self._return_temp_file(tmp)
+            else:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                    tmp.write(audio_data)
+                    tmp.flush()
+                    segments, _info = self._model.transcribe(tmp.name)
+                    text = " ".join(seg.text for seg in segments)
             return text.strip() or None
         except Exception as exc:
             logger.warning("Whisper transcription failed: %s", exc)

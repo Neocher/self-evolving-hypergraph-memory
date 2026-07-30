@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from typing import Any, Optional
 
 import numpy as np
@@ -38,6 +39,12 @@ class MemoryDefenseVerdict(Enum):
     ALLOW = "allow"
     QUARANTINE = "quarantine"
     BLOCK = "block"
+
+
+class EscalationFlag(Enum):
+    """升级标志，替代字符串匹配"""
+    NONE = auto()
+    BLOCK = auto()
 
 
 # ─── 配置 ──────────────────────────────────────────────────
@@ -189,10 +196,12 @@ class MemoryDefenseEngine:
         self.llm_client = llm_client
         self._history = AgentWriteHistory(window_seconds=self.config.write_window_seconds * 2)
         self._trust_scores: dict[str, float] = defaultdict(lambda: self.config.initial_trust)
+        self._trust_versions: dict[str, int] = defaultdict(int)
         self._exact_contents: dict[str, list[tuple[str, float]]] = defaultdict(list)
         self._recovery_counter: dict[str, int] = defaultdict(int)
+        self._lock = asyncio.Lock()
 
-    def pre_check(
+    async def pre_check(
         self,
         content: str,
         source: str,
@@ -213,66 +222,68 @@ class MemoryDefenseEngine:
         reasons: list[str] = []
         verdict = MemoryDefenseVerdict.ALLOW
 
-        # 记录本次写入（不分 verdict，所有写入都记录）
-        self._history.record(source, content, ts)
-        self._exact_contents[source].append((content, ts))
-        self._trim_exact(source)
-
-        # R1 — 写入频率尖峰
-        r1_pass, r1_reason = self._check_r1(source)
-        if not r1_pass:
-            reasons.append(r1_reason)
-            verdict = self._escalate(verdict)
-
-        # R2 — 语义漂移（需要编码器或 LLM）
-        r2_pass, r2_reason = self._check_r2(source, content)
+        # R2 编码移出锁范围（避免编码器阻塞锁内其他规则）
+        r2_pass, r2_reason, r2_flag = self._check_r2(source, content)
         if not r2_pass:
             reasons.append(r2_reason)
-            verdict = self._escalate(verdict)
 
-        # R3 — 实体共现异常
-        r3_pass, r3_reason = self._check_r3(content)
-        if not r3_pass:
-            reasons.append(r3_reason)
-            verdict = self._escalate(verdict)
+        async with self._lock:
+            # 锁内只做计数器状态操作（R1/R3/R4/R5）
+            # R1 — 写入频率尖峰（含本次写入的预计算）
+            r1_pass, r1_reason, r1_flag = self._check_r1(source, include_pending=True)
+            if not r1_pass:
+                reasons.append(r1_reason)
 
-        # R4 — 重复洪泛
-        r4_pass, r4_reason = self._check_r4(source, content)
-        if not r4_pass:
-            reasons.append(r4_reason)
-            verdict = self._escalate(verdict)
+            # R3 — 实体共现异常
+            r3_pass, r3_reason, r3_flag = self._check_r3(content)
+            if not r3_pass:
+                reasons.append(r3_reason)
 
-        # R5 — 信任衰减
-        r5_pass, r5_reason = self._check_r5(source)
-        if not r5_pass:
-            reasons.append(r5_reason)
-            verdict = self._escalate(verdict, r5_reason)
+            # R4 — 重复洪泛（含本次写入的预计算）
+            r4_pass, r4_reason, r4_flag = self._check_r4(source, content, include_pending=True)
+            if not r4_pass:
+                reasons.append(r4_reason)
 
-        # 信任分更新 + 阻断时回滚记录
-        if verdict in (MemoryDefenseVerdict.BLOCK, MemoryDefenseVerdict.QUARANTINE):
-            self._trust_scores[source] = max(
-                0.0,
-                self._trust_scores[source] - self.config.trust_decay_per_block,
-            )
-            self._recovery_counter[source] = 0
-            # 回滚本次记录：阻断的写入不应影响后续 R1/R4 判定
-            self._history.undo_last(source)
-            if self._exact_contents[source]:
-                self._exact_contents[source].pop()
-            logger.warning(
-                "Defense %s: source=%s, reasons=%s",
-                verdict.value, source, reasons,
-            )
-        elif verdict == MemoryDefenseVerdict.ALLOW:
-            # 正常写入逐步恢复信任
-            self._recovery_counter[source] += 1
-            recovery_rate = 1.0 / max(self.config.trust_recovery_writes, 1)
-            self._trust_scores[source] = min(
-                self.config.initial_trust,
-                self._trust_scores[source] + recovery_rate,
-            )
+            # R5 — 信任衰减
+            r5_pass, r5_reason, r5_flag = self._check_r5(source)
+            if not r5_pass:
+                reasons.append(r5_reason)
 
-        # 静默模式：BLOCK 降级为 QUARANTINE
+            # 聚合升级
+            for flag in [r1_flag, r2_flag, r3_flag, r4_flag, r5_flag]:
+                if flag != EscalationFlag.NONE:
+                    verdict = self._escalate(verdict, flag)
+
+            # 根据判定结果执行操作
+            if verdict in (MemoryDefenseVerdict.BLOCK, MemoryDefenseVerdict.QUARANTINE):
+                # silent=True 时不执行真实的信任衰减（仅模拟判定）
+                if not self.config.silent:
+                    current_trust = self._trust_scores[source]
+                    expected_version = self._trust_versions[source]
+                    self._trust_versions[source] = expected_version + 1
+                    self._trust_scores[source] = max(0.0, current_trust - self.config.trust_decay_per_block)
+                self._recovery_counter[source] = 0
+                logger.warning(
+                    "Defense %s: source=%s, trust=%.2f, reasons=%s",
+                    verdict.value, source,
+                    self._trust_scores[source], reasons,
+                )
+            else:
+                # ALLOW: 记录本次写入
+                self._history.record(source, content, ts)
+                self._exact_contents[source].append((content, ts))
+                self._trim_exact(source)
+                self._recovery_counter[source] += 1
+                recovery_rate = 1.0 / max(self.config.trust_recovery_writes, 1)
+                current_trust = self._trust_scores[source]
+                expected_version = self._trust_versions[source]
+                self._trust_versions[source] = expected_version + 1
+                self._trust_scores[source] = min(
+                    self.config.initial_trust,
+                    current_trust + recovery_rate,
+                )
+
+        # 静默模式：BLOCK 降级为 QUARANTINE（在锁外，不影响状态）
         if verdict == MemoryDefenseVerdict.BLOCK and self.config.silent:
             verdict = MemoryDefenseVerdict.QUARANTINE
             reasons = [f"[silent] {r}" for r in reasons]
@@ -283,9 +294,9 @@ class MemoryDefenseEngine:
     # ── Verdict 升级 ─────────────────────────────────────
 
     @staticmethod
-    def _escalate(current: MemoryDefenseVerdict, detail: str = "") -> MemoryDefenseVerdict:
-        """ALLOW → QUARANTINE → BLOCK。含 block 关键字则直接 BLOCK。"""
-        if "block" in detail.lower():
+    def _escalate(current: MemoryDefenseVerdict, flag: EscalationFlag = EscalationFlag.NONE) -> MemoryDefenseVerdict:
+        """ALLOW → QUARANTINE → BLOCK。flag=BLOCK 则直接 BLOCK。"""
+        if flag == EscalationFlag.BLOCK:
             return MemoryDefenseVerdict.BLOCK
         if current == MemoryDefenseVerdict.ALLOW:
             return MemoryDefenseVerdict.QUARANTINE
@@ -295,26 +306,28 @@ class MemoryDefenseEngine:
 
     # ── R1: 写入频率尖峰 ─────────────────────────────────
 
-    def _check_r1(self, source: str) -> tuple[bool, str]:
+    def _check_r1(self, source: str, include_pending: bool = False) -> tuple[bool, str, EscalationFlag]:
         count = self._history.count_in_window(source, self.config.write_window_seconds)
+        if include_pending:
+            count += 1  # 含本次待写入
         if count > self.config.max_writes_per_window:
             return False, (
                 f"R1: write frequency spike — {count} writes in "
                 f"{self.config.write_window_seconds:.0f}s from '{source}' "
                 f"(threshold: {self.config.max_writes_per_window})"
-            )
-        return True, ""
+            ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
 
     # ── R2: 语义漂移 ─────────────────────────────────────
 
-    def _check_r2(self, source: str, content: str) -> tuple[bool, str]:
+    def _check_r2(self, source: str, content: str) -> tuple[bool, str, EscalationFlag]:
         recent = self._history.recent_contents(source, self.config.drift_reference_window)
         if len(recent) < 3:
-            return True, ""  # 历史不足，无法检测漂移
+            return True, "", EscalationFlag.NONE  # 历史不足，无法检测漂移
 
         content_emb = self._get_embedding(content)
         if content_emb is None:
-            return True, ""  # 无编码器可用，跳过 R2
+            return True, "", EscalationFlag.NONE  # 无编码器可用，跳过 R2
 
         # 取除当前外最近的 N 条作为参考
         ref_contents = recent[:-1]
@@ -325,7 +338,7 @@ class MemoryDefenseEngine:
                 ref_embs.append(emb)
 
         if not ref_embs:
-            return True, ""
+            return True, "", EscalationFlag.NONE
 
         avg_ref = np.mean(ref_embs, axis=0)
         similarity = _cosine_similarity(content_emb, avg_ref)
@@ -335,8 +348,8 @@ class MemoryDefenseEngine:
                 f"R2: semantic drift — cosine similarity {similarity:.3f} "
                 f"vs reference (threshold: {self.config.drift_cosine_threshold}) "
                 f"for source '{source}'"
-            )
-        return True, ""
+            ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
 
     def _get_embedding(self, text: str) -> Optional[np.ndarray]:
         """获取文本嵌入向量。
@@ -362,44 +375,46 @@ class MemoryDefenseEngine:
 
     # ── R3: 实体共现异常 ─────────────────────────────────
 
-    def _check_r3(self, content: str) -> tuple[bool, str]:
+    def _check_r3(self, content: str) -> tuple[bool, str, EscalationFlag]:
         entities = _extract_entities(content)
         if len(entities) > self.config.max_entity_cooccurrence:
             return False, (
                 f"R3: entity co-occurrence anomaly — {len(entities)} entities detected "
                 f"(threshold: {self.config.max_entity_cooccurrence})"
-            )
-        return True, ""
+            ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
 
     # ── R4: 重复洪泛 ─────────────────────────────────────
 
-    def _check_r4(self, source: str, content: str) -> tuple[bool, str]:
+    def _check_r4(self, source: str, content: str, include_pending: bool = False) -> tuple[bool, str, EscalationFlag]:
         cutoff = time.time() - self.config.repeat_dedup_window
         recent = [c for c, ts in self._exact_contents[source] if ts >= cutoff]
         repeat_count = sum(1 for c in recent if c == content)
+        if include_pending:
+            repeat_count += 1  # 含本次待写入
         if repeat_count > self.config.max_repeat_exact:
             return False, (
                 f"R4: repeat flooding — {repeat_count} exact duplicates "
                 f"in {self.config.repeat_dedup_window:.0f}s from '{source}' "
                 f"(threshold: {self.config.max_repeat_exact})"
-            )
-        return True, ""
+            ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
 
     # ── R5: 信任衰减 ─────────────────────────────────────
 
-    def _check_r5(self, source: str) -> tuple[bool, str]:
+    def _check_r5(self, source: str) -> tuple[bool, str, EscalationFlag]:
         trust = self._trust_scores[source]
         if trust < self.config.block_trust_threshold:
             return False, (
                 f"R5: trust decay — trust score {trust:.2f} for '{source}' "
                 f"below block threshold {self.config.block_trust_threshold}"
-            )
+            ), EscalationFlag.BLOCK
         if trust < self.config.quarantine_trust_threshold:
             return False, (
                 f"R5: trust decay — trust score {trust:.2f} for '{source}' "
                 f"below quarantine threshold {self.config.quarantine_trust_threshold}"
-            )
-        return True, ""
+            ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
 
     # ── 内部辅助 ─────────────────────────────────────────
 

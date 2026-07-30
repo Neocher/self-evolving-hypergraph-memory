@@ -178,6 +178,9 @@ class DiagnosisEngine:
       - 退化模式触发 → 提权实体匹配精确度
     """
 
+    def __init__(self, damping: float = 0.5):
+        self._damping = damping  # 阻尼因子 (0~1)，越小越不敏感
+
     def diagnose(self, snapshots: list[RetrievalSnapshot],
                  current_params: EvolvableParams) -> DiagnosisResult:
         if not snapshots:
@@ -197,51 +200,58 @@ class DiagnosisEngine:
         vector_delta = 0.0
         confidence = 0.5  # 基线
 
+        d = self._damping
+
         # 规则 1: 结果太少 → 提权向量
         if avg_n < 3:
-            vector_delta += 0.1
-            reasons.append(f"结果太少(avg={avg_n:.1f})，提权向量+0.1")
-            confidence = min(0.8, confidence + 0.2)
+            vector_delta += 0.1 * d
+            reasons.append(f"结果太少(avg={avg_n:.1f})，提权向量+{0.1*d:.3f}")
+            confidence = min(0.8, confidence + 0.2 * d)
 
         # 规则 2: 分数低 → 降 BM25（短查询质量差），提权实体匹配
         if avg_s < 0.3:
-            bm25_delta -= 0.05
-            entity_delta += 0.05
-            reasons.append(f"平均分低(avg={avg_s:.2f})，降BM25-0.05，提权实体+0.05")
-            confidence = min(0.8, confidence + 0.2)
+            bm25_delta -= 0.05 * d
+            entity_delta += 0.05 * d
+            reasons.append(f"平均分低(avg={avg_s:.2f})，降BM25-{0.05*d:.3f}，提权实体+{0.05*d:.3f}")
+            confidence = min(0.8, confidence + 0.2 * d)
 
         # 规则 3: 内容单一 → 提权 BM25 增加多样性
         if avg_d < 2:
-            bm25_delta += 0.10
-            reasons.append(f"结果单一(多样={avg_d:.1f})，提权BM25+0.1")
-            confidence = min(0.75, confidence + 0.15)
+            bm25_delta += 0.10 * d
+            reasons.append(f"结果单一(多样={avg_d:.1f})，提权BM25+{0.10*d:.3f}")
+            confidence = min(0.75, confidence + 0.15 * d)
 
-        # 合并 delta → suggested
+        # 合并 delta → suggested（单次演化只改一个维度，防振荡）
+        changes = []
         if bm25_delta != 0:
-            suggested["weight_fusion_bm25"] = max(0.0, min(1.0, 
-                current_params.weight_fusion_bm25 + bm25_delta))
+            changes.append(("weight_fusion_bm25", bm25_delta))
         if entity_delta != 0:
-            suggested["weight_fusion_entity"] = max(0.0, min(1.0, 
-                current_params.weight_fusion_entity + entity_delta))
+            changes.append(("weight_fusion_entity", entity_delta))
         if vector_delta != 0:
-            suggested["weight_fusion_vector"] = max(0.0, min(1.0, 
-                current_params.weight_fusion_vector + vector_delta))
+            changes.append(("weight_fusion_vector", vector_delta))
+
+        if changes:
+            # 只选 delta 绝对值最大的维度修改，单次只改一个
+            changes.sort(key=lambda x: abs(x[1]), reverse=True)
+            chosen_param, chosen_delta = changes[0]
+            suggested[chosen_param] = max(0.0, min(1.0,
+                getattr(current_params, chosen_param) + chosen_delta))
 
         # 规则 4: 延迟高 → 降低 top_k
         if avg_lat > 500:
-            new_topk = max(5, int(current_params.top_k_fusion * 0.8))
+            new_topk = max(5, int(current_params.top_k_fusion * (1.0 - 0.2 * d)))
             suggested["top_k_fusion"] = new_topk
             reasons.append(f"延迟高({avg_lat:.0f}ms)，降top_k {current_params.top_k_fusion}→{new_topk}")
-            confidence = min(0.7, confidence + 0.1)
+            confidence = min(0.7, confidence + 0.1 * d)
 
         # 规则 5: 降级触发 → 提权精确匹配
         if any(s.degraded for s in snapshots):
             suggested["weight_fusion_entity"] = min(
-                0.7, current_params.weight_fusion_entity + 0.1)
+                0.7, current_params.weight_fusion_entity + 0.1 * d)
             suggested["weight_fusion_vector"] = min(
-                0.5, current_params.weight_fusion_vector + 0.05)
+                0.5, current_params.weight_fusion_vector + 0.05 * d)
             reasons.append("降级触发，提权实体+向量")
-            confidence = min(0.85, confidence + 0.2)
+            confidence = min(0.85, confidence + 0.2 * d)
 
         if not suggested:
             return DiagnosisResult("检索正常，无需调整", 0.3, {})
@@ -291,7 +301,11 @@ class EvolutionGuard:
         return self.params
 
     def apply(self, suggested: dict) -> tuple[bool, str]:
-        """应用配置调整，返回 (是否应用, 消息)"""
+        """应用配置调整，返回 (是否应用, 消息)
+
+        版本号使用单调递增 int，添加 reset 保护：
+        当 history 超过 100 条时强制清理旧记录并重置版本标记。
+        """
         errs = []
         new_params = deepcopy(self.params)
         for k, v in suggested.items():
@@ -307,8 +321,13 @@ class EvolutionGuard:
         if verrs:
             return False, f"校验失败: {', '.join(verrs)}"
 
+        # 版本保护：history 超过 100 条时归档清理
+        if len(self.history) >= 100:
+            self.history = self.history[-50:]
+            logger.info("Evolution history trimmed to last 50 entries")
+
         self._version += 1
-        self._no_change_count = 0  # 重置停滞计数器
+        self._no_change_count = 0
         old_params = deepcopy(self.params)
         self.params = new_params
         self._pending = ConfigVersion(
@@ -490,7 +509,9 @@ class SelfEvolvingRetrieval:
             self._sync_params()
             logger.info("回滚生效，参数已重置")
 
-        self.guard._explore_if_stagnant()
+        # 仅在诊断周期检查停滞，而非每次 retrieve
+        if needs_diagnosis:
+            self.guard._explore_if_stagnant()
 
         # 触发诊断
         if needs_diagnosis and (time.time() - self._last_diagnosis > 60):
