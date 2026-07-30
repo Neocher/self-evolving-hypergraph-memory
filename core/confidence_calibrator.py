@@ -131,8 +131,19 @@ class ConfidenceCalibrator:
             if r.flagged
         ]
 
+    def cleanup(self, max_records: int = 10000) -> int:
+        if len(self._records) <= max_records:
+            return 0
+        to_remove = max(1, len(self._records) - max_records)
+        sorted_items = sorted(self._records.items(), key=lambda x: x[1].last_consolidated)
+        for key, _ in sorted_items[:to_remove]:
+            del self._records[key]
+        return to_remove
+
     def state(self) -> dict:
         """校准器状态摘要"""
+        if len(self._records) > 10000:
+            self.cleanup(max_records=10000)
         total = len(self._records)
         flagged = sum(1 for r in self._records.values() if r.flagged)
         high_consolidation = sum(

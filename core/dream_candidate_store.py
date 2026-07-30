@@ -237,10 +237,21 @@ class DreamCandidateStore:
                 try:
                     target = op.get("target", "")
                     if target:
+                        source_rows = kuzu_store.query_cypher(
+                            "MATCH (s:EpisodeNode {id: $id}) RETURN s.content AS content",
+                            {"id": op["node_id"]}
+                        )
+                        source_content = ""
+                        if source_rows and len(source_rows) > 0:
+                            row = source_rows[0]
+                            if isinstance(row, (list, tuple)):
+                                source_content = str(row[0])
+                            elif isinstance(row, dict):
+                                source_content = str(row.get("content", ""))
                         kuzu_store.query_cypher(
                             "MATCH (target:EpisodeNode {id: $target}) "
                             "SET target.content = target.content + ' | merged: ' || $content",
-                            {"target": target, "content": ""}
+                            {"target": target, "content": source_content}
                         )
                     kuzu_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",

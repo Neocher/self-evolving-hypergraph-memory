@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-import time
+import asyncio
 import functools
 from typing import Tuple, Type
 
@@ -58,31 +58,34 @@ def with_retry(
     """
     def decorator(func):
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             last_exception = None
-            start_time = time.monotonic() if max_total_timeout > 0 else None
+            loop_time = asyncio.get_running_loop().time
+            start_time = loop_time() if max_total_timeout > 0 else None
             for attempt in range(max_attempts):
                 if start_time is not None:
-                    elapsed = time.monotonic() - start_time
+                    elapsed = loop_time() - start_time
                     if elapsed >= max_total_timeout:
                         raise TimeoutError(
                             f"with_retry total timeout {max_total_timeout}s exceeded "
                             f"after {attempt} attempts ({elapsed:.1f}s)"
                         )
                 try:
+                    if asyncio.iscoroutinefunction(func):
+                        return await func(*args, **kwargs)
                     return func(*args, **kwargs)
                 except retryable_exceptions as e:
                     last_exception = e
                     if attempt < max_attempts - 1:
                         delay = base_delay * (backoff ** attempt)
                         if start_time is not None:
-                            remaining = max_total_timeout - (time.monotonic() - start_time)
+                            remaining = max_total_timeout - (loop_time() - start_time)
                             delay = min(delay, max(0.1, remaining - 0.5))
                             if delay <= 0:
                                 raise TimeoutError(
                                     f"with_retry total timeout {max_total_timeout}s exceeded"
                                 )
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
             raise last_exception  # type: ignore[misc]
         return wrapper
     return decorator

@@ -67,7 +67,7 @@ class HealthChecker:
         audit_chain=None,
         dream_scheduler=None,
     ) -> None:
-        self.kuzu_store = graph_store  # kuzu_store 作为属性名保持向后兼容
+        self.graph_store = graph_store
         self.faiss_index = faiss_index
         self.audit_chain = audit_chain
         self.dream_scheduler = dream_scheduler
@@ -89,9 +89,9 @@ class HealthChecker:
                 result.faiss_index_size = 0
 
         # 查询真实节点数和超边数
-        if self.kuzu_store is not None:
+        if self.graph_store is not None:
             try:
-                node_rows = self.kuzu_store.query_cypher(
+                node_rows = self.graph_store.query_cypher(
                     "MATCH (n) RETURN count(*) AS cnt"
                 )
                 if node_rows and len(node_rows) > 0:
@@ -104,7 +104,7 @@ class HealthChecker:
             except Exception:
                 result.node_count = 0
             try:
-                he_rows = self.kuzu_store.query_cypher(
+                he_rows = self.graph_store.query_cypher(
                     "MATCH (h:HyperedgeNode) RETURN count(*) AS cnt"
                 )
                 if he_rows and len(he_rows) > 0:
@@ -144,10 +144,10 @@ class HealthChecker:
 
     def _check_graph(self) -> bool:
         """检查 RyuGraph 连接状态。"""
-        if self.kuzu_store is None:
+        if self.graph_store is None:
             return False
         try:
-            self.kuzu_store.query_cypher("RETURN 1 AS test")
+            self.graph_store.query_cypher("RETURN 1 AS test")
             return True
         except Exception:
             return False
@@ -164,9 +164,9 @@ class HealthChecker:
 
     def _check_circuit_breaker(self) -> Dict[str, Any]:
         """检查断路器状态（适配滑动窗口接口）。"""
-        if self.kuzu_store is None:
+        if self.graph_store is None:
             return {"state": "unknown"}
-        cb = getattr(self.kuzu_store, "circuit_breaker", None)
+        cb = getattr(self.graph_store, "circuit_breaker", None)
         if cb is None:
             return {"state": "not_configured"}
 

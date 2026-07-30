@@ -61,8 +61,8 @@ def _extract_factual_core(content: str) -> str:
 class EvidenceTracker:
     """置信度追踪器"""
 
-    def __init__(self, data_dir: str = "/home/admin/shm/data"):
-        self.data_dir = data_dir
+    def __init__(self, data_dir: Optional[str] = None):
+        self.data_dir = data_dir or os.environ.get("SHM_DATA_DIR", "./data")
         self._evidence: Dict[str, Dict[str, Any]] = {}  # hash -> record
         self._source_hash: Dict[str, str] = {}           # source_text_hash -> evidence_hash
         self._dirty = False
