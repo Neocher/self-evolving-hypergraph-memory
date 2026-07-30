@@ -1,22 +1,30 @@
 """
 SHM API Routes — 模块化路由组织
-================================
-路由实现保留在 api/_routes.py (向后兼容)，本包提供模块化导入入口。
-下一阶段：按功能域拆分为独立的 route 模块。
-
-模块划分:
-  - routes/write.py       → 记忆写入 (sensory, episodes, promote)
-  - routes/search.py      → 检索 (retrieve, vector, cypher, namespace)
-  - routes/dream.py       → 梦境 (trigger, reset, notify, candidates)
-  - routes/hyperedges.py  → 超边管理 (CRUD)
-  - routes/communities.py → 社区 + 冲突 (communities, conflicts)
-  - routes/ontology.py    → 本体系统 (types, edges, discover)
-  - routes/visual.py      → 视觉记忆 (visual CRUD, heatmap)
-  - routes/system.py      → 系统端点 (health, metrics, audit, sessions, batch)
+===============================
+子模块托管所有 handler，本文件聚合导出。
 """
 
-from api._routes import router, Services, init_services, get_services
-from api._routes import flush_faiss_buffer, incremental_faiss_update, rebuild_index
+from api.routes._deps import (
+    router, Services, init_services, get_services,
+    flush_faiss_buffer, incremental_faiss_update,
+)
 
-__all__ = ["router", "Services", "init_services", "get_services",
-           "flush_faiss_buffer", "incremental_faiss_update", "rebuild_index"]
+# 导入子模块触发 @router 注册
+import api.routes.write
+import api.routes.search
+import api.routes.hyperedges
+import api.routes.communities
+import api.routes.dream
+import api.routes.system
+import api.routes.ontology
+import api.routes.visual
+
+# 聚合导出
+from api.routes.system import rebuild_index
+from api.routes.write import _process_embed_queue
+
+__all__ = [
+    "router", "Services", "init_services", "get_services",
+    "flush_faiss_buffer", "incremental_faiss_update",
+    "rebuild_index",
+]
