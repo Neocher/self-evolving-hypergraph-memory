@@ -111,6 +111,11 @@ class AgentWriteHistory:
         """获取某个来源最近 n 条写入内容。"""
         return [r["content"] for r in self._records.get(source, [])[-n:]]
 
+    def undo_last(self, source: str) -> None:
+        """撤销最近一次记录（用于阻断写入回滚）。"""
+        if self._records.get(source):
+            self._records[source].pop()
+
     def clear_source(self, source: str) -> None:
         """清除某个来源的所有记录。"""
         self._records.pop(source, None)
@@ -243,13 +248,17 @@ class MemoryDefenseEngine:
             reasons.append(r5_reason)
             verdict = self._escalate(verdict, r5_reason)
 
-        # 信任分更新
+        # 信任分更新 + 阻断时回滚记录
         if verdict in (MemoryDefenseVerdict.BLOCK, MemoryDefenseVerdict.QUARANTINE):
             self._trust_scores[source] = max(
                 0.0,
                 self._trust_scores[source] - self.config.trust_decay_per_block,
             )
             self._recovery_counter[source] = 0
+            # 回滚本次记录：阻断的写入不应影响后续 R1/R4 判定
+            self._history.undo_last(source)
+            if self._exact_contents[source]:
+                self._exact_contents[source].pop()
             logger.warning(
                 "Defense %s: source=%s, reasons=%s",
                 verdict.value, source, reasons,

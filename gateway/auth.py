@@ -2,11 +2,14 @@
 gateway/auth.py — 认证系统
 ==========================
 Token 文件: ~/.shm/auth.tokens (JSON, chmod 600)
-DEV_MODE=true 跳过认证
+Token 存储使用 SHA-256 哈希，不存明文。
+DEV_MODE=true 跳过认证。
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -18,7 +21,11 @@ DEFAULT_TOKEN_DIR = os.path.expanduser("~/.shm")
 
 
 class TokenManager:
-    """基于文件的 Token 认证管理器。支持 TTL 和 scope。"""
+    """基于文件的 Token 认证管理器。支持 TTL 和 scope。
+    
+    【安全】Token 以 SHA-256 哈希存储，原始 token 仅创建时返回一次。
+    验证时比对哈希值，防止文件泄露导致凭证失窃。
+    """
 
     DEFAULT_TTL = 30 * 24 * 3600  # 默认 30 天
 
@@ -27,16 +34,23 @@ class TokenManager:
         self._tokens: dict[str, dict] = {}
         self._load()
 
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        """对 token 做 SHA-256 哈希，不可逆。"""
+        return hashlib.sha256(token.encode()).hexdigest()
+
     def validate(self, token: str) -> Optional[dict]:
-        """验证 token 有效性，返回 token 信息或 None。"""
+        """验证 token 有效性，返回 token 信息或 None（不含原始 token 值）。"""
         now = time.time()
+        token_hash = self._hash_token(token)
         for name, info in self._tokens.items():
-            if info.get("token") == token:
+            if info.get("token_hash") == token_hash:
                 expires_at = info.get("expires_at", 0)
                 if expires_at and now > expires_at:
                     self.revoke_key(name)
                     return None
-                return {"name": name, **info}
+                return {"name": name, "scope": info.get("scope", ""),
+                        "created_at": info.get("created_at", 0)}
         return None
 
     def create_key(self, name: str, ttl: int = DEFAULT_TTL, scope: str = "admin") -> str:
@@ -45,17 +59,19 @@ class TokenManager:
             name: token 名称标识
             ttl: 过期时间（秒），默认 30 天
             scope: 权限范围（admin/readonly）
+        Returns:
+            str: 原始 token（仅在创建时返回一次，不会持久化到文件）
         """
-        token = "shm_" + secrets.token_hex(16)
+        raw_token = "shm_" + secrets.token_hex(16)
         self._tokens[name] = {
-            "token": token,
+            "token_hash": self._hash_token(raw_token),
             "created_at": time.time(),
             "expires_at": time.time() + ttl,
             "name": name,
             "scope": scope,
         }
         self._save()
-        return token
+        return raw_token
 
     def revoke_key(self, name: str) -> bool:
         """撤销 token。"""
@@ -66,7 +82,7 @@ class TokenManager:
         return False
 
     def list_keys(self) -> list[dict]:
-        """列出所有 token（不含 token 值）。"""
+        """列出所有 token（不含 token 值和哈希）。"""
         return [
             {"name": k, "created_at": v["created_at"],
              "expires_at": v.get("expires_at", 0), "scope": v.get("scope", "")}
@@ -75,6 +91,9 @@ class TokenManager:
 
     def count(self) -> int:
         return len(self._tokens)
+
+    def __repr__(self) -> str:
+        return f"TokenManager(path={self._path!r}, keys={len(self._tokens)})"
 
     def _load(self):
         try:
@@ -102,25 +121,37 @@ class TokenManager:
         os.chmod(self._path, stat.S_IRUSR | stat.S_IWUSR)
 
 
-def create_auth_middleware(dev_mode: bool = True, skip_paths: Optional[list] = None,
+def create_auth_middleware(dev_mode: bool = False, skip_paths: Optional[list] = None,
                            token_manager: Optional[TokenManager] = None):
-    """创建 FastAPI 中间件工厂 — 认证 + 速率限制。"""
+    """创建 FastAPI 中间件工厂 — 认证 + 速率限制。
+
+    WARNING: dev_mode=True disables authentication. NEVER use in production.
+    """
     from fastapi.responses import JSONResponse
     from gateway.rate_limit import RateLimiter
 
-    skip = set(skip_paths or ["/health", "/docs", "/openapi.json", "/"])
+    if dev_mode:
+        import logging
+        logging.getLogger(__name__).warning(
+            "DEV_MODE=true: authentication is DISABLED. "
+            "Set DEV_MODE=false in production."
+        )
+
+    skip = set(skip_paths if skip_paths is not None else ["/health"])
     tm = token_manager or (None if dev_mode else TokenManager())
     rl = RateLimiter()
 
     async def middleware(request, call_next):
+        if dev_mode:
+            return await call_next(request)
+
         if request.url.path in skip:
             return await call_next(request)
 
-        if not dev_mode and tm is not None:
-            auth = request.headers.get("Authorization", "")
-            token = auth[7:] if auth.startswith("Bearer ") else ""
-            if not token or not tm.validate(token):
-                return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token or not tm.validate(token):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
         ip = request.client.host if request.client else "127.0.0.1"
         if not rl.check(ip):

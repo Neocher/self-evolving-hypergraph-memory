@@ -16,6 +16,7 @@ from __future__ import annotations
 import ryugraph as kuzu
 import logging
 import time
+import re
 from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass
@@ -59,7 +60,8 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
         self.last_failure_time: float = 0.0
         # [Fix] 滑动窗口：记录最近 N 次请求的成功/失败
-        self._window: collections.deque[bool] = __import__('collections').deque(
+        import collections as _collections
+        self._window: _collections.deque[bool] = _collections.deque(
             maxlen=self.config.window_size
         )
 
@@ -68,7 +70,6 @@ class CircuitBreaker:
         self._window.append(True)
         if self.state == CircuitState.HALF_OPEN:
             self.state = CircuitState.CLOSED
-            self._window.clear()
 
     def record_failure(self) -> None:
         """记录失败调用"""
@@ -410,6 +411,12 @@ class RyuStore:
 
         return self._execute_with_circuit_breaker(_do_get)
 
+    @staticmethod
+    def _validate_cypher_key(key: str) -> str:
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
+            raise ValueError(f"Invalid Cypher property key: {key!r}")
+        return key
+
     def update_with_version(
         self,
         node_id: str,
@@ -436,24 +443,25 @@ class RyuStore:
             }
         """
         def _do_update():
+            safe_keys = [k for k in data if k != "id"]
+            for k in safe_keys:
+                self._validate_cypher_key(k)
+            set_clauses = ", ".join(
+                f"e.{k} = ${k}" for k in safe_keys
+            )
+            if not set_clauses:
+                return {"success": True, "updated": False,
+                        "version_conflict": False, "current_version": None}
+            params = {k: v for k, v in data.items() if k != "id"}
+            params["id"] = node_id
+            set_clauses += ", e.version = COALESCE(e.version, 1) + 1"
+
             if expected_version is None:
-                # 强制写入 — 不检查版本
-                set_clauses = ", ".join(
-                    f"e.{k} = ${k}" for k in data if k != "id"
-                )
-                if not set_clauses:
-                    return {"success": True, "updated": False,
-                            "version_conflict": False, "current_version": None}
-                params = {k: v for k, v in data.items() if k != "id"}
-                params["id"] = node_id
-                # version 递增
-                set_clauses += ", e.version = COALESCE(e.version, 1) + 1"
                 self.conn.execute(
                     f"MATCH (e:EpisodeNode {{id: $id}}) "
                     f"SET {set_clauses}",
                     params,
                 )
-                # 回读确认
                 node = self.get_episode(node_id)
                 return {
                     "success": True,
@@ -462,19 +470,7 @@ class RyuStore:
                     "current_version": node.get("version", 1) if node else None,
                 }
 
-            # OCC 条件更新：version 必须匹配
-            set_clauses = ", ".join(
-                f"e.{k} = ${k}" for k in data if k != "id"
-            )
-            if not set_clauses:
-                return {"success": True, "updated": False,
-                        "version_conflict": False, "current_version": None}
-            params = {k: v for k, v in data.items() if k != "id"}
-            params["id"] = node_id
             params["expected_version"] = expected_version
-            # version 递增
-            set_clauses += ", e.version = COALESCE(e.version, 1) + 1"
-
             self.conn.execute(
                 f"MATCH (e:EpisodeNode {{id: $id}}) "
                 f"WHERE e.version = $expected_version "
@@ -482,7 +478,6 @@ class RyuStore:
                 params,
             )
 
-            # 回读验证：如果 version 没变，说明 WHERE 条件未匹配
             node = self.get_episode(node_id)
             if node is None:
                 return {"success": False, "updated": False,
@@ -505,37 +500,45 @@ class RyuStore:
         if not node_ids:
             return []
 
+        _FALLBACK_COLS = [
+            'e.id', 'e.content', 'e.embedding', 'e.created_at',
+            'e.tau_initial', 'e.tau_value', 'e.trust_score',
+            'e.ontology_type', 'e.source', 'e.visibility',
+            'e.quarantine', 'e.quarantine_reason',
+            'e.quarantine_source', 'e.quarantined_at', 'e.version',
+        ]
+
         def _do_batch():
             result = self.conn.execute(
                 "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.*",
                 {"ids": node_ids}
             )
-            # RyuGraph 25.9: get_as_pl 可能失败，用原生遍历兜底
+            # Try get_as_pl first (bulk dict conversion)
+            pl = None
             try:
                 pl = result.get_as_pl()
-                if pl is not None and hasattr(pl, 'to_dicts'):
-                    return [_clean_kuzu_row(d) for d in pl.to_dicts()]
             except Exception:
                 pass
-            
-            # 原生方式遍历
-            # 重新执行获取 column names（第一次已被 get_as_pl 消耗）
-            r2 = self.conn.execute(
+
+            if pl is not None and hasattr(pl, 'to_dicts'):
+                try:
+                    return [_clean_kuzu_row(d) for d in pl.to_dicts()]
+                except Exception:
+                    pass
+
+            # Fallback: re-execute since get_as_pl may have consumed the result
+            result = self.conn.execute(
                 "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.*",
                 {"ids": node_ids}
             )
             try:
-                cols = r2.get_column_names()
+                cols = result.get_column_names()
             except Exception:
-                cols = ['e.id', 'e.content', 'e.embedding', 'e.created_at',
-                        'e.tau_initial', 'e.tau_value', 'e.trust_score',
-                        'e.ontology_type', 'e.source', 'e.visibility',
-                        'e.quarantine', 'e.quarantine_reason',
-                        'e.quarantine_source', 'e.quarantined_at', 'e.version']
-            
+                cols = _FALLBACK_COLS
+
             cleaned = []
-            while r2.has_next():
-                row = r2.get_next()
+            while result.has_next():
+                row = result.get_next()
                 if isinstance(row, dict):
                     cleaned.append(_clean_kuzu_row(row))
                 elif isinstance(row, (list, tuple)):

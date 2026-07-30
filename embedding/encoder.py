@@ -122,15 +122,14 @@ class TextEncoder:
         """带缓存的嵌入（LRU淘汰）。"""
         if text in self._cache:
             self._cache_hits += 1
-            return self._cache[text]
+            vec = self._cache.pop(text)
+            self._cache[text] = vec
+            return vec
         self._cache_misses += 1
         vec = self._do_embed(text)
-        # LRU: 超过 512 条时清理一半
         if len(self._cache) >= 512:
-            # 保留最近插入的 256 条
-            keys = list(self._cache.keys())
-            for k in keys[:256]:
-                del self._cache[k]
+            oldest = next(iter(self._cache))
+            del self._cache[oldest]
         self._cache[text] = vec
         return vec
 

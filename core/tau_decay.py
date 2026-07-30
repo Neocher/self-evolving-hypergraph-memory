@@ -274,7 +274,7 @@ class TauDecayEngine:
         ROEM_ALPHA=1.0 时行为与 compute_tau() 完全一致（向后兼容）。
         """
         age = max(0.0, time.time() - created_at)
-        tau_val = self.compute_tau(node_id="", created_at=created_at)
+        tau_val = self.compute_tau(node_id=None, created_at=created_at)
         phase_sim = _phase_similarity(age, ROEM_PERIODS)
         return ROEM_ALPHA * tau_val + (1.0 - ROEM_ALPHA) * (phase_sim + 1.0) / 2.0
 

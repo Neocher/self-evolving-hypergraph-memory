@@ -90,7 +90,9 @@ community:
 llm:
   endpoint: "http://127.0.0.1:11434/v1/chat/completions"  # LLM API 端点（Ollama 默认）
   model: "llama3"                # 默认模型名
-  api_key: ""                    # API Key（空 = 无需认证）
+  # ⚠️ 安全警告: 不要在此文件中填写 api_key。必须通过环境变量 DEEPSEEK_API_KEY / OPENAI_API_KEY 等设置。
+  #    默认值为空字符串，表示"无需认证"。填写到 YAML 可能导致密钥被误提交到版本控制。
+  api_key: ""                    # ❌ 请勿填写！使用环境变量
   timeout: 60.0                  # 超时秒数
   max_retries: 3                 # 最大重试次数
   fallback_endpoints: []         # 备用端点列表（按顺序尝试）

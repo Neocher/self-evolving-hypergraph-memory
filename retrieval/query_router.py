@@ -330,12 +330,14 @@ class QueryRouter:
 
         for qf_idx in query_indices:
             idf = self._bm25_idf[qf_idx]
-            tf_col = self._bm25_doc_term_matrix[:, qf_idx].toarray().ravel()
-            # BM25 term score
-            numerator = tf_col * (k1 + 1.0)
-            denominator = tf_col + k1 * (1.0 - b + b * self._bm25_doc_lens / self._bm25_avgdl)
-            term_scores = idf * numerator / denominator
-            scores += term_scores
+            col = self._bm25_doc_term_matrix[:, qf_idx]
+            rows = col.indices
+            if rows.size == 0:
+                continue
+            vals = col.data
+            numerator = vals * (k1 + 1.0)
+            denominator = vals + k1 * (1.0 - b + b * self._bm25_doc_lens[rows] / self._bm25_avgdl)
+            scores[rows] += idf * numerator / denominator
 
         # 找出 top-k
         top_k = min(k, n_docs)
@@ -405,8 +407,8 @@ class QueryRouter:
                     "WHERE toLower(e.content) CONTAINS $term "
                     "RETURN e.id AS node_id, e.content AS content, "
                     "e.tau_initial AS tau_value "
-                    f"LIMIT {limit_per_term}",
-                    {"term": term},
+                    "LIMIT $limit",
+                    {"term": term, "limit": limit_per_term},
                 )
             except Exception:
                 continue
@@ -846,8 +848,9 @@ class QueryRouter:
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE {conditions} "
                 f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value "
-                f"LIMIT {self.config.top_k_keyword}"
+                "LIMIT $limit"
             )
+            params["limit"] = self.config.top_k_keyword
             rows = self.kuzu_store.query_cypher(cypher, params)
             results = []
             for row in rows:

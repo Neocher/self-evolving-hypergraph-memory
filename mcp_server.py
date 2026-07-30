@@ -23,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("mcp-server")
 
@@ -63,11 +64,24 @@ def handle_search_files(pattern: str, target: str = "content") -> dict:
         return {"error": str(e)}
 
 
+ALLOWED_COMMANDS = {
+    "ls", "cat", "head", "tail", "wc", "find", "grep", "rg",
+    "python", "python3", "pytest", "ruff", "mypy",
+    "git", "make", "tree", "du", "df", "file", "stat",
+    "pip", "pip3", "npm", "node",
+}
+
 def handle_terminal(command: str, timeout: int = 15) -> dict:
-    """执行命令"""
+    """执行命令（受白名单限制）"""
     try:
+        cmd_parts = shlex.split(command)
+        if not cmd_parts:
+            return {"error": "empty command"}
+        base = os.path.basename(cmd_parts[0])
+        if base not in ALLOWED_COMMANDS:
+            return {"error": f"command not allowed: {base}"}
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
+            cmd_parts, capture_output=True, text=True,
             timeout=timeout, cwd=str(WORKDIR),
         )
         return {

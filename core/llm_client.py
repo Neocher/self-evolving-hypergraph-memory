@@ -48,20 +48,12 @@ class LLMClient:
         timeout: Optional[float] = None,
         fallback_endpoints: Optional[list[str]] = None,
     ) -> None:
-        # 从 config 加载默认值（可被构造参数覆盖）
-        try:
-            from config.settings import get_settings
-            cfg = get_settings().llm
-        except Exception:
-            cfg = None
-
-        self.base_url = (base_url or (cfg.endpoint if cfg else _DEFAULT_BASE_URL))
-        self.model = model or (cfg.model if cfg else _DEFAULT_MODEL)
-        self.timeout = timeout or (cfg.timeout if cfg else _DEFAULT_TIMEOUT)
-        self.fallback_endpoints = fallback_endpoints or (
-            cfg.fallback_endpoints if cfg and cfg.fallback_endpoints
-            else self._DEFAULT_FALLBACK_ENDPOINTS
-        )
+        # 【安全】api_key 仅从构造参数或环境变量加载，不从 YAML 配置读取
+        # 以防止密钥被误提交到版本控制的 defaults.yaml 泄露
+        self.base_url = (base_url or _DEFAULT_BASE_URL)
+        self.model = model or _DEFAULT_MODEL
+        self.timeout = timeout or _DEFAULT_TIMEOUT
+        self.fallback_endpoints = fallback_endpoints or list(self._DEFAULT_FALLBACK_ENDPOINTS)
         self._base_urls = [self.base_url] + [
             ep for ep in self.fallback_endpoints if ep != self.base_url
         ]
@@ -71,6 +63,7 @@ class LLMClient:
         if not self.api_key:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 
+        self._env_keys: dict[str, str] = {}  # internal store (not os.environ) for hot-reloaded keys
         self._client = httpx.AsyncClient(
             base_url=self.base_url.rstrip("/"),
             headers=self._build_headers(),
@@ -78,16 +71,23 @@ class LLMClient:
         )
         self._client_lock = asyncio.Lock()
 
+    def __repr__(self) -> str:
+        """防止 api_key 在日志/调试输出中泄露。"""
+        return f"LLMClient(base_url={self.base_url}, model={self.model}, api_key=***)"
+
+    __str__ = __repr__
+
     _HERMES_ENV = os.path.expanduser("~/.hermes/.env")
     _HERMES_ENV_MTIME: float = 0.0
 
-    @staticmethod
-    def _load_key_from_env() -> str:
-        """从环境变量读取 API Key，支持多个 provider。"""
-        for k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+    _KEY_NAMES = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
                   "ANTHROPIC_API_KEY", "KIMI_API_KEY",
-                  "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
-            v = os.environ.get(k, "")
+                  "OPENROUTER_API_KEY", "GEMINI_API_KEY")
+
+    def _load_key_from_env(self) -> str:
+        """从内部存储或环境变量读取 API Key（内部存储优先）。"""
+        for k in self._KEY_NAMES:
+            v = self._env_keys.get(k) or os.environ.get(k, "")
             if v:
                 return v
         return ""
@@ -110,19 +110,18 @@ class LLMClient:
         if new_mtime <= self._HERMES_ENV_MTIME:
             return False
         
-        # 文件变了，读取所有 API Key 到环境变量
+        # 文件变了，读取所有 API Key 到内部存储（不污染 os.environ）
         self._HERMES_ENV_MTIME = new_mtime
-        for line in open(self._HERMES_ENV):
-            line = line.strip()
-            if line and '=' in line and not line.startswith('#'):
-                k, v = line.split('=', 1)
-                if k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
-                         "ANTHROPIC_API_KEY", "KIMI_API_KEY",
-                         "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
-                    if v:
-                        os.environ[k] = v  # 同步到当前进程环境
+        with open(self._HERMES_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line and '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    if k in self._KEY_NAMES:
+                        if v:
+                            self._env_keys[k] = v  # 仅存实例内部，子进程不继承
         
-        # 用统一优先级逻辑读取（保证与 __init__ 一致）
+        # 从内部存储读取（保证与 __init__ 一致）
         new_key = self._load_key_from_env()
         if new_key and new_key != self.api_key:
             logger.info(f"LLMClient: API Key 已热更新 (从 {self._HERMES_ENV})")

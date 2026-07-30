@@ -90,7 +90,7 @@ class MediaStore:
         Returns:
             本地 Path 对象，文件不存在时返回 None。
         """
-        full = self.base_dir.parent / rel_path if "/" in rel_path else self.base_dir / rel_path
+        full = self.base_dir / rel_path
         if full.exists() and full.is_file():
             return full.resolve()
         return None

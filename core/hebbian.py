@@ -12,8 +12,11 @@ v2.0: 新增 RyuGraph 持久化支持，Hebbian 连接不再仅存内存。
 from __future__ import annotations
 
 import heapq
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -135,7 +138,7 @@ class SparseHebbianUpdater:
             try:
                 self._kuzu_store.update_hebbian_connection(src, dst, weight)
             except Exception:
-                pass  # 持久化失败不影响主流程
+                logger.exception("Hebbian persist failed for %s→%s", src[:12], dst[:12])
 
     def compute_connection_strength(
         self,

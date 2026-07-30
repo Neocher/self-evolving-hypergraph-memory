@@ -107,7 +107,7 @@ class APIConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "WARNING"
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = field(default_factory=lambda: ["http://127.0.0.1:8000", "http://localhost:8000"])
 
 
 @dataclass
@@ -175,6 +175,15 @@ class LLMConfig:
     timeout: float = 60.0
     max_retries: int = 3
     fallback_endpoints: list[str] = field(default_factory=list)
+
+    def __repr__(self) -> str:
+        masked = (self.api_key[:6] + "..." + self.api_key[-4:]) if len(self.api_key) > 10 else ("*****" if self.api_key else "")
+        return (
+            f"LLMConfig(endpoint={self.endpoint!r}, model={self.model!r}, "
+            f"api_key={masked!r}, timeout={self.timeout}, "
+            f"max_retries={self.max_retries}, "
+            f"fallback_endpoints={self.fallback_endpoints!r})"
+        )
 
 
 @dataclass

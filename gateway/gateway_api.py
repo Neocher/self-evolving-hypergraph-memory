@@ -39,6 +39,29 @@ from graph.hyperedge import HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker
 
 
+# ── 凭据扫描 ──
+
+_CREDENTIAL_PATTERNS = [
+    r'(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key)\s*[:=]{1}\s*[\'"]?[A-Za-z0-9_\-]{16,}',
+    r'(?i)sk-[A-Za-z0-9]{20,}',
+    r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}',
+    r'(?i)(-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----)',
+    r'(?i)(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}',
+    r'(?i)(xox[bpsar]-[A-Za-z0-9\-]{10,})',
+    r'(?i)(AKIA[0-9A-Z]{16})',
+]
+
+
+def _scan_credentials(content: str) -> list[str]:
+    """扫描文本中是否包含疑似凭据/密钥内容。返回匹配的规则描述列表。"""
+    import re
+    findings: list[str] = []
+    for pattern in _CREDENTIAL_PATTERNS:
+        if re.search(pattern, content):
+            findings.append(f"matched pattern: {pattern[:50]}...")
+    return findings
+
+
 class GatewayAPI:
     """统一的 SHM 核心接口 — 所有协议适配器都通过它访问 SHM。
 
@@ -62,6 +85,9 @@ class GatewayAPI:
         visibility: str = "private",
     ) -> SensoryResponse:
         """将原始文本写入 Layer1 环形缓冲区。"""
+        creds = _scan_credentials(content)
+        if creds:
+            self._logger.warning("Credential-like content detected in write_sensory from %s: %s", source, creds)
         record_id = str(uuid.uuid4())
         created_at = time.time()
         buf = getattr(self._svc.kuzu_store, "_sensory_buffer", None)
@@ -128,16 +154,15 @@ class GatewayAPI:
 
         # SSM 门控过滤
         if self._svc.ssm_gate is not None and self._svc.tau_engine is not None:
-            features = np.array([
-                float(len(content)),
-                float(created_at - time.time()),
-            ], dtype=np.float32)
-            if features.shape[0] != self._svc.ssm_gate.config.input_dim:
-                features = np.pad(
-                    features,
-                    (0, max(0, self._svc.ssm_gate.config.input_dim - features.shape[0])),
-                    mode="constant",
-                )[: self._svc.ssm_gate.config.input_dim]
+            input_dim = self._svc.ssm_gate.config.input_dim
+            age_hours = 0.0
+            features = np.zeros(input_dim, dtype=np.float32)
+            norm_len = min(float(len(content)) / 1000.0, 1.0)
+            features[0] = norm_len
+            if input_dim > 1:
+                features[1] = age_hours
+            if input_dim > 2:
+                features[2] = 0.0
             try:
                 _ = self._svc.ssm_gate.hidden_state
             except AttributeError:
@@ -610,10 +635,11 @@ class GatewayAPI:
     async def cypher_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> dict:
         """执行只读 Cypher 查询（禁止写操作）。"""
         import re
+        stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '', query)
         blocked = re.compile(
-            r"\b(?:CREATE|DELETE|SET|DROP|MERGE|REMOVE|DETACH)\b", re.IGNORECASE
+            r"\b(?:CREATE|DELETE|SET\s+\w+|DROP|MERGE|REMOVE|DETACH|INSERT|LOAD\s+CSV)\b", re.IGNORECASE
         )
-        if blocked.search(query):
+        if blocked.search(stripped):
             return {"error": "Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH", "rows": [], "count": 0}
         params = params or {}
         try:
