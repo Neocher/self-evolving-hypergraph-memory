@@ -7,7 +7,7 @@ from api.routes._deps import (
     _result_cache, _result_cache_lock, _result_cache_max,
     set_trace_id, record_request,
     Depends, Query, HTTPException,
-    uuid, np, time,
+    uuid, np, time, threading,
     RetrieveRequest, RetrieveResponse, EpisodicResult,
     SearchVectorRequest, SearchVectorResult, SearchVectorResponse,
     SessionMemoryCreate, SessionMemoryItem, SessionMemoryListResponse,
