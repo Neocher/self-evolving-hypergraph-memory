@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.17.3"
-__version_info__ = (5, 17, 3)
-__version_name__ = "深度安全审计 — 10项修复 + 端口加固 + CORS限制 + 认证链路增强"
+__version__ = "5.17.8"
+__version_info__ = (5, 17, 8)
+__version_name__ = "全量审计完成 — 34项修复 + 路由拆分 + 跨文件兼容 + OCC修复 + I/O优化"
 __release_date__ = "2026-07-30"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
