@@ -133,4 +133,11 @@ def create_auth_middleware(dev_mode: bool = True, skip_paths: Optional[list] = N
 
 
 def is_dev_mode() -> bool:
-    return os.environ.get("DEV_MODE", "false").lower() == "true"
+    mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+    if mode:
+        import logging
+        logging.getLogger(__name__).warning(
+            "DEV_MODE=true: authentication is DISABLED. "
+            "Set DEV_MODE=false in production."
+        )
+    return mode

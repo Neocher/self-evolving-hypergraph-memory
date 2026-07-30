@@ -8,6 +8,8 @@ FastAPI 路由注册
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import uuid
 import threading
@@ -16,10 +18,10 @@ from typing import Any, Dict, List, Optional
 
 from shm._version import __version__, __version_name__
 
+import base64
 import numpy as np
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse
 
 from api.models import (
@@ -87,6 +89,7 @@ class Services:
     faiss_dim: int = 384
     faiss_index_type: str = "IVFFlat"
     faiss_nlist: int = 100
+    faiss_id_map: dict = field(default_factory=dict)
     tau_engine: Any = None
     hebbian_updater: Any = None
     ssm_gate: Any = None
@@ -129,7 +132,6 @@ _services: Optional[Services] = None
 def init_services(svc: Services) -> None:
     """由 app.py 在启动时调用，注入服务容器。"""
     global _services
-    import threading
     svc._faiss_buffer_lock = threading.Lock()
     svc._session_memory_lock = threading.Lock()
     # 初始化记忆投毒防御引擎 + 隔离存储
@@ -211,10 +213,10 @@ def _process_embed_queue(deps: Services) -> int:
                             {episode_id: 1.0}, deps.kuzu_store.get_all_connections()
                         )
                 except Exception:
-                    pass
+                    logger.exception("Hebbian update failed for %s", episode_id)
                 count += 1
         except Exception:
-            pass
+            logger.exception("FAISS add_with_ids failed for %s", episode_id)
     # 批量 flush FAISS
     flush_faiss_buffer(deps)
     if count:
@@ -390,13 +392,16 @@ async def write_multimodal(
             store = MediaStore()
             deps._media_store = store
         except Exception:
+            logger.exception("MediaStore init failed")
             store = None
 
     # ── 处理图像 ──
     image_embeddings: list[np.ndarray] = []
     for b64_str in req.images:
         try:
-            import base64
+            if len(b64_str) > 10 * 1024 * 1024:  # 10MB max per media item
+                logger.warning("Image too large (%d bytes), skipping", len(b64_str))
+                continue
             img_bytes = base64.b64decode(b64_str)
         except Exception:
             continue
@@ -412,7 +417,9 @@ async def write_multimodal(
     audio_texts: list[str] = []
     for b64_str in req.audio:
         try:
-            import base64
+            if len(b64_str) > 10 * 1024 * 1024:
+                logger.warning("Audio too large (%d bytes), skipping", len(b64_str))
+                continue
             aud_bytes = base64.b64decode(b64_str)
         except Exception:
             continue
@@ -427,7 +434,9 @@ async def write_multimodal(
     # ── 处理视频 ──
     for b64_str in req.video:
         try:
-            import base64
+            if len(b64_str) > 10 * 1024 * 1024:
+                logger.warning("Video too large (%d bytes), skipping", len(b64_str))
+                continue
             vid_bytes = base64.b64decode(b64_str)
         except Exception:
             continue
@@ -586,13 +595,13 @@ async def create_episode(
                          "a": episode_id, "b": conflict_id,
                          "rule": "write_validate", "t": _now()})
                 except Exception:
-                    pass
+                    logger.warning("Conflict node creation failed for %s / %s", episode_id, conflict_id)
             # P2: 通知梦境调度器有冲突产生
             try:
                 if deps.dream_scheduler:
                     await deps.dream_scheduler.on_conflict_detected()
             except Exception:
-                pass
+                logger.warning("Failed to notify dream scheduler of conflict")
     deps.kuzu_store.create_episode({
         "id": episode_id,
         "content": req.content,
@@ -691,7 +700,7 @@ async def create_episode(
             if rel_count > 0:
                 logger.info("Write-time entity relations: %d edges (fallback)", rel_count)
         except Exception:
-            pass
+            logger.exception("Entity relations extraction failed (non-fatal)")
 
     # 【P6】异步 embedding：入队后立即返回（不阻塞写入响应）
     with _embed_queue_lock:
@@ -708,19 +717,19 @@ async def create_episode(
     try:
         await _auto_create_hyperedges(episode_id, req.source, req.content, deps)
     except Exception:
-        pass
+        logger.exception("Auto hyperedge creation failed for episode %s", episode_id)
 
     # 【P0-①】会话观测节点：通过 X-Session-Id header 关联记忆到同一会话
     try:
         session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
         if session_id and deps.kuzu_store is not None:
             session_node_id = deps.kuzu_store.get_or_create_session(
-                session_id, metadata='{"source": "' + req.source + '"}'
+                session_id, metadata=json.dumps({"source": req.source})
             )
             if session_node_id:
                 deps.kuzu_store.link_session_member(session_node_id, episode_id)
     except Exception:
-        pass
+        logger.exception("Session memory link failed for episode %s", episode_id)
 
     record_request("POST", "/memories/episodes", "200", _now() - start)
     return EpisodeResponse(
@@ -895,7 +904,7 @@ async def retrieve(
                 )
                 ns_set = {row[0] for row in ns_rows} if ns_rows else set()
             except Exception:
-                pass
+                logger.warning("Namespace query failed, skipping namespace filter")
         for r in results_raw:
             key = r.get("content", "")[:100]
             if key and key not in seen:
@@ -918,7 +927,6 @@ async def retrieve(
         degraded = first_level != "hypergraph"
 
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
-    # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
         try:
             validated = deps.ontology_validator.read_validate(
@@ -940,8 +948,6 @@ async def retrieve(
                     r["score"] = v.adjusted_score if v.adjusted_score is not None else 0.0
                     if v.conflict_note:
                         r["conflict_note"] = v.conflict_note
-        except Exception as val_err:
-            logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
         except Exception as val_err:
             logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
 
@@ -1231,7 +1237,7 @@ async def list_communities(
     try:
         rows = deps.kuzu_store.query_cypher(
             "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
-            "LIMIT $limit",
+            "SKIP $offset LIMIT $limit",
             {"offset": offset, "limit": limit},
         )
     except Exception as e:
@@ -1669,10 +1675,10 @@ async def list_conflicts(
 
     episode_map = {}
     if all_episode_ids and deps.kuzu_store is not None:
-        id_list = "', '".join(all_episode_ids)
         try:
             ep_rows = deps.kuzu_store.query_cypher(
-                f"MATCH (e:EpisodeNode) WHERE e.id IN ['{id_list}'] RETURN e.id, e.version"
+                "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.id, e.version",
+                {"ids": list(all_episode_ids)}
             )
             for er in ep_rows:
                 if isinstance(er, (list, tuple)):
@@ -1680,7 +1686,7 @@ async def list_conflicts(
                 elif isinstance(er, dict):
                     episode_map[str(er.get("e.id", ""))] = int(er.get("e.version", 1))
         except Exception:
-            pass
+            logger.exception("Failed to query episode versions for %d conflicts", len(all_episode_ids))
 
     for r in rows:
         conflict_entry = {
@@ -1915,9 +1921,6 @@ async def get_reconcile_log(
 # ═══════════════════════════════════════════════════════════
 # 多模态视觉 (Visual) 端点
 # ═══════════════════════════════════════════════════════════
-
-import os
-import base64
 
 VISUALS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "visuals")
 
@@ -2452,10 +2455,10 @@ async def ontology_discover(
                 elif isinstance(r, dict):
                     contents.append(str(r.get("e.content", r.get("content", ""))))
         except Exception:
-            pass
+            logger.warning("Episode content query failed for ontology discover")
 
     result = engine.scan(contents, min_occurrences=2, max_candidates=50)
-
+    
     entities_out = []
     for e in result.candidate_entities[:20]:
         entities_out.append({
@@ -2509,7 +2512,7 @@ async def ontology_discover_apply(
                 elif isinstance(r, dict):
                     contents.append(str(r.get("e.content", r.get("content", ""))))
         except Exception:
-            pass
+            logger.warning("Episode content query failed for ontology discover apply")
 
     result = engine.scan(contents, min_occurrences=2, max_candidates=50)
     apply_result = engine.apply_to_ontology(result, auto_register=True)
@@ -2666,17 +2669,6 @@ async def rebuild_index(
         tfidf = getattr(deps, "tfidf_index", None)
         if tfidf is not None:
             deps.query_router.tfidf_index = tfidf
-    # 同步更新查询路由的索引引用（下方重复块）
-    if deps.query_router is not None:
-        deps.query_router.faiss_index = new_index
-        deps.query_router.faiss_id_map = deps.faiss_id_map
-        if hasattr(deps.query_router, '_qr'):
-            deps.query_router._qr.faiss_index = new_index
-            deps.query_router._qr.faiss_id_map = deps.faiss_id_map
-        # 同步 TF-IDF 索引
-        tfidf = getattr(deps, "tfidf_index", None)
-        if tfidf is not None:
-            deps.query_router.tfidf_index = tfidf
 
     # 【FIX】同时重建Hebbian连接
     logger.info("Rebuilding Hebbian connections...")
@@ -2685,7 +2677,7 @@ async def rebuild_index(
     try:
         deps.kuzu_store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
     except Exception:
-        pass
+        logger.exception("Failed to clear Hebbian connections")
     # 为每个节点找5个最相似邻居建连接
     for i in range(len(node_ids)):
         query_vec = embeddings[i:i+1].astype(np.float32)
@@ -2707,9 +2699,9 @@ async def rebuild_index(
                     )
                     hebbian_count += 1
                 except Exception:
-                    pass
+                    logger.exception("Hebbian connection creation failed for node %s", node_ids[i])
         except Exception:
-            pass
+            logger.exception("FAISS search failed for Hebbian rebuild at index %d", i)
 
     record_request("POST", "/index/rebuild", "200", _now() - start)
     logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",
@@ -2737,9 +2729,6 @@ async def rebuild_index(
 # v2.0: 工作记忆（Session Memory）路由
 # ====================================================================
 
-import uuid as _uuid
-
-
 @router.post("/sessions/{session_id}/working-memory",
              summary="写入工作记忆（会话级临时上下文，不持久化到Kuzu）")
 async def write_session_memory(
@@ -2753,10 +2742,10 @@ async def write_session_memory(
     类比 Human-Inspired Memory Architecture 的「工作记忆」层。
     """
     if svc._session_memory_lock is None:
-        svc._session_memory_lock = __import__("threading").Lock()
+        svc._session_memory_lock = threading.Lock()
     
     item = {
-        "id": str(_uuid.uuid4()),
+        "id": str(uuid.uuid4()),
         "session_id": session_id,
         "content": body.content,
         "metadata": body.metadata or {},
@@ -2856,14 +2845,17 @@ async def analyze_concepts(
     """分析现有社区，自动发现跨社区概念。"""
     from core.conceptual_memory import ConceptualMemoryEngine
     # 获取所有社区
-    result = svc.kuzu_store.conn.execute(
+    rows = svc.kuzu_store.query_cypher(
         "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC"
     )
-    rows = result.get_as_pl()
-    dicts = rows.to_dicts() if rows else []
     communities = []
-    for r in dicts:
-        r = _clean_kuzu_row(r)
+    for r in rows:
+        if isinstance(r, (list, tuple)):
+            r = {"id": str(r[0]), "name": str(r[1]) if len(r) > 1 else "",
+                 "summary": str(r[2]) if len(r) > 2 else "",
+                 "keywords": r[3] if len(r) > 3 else []}
+        elif isinstance(r, dict):
+            r = {k.split(".")[-1]: v for k, v in r.items()}
         communities.append({
             "id": r.get("id", ""),
             "name": r.get("name", ""),

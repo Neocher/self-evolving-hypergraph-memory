@@ -42,6 +42,9 @@ class MockKuzuStore:
     def get_episode(self, episode_id: str) -> dict | None:
         return self.episodes.get(episode_id)
 
+    def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
+        return [self.episodes.get(pid) for pid in node_ids if pid in self.episodes]
+
     def query_cypher(self, *args, **kwargs):
         return []
 

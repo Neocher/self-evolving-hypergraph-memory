@@ -65,7 +65,7 @@ embedding:
   device: "cuda"                 # 推理设备 (cpu/cuda)
 
 api:
-  host: "0.0.0.0"               # 服务监听地址
+  host: "127.0.0.1"             # 服务监听地址（生产环境使用 0.0.0.0）
   port: 8000                     # 服务监听端口
   log_level: "INFO"              # 日志级别 (DEBUG/INFO/WARNING/ERROR)
   cors_origins: ["*"]            # CORS 允许的源

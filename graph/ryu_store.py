@@ -352,7 +352,7 @@ class RyuStore:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_source ON (EpisodeNode.source)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_hyperedge_created_at ON (HyperedgeNode.created_at)")
         except RuntimeError:
-            pass  # 旧版本 RyuGraph 可能不支持 CREATE INDEX
+            logger.warning("CREATE INDEX not supported by this RyuGraph version; query performance may degrade")
 
     def _execute_with_circuit_breaker(self, query_func, *args, **kwargs):
         """

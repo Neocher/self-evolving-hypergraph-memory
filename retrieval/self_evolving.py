@@ -36,8 +36,6 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
 
-import random
-
 # 可插拔向量存储工厂
 from retrieval.vector_store import VectorStoreFactory, BaseVectorStore
 
@@ -441,9 +439,8 @@ class SelfEvolvingRetrieval:
         self._total_calls = 0
         self._last_diagnosis = 0.0
         self._lock = threading.Lock()
-        # 可插拔向量存储实例
-        self._vector_store: BaseVectorStore = VectorStoreFactory.create()
-        logger.info("SelfEvolvingRetrieval: vector_store=%s", type(self._vector_store).__name__)
+        # 可插拔向量存储实例（设为 None，由外部共享 Services.faiss_index 代替）
+        self._vector_store: Optional[BaseVectorStore] = None
 
     def retrieve(self, query: str):
         """执行检索 + 质量评估 + 自演化"""

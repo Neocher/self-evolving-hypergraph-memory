@@ -104,7 +104,7 @@ class EmbeddingConfig:
 
 @dataclass
 class APIConfig:
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "WARNING"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
