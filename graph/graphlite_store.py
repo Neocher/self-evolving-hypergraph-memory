@@ -63,17 +63,17 @@ class GraphLiteStore:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db_path = db_path
 
-        if os.path.exists(db_path):
-            shutil.rmtree(db_path, ignore_errors=True)
-
         self._db = GraphLite.open(db_path)
         self._session = self._db.session("shm")
-
-        # Setup schema + graph (GQL requires this)
-        self._session.execute(f"CREATE SCHEMA IF NOT EXISTS {SHM_SCHEMA}")
-        self._session.execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
-        self._session.execute(f"CREATE GRAPH IF NOT EXISTS {SHM_GRAPH}")
-        self._session.execute(f"SESSION SET GRAPH {SHM_GRAPH}")
+        # Setup schema if first time, otherwise just set context
+        try:
+            self._session.execute("SESSION SET SCHEMA /shm")
+            self._session.execute("SESSION SET GRAPH default")
+        except Exception:
+            self._session.execute("CREATE SCHEMA /shm")
+            self._session.execute("CREATE GRAPH default")
+            self._session.execute("SESSION SET SCHEMA /shm")
+            self._session.execute("SESSION SET GRAPH default")
 
     # ─── Episode CRUD ───────────────────────────────
 
