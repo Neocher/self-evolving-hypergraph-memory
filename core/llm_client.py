@@ -111,18 +111,18 @@ class LLMClient:
         if new_mtime <= self._HERMES_ENV_MTIME:
             return False
         
-        # 文件变了，读取所有 API Key 到内部存储（不污染 os.environ）
+        # 文件变了，读取所有 API Key 到实例变量（不写入 os.environ，防止子进程继承）
         self._HERMES_ENV_MTIME = new_mtime
         with open(self._HERMES_ENV) as f:
             for line in f:
                 line = line.strip()
                 if line and '=' in line and not line.startswith('#'):
                     k, v = line.split('=', 1)
-                    if k in self._KEY_NAMES:
+                    if k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                             "ANTHROPIC_API_KEY", "KIMI_API_KEY",
+                             "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
                         if v:
-                            self._env_keys[k] = v  # 仅存实例内部，子进程不继承
-        
-        # 从内部存储读取（保证与 __init__ 一致）
+                            self._env_keys[k] = v  # 存入实例变量，不广播到进程环境
         new_key = self._load_key_from_env()
         if new_key and new_key != self.api_key:
             logger.info(f"LLMClient: API Key 已热更新 (从 {self._HERMES_ENV})")
