@@ -139,6 +139,9 @@ class GatewayAPI:
         从 _routes.create_episode 提取核心逻辑：τ 计算 → SSM 门控 →
         本体验证 → 持久化 → 命名空间链接 → 关系抽取。
         """
+        creds = _scan_credentials(content)
+        if creds:
+            self._logger.warning("Credential-like content detected in store_episode from %s: %s", source, creds)
         episode_id = str(uuid.uuid4())
         created_at = time.time()
         tau_initial = 1.0
@@ -339,6 +342,9 @@ class GatewayAPI:
 
         # 写入 EpisodeNode（文本索引）
         if merged_text and self._svc.kuzu_store is not None:
+            creds = _scan_credentials(merged_text)
+            if creds:
+                self._logger.warning("Credential-like content detected in store_multimodal: %s", creds)
             self._svc.kuzu_store.create_episode({
                 "id": episode_id,
                 "content": merged_text,

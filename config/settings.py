@@ -176,6 +176,16 @@ class LLMConfig:
     max_retries: int = 3
     fallback_endpoints: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """空 API key 时发出警告（防止从 Ollama 切换到云服务时静默无认证）。"""
+        if not self.api_key and self.endpoint and "ollama" not in self.endpoint.lower() and "127.0.0.1" not in self.endpoint:
+            import logging
+            logging.getLogger(__name__).warning(
+                "LLMConfig: api_key is empty but endpoint '%s' is not a local service. "
+                "Set SHM_LLM__API_KEY or configure api_key in defaults.yaml.",
+                self.endpoint,
+            )
+
     def __repr__(self) -> str:
         masked = (self.api_key[:6] + "..." + self.api_key[-4:]) if len(self.api_key) > 10 else ("*****" if self.api_key else "")
         return (

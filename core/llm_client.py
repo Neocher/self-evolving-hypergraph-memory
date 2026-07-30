@@ -58,12 +58,13 @@ class LLMClient:
             ep for ep in self.fallback_endpoints if ep != self.base_url
         ]
 
-        # API Key 优先级：构造参数 > 环境变量
+        # internal store for hot-reloaded keys (not os.environ — avoids child-process leakage)
+        self._env_keys: dict[str, str] = {}
+
+        # API Key 优先级：构造参数 > 内部存储 > 环境变量
         self.api_key = api_key or self._load_key_from_env()
         if not self.api_key:
             logger.warning("LLMClient: No API key found (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
-
-        self._env_keys: dict[str, str] = {}  # internal store (not os.environ) for hot-reloaded keys
         self._client = httpx.AsyncClient(
             base_url=self.base_url.rstrip("/"),
             headers=self._build_headers(),

@@ -53,16 +53,22 @@ _CLOUD_PROVIDERS = [
 ]
 
 
-def _cloud_embed(texts: list[str]) -> Optional[list[list[float]]]:
+def _cloud_embed(
+    texts: list[str],
+    api_keys: Optional[dict[str, str]] = None,
+) -> Optional[list[list[float]]]:
     """Tier 1: 尝试调用云端 Embedding API。
     
     按 DEEPSEEK → OPENAI → KIMI 顺序尝试，第一个成功的返回。
     Returns None 如果所有 API 都不可用。
+    
+    【安全】api_keys 参数从调用者传入的私有存储读取，不从 os.environ 运行时读取。
     """
     import httpx
 
+    keys = api_keys or {}
     for provider in _CLOUD_PROVIDERS:
-        api_key = os.environ.get(provider["key_env"], "")
+        api_key = keys.get(provider["key_env"], "")
         if not api_key:
             continue
         model = os.environ.get(provider["model_env"], provider["default_model"])
@@ -101,6 +107,9 @@ class TextEncoder:
     集成 FAISS 索引过期管理。
     支持 CPU (device='cpu') 和 GPU (device='cuda')。
     自动检测 ONNX INT8 模型（./data/all-MiniLM-L6-v2-int8）并优先使用。
+
+    【安全】API keys 在初始化时从环境变量读取一次并存储在私有实例变量中，
+    不依赖 os.environ 运行时读取，防止子进程继承。
     """
 
     def __init__(
@@ -117,6 +126,20 @@ class TextEncoder:
         self._cache: Dict[str, np.ndarray] = {}  # 【Perf】嵌入缓存
         self._cache_hits: int = 0
         self._cache_misses: int = 0
+        self._api_keys: dict[str, str] = {}  # 【安全】私有 API key 存储，不从 os.environ 运行时读取
+        self._preload_api_keys()
+
+    def __repr__(self) -> str:
+        return f"TextEncoder(model={self.model_name!r}, cloud={self._cloud_available}, cached={len(self._cache)})"
+
+    __str__ = __repr__
+
+    def _preload_api_keys(self) -> None:
+        """初始化时从环境变量预加载 API keys 到私有存储。"""
+        for provider in _CLOUD_PROVIDERS:
+            k = os.environ.get(provider["key_env"], "")
+            if k:
+                self._api_keys[provider["key_env"]] = k
 
     def _cached_embed(self, text: str) -> np.ndarray:
         """带缓存的嵌入（LRU淘汰）。"""
@@ -163,7 +186,7 @@ class TextEncoder:
         """不加缓存的原始嵌入（供缓存内部调用）。"""
         if self._cloud_available:
             try:
-                result = _cloud_embed([text])
+                result = _cloud_embed([text], api_keys=self._api_keys)
                 if result:
                     return np.array(result[0], dtype=np.float32)
             except Exception:
@@ -190,7 +213,7 @@ class TextEncoder:
         # Tier 1: Cloud API (批量调用更高效)
         if self._cloud_available:
             try:
-                result = _cloud_embed(texts)
+                result = _cloud_embed(texts, api_keys=self._api_keys)
                 if result:
                     return np.array(result, dtype=np.float32)
             except Exception:
@@ -348,9 +371,9 @@ def create_encoder(
     encoder = TextEncoder(model_name=model_name, device=device)
     
     if prefer_cloud:
-        # 检查是否有可用的 Cloud API Key
+        # 用已预加载的私有 key 存储检查（不从 os.environ 运行时读取）
         for provider in _CLOUD_PROVIDERS:
-            if os.environ.get(provider["key_env"], ""):
+            if encoder._api_keys.get(provider["key_env"], ""):
                 encoder._cloud_available = True
                 logger.info("Cloud embedding available via %s", provider["provider"])
                 break
