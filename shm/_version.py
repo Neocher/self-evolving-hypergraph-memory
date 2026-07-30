@@ -1,9 +1,9 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.17.0"
-__version_info__ = (5, 17, 0)
-__version_name__ = "全栈代码审查闭环 — 45问题修复 + 243测试全绿 + 全链路安全加固"
-__release_date__ = "2026-07-29"
+__version__ = "5.17.1"
+__version_info__ = (5, 17, 1)
+__version_name__ = "三体协奏修复 — 8问题修复 + 246测试全绿"
+__release_date__ = "2026-07-30"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
