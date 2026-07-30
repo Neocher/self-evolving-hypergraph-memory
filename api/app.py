@@ -35,20 +35,26 @@ def _init_services() -> Services:
     svc = Services()
     errors = []
 
-    # 1. Kuzu 图数据库
+    # 1. GraphLite 图数据库 (替换RyuGraph)
     try:
-        from graph.ryu_store import RyuStore, RyuConfig
-        kuzu_cfg = RyuConfig(
-            database_path=str(cfg.kuzu.database_path),
-            buffer_pool_size_mb=cfg.kuzu.buffer_pool_size_mb,
-            max_threads=cfg.kuzu.max_threads,
-        )
-        svc.kuzu_store = RyuStore(config=kuzu_cfg)
+        import sys as _sys
+        _bindings = "/home/admin/GraphLite/bindings/python"
+        _sdk = "/home/admin/GraphLite/sdk-python/src"
+        for _p in [_bindings, _sdk]:
+            if _p not in _sys.path:
+                _sys.path.insert(0, _p)
+        from graph.graphlite_store import GraphLiteStore
+        kuzu_cfg = type("cfg", (), {
+            "database_path": str(cfg.kuzu.database_path).replace("ryugraph", "graphlite"),
+            "max_threads": cfg.kuzu.max_threads,
+        })()
+        svc.kuzu_store = GraphLiteStore(config=kuzu_cfg)
         svc.kuzu_store.connect()
-        logger.info("RyuStore initialized", path=cfg.kuzu.database_path)
+        logger.info("GraphLiteStore initialized", path=kuzu_cfg.database_path)
     except Exception as e:
-        errors.append(f"RyuStore: {e}")
-        logger.warning("RyuStore init failed", error=str(e))
+        import traceback
+        errors.append(f"GraphLiteStore: {e}")
+        logger.warning("GraphLiteStore init failed", error=str(e), traceback=traceback.format_exc())
 
     # 2. FAISS 向量索引
     if svc.kuzu_store is not None:
