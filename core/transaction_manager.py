@@ -93,11 +93,14 @@ class MemoryTransaction:
                     expected_ver = op.data.get("_expected_version")
                     if expected_ver is not None:
                         if not self._mgr.version_check(expected_ver, node_id):
+                            current_ver = -1
+                            if self._mgr._graph_store:
+                                node = self._mgr._graph_store.get_episode(node_id)
+                                current_ver = node.get("version", 1) if node else -1
                             conflict = self._mgr.record_conflict(
                                 node_id=node_id,
                                 expected_version=expected_ver,
-                                current_version=self._mgr._kuzu_store.get_node_version(node_id)
-                                if self._mgr._kuzu_store else -1,
+                                current_version=current_ver,
                                 strategy="occ_abort",
                                 resolved=False,
                                 detail=f"TX {self.tx_id[:8]} commit aborted by OCC"
@@ -111,8 +114,11 @@ class MemoryTransaction:
             for op in self.operations:
                 node_id = op.data.get("id") or op.data.get("node_id", "")
                 if node_id and op.op in (OpType.UPDATE_NODE, OpType.DELETE_NODE):
-                    if self._mgr._kuzu_store is not None:
-                        self._mgr._kuzu_store.increment_node_version(node_id)
+                    if self._mgr._graph_store is not None:
+                        self._mgr._graph_store.query_cypher(
+                            "MATCH (e:EpisodeNode {id: $id}) SET e.version = COALESCE(e.version, 1) + 1",
+                            {"id": node_id}
+                        )
 
         self.status = TransactionStatus.COMMITTED
         self._explicitly_closed = True
@@ -130,19 +136,19 @@ class MemoryTransaction:
         """回滚 — 从 Kuzu 清除暂存数据"""
         self.status = TransactionStatus.ROLLED_BACK
         self._explicitly_closed = True
-        if self._mgr is not None and self._mgr._kuzu_store is not None:
+        if self._mgr is not None and self._mgr._graph_store is not None:
             try:
                 tx_tag = f"tx_{self.tx_id[:8]}"
                 for op in reversed(self.operations):
                     node_id = op.data.get("id") or op.data.get("node_id", "")
                     if node_id and op.op in (OpType.CREATE_NODE, OpType.UPDATE_NODE):
-                        self._mgr._kuzu_store.query_cypher(
+                        self._mgr._graph_store.query_cypher(
                             "MATCH (n {id: $id}) WHERE n.tx_tag = $tag "
                             "REMOVE n.tx_tag",
                             {"id": node_id, "tag": tx_tag}
                         )
                     elif node_id and op.op == OpType.DELETE_NODE:
-                        self._mgr._kuzu_store.query_cypher(
+                        self._mgr._graph_store.query_cypher(
                             "MATCH (n {id: $id}) WHERE n.tx_tag = $tag "
                             "REMOVE n.tx_tag",
                             {"id": node_id, "tag": tx_tag}
@@ -166,11 +172,11 @@ class MemoryTransaction:
 class TransactionManager:
     """事务管理器 — 管理所有活跃事务 + OCC 版本检查 + 冲突日志"""
 
-    def __init__(self, kuzu_store=None):
+    def __init__(self, graph_store=None):
         self._active: dict[str, MemoryTransaction] = {}
         self._history: list[MemoryTransaction] = []  # 已完成的事务日志（ring buffer, max=1000）
         self._conflict_log: deque[dict] = deque(maxlen=1000)  # 写入冲突日志
-        self._kuzu_store = kuzu_store
+        self._graph_store = graph_store
 
     def begin(self, metadata: Optional[dict] = None) -> MemoryTransaction:
         """开启新事务"""
@@ -222,9 +228,10 @@ class TransactionManager:
             True 如果版本一致，允许提交。
             False 如果版本不一致，需要消解或回滚。
         """
-        if self._kuzu_store is None:
+        if self._graph_store is None:
             return True  # 无数据库可用时跳过
-        current_version = self._kuzu_store.get_node_version(node_id)
+        node = self._graph_store.get_episode(node_id)
+        current_version = node.get("version", 1) if node else None
         ok = expected_version == current_version
         if not ok:
             logger.warning(

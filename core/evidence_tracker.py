@@ -84,7 +84,11 @@ class EvidenceTracker:
                 logger.warning("EvidenceTracker: load failed (%s), starting fresh", e)
 
     def _save(self) -> None:
-        """保存证据数据到磁盘"""
+        """标记数据为脏，延迟写入"""
+        self._dirty = True
+
+    def flush(self) -> None:
+        """立即将脏数据写入磁盘"""
         if not self._dirty:
             return
         path = os.path.join(self.data_dir, "evidence_tracker.json")
@@ -120,7 +124,6 @@ class EvidenceTracker:
                 record["sources"].append(source)
                 record["last_seen"] = time.time()
                 self._dirty = True
-                self._save()
                 logger.debug("EvidenceTracker: increment %s → count=%d (exact match)",
                              evidence_key[:8], record["count"])
                 return record["count"]
@@ -137,7 +140,6 @@ class EvidenceTracker:
                 erecord["last_seen"] = time.time()
                 self._source_hash[content_hash] = ekey
                 self._dirty = True
-                self._save()
                 logger.debug("EvidenceTracker: increment %s → count=%d (semantic match %.2f)",
                              ekey[:8], erecord["count"],
                              self._similarity(factual_core, existing_core))
@@ -159,7 +161,6 @@ class EvidenceTracker:
         self._evidence[evidence_key] = evidence
         self._source_hash[content_hash] = evidence_key
         self._dirty = True
-        self._save()
         logger.debug("EvidenceTracker: new record %s (total now %d)",
                      evidence_key[:8], len(self._evidence))
         return 1
@@ -212,7 +213,7 @@ class EvidenceTracker:
             key=lambda x: -x["count"]
         )
 
-        return {
+        result = {
             "total_records": len(self._evidence),
             "total_sources": len(self._source_hash),
             "top_evidence": [
@@ -225,3 +226,5 @@ class EvidenceTracker:
                 for e in sorted_by_count[:10]
             ],
         }
+        self.flush()
+        return result
