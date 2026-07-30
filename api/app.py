@@ -576,7 +576,7 @@ def create_app() -> FastAPI:
     if origins:
         allow_origins = [o.strip() for o in origins.split(",")]
     else:
-        allow_origins = ["*"]
+        allow_origins = ["http://127.0.0.1:8000"]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,
@@ -598,8 +598,8 @@ def create_app() -> FastAPI:
     # 认证 + 速率限制（在 observe_request 之前）
     from gateway.auth import create_auth_middleware, is_dev_mode
     dev_mode = is_dev_mode()
-    if not dev_mode:
-        app.middleware("http")(create_auth_middleware(dev_mode=dev_mode))
+    skip_paths = ["/health", "/metrics"]
+    app.middleware("http")(create_auth_middleware(dev_mode=dev_mode, skip_paths=skip_paths))
 
     # 请求级中间件：trace_id + 性能监控
     @app.middleware("http")

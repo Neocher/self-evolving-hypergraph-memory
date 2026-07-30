@@ -255,6 +255,6 @@ if __name__ == "__main__":
         port = int(port_str) if port_str else 8222
         import uvicorn
         logger.warning("SHM MCP v2 HTTP server on http://%s:%s", host, port)
-        run_http(host or "0.0.0.0", port)
+        run_http(host or "127.0.0.1", port)
     else:
         run_stdio()

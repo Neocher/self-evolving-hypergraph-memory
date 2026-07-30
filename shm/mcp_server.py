@@ -251,7 +251,7 @@ def run_stdio() -> None:
         _send(_error(rid, -32601, f"Method not found: {method}"))
 
 
-def run_http(host: str = "0.0.0.0", port: int = 8001) -> None:
+def run_http(host: str = "127.0.0.1", port: int = 8001) -> None:
     """通过 HTTP/SSE 运行 MCP 服务器（调试模式）"""
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -312,6 +312,6 @@ if __name__ == "__main__":
         addr = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ":8001"
         host, _, port_str = addr.partition(":")
         port = int(port_str) if port_str else 8001
-        run_http(host or "0.0.0.0", port)
+        run_http(host or "127.0.0.1", port)
     else:
         run_stdio()

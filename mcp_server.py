@@ -71,6 +71,12 @@ ALLOWED_COMMANDS = {
     "pip", "pip3", "npm", "node",
 }
 
+def _minimal_env() -> dict[str, str]:
+    safe_keys = {"PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL"}
+    return {k: v for k, v in os.environ.items()
+            if k in safe_keys and not k.endswith("_API_KEY")}
+
+
 def handle_terminal(command: str, timeout: int = 15) -> dict:
     """执行命令（受白名单限制）"""
     try:
@@ -83,6 +89,7 @@ def handle_terminal(command: str, timeout: int = 15) -> dict:
         result = subprocess.run(
             cmd_parts, capture_output=True, text=True,
             timeout=timeout, cwd=str(WORKDIR),
+            env=_minimal_env(),
         )
         return {
             "stdout": result.stdout[-2000:],

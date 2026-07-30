@@ -59,6 +59,7 @@ class EpisodeResponse(BaseModel):
     created_at: float = Field(..., description="创建时间戳（Unix 秒）")
     source: str = Field(default="user", description="来源标签")
     status: str = Field(default="created", description="创建状态: created/filtered/error")
+    error: Optional[str] = Field(default=None, description="拒绝原因（写入被拒绝时非空）")
 
 
 # ─── Hyperedge 请求/响应 ───────────────────────────────────
@@ -123,6 +124,7 @@ class SensoryResponse(BaseModel):
     status: str = Field(default="ok")
     record_id: str = Field(..., description="分配的记录 ID")
     buffer_usage: int = Field(default=0, description="当前缓冲区使用量")
+    error: Optional[str] = Field(default=None, description="拒绝原因（写入被拒绝时非空）")
 
 
 # ─── 提升 ──────────────────────────────────────────────────
@@ -457,3 +459,4 @@ class MultimodalResponse(BaseModel):
     media_paths: List[str] = Field(default_factory=list, description="存储的媒体文件路径列表")
     transcription: Optional[str] = Field(default=None, description="音频转录文本")
     created_at: float = Field(..., description="创建时间戳")
+    error: Optional[str] = Field(default=None, description="拒绝原因（写入被拒绝时非空）")

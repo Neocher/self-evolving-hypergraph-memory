@@ -11,6 +11,7 @@ ACP Agent Client — CC/Codex 的 ACP 协议适配器
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -65,6 +66,12 @@ def report_result(bridge_url: str, task_id: str, agent_name: str,
     urllib.request.urlopen(req, timeout=5)
 
 
+def _minimal_env() -> dict[str, str]:
+    safe_keys = {"PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL"}
+    return {k: v for k, v in os.environ.items()
+            if k in safe_keys and not k.endswith("_API_KEY")}
+
+
 def execute_task(task: dict) -> tuple[str, str, str]:
     """根据 agent 类型执行任务"""
     agent = task["target"]
@@ -83,6 +90,7 @@ def execute_task(task: dict) -> tuple[str, str, str]:
                 input=full_prompt.encode(),
                 capture_output=True, text=True, timeout=50,
                 cwd="/home/admin/shm",
+                env=_minimal_env(),
             )
             if result.returncode == 0:
                 return ("completed", result.stdout.strip(), "")
@@ -94,6 +102,7 @@ def execute_task(task: dict) -> tuple[str, str, str]:
                  "-c", 'sandbox_permissions=["full"]', full_prompt],
                 capture_output=True, text=True, timeout=50,
                 cwd="/home/admin/shm",
+                env=_minimal_env(),
             )
             if result.returncode == 0:
                 return ("completed", result.stdout.strip(), "")

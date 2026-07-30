@@ -87,7 +87,9 @@ class GatewayAPI:
         """将原始文本写入 Layer1 环形缓冲区。"""
         creds = _scan_credentials(content)
         if creds:
-            self._logger.warning("Credential-like content detected in write_sensory from %s: %s", source, creds)
+            self._logger.warning("Credential-like content REJECTED in write_sensory from %s: %s", source, creds)
+            return SensoryResponse(record_id="", buffer_usage=0,
+                                    error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)")
         record_id = str(uuid.uuid4())
         created_at = time.time()
         buf = getattr(self._svc.kuzu_store, "_sensory_buffer", None)
@@ -141,7 +143,12 @@ class GatewayAPI:
         """
         creds = _scan_credentials(content)
         if creds:
-            self._logger.warning("Credential-like content detected in store_episode from %s: %s", source, creds)
+            self._logger.warning("Credential-like content REJECTED in store_episode from %s: %s", source, creds)
+            return EpisodeResponse(
+                episode_id="", status="rejected_credential", tau_initial=0.0,
+                content=content, source=source, created_at=time.time(),
+                error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)",
+            )
         episode_id = str(uuid.uuid4())
         created_at = time.time()
         tau_initial = 1.0
@@ -344,7 +351,12 @@ class GatewayAPI:
         if merged_text and self._svc.kuzu_store is not None:
             creds = _scan_credentials(merged_text)
             if creds:
-                self._logger.warning("Credential-like content detected in store_multimodal: %s", creds)
+                self._logger.warning("Credential-like content REJECTED in store_multimodal: %s", creds)
+                return MultimodalResponse(
+                    episode_id="", text=None, media_paths=media_paths,
+                    transcription=transcription, created_at=created_at,
+                    error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)",
+                )
             self._svc.kuzu_store.create_episode({
                 "id": episode_id,
                 "content": merged_text,
@@ -643,10 +655,10 @@ class GatewayAPI:
         import re
         stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '', query)
         blocked = re.compile(
-            r"\b(?:CREATE|DELETE|SET\s+\w+|DROP|MERGE|REMOVE|DETACH|INSERT|LOAD\s+CSV)\b", re.IGNORECASE
+            r"\b(?:CREATE|DELETE|SET|DROP|MERGE|REMOVE|DETACH|INSERT|LOAD\s+CSV)\b", re.IGNORECASE
         )
         if blocked.search(stripped):
-            return {"error": "Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH", "rows": [], "count": 0}
+            return {"error": "Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH/INSERT/LOAD CSV", "rows": [], "count": 0}
         params = params or {}
         try:
             rows = self._svc.kuzu_store.query_cypher(query, params)

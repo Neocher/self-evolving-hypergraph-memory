@@ -1582,14 +1582,16 @@ async def cypher_query(
     deps: Services = Depends(get_services),
 ) -> dict:
     # 执行原始 Cypher 查询（只读）。用于 Hermes SHM 插件的搜索检索。
+    # 安全：剥离字符串字面量后再检查写关键词，防御引号内关键词绕过
     import re
+    stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '', req.query)
     blocked_pattern = re.compile(
-        r'\b(?:CREATE|DELETE|SET|DROP|MERGE|REMOVE|DETACH)\b',
+        r'\b(?:CREATE|DELETE|SET|DROP|MERGE|REMOVE|DETACH|INSERT|LOAD\s+CSV)\b',
         re.IGNORECASE
     )
-    if blocked_pattern.search(req.query):
+    if blocked_pattern.search(stripped):
         from fastapi import HTTPException as _HE
-        raise _HE(status_code=400, detail=f"Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH")
+        raise _HE(status_code=400, detail=f"Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH/INSERT/LOAD CSV")
     try:
         rows = deps.kuzu_store.query_cypher(req.query, req.params)
         return {"rows": rows, "count": len(rows)}

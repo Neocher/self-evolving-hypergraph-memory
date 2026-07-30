@@ -9,7 +9,6 @@ DEV_MODE=true 跳过认证。
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -44,13 +43,15 @@ class TokenManager:
         now = time.time()
         token_hash = self._hash_token(token)
         for name, info in self._tokens.items():
-            if info.get("token_hash") == token_hash:
-                expires_at = info.get("expires_at", 0)
-                if expires_at and now > expires_at:
-                    self.revoke_key(name)
-                    return None
-                return {"name": name, "scope": info.get("scope", ""),
-                        "created_at": info.get("created_at", 0)}
+            stored_hash = info.get("token_hash", "")
+            if not secrets.compare_digest(token_hash, stored_hash):
+                continue
+            expires_at = info.get("expires_at", 0)
+            if expires_at and now > expires_at:
+                self.revoke_key(name)
+                return None
+            return {"name": name, "scope": info.get("scope", ""),
+                    "created_at": info.get("created_at", 0)}
         return None
 
     def create_key(self, name: str, ttl: int = DEFAULT_TTL, scope: str = "admin") -> str:
@@ -150,8 +151,17 @@ def create_auth_middleware(dev_mode: bool = False, skip_paths: Optional[list] = 
 
         auth = request.headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
-        if not token or not tm.validate(token):
+        if not token:
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        info = tm.validate(token)
+        if not info:
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+        # scope enforcement: readonly tokens can only use safe HTTP methods
+        scope = info.get("scope", "")
+        if scope != "admin" and request.method not in ("GET", "HEAD", "OPTIONS"):
+            return JSONResponse(status_code=403, content={"error": "insufficient_scope",
+                                                           "required": "admin scope for write operations", "got": scope})
 
         ip = request.client.host if request.client else "127.0.0.1"
         if not rl.check(ip):
