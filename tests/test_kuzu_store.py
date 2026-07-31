@@ -10,7 +10,15 @@ import uuid
 
 import pytest
 
-from graph.ryu_store import RyuStore as KuzuStore, CircuitBreakerOpen, CircuitBreakerConfig
+try:
+    from graph.ryu_store import RyuStore as KuzuStore, CircuitBreakerOpen, CircuitBreakerConfig
+except ImportError:  # ryugraph 已被 GraphLite 替换，旧 store 不可用时跳过
+    KuzuStore = CircuitBreakerOpen = CircuitBreakerConfig = None
+
+pytestmark = pytest.mark.skipif(
+    KuzuStore is None,
+    reason="ryugraph 已废弃，旧 RyuStore 不可用（GraphLite 替代）",
+)
 
 
 class TestKuzuStore:

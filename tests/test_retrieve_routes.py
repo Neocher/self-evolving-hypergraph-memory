@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import numpy as np
 
-from api._routes import router, init_services, Services, get_services
+from api.routes import router, init_services, Services, get_services
 
 
 @pytest.fixture
@@ -155,7 +155,7 @@ class TestDegradationScenarios:
 
     def test_all_paths_registered(self):
         """所有关键路径都已注册"""
-        from api._routes import router
+        from api.routes import router
         paths = {r.path for r in router.routes}
         required = {
             "/health", "/search/vector", "/memories/retrieve",
@@ -169,7 +169,7 @@ class TestDegradationScenarios:
 
     def test_cache_isolated_to_write(self):
         """缓存在写入后不清空（只对检索有效）"""
-        from api._routes import _result_cache, _result_cache_lock
+        from api.routes._deps import _result_cache, _result_cache_lock
         with _result_cache_lock:
             _result_cache["test:5"] = "cached_result"
         assert _result_cache.get("test:5") == "cached_result"
@@ -180,12 +180,13 @@ class TestEmbedQueue:
 
     def test_embed_queue_module_level(self):
         """嵌入队列是模块级全局变量"""
-        from api._routes import _embed_queue, _embed_queue_lock, _FAISS_BATCH_SIZE
+        from api.routes.write import _embed_queue, _embed_queue_lock
+        from api.routes._deps import _FAISS_BATCH_SIZE
         assert isinstance(_embed_queue, list)
         assert _FAISS_BATCH_SIZE >= 50
 
     def test_embed_queue_thread_safe(self):
         """嵌入队列有线程锁保护"""
-        from api._routes import _embed_queue_lock
+        from api.routes.write import _embed_queue_lock
         import threading as _th
         assert isinstance(_embed_queue_lock, type(_th.Lock()))

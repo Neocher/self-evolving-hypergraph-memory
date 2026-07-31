@@ -18,14 +18,14 @@ class TestRetrievalCache:
 
     def test_result_cache_hit(self):
         """相同 query+top_k 第二次应命中缓存"""
-        from api._routes import _result_cache, _result_cache_lock, _result_cache_max
+        from api.routes._deps import _result_cache, _result_cache_lock
         with _result_cache_lock:
             _result_cache.clear()
         assert len(_result_cache) == 0
 
     def test_result_cache_lru_eviction(self):
         """超过最大缓存数时应能容纳（LRU在API调用时淘汰）"""
-        from api._routes import _result_cache, _result_cache_lock, _result_cache_max
+        from api.routes._deps import _result_cache, _result_cache_lock, _result_cache_max
         with _result_cache_lock:
             _result_cache.clear()
             for i in range(_result_cache_max + 10):
@@ -120,12 +120,12 @@ class TestWriteSpeed:
 
     def test_faiss_batch_buffer_size(self):
         """FAISS 批量缓冲区大小应为 50"""
-        from api._routes import _FAISS_BATCH_SIZE
+        from api.routes._deps import _FAISS_BATCH_SIZE
         assert _FAISS_BATCH_SIZE == 50
 
     def test_embed_queue_async(self):
         """嵌入队列应为异步（不阻塞写入响应）"""
-        from api._routes import _embed_queue, _embed_queue_lock
+        from api.routes.write import _embed_queue, _embed_queue_lock
         # 队列应该存在且可操作
         assert isinstance(_embed_queue, list)
         with _embed_queue_lock:
