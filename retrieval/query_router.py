@@ -283,9 +283,11 @@ class QueryRouter:
             self._bm25_doc_tau = self._bm25_doc_tau[:max_corpus]
 
         try:
+            # 中文检索：使用字符级 bigram/trigram/4-gram（与 TfidfEncoder 一致），
+            # 避免 \b 词边界对连续汉字失效导致中文语义词无法匹配
             vectorizer = TfidfVectorizer(
-                stop_words="english",
-                token_pattern=r"(?u)\b\w+\b",
+                analyzer="char_wb",
+                ngram_range=(2, 4),
                 lowercase=True,
                 max_features=50000,
             )
@@ -593,6 +595,7 @@ class QueryRouter:
             检索结果列表 [...]
         """
         # 查询归一化：中文标点统一 + 中文技术术语→英文
+        raw_query = query  # 保留原始查询（BM25 通道需要未归一化的中文原文）
         query = self._normalize_query(query)
 
         strategy = self.detect_strategy(query)
@@ -600,7 +603,7 @@ class QueryRouter:
 
         # F — 三路并行融合（向量 + BM25 + 实体匹配）
         if level == RetrievalLevel.FUSION:
-            return self._fusion_retrieve(query, query_embedding)
+            return self._fusion_retrieve(query, query_embedding, raw_query)
 
         # 从指定级别开始，逐级尝试（空结果自动级联）
         results: list[dict] = []
@@ -648,15 +651,19 @@ class QueryRouter:
         return self._kuzu_text_fallback(query, "L3 empty")
 
     def _fusion_retrieve(
-        self, query: str, query_embedding: Optional[np.ndarray] = None
+        self,
+        query: str,
+        query_embedding: Optional[np.ndarray] = None,
+        raw_query: Optional[str] = None,
     ) -> list[dict]:
         """三路并行融合检索。
 
         同时运行向量、BM25、实体匹配三条通道，输出加权融合结果。
 
         Args:
-            query: 查询文本
+            query: 归一化后的查询文本
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
+            raw_query: 未归一化的原始查询（语料为原始中文，BM25 通道必须用它）
 
         Returns:
             融合检索结果列表
@@ -672,10 +679,11 @@ class QueryRouter:
         except Exception:
             logger.exception("Fusion: vector channel failed")
 
-        # 2. BM25 通道
+        # 2. BM25 通道（用未归一化的原始查询：语料为原始中文，归一化后无交集）
         bm25_results: list[dict] = []
         try:
-            bm25_results = self._bm25_search(query, cfg.top_k_vector)
+            bm25_query = raw_query if raw_query is not None else query
+            bm25_results = self._bm25_search(bm25_query, cfg.top_k_vector)
         except Exception:
             logger.exception("Fusion: BM25 channel failed")
 
