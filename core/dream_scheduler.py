@@ -121,14 +121,16 @@ class DreamScheduler:
                 trigger_mode = TriggerMode.CONFLICT_RESOLUTION
 
             # 兜底：距离上次梦境超过 6 小时，强制触发一次
+            # 【FIX】_last_run_time 初值为 0，须特殊处理首次运行
             FORCED_INTERVAL_HOURS = 6
-            if not should_run and self._last_run_time > 0:
-                hours_since_last = (now - self._last_run_time) / 3600.0
+            if not should_run:
+                hours_since_last = ((now - self._last_run_time) / 3600.0
+                                    if self._last_run_time > 0 else float('inf'))
                 if hours_since_last >= FORCED_INTERVAL_HOURS:
                     should_run = True
                     trigger_mode = TriggerMode.IDLE
-                    logger.info("Forced dream trigger: %d hours since last run >= %d hours",
-                                int(hours_since_last), FORCED_INTERVAL_HOURS)
+                    logger.info("Forced dream trigger: %.1f hours since last run >= %d hours",
+                                hours_since_last, FORCED_INTERVAL_HOURS)
 
             # 候选文件触发：data/dream_candidates/ 目录中候选文件 > 10 时触发
             if not should_run:
@@ -184,7 +186,21 @@ class DreamScheduler:
                         if rows:
                             for row in rows:
                                 if isinstance(row, dict):
-                                    nodes.append(row)
+                                    # 【FIX v5.18】GraphLite 返回深层嵌套格式，需 flatten
+                                    flat = kuzu_store._flatten_row(row, "e")
+                                    if flat:
+                                        # 【FIX v5.18】GraphLite 所有属性为字符串，需类型转换
+                                        try:
+                                            flat["created_at"] = float(flat.get("created_at", 0))
+                                        except (ValueError, TypeError):
+                                            flat["created_at"] = 0.0
+                                        try:
+                                            flat["tau_initial"] = float(flat.get("tau_initial", 1.0))
+                                        except (ValueError, TypeError):
+                                            flat["tau_initial"] = 1.0
+                                        nodes.append(flat)
+                                    else:
+                                        nodes.append(row)
                                 elif isinstance(row, (list, tuple)) and len(row) > 0:
                                     nodes.append({
                                         "id": str(row[0]),

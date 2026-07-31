@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.18.0"
-__version_info__ = (5, 18, 0)
-__version_name__ = "图引擎替换 — RyuGraph → GraphLite (GQL)，修复UTF-8 + ALTER TABLE"
+__version__ = "5.18.1"
+__version_info__ = (5, 18, 1)
+__version_name__ = "fix: 梦境调度器首次强制触发Bug + GraphLite数据格式适配"
 __release_date__ = "2026-07-30"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
