@@ -32,7 +32,11 @@ class TestDualAdaptiveGate:
         assert 0.0 <= gate_value <= 1.0
 
     def test_should_keep_uses_config_threshold(self, gate: DualAdaptiveGate):
-        """should_keep 应使用 config.gate_threshold。"""
+        """should_keep: 冷启动期(warmup_steps 内)默认放行, 之后按阈值。"""
+        # 冷启动期：即使门控值低也放行
+        assert gate.should_keep(0.2) is True
+        # 超过 warmup 后按阈值
+        gate._step_count = gate.config.warmup_steps + 1
         assert gate.should_keep(0.8) is True
         assert gate.should_keep(0.2) is False
 

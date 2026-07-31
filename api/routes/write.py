@@ -275,13 +275,15 @@ async def create_episode(
         if not deps.ssm_gate.should_keep(gate_value):
             logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
+                                   created_at=created_at,  # 【FIX】缺 created_at → 500
                                    content=req.content, source=req.source)
 
     # [Defense] 记忆投毒预检（在 Kuzu 写入前执行）
     defense_verdict = None
     defense_reason = ""
     if deps.defense_engine and deps.defense_engine.config.enabled:
-        verdict, reason = deps.defense_engine.pre_check(
+        # 【FIX】pre_check 是 async 函数，缺 await 导致 TypeError: cannot unpack coroutine
+        verdict, reason = await deps.defense_engine.pre_check(
             content=req.content, source=req.source, created_at=created_at,
         )
         defense_verdict = verdict

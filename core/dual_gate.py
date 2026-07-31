@@ -81,6 +81,11 @@ class DualGateConfig:
     # 随机种子
     seed: int = 42
 
+    # 【FIX 2026-07-31】冷启动保护：门控未训练时默认放行（fail-open）
+    # 随机初始化权重的 SSM+MLP 对任意输入输出 ≈0.45 < 0.5 → 所有写入被过滤，
+    # 导致 EpisodeNode 永远为 0。冷启动期放行，积累数据后门控才生效。
+    warmup_steps: int = 100   # 前 N 次 step 不过滤（默认放行）
+
     # 输入特征索引
     feat_mean_activation: int = 0
     feat_age_hours: int = 1
@@ -319,6 +324,7 @@ class DualAdaptiveGate:
 
         # 学习状态
         self._total_reward: float = 0.0
+        self._step_count: int = 0  # 【FIX】总步数计数（冷启动保护用）
 
     def step(
         self, hidden_state: np.ndarray, input_features: np.ndarray
@@ -343,9 +349,15 @@ class DualAdaptiveGate:
         # 3. α 融合
         g = self.alpha * g_ssm + (1.0 - self.alpha) * g_mlp
 
+        # 【FIX】步数计数（冷启动保护用）
+        self._step_count += 1
+
         return new_h, float(g)
 
     def should_keep(self, gate_value: float) -> bool:
+        # 【FIX】冷启动保护：未训练够 warmup_steps 之前默认放行（fail-open）
+        if self._step_count <= self.config.warmup_steps:
+            return True
         return gate_value > self.config.gate_threshold
 
     def compute_input_features(self, hyperedge_data: dict) -> np.ndarray:

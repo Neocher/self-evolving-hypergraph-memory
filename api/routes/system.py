@@ -15,6 +15,17 @@ from api.routes._deps import (
 )
 
 
+def _decode_b64(s: str) -> str:
+    """GraphLite 对 UTF-8 内容做 {b64}<base64> 透明编解码，此处解码回明文。"""
+    if s.startswith("{b64}"):
+        try:
+            import base64
+            return base64.b64decode(s[5:]).decode("utf-8", errors="replace")
+        except Exception:
+            return s
+    return s
+
+
 @router.get("/memories/audit/{node_id}", summary="查询节点溯源链")
 async def get_audit_trail(
     node_id: str,
@@ -181,8 +192,10 @@ async def rebuild_index(
     node_ids = []
     contents = []
     for row in rows:
-        # GraphLite 返回深层嵌套 {"e": {"Node": {"properties": {...}}}}，
-        # RyuStore 返回 [[id, content]] —— 两种格式都兼容
+        # GraphLite 返回三种格式，全部兼容：
+        #  1. 深层嵌套 {"e": {"Node": {"properties": {...}}}}
+        #  2. 别名扁平 {"e.id": "...", "e.content": "..."}
+        #  3. RyuStore 旧格式 [[id, content]]
         if isinstance(row, dict) and "e" in row:
             try:
                 from graph.graphlite_store import GraphLiteStore
@@ -190,6 +203,11 @@ async def rebuild_index(
                 nid, content = str(flat.get("id", "")), str(flat.get("content", ""))
             except Exception:
                 nid, content = str(row.get("id", "")), str(row.get("content", ""))
+        elif isinstance(row, dict) and "e.content" in row:
+            nid = str(row.get("e.id", "") or row.get("id", ""))
+            raw_content = str(row.get("e.content", "") or row.get("content", ""))
+            # GraphLite 对 UTF-8 中文做 {b64} 透明编解码
+            content = _decode_b64(raw_content)
         elif isinstance(row, (list, tuple)):
             nid, content = str(row[0]), str(row[1]) if len(row) > 1 else ""
         elif isinstance(row, dict):
