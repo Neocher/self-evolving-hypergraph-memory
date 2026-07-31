@@ -40,10 +40,10 @@ def validator_disabled() -> OntologyValidator:
 
 
 @pytest.fixture
-def kuzu_validator(kuzu_store) -> OntologyValidator:
-    """带Kuzu的验证器（可做真正的Cypher矛盾检测）。"""
+def kuzu_validator(graphlite_store) -> OntologyValidator:
+    """带真实 GraphLite 的验证器（可做真正的 GQL 矛盾检测）。"""
     return OntologyValidator(
-        kuzu_store=kuzu_store,
+        kuzu_store=graphlite_store,
         config=OntologyConfig(enabled=True, reject_on_contradiction=True),
     )
 
@@ -67,16 +67,20 @@ def _make_result_dict(
     }
 
 
-def _create_episode_with_ontology(kuzu_store, content: str, ontology_type: str,
+def _create_episode_with_ontology(graphlite_store, content: str, ontology_type: str,
                                    trust: float = 0.8) -> str:
-    """用 query_cypher 创建含额外属性的节点。"""
+    """用 GraphLiteStore.create_episode 创建含本体属性的节点。"""
     ep_id = str(uuid.uuid4())
-    kuzu_store.query_cypher(
-        "CREATE (e:EpisodeNode {id: $id, content: $content, created_at: $t, "
-        "tau_initial: 1.0, tau_value: 0.6, source: 'test', "
-        "trust_score: $trust, ontology_type: $otype})",
-        {"id": ep_id, "content": content, "t": 1.0, "trust": trust, "otype": ontology_type},
-    )
+    graphlite_store.create_episode({
+        "id": ep_id,
+        "content": content,
+        "created_at": 1.0,
+        "tau_initial": 1.0,
+        "tau_value": 0.6,
+        "source": "test",
+        "trust_score": trust,
+        "ontology_type": ontology_type,
+    })
     return ep_id
 
 
@@ -229,17 +233,16 @@ class TestWriteValidate:
         result = validator.write_validate("")
         assert result.passed is True
 
-    def test_no_entity_text_passes(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_no_entity_text_passes(self, kuzu_validator: OntologyValidator, graphlite_store):
         """无实体的文本不应触发矛盾检测。"""
         result = kuzu_validator.write_validate("今天天气不错")
         assert result.passed is True
         assert result.conflict_count == 0
 
-    @pytest.mark.skip(reason="需要真实 GraphLite 引擎（mock 无法测 Cypher 矛盾检测）")
-    def test_same_entity_diff_value_detected(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_same_entity_diff_value_detected(self, kuzu_validator: OntologyValidator, graphlite_store):
         """同一实体写入矛盾年份时应检测到冲突（置信度降低但默认不拒绝）。"""
         _create_episode_with_ontology(
-            kuzu_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
 
         result = kuzu_validator.write_validate(
             "张三出生于2000年", episode_id=str(uuid.uuid4()))
@@ -251,10 +254,10 @@ class TestWriteValidate:
         assert result.confidence > 0.3  # 但未低于拒绝阈值
         assert result.passed is True   # 优雅降级：置信度降低但写操作通过
 
-    def test_different_entity_no_conflict(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_different_entity_no_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
         """不同实体不应触发冲突。"""
         _create_episode_with_ontology(
-            kuzu_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
 
         result = kuzu_validator.write_validate(
             "李四出生于1990年", episode_id=str(uuid.uuid4()))
@@ -262,13 +265,12 @@ class TestWriteValidate:
         assert result.conflict_count == 0
         assert result.entity_name != "张三"
 
-    @pytest.mark.skip(reason="需要真实 GraphLite 引擎（mock 无法测 Cypher 矛盾检测）")
-    def test_confidence_penalty_multiple_conflicts(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_confidence_penalty_multiple_conflicts(self, kuzu_validator: OntologyValidator, graphlite_store):
         """多条矛盾事实应有置信度累积衰减。"""
         _create_episode_with_ontology(
-            kuzu_store, "张三出生于1990年", ontology_type="person_birth", trust=0.8)
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth", trust=0.8)
         _create_episode_with_ontology(
-            kuzu_store, "张三出生于1985年", ontology_type="person_birth", trust=0.8)
+            graphlite_store, "张三出生于1985年", ontology_type="person_birth", trust=0.8)
 
         result = kuzu_validator.write_validate(
             "张三出生于2000年", episode_id=str(uuid.uuid4()))
@@ -316,13 +318,12 @@ class TestReadValidate:
         scores = [v.adjusted_score for v in validated]
         assert scores == sorted(scores, reverse=True), "Results not sorted descending"
 
-    @pytest.mark.skip(reason="需要真实 GraphLite 引擎（mock 无法测 Cypher 矛盾检测）")
-    def test_ontology_confidence_penalized_on_conflict(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_ontology_confidence_penalized_on_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
         """包含冲突实体的事实应被降低 ontology_confidence。"""
         ep1 = _create_episode_with_ontology(
-            kuzu_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
         _create_episode_with_ontology(
-            kuzu_store, "张三出生于2000年", ontology_type="person_birth")
+            graphlite_store, "张三出生于2000年", ontology_type="person_birth")
 
         results = [
             _make_result_dict(content="张三出生于1990年", score=0.9, ep_id=ep1),
@@ -345,14 +346,13 @@ class TestReadValidate:
 
 class TestWriteThenRead:
 
-    @pytest.mark.skip(reason="需要真实 GraphLite 引擎（mock 无法测 Cypher 矛盾检测）")
-    def test_write_read_integration(self, kuzu_validator: OntologyValidator, kuzu_store):
+    def test_write_read_integration(self, kuzu_validator: OntologyValidator, graphlite_store):
         """写时验证 → 写入 → 读时验证 完整闭环。"""
         # 1. 写入两条矛盾事实
         ep1 = _create_episode_with_ontology(
-            kuzu_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
         ep2 = _create_episode_with_ontology(
-            kuzu_store, "张三出生于2000年", ontology_type="person_birth")
+            graphlite_store, "张三出生于2000年", ontology_type="person_birth")
 
         # 2. 写时验证新矛盾
         result = kuzu_validator.write_validate(

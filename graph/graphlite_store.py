@@ -242,10 +242,11 @@ class GraphLiteStore:
 
     # ─── Direct GQL ─────────────────────────────────
 
-    def execute_cypher(self, query: str, params: Optional[dict] = None) -> None:
-        """Execute GQL directly (passthrough)."""
+    def execute_cypher(self, query: str, params: Optional[dict] = None) -> list:
+        """Execute GQL directly, return list of row dicts (MATCH/DML results)."""
         q = self._interpolate(query, params)
-        self._session.execute(q)
+        result = self._session.query(q)
+        return list(result.rows)
 
     def query_cypher(self, query: str, params: Optional[dict] = None) -> list:
         """Query GQL, return list of dicts."""
@@ -299,12 +300,25 @@ class GraphLiteStore:
     @staticmethod
     def _interpolate(query: str, params: Optional[dict] = None) -> str:
         """Basic $param interpolation to GQL literals (security: simple only)."""
+        from base64 import b64encode
         if not params:
             return query
         result = query
         for k, v in params.items():
             if isinstance(v, str):
-                result = result.replace(f"${k}", f"'{v}'")
+                if not v:
+                    # 空串：GraphLite 中 CONTAINS '' 恒真 → NOT CONTAINS '' 恒假，
+                    # read_validate 的 $new_value 为空会导致矛盾漏检。
+                    # 用哨兵值使 NOT CONTAINS 恒真（语义 = 不排除已有事实）。
+                    result = result.replace(f"${k}", "'__SHM_NO_VALUE__'")
+                else:
+                    try:
+                        v.encode('ascii')
+                        result = result.replace(f"${k}", f"'{v}'")
+                    except UnicodeEncodeError:
+                        # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
+                        b64 = b64encode(v.encode('utf-8')).decode('ascii')
+                        result = result.replace(f"${k}", f"'{{b64}}{b64}'")
             elif isinstance(v, (int, float)):
                 result = result.replace(f"${k}", str(v))
             elif v is None:

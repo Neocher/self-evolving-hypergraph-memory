@@ -632,20 +632,39 @@ class OntologyValidator:
         for entity, etype in self.ENTITY_TYPE_MAP.items():
             category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
             try:
-                # 创建类型节点（只对主键 name MERGE）
+                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 + SET 更新属性。
+                # 注意 INSERT 对节点非幂等（同名不同属性会重复建节点），故必须先查再插。
+                if not self.kuzu.execute_cypher(
+                    "MATCH (t:OntologyType {name: $type}) RETURN t",
+                    {"type": etype},
+                ):
+                    self.kuzu.execute_cypher(
+                        "INSERT (t:OntologyType {name: $type})",
+                        {"type": etype},
+                    )
                 self.kuzu.execute_cypher(
-                    "MERGE (t:OntologyType {name: $type}) "
-                    "SET t.category = $cat",
+                    "MATCH (t:OntologyType {name: $type}) SET t.category = $cat",
                     {"type": etype, "cat": category},
                 )
-                # 创建实体节点 + IS_A 边（只对主键 name MERGE，防止重复键冲突）
+                if not self.kuzu.execute_cypher(
+                    "MATCH (e:OntologyEntity {name: $name}) RETURN e",
+                    {"name": entity},
+                ):
+                    self.kuzu.execute_cypher(
+                        "INSERT (e:OntologyEntity {name: $name})",
+                        {"name": entity},
+                    )
                 self.kuzu.execute_cypher(
-                    "MERGE (e:OntologyEntity {name: $name}) "
-                    "SET e.type = $etype, e.category = $cat "
-                    "WITH e "
-                    "MATCH (t:OntologyType {name: $type}) "
-                    "MERGE (e)-[:IS_A]->(t)",
-                    {"name": entity, "etype": etype, "cat": category, "type": etype},
+                    "MATCH (e:OntologyEntity {name: $name}) "
+                    "SET e.type = $etype, e.category = $cat",
+                    {"name": entity, "etype": etype, "cat": category},
+                )
+                # IS_A 边：MATCH 两节点 + INSERT（INSERT 对边幂等，无重复边）
+                self.kuzu.execute_cypher(
+                    "MATCH (e:OntologyEntity {name: $name}), "
+                    "(t:OntologyType {name: $type}) "
+                    "INSERT (e)-[:IS_A]->(t)",
+                    {"name": entity, "type": etype},
                 )
                 count += 1
             except Exception as e:
@@ -690,7 +709,12 @@ class OntologyValidator:
             return 0
         rel_count = 0
         for row in rows:
-            content = row.get("content", "") if isinstance(row, dict) else str(row[0]) if isinstance(row, (list, tuple)) and len(row) > 0 else ""
+            # GraphLite 的 RETURN 列键是 "e.content"（别名格式），兼容 "content"
+            content = (
+                row.get("content") or row.get("e.content", "")
+                if isinstance(row, dict)
+                else str(row[0]) if isinstance(row, (list, tuple)) and len(row) > 0 else ""
+            )
             if not content:
                 continue
             entities = self._extract_entity_cooccurrence(content)
@@ -700,13 +724,21 @@ class OntologyValidator:
             for i in range(len(entities)):
                 for j in range(i + 1, len(entities)):
                     try:
-                        self.kuzu.execute_cypher(
-                            "MATCH (a:OntologyEntity {name: $a_name}) "
-                            "MATCH (b:OntologyEntity {name: $b_name}) "
-                            "MERGE (a)-[:RELATES_TO {relation: 'co_occur'}]->(b) "
-                            "MERGE (b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                        # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（INSERT 幂等，无重复边）
+                        exists = self.kuzu.execute_cypher(
+                            "MATCH (a:OntologyEntity {name: $a_name})"
+                            "-[:RELATES_TO]->"
+                            "(b:OntologyEntity {name: $b_name}) RETURN a",
                             {"a_name": entities[i], "b_name": entities[j]},
                         )
+                        if not exists:
+                            self.kuzu.execute_cypher(
+                                "MATCH (a:OntologyEntity {name: $a_name}), "
+                                "(b:OntologyEntity {name: $b_name}) "
+                                "INSERT (a)-[:RELATES_TO {relation: 'co_occur'}]->(b), "
+                                "(b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                                {"a_name": entities[i], "b_name": entities[j]},
+                            )
                         rel_count += 1
                     except Exception as e:
                         logger.warning("Failed to create RELATES_TO edge: %s", e)
@@ -746,13 +778,21 @@ class OntologyValidator:
         for i in range(len(entities)):
             for j in range(i + 1, len(entities)):
                 try:
-                    self.kuzu.execute_cypher(
-                        "MATCH (a:OntologyEntity {name: $a_name}) "
-                        "MATCH (b:OntologyEntity {name: $b_name}) "
-                        "MERGE (a)-[:RELATES_TO {relation: 'co_occur'}]->(b) "
-                        "MERGE (b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                    # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（INSERT 幂等，无重复边）
+                    exists = self.kuzu.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $a_name})"
+                        "-[:RELATES_TO]->"
+                        "(b:OntologyEntity {name: $b_name}) RETURN a",
                         {"a_name": entities[i], "b_name": entities[j]},
                     )
+                    if not exists:
+                        self.kuzu.execute_cypher(
+                            "MATCH (a:OntologyEntity {name: $a_name}), "
+                            "(b:OntologyEntity {name: $b_name}) "
+                            "INSERT (a)-[:RELATES_TO {relation: 'co_occur'}]->(b), "
+                            "(b)-[:RELATES_TO {relation: 'co_occur'}]->(a)",
+                            {"a_name": entities[i], "b_name": entities[j]},
+                        )
                     count += 1
                 except Exception as e:
                     logger.warning("Topology path query failed: %s", e)

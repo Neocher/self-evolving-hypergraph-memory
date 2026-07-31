@@ -47,6 +47,18 @@ def kuzu_store(temp_db_path: Path):
 
 
 @pytest.fixture
+def graphlite_store(temp_db_path: Path):
+    """真实 GraphLiteStore 临时库（本体矛盾检测等集成测试用）。"""
+    from graph.graphlite_store import GraphLiteStore
+
+    config = type("cfg", (), {"database_path": str(temp_db_path), "max_threads": 4})()
+    store = GraphLiteStore(config=config)
+    store.connect()
+    yield store
+    store.close()
+
+
+@pytest.fixture
 def mock_faiss_index() -> Any:
     """模拟 FAISS 索引（用 numpy 模拟 search/add_with_ids/remove_ids）。"""
     import types
