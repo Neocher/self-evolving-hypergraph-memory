@@ -532,17 +532,18 @@ class DreamPipeline:
         优先使用 cdlib Leiden，回退到 networkx Louvain，
         最后回退到连通分量。
         """
+        # Leiden 分支（cdlib）
         try:
-            import cdlib
+            from cdlib import algorithms as cdlib_algorithms
             from networkx import convert_node_labels_to_integers
 
-            H = convert_node_labels_to_integers(G, label_attribute="orig_id")
-            communities_list = cdlib.algorithms.leiden(H)
+            H = convert_node_labels_to_integers(G, label_attribute="_orig_id")  # 防属性冲突
+            communities_list = cdlib_algorithms.leiden(H)
             # 还原原始节点 ID
             partition: dict[str, int] = {}
             for comm_idx, comm in enumerate(communities_list.communities):
                 for int_id in comm:
-                    orig_id = H.nodes[int_id].get("orig_id", str(int_id))
+                    orig_id = H.nodes[int_id].get("_orig_id", str(int_id))
                     partition[orig_id] = comm_idx
             # 未分配的孤立节点各自成社区
             next_comm = len(communities_list.communities)
@@ -552,8 +553,13 @@ class DreamPipeline:
                     next_comm += 1
             return partition
         except ImportError:
-            pass
+            # cdlib 未装 / leidenalg 缺失 → 依赖不可用，回退 Louvain
+            logger.warning("cdlib/leidenalg unavailable, falling back to Louvain", exc_info=True)
+        except Exception:
+            # 算法运行失败或胶水代码 bug → 回退，但按 error 记录避免掩盖真 bug
+            logger.error("cdlib Leiden failed unexpectedly, falling back to Louvain", exc_info=True)
 
+        # Louvain 分支（networkx）
         try:
             from networkx.algorithms.community import louvain_communities
 
@@ -561,14 +567,15 @@ class DreamPipeline:
             for comm_idx, comm in enumerate(louvain_communities(G)):
                 for node_id in comm:
                     partition[node_id] = comm_idx
-            next_comm = len(partition) // max(1, len(set(partition.values())))
+            # 修复 next_comm bug：下一个可用社区 ID = max+1
+            next_comm = (max(partition.values()) + 1) if partition else 0
             for node in G.nodes:
                 if node not in partition:
                     partition[node] = next_comm
                     next_comm += 1
             return partition
-        except ImportError:
-            pass
+        except Exception:
+            logger.warning("networkx Louvain unavailable, falling back to connected components", exc_info=True)
 
         # 最终回退：连通分量
         from networkx import connected_components

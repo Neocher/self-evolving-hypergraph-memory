@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.19.0"
-__version_info__ = (5, 19, 0)
-__version_name__ = "feat: OWL导出 + 本体匹配 + LLM关系抽取 (design_ontology_gaps v2)"
+__version__ = "5.19.1"
+__version_info__ = (5, 19, 1)
+__version_name__ = "fix: cdlib社区检测兼容 + Louvain next_comm 边界修复 (design_cdlib_fix v2)"
 __release_date__ = "2026-07-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
