@@ -97,7 +97,7 @@ class ConflictDetector:
         从 Kuzu 读取节点当前版本并检测冲突。
 
         Args:
-            kuzu_store: RyuStore 实例。
+            kuzu_store: GraphLiteStore 实例。
             node_id: 目标节点 ID。
             expected_version: 写入方预期的版本号。
 

@@ -1,4 +1,4 @@
-"""GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器，替换 RyuStore."""
+"""GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器（当前图引擎）。"""
 import json, shutil, os, time, uuid, sys, tempfile
 from pathlib import Path
 from typing import Optional, Any
@@ -41,8 +41,13 @@ def _dict_to_gql_values(d: dict, skip_keys: set = None) -> str:
     return ", ".join(parts)
 
 
+class CircuitBreakerOpen(Exception):
+    """断路器跳闸异常，供上层捕获降级（兼容 RyuStore 接口）。"""
+    pass
+
+
 class GraphLiteStore:
-    """GraphLite-backed graph store, drop-in for RyuStore+CircuitBreaker."""
+    """GraphLite-backed graph store, current graph engine."""
 
     def __init__(self, config: Optional[Any] = None):
         self._db: Optional[GraphLite] = None

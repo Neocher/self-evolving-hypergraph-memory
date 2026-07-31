@@ -48,7 +48,7 @@ class SparseHebbianUpdater:
         self._update_counter = 0
 
     def set_kuzu_store(self, store) -> None:
-        """运行时注入 RyuStore（用于启动后注入）。"""
+        """运行时注入 GraphLiteStore（用于启动后注入）。"""
         self._kuzu_store = store
 
     def update(

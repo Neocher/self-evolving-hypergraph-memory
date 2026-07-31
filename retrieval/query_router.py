@@ -28,7 +28,7 @@ from typing import Optional
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from graph.ryu_store import CircuitBreakerOpen
+from graph.graphlite_store import CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
