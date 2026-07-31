@@ -19,7 +19,10 @@ from typing import Any, Generator, Optional
 import numpy as np
 import pytest
 
-from graph.ryu_store import RyuStore, RyuConfig, CircuitBreaker, CircuitBreakerConfig
+try:
+    from graph.ryu_store import RyuStore, RyuConfig, CircuitBreaker, CircuitBreakerConfig
+except ImportError:  # ryugraph 已被 GraphLite 替换，旧 store 不可用时跳过依赖它的测试
+    RyuStore = RyuConfig = CircuitBreaker = CircuitBreakerConfig = None
 
 
 @pytest.fixture
@@ -36,6 +39,8 @@ def temp_db_path() -> Generator[Path, None, None]:
 @pytest.fixture
 def kuzu_store(temp_db_path: Path) -> Generator[RyuStore, None, None]:
     """带临时数据库的 RyuStore 实例。"""
+    if RyuStore is None:
+        pytest.skip("ryugraph not installed (replaced by GraphLite)")
     config = RyuConfig(
         database_path=str(temp_db_path),
         buffer_pool_size_mb=64,

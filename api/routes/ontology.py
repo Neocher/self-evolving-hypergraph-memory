@@ -9,8 +9,9 @@ from api.routes._deps import (
     EntityTypeDefModel, EntityTypeListResponse,
     AttributeDefModel, EdgeTypeDefModel,
     EdgeTypeListResponse, OntologyStatsResponse,
-    Dict, Any, List, BaseModel, Field,
+    Dict, Any, List, Optional, BaseModel, Field,
 )
+from fastapi import Query, Response
 
 
 class DiscoverResponse(BaseModel):
@@ -333,3 +334,133 @@ async def batch_relations(
     set_trace_id()
     record_request("POST", "/batch/relations", "200", _now() - start)
     return results
+
+
+# ─── v5.19: OWL 导出 / 本体匹配 / LLM 关系抽取 ───────────────
+
+
+class OntologyMatchAttribute(BaseModel):
+    """序列化的属性定义（匹配请求体用）"""
+    name: str
+    type: str = "string"
+
+
+class OntologyMatchEntityType(BaseModel):
+    """序列化的实体类型定义"""
+    name: str
+    description: str = ""
+    parent: Optional[str] = None
+    attributes: List[OntologyMatchAttribute] = Field(default_factory=list)
+
+
+class OntologyMatchEdgeType(BaseModel):
+    """序列化的边类型定义"""
+    name: str
+    description: str = ""
+    source_types: List[str] = Field(default_factory=list)
+    target_types: List[str] = Field(default_factory=list)
+
+
+class OntologyMatchRequest(BaseModel):
+    """跨系统本体匹配请求体"""
+    other_ontology: Dict[str, Any] = Field(..., description="待匹配本体的序列化定义")
+    max_types: int = Field(100, ge=1, le=1000, description="结构匹配 O(N²) 车挡器")
+
+
+class OntologyExtractRequest(BaseModel):
+    """关系抽取请求体"""
+    text: str = Field(..., min_length=1, description="待抽取文本")
+
+
+def _ontology_from_dict(data: Dict[str, Any]) -> "OntologyService":
+    """将序列化的本体定义重建为临时 OntologyService（仅用于匹配，不入库）。"""
+    from core.ontology_v2 import AttrType, AttributeDef, EdgeTypeDef, EntityTypeDef, OntologyService
+    svc = OntologyService()
+    for t in data.get("entity_types", []):
+        attrs = [AttributeDef(name=a["name"],
+                              type=AttrType(a["type"]) if a.get("type") in AttrType._value2member_map_
+                              else AttrType.STRING)
+                 for a in t.get("attributes", [])]
+        svc.register_entity_type(EntityTypeDef(
+            name=t["name"], description=t.get("description", ""),
+            parent=t.get("parent"), attributes=attrs))
+    for e in data.get("edge_types", []):
+        svc.register_edge_type(EdgeTypeDef(
+            name=e["name"], description=e.get("description", ""),
+            source_types=e.get("source_types", []),
+            target_types=e.get("target_types", [])))
+    return svc
+
+
+@router.get("/ontology/export", summary="导出本体为 OWL/Turtle")
+async def ontology_export(
+    format: str = Query("turtle", description="导出格式（当前仅支持 turtle/ttl）"),
+    deps: Services = Depends(get_services),
+) -> Response:
+    """将当前 Ontology v2 导出为标准 OWL/Turtle（GET 无副作用）。"""
+    from core.ontology_owl import OntologyOwlExporter
+    fmt = format.lower()
+    if fmt not in ("turtle", "ttl"):
+        raise HTTPException(status_code=400, detail=f"Unsupported format '{format}', only turtle")
+    turtle = OntologyOwlExporter().export_turtle(deps.ontology_v2)
+    return Response(content=turtle, media_type="text/turtle; charset=utf-8")
+
+
+@router.post("/ontology/match", summary="跨系统本体匹配")
+async def ontology_match(
+    req: OntologyMatchRequest,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """将请求体中的序列化本体与当前本体对齐，返回匹配报告。"""
+    from core.ontology_matcher import OntologyMatcher
+    try:
+        other = _ontology_from_dict(req.other_ontology)
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid other_ontology: {e}")
+    matcher = OntologyMatcher(max_types=req.max_types)
+    return matcher.match_report(deps.ontology_v2, other)
+
+
+# 全局单例关系抽取器（注入 LLM 客户端，跨请求复用动态关系缓存）
+_relation_extractor: Optional[Any] = None
+
+
+def _get_relation_extractor() -> Any:
+    """懒加载全局关系抽取器：注入全局单例 LLM 客户端，复用动态关系缓存。
+
+    LLMClient 初始化失败时退化为纯正则（llm_client=None）。
+    """
+    global _relation_extractor
+    if _relation_extractor is None:
+        from core.llm_client import LLMClient
+        from core.relation_extractor import RelationExtractor
+        llm_client = None
+        try:
+            llm_client = LLMClient()  # 自动从 config/settings.py 读取 llm 段
+        except Exception as e:
+            logger.warning("RelationExtractor LLMClient init skipped (regex-only): %s", e)
+        _relation_extractor = RelationExtractor(llm_client=llm_client)
+    return _relation_extractor
+
+
+@router.post("/ontology/relations/extract", summary="关系抽取（正则 + 动态关系缓存）")
+async def ontology_relations_extract(
+    req: OntologyExtractRequest,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """同步混合抽取：正则结果 + 上次 LLM 发现的动态关系缓存匹配（无 LLM 调用）。"""
+    extractor = _get_relation_extractor()
+    triples = extractor.extract_hybrid(req.text)
+    return {
+        "count": len(triples),
+        "triples": [
+            {
+                "subject": t.subject,
+                "relation": t.relation,
+                "object": t.obj,
+                "confidence": t.confidence,
+                "attributes": t.attributes,
+            }
+            for t in triples
+        ],
+    }

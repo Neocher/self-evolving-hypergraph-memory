@@ -11,10 +11,13 @@ Relation Extractor — 关系抽取细化
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +149,31 @@ class RelationTriple:
     attributes: Dict[str, Any] = field(default_factory=dict)  # 额外属性
 
 
+@dataclass
+class DynamicRelationInfo:
+    """LLM 发现的关系缓存条目（轻量，不承载 EdgeTypeDef 约束）。
+
+    新关系只注册在此缓存中，**不写入 OntologyService**（防污染，
+    人工确认后才可固化到本体）。
+    """
+    name: str
+    description: str = ""
+    discovery_count: int = 0
+    last_seen: float = 0.0
+
+
 class RelationExtractor:
     """关系抽取器 — 将文本中的语义关系提取为结构化三元组"""
 
-    def __init__(self):
+    # LLM 返回置信度缺失/非法时的回退值
+    LLM_CONFIDENCE_FALLBACK = 0.75
+
+    def __init__(self, llm_client: Any = None):
+        """llm_client 可选注入（None = 仅正则，不调用 LLM）"""
+        self._llm_client = llm_client
+        self._dynamic_relations: Dict[str, DynamicRelationInfo] = {}
+        # 动态关系涉及的实体对（以 (relation, subj, obj) 为键，extract_hybrid 复用缓存的依据）
+        self._dynamic_relation_entities: Set[Tuple[str, str, str]] = set()
         # 编译所有模式
         self._patterns: List[Tuple] = []
         for rel_type, pattern_str, attr_pattern in RELATION_PATTERNS:
@@ -163,13 +187,23 @@ class RelationExtractor:
         logger.info("RelationExtractor initialized: %d patterns", len(self._patterns))
 
     def extract(self, text: str) -> List[RelationTriple]:
-        """从文本中提取关系三元组"""
+        """从文本中提取关系三元组（纯同步，仅正则，向后兼容）"""
+        triples, _ = self._extract_with_spans(text)
+        return triples
+
+    def _extract_with_spans(self, text: str) -> Tuple[List[RelationTriple], List[Tuple[int, int]]]:
+        """正则抽取 + 返回所有命中片段的 (start, end) 跨度。
+
+        跨度供 extract_async 计算未命中片段（送给 LLM 的文本）。
+        """
         triples: List[RelationTriple] = []
+        spans: List[Tuple[int, int]] = []
         # 避免重复（同关系+同实体对）
         seen: set[tuple] = set()
 
         for rel_type, pattern, attr_pattern in self._patterns:
             for m in pattern.finditer(text):
+                spans.append((m.start(), m.end()))
                 # subject 和 obj 分别在第1、第2捕获组
                 subject = m.group(1).strip()
                 obj = m.group(2).strip()
@@ -207,7 +241,7 @@ class RelationExtractor:
         triples.sort(key=lambda t: t.relation)
         if triples:
             logger.info("Extracted %d relation triples from text", len(triples))
-        return triples
+        return triples, spans
 
     def extract_and_report(self, text: str) -> Dict[str, Any]:
         """提取并返回可读报告"""
@@ -228,3 +262,217 @@ class RelationExtractor:
                 for t in triples
             ],
         }
+
+    # ─── LLM 增强（v5.19）────────────────────────────────────
+
+    async def extract_async(self, text: str, ontology: Any = None) -> List[RelationTriple]:
+        """异步混合抽取：先正则快速路径，未命中片段送 LLM。
+
+        Args:
+            text: 输入文本
+            ontology: 可选 OntologyService，仅用于 prompt 提示（不写入）
+
+        Returns:
+            正则 + LLM 合并后的三元组列表（去重，按 relation 排序）
+        """
+        regex_triples, spans = self._extract_with_spans(text)
+        if not self._llm_client:
+            return regex_triples
+
+        uncovered = self._uncovered_sentences(text, spans)
+        if not uncovered:
+            return regex_triples
+
+        llm_triples = await self._llm_extract(uncovered, ontology)
+        merged = self._merge_triples(regex_triples, llm_triples)
+        if merged:
+            logger.info("Extract async: %d regex + %d llm = %d triples",
+                        len(regex_triples), len(llm_triples), len(merged))
+        return merged
+
+    def extract_hybrid(self, text: str) -> List[RelationTriple]:
+        """同步混合抽取：正则结果 + 上次 LLM 缓存的动态关系匹配（无 LLM 调用）。
+
+        仅基于 _dynamic_relations 缓存中 subject/object 均在文本中出现的
+        关系；不发起任何网络调用，可在同步上下文安全使用。
+        """
+        regex_triples = self.extract(text)
+        text_lower = text.lower()
+        cached: List[RelationTriple] = []
+        for rel, subj, obj in self._dynamic_relation_entities:
+            if self._in_text(text_lower, subj) and self._in_text(text_lower, obj):
+                cached.append(RelationTriple(
+                    subject=subj, relation=rel, obj=obj,
+                    confidence=0.85,  # 缓存命中复用（非实时 LLM 判定）
+                    attributes={},
+                ))
+        # _merge_triples 与正则结果去重（同键保留高置信度）并按 relation 排序
+        return self._merge_triples(regex_triples, cached)
+
+    @staticmethod
+    def _in_text(text_lower: str, entity: str) -> bool:
+        """实体是否出现在文本中：英文按词边界匹配，中文直接包含。
+
+        避免子串误匹配（如 "AI" 误中 "brain"）；中文无空格分词，
+        \\b 不适用，直接用包含判断。
+        """
+        ent = entity.lower()
+        if not ent:
+            return False
+        if re.search(r"[\u4e00-\u9fff]", ent):
+            return ent in text_lower
+        return re.search(r"\b" + re.escape(ent) + r"\b", text_lower) is not None
+
+    async def _llm_extract(self, fragments: List[str], ontology: Any = None) -> List[RelationTriple]:
+        """将未命中片段发送给 LLM，解析 JSON 三元组（非法 confidence 回退 0.75）。"""
+        hints = self._ontology_hints(ontology)
+        prompt = self._llm_prompt("\n".join(fragments), hints)
+        try:
+            raw = await self._llm_client.chat(
+                messages=[
+                    {"role": "system",
+                     "content": "You extract semantic relations from text. "
+                                "Respond with JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            logger.warning("RelationExtractor: LLM call failed, regex-only result",
+                           exc_info=True)
+            return []
+        if not raw:
+            return []
+        return self._parse_llm_json(raw)
+
+    @staticmethod
+    def _llm_prompt(fragments: str, hints: str) -> str:
+        """构建 LLM 抽取 prompt（要求输出 confidence 字段）。"""
+        return (
+            "Extract all semantic relations from the following text fragment(s).\n\n"
+            f"{fragments}\n\n"
+            "Respond with a JSON array only, each item:\n"
+            '{"subject": "entity", "relation": "RELATION_NAME", '
+            '"object": "entity", "confidence": 0.0-1.0}\n'
+            "confidence must be a number in [0, 1]. "
+            "Use uppercase snake_case relation names.\n"
+            f"{hints}"
+        )
+
+    @staticmethod
+    def _ontology_hints(ontology: Any) -> str:
+        """从可选本体提取类型提示（仅提示用，不修改本体）。"""
+        if ontology is None:
+            return ""
+        try:
+            types = [t.name for t in ontology.list_entity_types()]
+            edges = [e.name for e in ontology.list_edge_types()]
+        except Exception:
+            return ""
+        if not types and not edges:
+            return ""
+        return ("Known entity types: " + ", ".join(types[:50])
+                + " | Known edge types: " + ", ".join(edges[:50]))
+
+    def _parse_llm_json(self, raw: str) -> List[RelationTriple]:
+        """解析 LLM 返回的 JSON（容忍 markdown 代码围栏）。
+
+        confidence 缺失/非法/越界 → 回退 0.75。
+        新关系注册到 _dynamic_relations（不写入 OntologyService）。
+        """
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("RelationExtractor: LLM returned non-JSON output")
+            return []
+        if not isinstance(data, list):
+            data = [data]
+
+        triples: List[RelationTriple] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject", "")).strip()
+            obj = str(item.get("object", "")).strip()
+            rel = str(item.get("relation", "")).strip()
+            if not subject or not obj or not rel:
+                continue
+            confidence = self._validate_confidence(item.get("confidence"))
+            triples.append(RelationTriple(
+                subject=subject, relation=rel.upper(), obj=obj,
+                confidence=confidence, attributes={},
+            ))
+            self._register_dynamic(rel, description="LLM-discovered relation")
+            self._dynamic_relation_entities.add((rel.upper(), subject, obj))
+        return triples
+
+    @staticmethod
+    def _validate_confidence(value: Any) -> float:
+        """校验 LLM 置信度 ∈ [0,1]；缺失/非法/越界回退 0.75。"""
+        try:
+            conf = float(value)
+        except (TypeError, ValueError):
+            return RelationExtractor.LLM_CONFIDENCE_FALLBACK
+        if not 0.0 <= conf <= 1.0:
+            return RelationExtractor.LLM_CONFIDENCE_FALLBACK
+        return round(conf, 4)
+
+    def _register_dynamic(self, name: str, description: str = "") -> None:
+        """注册/更新动态关系缓存（仅内存，不写入 OntologyService）。"""
+        key = name.upper()
+        info = self._dynamic_relations.get(key)
+        if info is None:
+            info = DynamicRelationInfo(name=key, description=description)
+            self._dynamic_relations[key] = info
+        info.discovery_count += 1
+        info.last_seen = time.time()
+
+    @staticmethod
+    def _uncovered_sentences(text: str, spans: List[Tuple[int, int]]) -> List[str]:
+        """找出未被任何正则命中覆盖的句子片段（送 LLM 的候选）。"""
+        if not spans:
+            return [s for s in re.split(r"(?<=[.!?。！？])\s+|\n+", text) if s.strip()]
+        merged = RelationExtractor._merge_spans(spans)
+        sentences = [s for s in re.split(r"(?<=[.!?。！？])\s+|\n+", text) if s.strip()]
+        uncovered: List[str] = []
+        pos = 0
+        for sent in sentences:
+            start = text.find(sent, pos)
+            pos = start + len(sent) if start >= 0 else pos
+            covered = any(a <= start < b or a < start + len(sent) <= b
+                          for a, b in merged)
+            if not covered:
+                uncovered.append(sent)
+        return uncovered
+
+    @staticmethod
+    def _merge_spans(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """合并重叠的 (start, end) 跨度列表。"""
+        if not spans:
+            return []
+        ordered = sorted(spans)
+        merged = [list(ordered[0])]
+        for s, e in ordered[1:]:
+            if s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        return [(a, b) for a, b in merged]
+
+    @staticmethod
+    def _merge_triples(*groups: List[RelationTriple]) -> List[RelationTriple]:
+        """合并多组三元组并按 relation 排序（同键保留高置信度）。"""
+        by_key: Dict[Tuple[str, str, str], RelationTriple] = {}
+        for group in groups:
+            for t in group:
+                key = (t.relation.upper(), t.subject.lower(), t.obj.lower())
+                prev = by_key.get(key)
+                if prev is None or t.confidence > prev.confidence:
+                    by_key[key] = t
+        triples = sorted(by_key.values(), key=lambda t: t.relation)
+        return triples

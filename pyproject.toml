@@ -59,4 +59,5 @@ testpaths = ["tests"]
 markers = [
     "benchmark: Long-running benchmark tests",
     "slow: Slow tests that take more than 1 second",
+    "integration: Tests requiring live DEEPSEEK_API_KEY",
 ]
