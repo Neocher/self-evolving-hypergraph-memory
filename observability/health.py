@@ -56,6 +56,10 @@ class _ChainVerificationCache:
 # 模块级共享缓存实例，跨请求复用
 _CHAIN_CACHE = _ChainVerificationCache(max_age=300.0)
 
+# 【FIX】进程级启动时间（uptime 基准）：模块导入时即记录，
+# 而非 HealthChecker 首次实例化（那样每次请求才创建 → uptime 恒≈0）
+_PROCESS_START_TIME: float = time.time()
+
 
 class HealthChecker:
     """深度健康检查器，聚合各组件状态生成统一的健康检查报告。"""
@@ -71,7 +75,8 @@ class HealthChecker:
         self.faiss_index = faiss_index
         self.audit_chain = audit_chain
         self.dream_scheduler = dream_scheduler
-        self._start_time = time.time()
+        # 【FIX】uptime 基准 = 模块导入时刻（进程启动时），跨实例共享
+        self._start_time = _PROCESS_START_TIME
 
     def check(self) -> HealthCheckResult:
         """执行完整的深度健康检查。"""

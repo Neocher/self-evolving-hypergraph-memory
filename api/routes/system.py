@@ -181,7 +181,16 @@ async def rebuild_index(
     node_ids = []
     contents = []
     for row in rows:
-        if isinstance(row, (list, tuple)):
+        # GraphLite 返回深层嵌套 {"e": {"Node": {"properties": {...}}}}，
+        # RyuStore 返回 [[id, content]] —— 两种格式都兼容
+        if isinstance(row, dict) and "e" in row:
+            try:
+                from graph.graphlite_store import GraphLiteStore
+                flat = GraphLiteStore._flatten_row(row, "e")
+                nid, content = str(flat.get("id", "")), str(flat.get("content", ""))
+            except Exception:
+                nid, content = str(row.get("id", "")), str(row.get("content", ""))
+        elif isinstance(row, (list, tuple)):
             nid, content = str(row[0]), str(row[1]) if len(row) > 1 else ""
         elif isinstance(row, dict):
             nid, content = str(row.get("id", "")), str(row.get("content", ""))

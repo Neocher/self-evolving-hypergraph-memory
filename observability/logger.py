@@ -44,6 +44,16 @@ def configure_logging(log_level: str = "INFO") -> None:
     若 structlog 初始化失败，自动降级到标准 logging 模块。
     """
     try:
+        # 绑定 stdlib root logger 的 handler，否则 structlog 的 LoggerFactory
+        # 路由到 stdlib logging 后 INFO/WARNING 全部丢失（仅 uvicorn 自己的 handler 有输出）
+        _root = _stdlib_logging.getLogger()
+        _root.setLevel(getattr(_stdlib_logging, log_level.upper(), _stdlib_logging.INFO))
+        if not any(isinstance(h, _stdlib_logging.StreamHandler) for h in _root.handlers):
+            _handler = _stdlib_logging.StreamHandler()
+            _handler.setFormatter(_stdlib_logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            _root.addHandler(_handler)
+
         structlog.configure(
             processors=[
                 structlog.stdlib.add_log_level,
