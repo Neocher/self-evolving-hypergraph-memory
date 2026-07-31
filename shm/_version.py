@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.19.4"
+__version__ = "5.19.5"
 __version_info__ = (5, 19, 4)
-__version_name__ = "fix: auto-apply 队列卡死修复 — 质量门控失败时跳过候选"
+__version_name__ = "RyuStore-removed"
 __release_date__ = "2026-07-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
