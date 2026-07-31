@@ -39,7 +39,7 @@ dream:
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
 
 kuzu:
-  database_path: "./data/shm_ryugraph_db"  # RyuGraph 数据库文件路径
+  database_path: "./data/shm_graphlite_db"  # GraphLite 数据库文件路径
   buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
   max_threads: 4                 # 最大工作线程数
 

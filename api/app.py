@@ -45,7 +45,7 @@ def _init_services() -> Services:
                 _sys.path.insert(0, _p)
         from graph.graphlite_store import GraphLiteStore
         kuzu_cfg = type("cfg", (), {
-            "database_path": str(cfg.kuzu.database_path).replace("ryugraph", "graphlite"),
+            "database_path": str(cfg.kuzu.database_path),
             "max_threads": cfg.kuzu.max_threads,
         })()
         svc.kuzu_store = GraphLiteStore(config=kuzu_cfg)

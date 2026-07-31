@@ -70,7 +70,7 @@ class DreamConfig:
 
 @dataclass
 class KuzuConfig:
-    database_path: str = "./data/shm_ryugraph_db"
+    database_path: str = "./data/shm_graphlite_db"
     buffer_pool_size_mb: int = 256
     max_threads: int = 4
 
