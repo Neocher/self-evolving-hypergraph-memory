@@ -275,7 +275,10 @@ def _init_services() -> Services:
         class TfidfSearchIndex:
             """包装 TF-IDF 向量化器提供 search() 接口。"""
             def __init__(self):
-                self.vectorizer = TfidfVectorizer(max_features=5000)
+                # 字符级 2-4gram：兼容中文单字/短文本（默认 \b\w+\b 对 CJK 边界失效）
+                self.vectorizer = TfidfVectorizer(
+                    analyzer="char_wb", ngram_range=(2, 4), max_features=5000
+                )
                 self._fitted = False
             def fit(self, texts):
                 if texts:
@@ -406,18 +409,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.info("Startup: auto-building FAISS + TF-IDF...")
             result = await rebuild_index(svc)
             idx = result.get("indexed_count", 0)
-            # 拟合 TF-IDF
-            if idx > 0 and hasattr(svc, "tfidf_index") and svc.tfidf_index is not None and svc.kuzu_store is not None:
-                rows = svc.kuzu_store.query_cypher("MATCH (e:EpisodeNode) RETURN e.content LIMIT 10000")
-                texts = []
-                for row in rows:
-                    if isinstance(row, (list, tuple)) and len(row) > 0:
-                        texts.append(str(row[0]))
-                    elif isinstance(row, dict):
-                        texts.append(str(row.get("content", "")))
-                if texts:
-                    svc.tfidf_index.fit(texts)
-                    logger.info("Startup: TF-IDF fitted with %d texts", len(texts))
+            # 注意: rebuild_index (api/routes/system.py) 内部已做 TF-IDF fit
+            # (含 GraphLite 嵌套/b64 兼容解析), 此处无需重复拟合。
             logger.info("Startup: FAISS auto-build complete", indexed=idx)
         except Exception as e:
             logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
