@@ -71,23 +71,35 @@ class GraphLiteStore:
         self._db = GraphLite.open(db_path)
         self._session = self._db.session("shm")
         # Setup schema if first time, otherwise just set context
-        try:
-            self._session.execute("SESSION SET SCHEMA /shm")
-            self._session.execute("SESSION SET GRAPH default")
-        except Exception:
+        # GraphLite 本版要求 graph 名称带 / 前缀（如 /shm），但旧库用 default（无斜杠）
+        # 双名兼容：先试 default（兼容现有生产库），再试 /shm（新格式）
+        self._graph_name: str = ""
+        # 双名探测：default（旧生产库）→ /shm（新格式）。
+        # 注意：探测在同一 try 内先 SET SCHEMA 再 SET GRAPH——若 schema 不存在
+        # 则 default 候选也被跳过（落入创建路径）。当前生产库 schema=/shm，
+        # 该前提成立；非 /shm schema 的 legacy 库会新建空 /shm graph。
+        for candidate in (SHM_GRAPH, SHM_SCHEMA):
             try:
-                self._session.execute("CREATE SCHEMA /shm")
+                self._session.execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
+                self._session.execute(f"SESSION SET GRAPH {candidate}")
+                self._graph_name = candidate
+                break
+            except Exception:
+                continue
+        if not self._graph_name:
+            # 全新库：按序创建 schema → set schema → create graph → set graph
+            # （CREATE GRAPH 前必须先 SESSION SET SCHEMA，顺序颠倒会失败）
+            try:
+                self._session.execute(f"CREATE SCHEMA {SHM_SCHEMA}")
             except Exception:
                 pass  # schema 可能已存在
+            self._session.execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
             try:
-                self._session.execute("CREATE GRAPH IF NOT EXISTS default")
+                self._session.execute(f"CREATE GRAPH {SHM_SCHEMA}")
             except Exception:
-                self._session.execute("CREATE GRAPH IF NOT EXISTS social")
-            self._session.execute("SESSION SET SCHEMA /shm")
-            try:
-                self._session.execute("SESSION SET GRAPH default")
-            except Exception:
-                self._session.execute("SESSION SET GRAPH social")
+                pass  # graph 可能已存在
+            self._session.execute(f"SESSION SET GRAPH {SHM_SCHEMA}")
+            self._graph_name = SHM_SCHEMA
 
     # ─── Episode CRUD ───────────────────────────────
 
