@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.19.3"
-__version_info__ = (5, 19, 3)
-__version_name__ = "fix: SSM门控冷启动放行 + 写入链路await修复 + GraphLite别名扁平解析"
+__version__ = "5.19.4"
+__version_info__ = (5, 19, 4)
+__version_name__ = "fix: auto-apply 队列卡死修复 — 质量门控失败时跳过候选"
 __release_date__ = "2026-07-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})

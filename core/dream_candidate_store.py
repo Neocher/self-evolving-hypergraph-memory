@@ -401,6 +401,13 @@ class DreamCandidateStore:
                 candidate.dream_id[:12], len(valid_communities),
                 candidate.conflict_count, candidate.community_count,
             )
+            # 【FIX 2026-07-31】质量门控失败 → 标记 discarded 跳过，避免卡死整个队列
+            # 根因: auto-apply 永远处理最旧 pending 候选, 若其质量不合格则 return,
+            # 后续所有候选全部堆积 (曾导致 113 个候选文件无限增长)
+            try:
+                self.discard_candidate(candidate.dream_id)
+            except Exception:
+                pass
             return (0, 0, 0)
 
         try:
