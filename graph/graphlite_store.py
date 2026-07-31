@@ -75,10 +75,19 @@ class GraphLiteStore:
             self._session.execute("SESSION SET SCHEMA /shm")
             self._session.execute("SESSION SET GRAPH default")
         except Exception:
-            self._session.execute("CREATE SCHEMA /shm")
-            self._session.execute("CREATE GRAPH default")
+            try:
+                self._session.execute("CREATE SCHEMA /shm")
+            except Exception:
+                pass  # schema 可能已存在
+            try:
+                self._session.execute("CREATE GRAPH IF NOT EXISTS default")
+            except Exception:
+                self._session.execute("CREATE GRAPH IF NOT EXISTS social")
             self._session.execute("SESSION SET SCHEMA /shm")
-            self._session.execute("SESSION SET GRAPH default")
+            try:
+                self._session.execute("SESSION SET GRAPH default")
+            except Exception:
+                self._session.execute("SESSION SET GRAPH social")
 
     # ─── Episode CRUD ───────────────────────────────
 

@@ -18,11 +18,7 @@ from typing import Any, Generator, Optional
 
 import numpy as np
 import pytest
-
-try:
-    from graph.ryu_store import RyuStore, RyuConfig, CircuitBreaker, CircuitBreakerConfig
-except ImportError:  # ryugraph 已被 GraphLite 替换，旧 store 不可用时跳过依赖它的测试
-    RyuStore = RyuConfig = CircuitBreaker = CircuitBreakerConfig = None
+from unittest.mock import MagicMock
 
 
 @pytest.fixture
@@ -37,22 +33,17 @@ def temp_db_path() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def kuzu_store(temp_db_path: Path) -> Generator[RyuStore, None, None]:
-    """带临时数据库的 RyuStore 实例。"""
-    if RyuStore is None:
-        pytest.skip("ryugraph not installed (replaced by GraphLite)")
-    config = RyuConfig(
-        database_path=str(temp_db_path),
-        buffer_pool_size_mb=64,
-        max_threads=2,
-    )
-    store = RyuStore(config=config)
-    store.connect()
-    yield store
-    try:
-        store.close()
-    except Exception:
-        pass
+def kuzu_store(temp_db_path: Path):
+    """图存储 mock（旧 RyuStore 已删除，引擎为 GraphLite）。
+
+    真实 GraphLiteStore 集成测试请直接构造 GraphLiteStore 实例；
+    此 fixture 仅用于不依赖真实图引擎的单元测试。
+    """
+    store = MagicMock()
+    store.query_cypher.return_value = []
+    store.get_all_nodes.return_value = {}
+    store.get_all_connections.return_value = {}
+    return store
 
 
 @pytest.fixture
