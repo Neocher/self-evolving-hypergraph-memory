@@ -195,6 +195,22 @@ class GraphLiteStore:
         except Exception:
             return []
 
+    def get_all_connections(self) -> dict[str, dict[str, float]]:
+        """全部 Hebbian 连接，格式 {src_id: {dst_id: weight}}（供 Hebbian 更新器使用）。"""
+        conns: dict[str, dict[str, float]] = {}
+        try:
+            for row in self.get_all_hebbian_connections():
+                src = row.get("src") or row.get("a.id")
+                dst = row.get("dst") or row.get("b.id")
+                if not src or not dst:
+                    continue
+                conns.setdefault(str(src), {})[str(dst)] = float(
+                    row.get("weight") or row.get("r.weight") or 0.0
+                )
+        except Exception:
+            pass  # 连接查询失败时返回空字典（与 get_all_hebbian_connections 一致）
+        return conns
+
     def link_to_session(self, session_id: str, episode_id: str) -> None:
         """Link episode to session node."""
         gql = (
