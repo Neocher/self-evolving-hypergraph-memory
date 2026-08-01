@@ -156,10 +156,17 @@ class GraphLiteStore:
 
     def update_with_version(self, node_id: str, updates: dict, expected_version: int) -> bool:
         """Optimistic lock update. GQL SET syntax."""
-        sets = _dict_to_gql_values(updates)
+        sets = _dict_to_gql_values(updates, skip_keys={"id"})
         if not sets:
             return True
-        gql = f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET e.{sets}"
+        # SET 需要 e. 前缀 + 等号: SET e.content = 'x'
+        # (_dict_to_gql_values 返回 INSERT 冒号格式, 需转换)
+        set_parts = sets.split(", ")
+        set_clause = ", ".join(
+            f"e.{p.replace(': ', ' = ', 1) if ': ' in p else p}"
+            for p in set_parts
+        )
+        gql = f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET {set_clause}"
         try:
             self._session.execute(gql)
             return True
