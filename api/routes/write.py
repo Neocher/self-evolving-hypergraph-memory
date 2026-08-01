@@ -310,12 +310,18 @@ async def create_episode(
             for c in val_result.contradictions:
                 try:
                     conflict_id = c.get("conflict_id", "")
-                    deps.kuzu_store.execute_cypher(
-                        "MERGE (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
-                        "rule_id: $rule, detected_at: $t, resolved: false})",
-                        {"id": f"conflict_{episode_id}_{conflict_id}",
-                         "a": episode_id, "b": conflict_id,
-                         "rule": "write_validate", "t": _now()})
+                    conflict_node_id = f"conflict_{episode_id}_{conflict_id}"
+                    # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
+                    if not deps.kuzu_store.execute_cypher(
+                        "MATCH (c:ConflictNode {id: $id}) RETURN c",
+                        {"id": conflict_node_id},
+                    ):
+                        deps.kuzu_store.execute_cypher(
+                            "INSERT (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
+                            "rule_id: $rule, detected_at: $t, resolved: false})",
+                            {"id": conflict_node_id,
+                             "a": episode_id, "b": conflict_id,
+                             "rule": "write_validate", "t": _now()})
                 except Exception:
                     logger.warning("Conflict node creation failed for %s / %s", episode_id, conflict_id)
             # P2: 通知梦境调度器有冲突产生
@@ -362,30 +368,36 @@ async def create_episode(
             rext = RelationExtractor()
             triples = rext.extract(req.content)
             if triples:
-                # 批量创建实体节点（一次 Kuzu 调用）
-                entity_statements = []
-                entity_params = {}
+                # 批量创建实体节点（GraphLite 不支持 MERGE/多语句：逐条 MATCH + INSERT）
                 seen_entities = set()
                 for t in triples:
                     for entity_name in (t.subject, t.obj):
+                        if not entity_name:
+                            continue  # 空串守卫：避免写入哨兵节点
                         if entity_name not in seen_entities:
                             seen_entities.add(entity_name)
-                            idx = len(seen_entities)
-                            entity_statements.append(
-                                f"MERGE (n{idx}:OntologyEntity {{name: $n{idx}_name}}) "
-                                f"ON CREATE SET n{idx}.type = 'discovered'"
-                            )
-                            entity_params[f"n{idx}_name"] = entity_name
-                if entity_statements:
-                    deps.kuzu_store.query_cypher(" ".join(entity_statements), entity_params)
-                # 批量创建关系边（一次 Kuzu 调用）
+                            if not deps.kuzu_store.execute_cypher(
+                                "MATCH (n:OntologyEntity {name: $name}) RETURN n",
+                                {"name": entity_name},
+                            ):
+                                deps.kuzu_store.execute_cypher(
+                                    "INSERT (n:OntologyEntity {name: $name, type: 'discovered'})",
+                                    {"name": entity_name},
+                                )
+                # 批量创建关系边（GraphLite 不支持 MERGE：MATCH 边存在性 + INSERT）
                 for t in triples:
-                    deps.kuzu_store.query_cypher(
-                        "MATCH (a:OntologyEntity {name: $subj}) "
-                        "MATCH (b:OntologyEntity {name: $obj}) "
-                        "MERGE (a)-[r:RELATES_TO {relation: $rel}]->(b)",
-                        {"subj": t.subject, "obj": t.obj, "rel": t.relation},
-                    )
+                    if not deps.kuzu_store.execute_cypher(
+                        "MATCH (a:OntologyEntity {name: $subj})"
+                        "-[:RELATES_TO]->"
+                        "(b:OntologyEntity {name: $obj}) RETURN a",
+                        {"subj": t.subject, "obj": t.obj},
+                    ):
+                        deps.kuzu_store.execute_cypher(
+                            "MATCH (a:OntologyEntity {name: $subj}), "
+                            "(b:OntologyEntity {name: $obj}) "
+                            "INSERT (a)-[:RELATES_TO {relation: $rel}]->(b)",
+                            {"subj": t.subject, "obj": t.obj, "rel": t.relation},
+                        )
             if triples:
                 logger.info("Relation extraction: %d typed edges", len(triples))
         except Exception:

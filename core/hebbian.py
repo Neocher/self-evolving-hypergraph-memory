@@ -131,21 +131,30 @@ class SparseHebbianUpdater:
         return all_connections
 
     def _persist_batch(self, updates: list[tuple[str, str, float]]) -> None:
-        """批量持久化 Hebbian 更新到 Kuzu（使用 UNWIND 单次写入）。"""
+        """批量持久化 Hebbian 更新到 Kuzu。
+
+        GraphLite 不支持 UNWIND/MERGE：改为循环逐条处理，
+        边存在则 SET 权重，不存在则 INSERT（UPDATE 语义）。
+        """
         if not self._kuzu_store or not updates:
             return
         try:
-            rows_param = [
-                {"src": s, "dst": d, "weight": w}
-                for s, d, w in updates
-            ]
-            self._kuzu_store.query_cypher(
-                "UNWIND $rows AS row "
-                "MATCH (a {id: row.src}), (b {id: row.dst}) "
-                "MERGE (a)-[r:HEBBIAN_CONNECTION]->(b) "
-                "SET r.weight = row.weight",
-                {"rows": rows_param},
-            )
+            for src, dst, weight in updates:
+                if self._kuzu_store.execute_cypher(
+                    "MATCH (a {id: $src})-[r:HEBBIAN_CONNECTION]->(b {id: $dst}) RETURN r",
+                    {"src": src, "dst": dst},
+                ):
+                    self._kuzu_store.execute_cypher(
+                        "MATCH (a {id: $src})-[r:HEBBIAN_CONNECTION]->(b {id: $dst}) "
+                        "SET r.weight = $weight",
+                        {"src": src, "dst": dst, "weight": weight},
+                    )
+                else:
+                    self._kuzu_store.execute_cypher(
+                        "MATCH (a {id: $src}), (b {id: $dst}) "
+                        "INSERT (a)-[:HEBBIAN_CONNECTION {weight: $weight}]->(b)",
+                        {"src": src, "dst": dst, "weight": weight},
+                    )
         except Exception:
             logger.exception("Hebbian batch persist failed for %d updates", len(updates))
 

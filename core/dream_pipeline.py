@@ -1115,27 +1115,48 @@ Text:
             logger.warning("Failed to clean before community upsert", exc_info=True)
         for comm in communities:
             try:
-                kuzu_store.query_cypher(
-                    "MERGE (c:CommunityNode {id: $id}) "
-                    "SET c.name = $name, c.summary = $summary, "
-                    "c.leiden_score = $score, c.created_at = $created_at",
-                    {
-                        "id": comm["id"],
-                        "name": f"dream_{dream_id[:8]}_comm_{created}",
-                        "summary": comm.get("report", "")[:800],
-                        "score": 0.0,
-                        "created_at": time.time(),
-                    }
-                )
+                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 / SET 更新属性
+                comm_vals = {
+                    "id": comm["id"],
+                    "name": f"dream_{dream_id[:8]}_comm_{created}",
+                    "summary": comm.get("report", "")[:800],
+                    "score": 0.0,
+                    "created_at": time.time(),
+                }
+                if kuzu_store.execute_cypher(
+                    "MATCH (c:CommunityNode {id: $id}) RETURN c",
+                    {"id": comm["id"]},
+                ):
+                    kuzu_store.execute_cypher(
+                        "MATCH (c:CommunityNode {id: $id}) "
+                        "SET c.name = $name, c.summary = $summary, "
+                        "c.leiden_score = $score, c.created_at = $created_at",
+                        comm_vals,
+                    )
+                else:
+                    kuzu_store.execute_cypher(
+                        "INSERT (c:CommunityNode {id: $id, name: $name, "
+                        "summary: $summary, leiden_score: $score, "
+                        "created_at: $created_at})",
+                        comm_vals,
+                    )
                 member_set: set[str] = set()
                 for member_id in comm.get("members", []):
                     member_set.add(member_id)
                     try:
-                        kuzu_store.query_cypher(
-                            "MATCH (c:CommunityNode {id: $cid}), (e:EpisodeNode {id: $eid}) "
-                            "MERGE (c)-[:COMMUNITY_MEMBER]->(e)",
-                            {"cid": comm["id"], "eid": member_id}
-                        )
+                        # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
+                        if not kuzu_store.execute_cypher(
+                            "MATCH (c:CommunityNode {id: $cid})"
+                            "-[:COMMUNITY_MEMBER]->"
+                            "(e:EpisodeNode {id: $eid}) RETURN c",
+                            {"cid": comm["id"], "eid": member_id},
+                        ):
+                            kuzu_store.execute_cypher(
+                                "MATCH (c:CommunityNode {id: $cid}), "
+                                "(e:EpisodeNode {id: $eid}) "
+                                "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
+                                {"cid": comm["id"], "eid": member_id},
+                            )
                     except Exception:
                         logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
                 new_member_sets[comm["id"]] = member_set

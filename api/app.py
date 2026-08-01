@@ -493,11 +493,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                             if svc.kuzu_store is not None:
                                 import json as _json
                                 state_json = _json.dumps(svc.dream_scheduler.save_state())
-                                svc.kuzu_store.query_cypher(
-                                    "MERGE (s:SystemNode {id: 'dream_scheduler_state'}) "
-                                    "SET s.payload = $payload",
-                                    {"payload": state_json},
-                                )
+                                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT/SET
+                                if svc.kuzu_store.execute_cypher(
+                                    "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) RETURN s"
+                                ):
+                                    svc.kuzu_store.execute_cypher(
+                                        "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) "
+                                        "SET s.payload = $payload",
+                                        {"payload": state_json},
+                                    )
+                                else:
+                                    svc.kuzu_store.execute_cypher(
+                                        "INSERT (s:SystemNode {id: 'dream_scheduler_state', "
+                                        "payload: $payload})",
+                                        {"payload": state_json},
+                                    )
                         except Exception:
                             pass
                     # 自动 apply 梦境候选

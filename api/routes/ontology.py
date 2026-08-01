@@ -309,22 +309,38 @@ async def batch_relations(
             continue
 
         try:
-            deps.kuzu_store.query_cypher(
-                "MERGE (a:OntologyEntity {name: $name})",
-                {"name": subj}
-            )
-            deps.kuzu_store.query_cypher(
-                "MERGE (a:OntologyEntity {name: $name})",
-                {"name": obj}
-            )
+            # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
+            if not deps.kuzu_store.execute_cypher(
+                "MATCH (a:OntologyEntity {name: $name}) RETURN a",
+                {"name": subj},
+            ):
+                deps.kuzu_store.execute_cypher(
+                    "INSERT (a:OntologyEntity {name: $name})",
+                    {"name": subj},
+                )
+            if not deps.kuzu_store.execute_cypher(
+                "MATCH (a:OntologyEntity {name: $name}) RETURN a",
+                {"name": obj},
+            ):
+                deps.kuzu_store.execute_cypher(
+                    "INSERT (a:OntologyEntity {name: $name})",
+                    {"name": obj},
+                )
 
             rel_type = item.get("edge_type", "RELATES_TO")
-            deps.kuzu_store.query_cypher(
-                f"MATCH (a:OntologyEntity {{name: $subj}}), "
-                f"(b:OntologyEntity {{name: $obj}}) "
-                f"MERGE (a)-[r:{rel_type} {{relation: $rel}}]->(b)",
-                {"subj": subj, "obj": obj, "rel": rel}
-            )
+            # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
+            if not deps.kuzu_store.execute_cypher(
+                f"MATCH (a:OntologyEntity {{name: $subj}})"
+                f"-[r:{rel_type}]->"
+                f"(b:OntologyEntity {{name: $obj}}) RETURN a",
+                {"subj": subj, "obj": obj},
+            ):
+                deps.kuzu_store.execute_cypher(
+                    f"MATCH (a:OntologyEntity {{name: $subj}}), "
+                    f"(b:OntologyEntity {{name: $obj}}) "
+                    f"INSERT (a)-[:{rel_type} {{relation: $rel}}]->(b)",
+                    {"subj": subj, "obj": obj, "rel": rel},
+                )
             results["created"] += 1
         except Exception as e:
             results["errors"] += 1

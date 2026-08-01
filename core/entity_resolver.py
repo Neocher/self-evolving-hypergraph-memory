@@ -267,12 +267,19 @@ class EntityResolver:
                 # 检查是否是同一实体的不同表达
                 if self._is_same_entity(e1["name"], e2["name"]):
                     try:
-                        self.kuzu_store.execute_cypher(
-                            "MATCH (a:OntologyEntity {name: $n1}) "
-                            "MATCH (b:OntologyEntity {name: $n2}) "
-                            "MERGE (a)-[:ALIAS_OF]->(b)",
+                        # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
+                        if not self.kuzu_store.execute_cypher(
+                            "MATCH (a:OntologyEntity {name: $n1})"
+                            "-[:ALIAS_OF]->"
+                            "(b:OntologyEntity {name: $n2}) RETURN a",
                             {"n1": e1["name"], "n2": e2["name"]},
-                        )
+                        ):
+                            self.kuzu_store.execute_cypher(
+                                "MATCH (a:OntologyEntity {name: $n1}), "
+                                "(b:OntologyEntity {name: $n2}) "
+                                "INSERT (a)-[:ALIAS_OF]->(b)",
+                                {"n1": e1["name"], "n2": e2["name"]},
+                            )
                         count += 1
                     except Exception:
                         pass
