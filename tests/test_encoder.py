@@ -67,8 +67,8 @@ class TestLoadPriority:
     def test_fallback_chain_bge_onnx_model_name(self):
         fake_model = mock.MagicMock()
         fake_model.get_sentence_embedding_dimension.return_value = 384
-        # bge 分支第一次实例化抛异常；model_name 分支第二次实例化成功
-        st = _fake_st_module([RuntimeError("bge fail"), fake_model])
+        # bge 第一次 (cuda) 抛异常 → CPU 重试也抛异常 → 落到 model_name 分支
+        st = _fake_st_module([RuntimeError("bge cuda fail"), RuntimeError("bge cpu fail"), fake_model])
         onnx_mods = _fake_onnx_modules(RuntimeError("onnx fail"))
 
         encoder = TextEncoder(

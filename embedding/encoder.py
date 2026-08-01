@@ -183,7 +183,13 @@ class TextEncoder:
             try:
                 from sentence_transformers import SentenceTransformer
                 logger.info("Loading Chinese embedding model (bge-small-zh-v1.5): %s", bge_snapshot)
-                self._model = SentenceTransformer(bge_snapshot, device=self.device)
+                try:
+                    self._model = SentenceTransformer(bge_snapshot, device=self.device)
+                except Exception:
+                    # CUDA 不可用时自动降级 CPU（如 "Torch not compiled with CUDA enabled"）
+                    logger.warning("bge device=%s failed, retry on cpu", self.device)
+                    self._model = SentenceTransformer(bge_snapshot, device="cpu")
+                    self.device = "cpu"
                 self.model_name = "BAAI/bge-small-zh-v1.5"
                 logger.info("Local embedding model loaded: dim=%d", self.dimension)
                 return
