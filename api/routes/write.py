@@ -300,6 +300,7 @@ async def create_episode(
 
     # [Ontology] 写时验证（v1 — 冲突检测）
     ontology_note = None
+    val_result = None
     if deps.ontology_validator is not None:
         val_result = deps.ontology_validator.write_validate(req.content, episode_id)
         if not val_result.passed:
@@ -330,14 +331,23 @@ async def create_episode(
                     await deps.dream_scheduler.on_conflict_detected()
             except Exception:
                 logger.warning("Failed to notify dream scheduler of conflict")
-    deps.kuzu_store.create_episode({
+    episode_data = {
         "id": episode_id,
         "content": req.content,
         "source": req.source,
         "visibility": req.visibility,
         "created_at": created_at,
         "tau_initial": tau_initial,
-    })
+    }
+    # 本体字段: 验证器提取到了就存独立字段, 供矛盾检测等值匹配 (b64 根治)
+    if val_result is not None:
+        if val_result.ontology_type:
+            episode_data["ontology_type"] = val_result.ontology_type
+        if val_result.entity_name:
+            episode_data["entity_name"] = val_result.entity_name
+        if val_result.entity_value:
+            episode_data["entity_value"] = val_result.entity_value
+    deps.kuzu_store.create_episode(episode_data)
 
     # [Defense] 隔离标记：QUARANTINE 判定的节点写入后标记隔离
     if defense_verdict is not None and defense_verdict.value == "quarantine":

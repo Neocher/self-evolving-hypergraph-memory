@@ -90,13 +90,17 @@ ONTOLOGY_TYPES: dict[str, dict[str, Any]] = {
 }
 
 # 矛盾规则模板（Cypher 模式）
+# 等值匹配根治 b64 缺陷: content 整体 b64 编码使 CONTAINS 误报/漏检,
+# 改独立字段 entity_name/entity_value 等值比较, 与字节对齐无关。
+# 已实测: 旧数据无 entity_value 时 NULL <> 'x' 不匹配 → 节点被排除, IS NOT NULL 显式防护兼容旧数据。
 CONTRADICTION_RULES: dict[str, str] = {
     "same_entity_diff_value": """
         MATCH (existing:EpisodeNode)
         WHERE existing.id <> $new_id
           AND existing.ontology_type = $ontology_type
-          AND existing.content CONTAINS $entity_name
-          AND NOT existing.content CONTAINS $new_value
+          AND existing.entity_name = $entity_name
+          AND existing.entity_value IS NOT NULL
+          AND existing.entity_value <> $new_value
         RETURN existing.id AS conflict_id,
                existing.content AS conflict_content,
                existing.trust_score AS conflict_trust,
@@ -137,6 +141,7 @@ class ValidationResult:
     passed: bool
     ontology_type: str = "generic_fact"
     entity_name: str = ""
+    entity_value: str = ""  # 提取的关键值 (年份/日期等), 供等值矛盾匹配
     confidence: float = 1.0
     contradictions: List[Dict[str, Any]] = None
     conflict_count: int = 0
@@ -1073,6 +1078,7 @@ class OntologyValidator:
 
         # 3. 提取关键值
         values = self._extract_values(content, ontology_type)
+        result.entity_value = values.get("year", values.get("date", ""))
 
         # 4. 对每个实体检查矛盾
         entity_name = entities[0]
@@ -1093,7 +1099,7 @@ class OntologyValidator:
                     "new_id": episode_id,
                     "ontology_type": ontology_type,
                     "entity_name": entity_name,
-                    "new_value": values.get("year", values.get("date", "")),
+                    "new_value": result.entity_value,
                 }
                 conflicts = self.kuzu.execute_cypher(rule, params)
 

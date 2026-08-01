@@ -68,10 +68,11 @@ def _make_result_dict(
 
 
 def _create_episode_with_ontology(graphlite_store, content: str, ontology_type: str,
+                                   entity_name: str = "", entity_value: str = "",
                                    trust: float = 0.8) -> str:
-    """用 GraphLiteStore.create_episode 创建含本体属性的节点。"""
+    """用 GraphLiteStore.create_episode 创建含本体属性的节点（含等值匹配字段）。"""
     ep_id = str(uuid.uuid4())
-    graphlite_store.create_episode({
+    data = {
         "id": ep_id,
         "content": content,
         "created_at": 1.0,
@@ -80,7 +81,12 @@ def _create_episode_with_ontology(graphlite_store, content: str, ontology_type: 
         "source": "test",
         "trust_score": trust,
         "ontology_type": ontology_type,
-    })
+    }
+    if entity_name:
+        data["entity_name"] = entity_name
+    if entity_value:
+        data["entity_value"] = entity_value
+    graphlite_store.create_episode(data)
     return ep_id
 
 
@@ -242,7 +248,8 @@ class TestWriteValidate:
     def test_same_entity_diff_value_detected(self, kuzu_validator: OntologyValidator, graphlite_store):
         """同一实体写入矛盾年份时应检测到冲突（置信度降低但默认不拒绝）。"""
         _create_episode_with_ontology(
-            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
 
         result = kuzu_validator.write_validate(
             "张三出生于2000年", episode_id=str(uuid.uuid4()))
@@ -250,6 +257,7 @@ class TestWriteValidate:
         assert result.conflict_count >= 1
         assert result.ontology_type == "person_birth"
         assert result.entity_name == "张三"
+        assert result.entity_value == "2000"
         assert result.confidence < 1.0  # 置信度已降低
         assert result.confidence > 0.3  # 但未低于拒绝阈值
         assert result.passed is True   # 优雅降级：置信度降低但写操作通过
@@ -257,7 +265,8 @@ class TestWriteValidate:
     def test_different_entity_no_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
         """不同实体不应触发冲突。"""
         _create_episode_with_ontology(
-            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
 
         result = kuzu_validator.write_validate(
             "李四出生于1990年", episode_id=str(uuid.uuid4()))
@@ -268,9 +277,11 @@ class TestWriteValidate:
     def test_confidence_penalty_multiple_conflicts(self, kuzu_validator: OntologyValidator, graphlite_store):
         """多条矛盾事实应有置信度累积衰减。"""
         _create_episode_with_ontology(
-            graphlite_store, "张三出生于1990年", ontology_type="person_birth", trust=0.8)
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth", trust=0.8,
+            entity_name="张三", entity_value="1990")
         _create_episode_with_ontology(
-            graphlite_store, "张三出生于1985年", ontology_type="person_birth", trust=0.8)
+            graphlite_store, "张三出生于1985年", ontology_type="person_birth", trust=0.8,
+            entity_name="张三", entity_value="1985")
 
         result = kuzu_validator.write_validate(
             "张三出生于2000年", episode_id=str(uuid.uuid4()))
@@ -282,6 +293,30 @@ class TestWriteValidate:
         """Kuzu查询出错时不应崩溃，应优雅降级。"""
         result = validator.write_validate("张三出生于1990年", episode_id="test")
         assert result.passed is True
+
+    def test_same_fact_rewrite_no_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
+        """缺陷1修复: 相同事实重复写入不报矛盾 (等值匹配, 不再依赖 b64 CONTAINS)。"""
+        _create_episode_with_ontology(
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
+
+        result = kuzu_validator.write_validate(
+            "张三出生于1990年", episode_id=str(uuid.uuid4()))
+        assert result.conflict_count == 0
+        assert result.confidence == 1.0
+        assert result.passed is True
+
+    def test_mixed_content_contradiction_detected(self, kuzu_validator: OntologyValidator, graphlite_store):
+        """缺陷2修复: 混合中英内容 (字节不对齐) 矛盾被检出 (等值匹配与字节对齐无关)。"""
+        _create_episode_with_ontology(
+            graphlite_store, "A张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
+
+        result = kuzu_validator.write_validate(
+            "B张三出生于2000年", episode_id=str(uuid.uuid4()))
+        assert result.conflict_count >= 1
+        assert result.entity_name == "张三"
+        assert result.entity_value == "2000"
 
 
 # ─── 读时验证测试 ─────────────────────────────────────────────
@@ -321,9 +356,11 @@ class TestReadValidate:
     def test_ontology_confidence_penalized_on_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
         """包含冲突实体的事实应被降低 ontology_confidence。"""
         ep1 = _create_episode_with_ontology(
-            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
         _create_episode_with_ontology(
-            graphlite_store, "张三出生于2000年", ontology_type="person_birth")
+            graphlite_store, "张三出生于2000年", ontology_type="person_birth",
+            entity_name="张三", entity_value="2000")
 
         results = [
             _make_result_dict(content="张三出生于1990年", score=0.9, ep_id=ep1),
@@ -350,9 +387,11 @@ class TestWriteThenRead:
         """写时验证 → 写入 → 读时验证 完整闭环。"""
         # 1. 写入两条矛盾事实
         ep1 = _create_episode_with_ontology(
-            graphlite_store, "张三出生于1990年", ontology_type="person_birth")
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
         ep2 = _create_episode_with_ontology(
-            graphlite_store, "张三出生于2000年", ontology_type="person_birth")
+            graphlite_store, "张三出生于2000年", ontology_type="person_birth",
+            entity_name="张三", entity_value="2000")
 
         # 2. 写时验证新矛盾
         result = kuzu_validator.write_validate(

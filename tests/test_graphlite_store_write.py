@@ -81,3 +81,15 @@ class TestEpisodeWritePath:
             str(uuid.uuid4()), {"content": "x"}, expected_version=1
         )
         assert ok is True
+
+    def test_ontology_fields_roundtrip(self, gstore):
+        """本体独立字段 (ontology_type/entity_name/entity_value) 写入 → 读回 闭环 (b64 根治基础)。"""
+        ep = _make_episode("张三出生于1990年")
+        ep["ontology_type"] = "person_birth"
+        ep["entity_name"] = "张三"
+        ep["entity_value"] = "1990"
+        eid = gstore.create_episode(ep)
+        got = gstore.get_episode(eid)
+        assert got["ontology_type"] == "person_birth"
+        assert got["entity_name"] == "张三"
+        assert got["entity_value"] == "1990"
