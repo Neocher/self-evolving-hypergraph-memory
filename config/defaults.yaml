@@ -44,7 +44,7 @@ kuzu:
   max_threads: 4                 # 最大工作线程数
 
 faiss:
-  dimension: 384                 # 向量维度（匹配 all-MiniLM-L6-v2）
+  dimension: 512                 # 向量维度（匹配 bge-small-zh-v1.5，512维中文模型）
   index_type: "FlatL2"           # FAISS 索引类型（<10K向量用FlatL2最快）
   nlist: 100                     # IVF 聚类中心数（IVFFlat 专用）
   nprobe: 3                      # 搜索时探测的聚类数（降低=更快）
@@ -61,7 +61,7 @@ retrieval:
   vector_weight: 0.6             # 向量相似度权重（混合模式）
 
 embedding:
-  model_name: "all-MiniLM-L6-v2" # sentence-transformers 模型名
+  model_name: "BAAI/bge-small-zh-v1.5" # 中文 embedding 模型（512维，离线加载）
   device: "cuda"                 # 推理设备 (cpu/cuda)
 
 api:

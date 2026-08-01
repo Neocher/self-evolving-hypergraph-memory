@@ -6,7 +6,7 @@
 
 环境变量:
     SHM_VECTOR_STORE: 向量存储引擎类型 (默认: "faiss")
-    SHM_FAISS_DIMENSION: 向量维度 (默认: 384)
+    SHM_FAISS_DIMENSION: 向量维度 (默认: 512)
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ class FaissStore(BaseVectorStore):
 
     def __init__(
         self,
-        dimension: int = 384,
+        dimension: int = 512,
         index_type: str = "FlatL2",
         nlist: int = 100,
     ):
@@ -173,7 +173,7 @@ class VectorStoreFactory:
     @classmethod
     def create(
         cls,
-        dimension: int = 384,
+        dimension: int = 512,
         index_type: str = "FlatL2",
         nlist: int = 100,
         engine: Optional[str] = None,

@@ -89,7 +89,11 @@ def _init_services() -> Services:
 
         try:
             from retrieval.vector_store import VectorStoreFactory
-            dim = cfg.faiss.dimension
+            # FAISS 维度从 encoder 动态获取（bge=512 / MiniLM-ONNX=384 / TF-IDF=384），
+            # 避免 dim 不匹配报错；encoder 不可用时回退到配置默认值
+            dim = getattr(svc.encoder, "dimension", None)
+            if not isinstance(dim, int) or dim <= 0:
+                dim = cfg.faiss.dimension
             store = VectorStoreFactory.create(
                 dimension=dim,
                 index_type=cfg.faiss.index_type,

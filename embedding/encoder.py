@@ -6,7 +6,7 @@
   Tier 2 — Local sentence-transformers（CPU，本地缓存模型）
   Tier 3 — TF-IDF 本地编码器（零依赖，最后兜底）
 
-默认使用 Tier 2（本地 all-MiniLM-L6-v2，384维，CPU 0.01s/条）。
+默认使用 Tier 2（本地 BAAI/bge-small-zh-v1.5，512维，中文专用，CPU 0.05s/条）。
 配置 DEEPSEEK_API_KEY + DEEPSEEK_EMBED_MODEL 可启用 Tier 1。
 
 FAISS 索引过期策略：
@@ -99,6 +99,17 @@ def _cloud_embed(
 # ─── Tier 2: 本地 sentence-transformers ────────────────────
 
 
+def _find_bge_snapshot() -> Optional[str]:
+    """定位 bge-small-zh-v1.5 的 HF 缓存 snapshot 路径（离线，不访问网络）。"""
+    import glob
+
+    snapshots = sorted(glob.glob(os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface", "hub",
+        "models--BAAI--bge-small-zh-v1.5", "snapshots", "*",
+    )), key=os.path.getmtime)
+    return snapshots[-1] if snapshots else None
+
+
 class TextEncoder:
     """
     文本嵌入编码器（Tier 2）。
@@ -106,14 +117,15 @@ class TextEncoder:
     封装 sentence-transformers，提供文本到向量的转换，
     集成 FAISS 索引过期管理。
     支持 CPU (device='cpu') 和 GPU (device='cuda')。
-    自动检测 ONNX INT8 模型（./data/all-MiniLM-L6-v2-int8）并优先使用。
+    加载优先级: bge-small-zh-v1.5（中文，512维，HF缓存snapshot）→
+    ONNX INT8（./data/all-MiniLM-L6-v2-int8，384维）→ model_name 通用模型。
 
     【安全】API keys 在初始化时从环境变量读取一次并存储在私有实例变量中，
     不依赖 os.environ 运行时读取，防止子进程继承。
     """
 
     def __init__(
-        self, model_name: str = "all-MiniLM-L6-v2", device: str = "cpu"
+        self, model_name: str = "BAAI/bge-small-zh-v1.5", device: str = "cpu"
     ) -> None:
         self.model_name = model_name
         self.device = device
@@ -157,21 +169,45 @@ class TextEncoder:
         return vec
 
     def load(self) -> None:
-        """加载模型。优先 ONNX INT8，其次 sentence-transformers。"""
+        """加载模型。优先 bge-small-zh-v1.5（中文，512维，HF 缓存 snapshot 离线加载），
+        fallback ONNX INT8（384维），再 fallback sentence-transformers（model_name）。"""
         import os as _os
+
+        # 进程内强制离线（SentenceTransformer 不支持 local_files_only 参数）
+        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+        # ── 优先: bge-small-zh-v1.5（中文专用，512维，本地缓存 snapshot，不访问 huggingface.co）──
+        bge_snapshot = _find_bge_snapshot()
+        if bge_snapshot is not None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading Chinese embedding model (bge-small-zh-v1.5): %s", bge_snapshot)
+                self._model = SentenceTransformer(bge_snapshot, device=self.device)
+                self.model_name = "BAAI/bge-small-zh-v1.5"
+                logger.info("Local embedding model loaded: dim=%d", self.dimension)
+                return
+            except Exception as e:
+                logger.warning("bge-small-zh-v1.5 load failed, fallback to ONNX/ST: %s", e)
+                self._model = None
 
         onnx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                                    "..", "data", "all-MiniLM-L6-v2-int8")
         if _os.path.isdir(onnx_path) and _os.path.exists(_os.path.join(onnx_path, "model.onnx")):
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
-            from transformers import AutoTokenizer
+            try:
+                from optimum.onnxruntime import ORTModelForFeatureExtraction
+                from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
-            self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
-                onnx_path, provider="CPUExecutionProvider", local_files_only=True
-            )
-            logger.info("ONNX INT8 model loaded from %s", onnx_path)
-            return
+                self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
+                self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
+                    onnx_path, provider="CPUExecutionProvider", local_files_only=True
+                )
+                logger.info("ONNX INT8 model loaded from %s", onnx_path)
+                return
+            except Exception as e:
+                logger.warning("ONNX INT8 model load failed, fallback to sentence-transformers: %s", e)
+                self._onnx_model = None
+                self._tokenizer = None
 
         from sentence_transformers import SentenceTransformer
         logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
@@ -179,7 +215,7 @@ class TextEncoder:
         logger.info("Local embedding model loaded: dim=%d", self.dimension)
 
     def embed(self, text: str) -> np.ndarray:
-        """单条文本 → embedding 向量 (384,) float32（带LRU缓存）。"""
+        """单条文本 → embedding 向量 (dim,) float32（带LRU缓存）。"""
         return self._cached_embed(text)
 
     def _do_embed(self, text: str) -> np.ndarray:
@@ -206,7 +242,7 @@ class TextEncoder:
         return self._model.encode(text)
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
-        """批量 → embedding 矩阵 (N, 384) float32。
+        """批量 → embedding 矩阵 (N, dim) float32。
         
         优先 Tier 1（Cloud API 批量），不可用时降级到 Tier 2。
         """
@@ -234,7 +270,15 @@ class TextEncoder:
 
     @property
     def dimension(self) -> int:
-        return 384
+        """实际加载模型的向量维度（bge-small-zh-v1.5=512，ONNX MiniLM=384）。"""
+        if self._onnx_model is not None:
+            return 384
+        if self._model is not None:
+            try:
+                return int(self._model.get_sentence_embedding_dimension())
+            except Exception:
+                pass
+        return 512 if "bge" in getattr(self, "model_name", "") else 384
 
     # ─── FAISS 索引过期管理 ───────────────────────────
 
@@ -351,7 +395,7 @@ class TfidfEncoder:
 
 
 def create_encoder(
-    model_name: str = "all-MiniLM-L6-v2",
+    model_name: str = "BAAI/bge-small-zh-v1.5",
     device: str = "cpu",
     prefer_cloud: bool = True,
 ) -> TextEncoder:

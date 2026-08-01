@@ -77,7 +77,7 @@ class KuzuConfig:
 
 @dataclass
 class FAISSConfig:
-    dimension: int = 384
+    dimension: int = 512
     index_type: str = "IVFFlat"
     nlist: int = 100
     nprobe: int = 10
@@ -98,7 +98,7 @@ class RetrievalConfig:
 
 @dataclass
 class EmbeddingConfig:
-    model_name: str = "all-MiniLM-L6-v2"
+    model_name: str = "BAAI/bge-small-zh-v1.5"
     device: str = "cpu"
 
 

@@ -87,7 +87,7 @@ class Services:
 
     kuzu_store: Any = None
     faiss_index: Any = None
-    faiss_dim: int = 384
+    faiss_dim: int = 512
     faiss_index_type: str = "IVFFlat"
     faiss_nlist: int = 100
     faiss_id_map: dict = field(default_factory=dict)
