@@ -1076,9 +1076,14 @@ class OntologyValidator:
         ontology_type = self._classify_ontology_type(content, entities)
         result.ontology_type = ontology_type
 
-        # 3. 提取关键值
+        # 3. 提取关键值 (日期优先于年份: 同年不同日期应视为不同值)
         values = self._extract_values(content, ontology_type)
-        result.entity_value = values.get("year", values.get("date", ""))
+        result.entity_value = values.get("date") or values.get("year", "")
+
+        # 3b. 无关键值时无等值可比较, 跳过等值矛盾检测
+        #     (避免 new_value 为空串时 entity_value <> '' 恒真导致的误报)
+        if not result.entity_value:
+            return result
 
         # 4. 对每个实体检查矛盾
         entity_name = entities[0]
@@ -1213,19 +1218,23 @@ class OntologyValidator:
                         )
                     )
                     if rule and ep_id:
+                        # 与写路径对称: 提取关键值做等值比较
+                        values = self._extract_values(content, otype)
+                        new_value = values.get("date") or values.get("year", "")
                         params = {
                             "new_id": ep_id,
                             "ontology_type": otype,
                             "entity_name": entities[0],
-                            "new_value": "",
+                            "new_value": new_value,
                         }
-                        conflicts = self.kuzu.execute_cypher(rule, params)
-                        if conflicts and isinstance(conflicts, list):
-                            conflict_count = len(conflicts)
-                            ontology_conf = max(
-                                0.1,
-                                1.0 - self.config.conflict_penalty_factor * conflict_count
-                            )
+                        if new_value:
+                            conflicts = self.kuzu.execute_cypher(rule, params)
+                            if conflicts and isinstance(conflicts, list):
+                                conflict_count = len(conflicts)
+                                ontology_conf = max(
+                                    0.1,
+                                    1.0 - self.config.conflict_penalty_factor * conflict_count
+                                )
                 except Exception as e:
                     # Kuzu 矛盾查询不可用时不阻塞类型一致性评分
                     logger.debug("Contradiction query skipped (non-fatal): %s", e)

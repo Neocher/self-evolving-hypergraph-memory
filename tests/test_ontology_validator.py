@@ -318,6 +318,28 @@ class TestWriteValidate:
         assert result.entity_name == "张三"
         assert result.entity_value == "2000"
 
+    def test_no_value_fact_no_false_positive(self, kuzu_validator: OntologyValidator, graphlite_store):
+        """缺陷A修复: 无年份/日期的事实 (\"张三出生于北京\") 不触发等值矛盾误报。"""
+        _create_episode_with_ontology(
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
+
+        result = kuzu_validator.write_validate(
+            "张三出生于北京", episode_id=str(uuid.uuid4()))
+        assert result.conflict_count == 0
+        assert result.passed is True
+
+    def test_same_year_diff_date_detected(self, kuzu_validator: OntologyValidator, graphlite_store):
+        """缺陷B修复: 同年不同日期 (2024-03-15 vs 2024-05-20) 应检出矛盾 (日期优先于年份)。"""
+        _create_episode_with_ontology(
+            graphlite_store, "张三出生于2024-03-15", ontology_type="person_birth",
+            entity_name="张三", entity_value="2024")  # 旧逻辑只存年份
+
+        result = kuzu_validator.write_validate(
+            "张三出生于2024-05-20", episode_id=str(uuid.uuid4()))
+        assert result.entity_value == "2024-05-20"  # 完整日期优先于年份
+        assert result.conflict_count >= 1
+
 
 # ─── 读时验证测试 ─────────────────────────────────────────────
 
@@ -376,6 +398,22 @@ class TestReadValidate:
         # 第二条无冲突
         v_other = [v for v in validated if v.episode_id != ep1][0]
         assert v_other.ontology_confidence == 0.5
+
+    def test_read_same_value_no_conflict(self, kuzu_validator: OntologyValidator, graphlite_store):
+        """缺陷C修复: 读路径提取实体值做等值比较, 内容完全相同 (同值) 不误罚。"""
+        ep1 = _create_episode_with_ontology(
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
+        _create_episode_with_ontology(
+            graphlite_store, "张三出生于1990年", ontology_type="person_birth",
+            entity_name="张三", entity_value="1990")
+
+        validated = kuzu_validator.read_validate([
+            _make_result_dict(content="张三出生于1990年", score=0.9, ep_id=ep1),
+        ])
+        v = validated[0]
+        assert v.conflict_count == 0
+        assert v.ontology_confidence == 0.5  # 无冲突: 仅中性类型重叠(0.5) × 置信度(1.0)
 
 
 # ─── 集成测试：写时验证 → 读时验证 全流程 ─────────────────
