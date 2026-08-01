@@ -61,7 +61,7 @@ class QuarantineStore:
                 {"id": episode_id, "reason": reason, "source": source, "ts": time.time()},
             )
             if not rows:
-                logger.warning("Quarantine: node %s not found in Kuzu, skipping", episode_id[:12])
+                logger.warning("Quarantine: node %s not found in GraphLite, skipping", episode_id[:12])
                 return False
             self._quarantined_ids.add(episode_id)
             logger.warning("Quarantined node %s: %s", episode_id[:12], reason[:80])

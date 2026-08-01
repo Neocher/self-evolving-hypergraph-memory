@@ -83,15 +83,15 @@ async def api_overview(
     """概览统计：记忆总数 / FAISS 状态 / 梦境状态 / 系统健康。"""
     stats: dict[str, Any] = {
         "timestamp": _now(),
-        "kuzu_connected": deps.kuzu_store is not None,
+        "graphlite_connected": deps.graphlite_store is not None,
         "encoder_loaded": deps.encoder is not None,
     }
 
     # 记忆统计
     memory_count = 0
-    if deps.kuzu_store is not None:
+    if deps.graphlite_store is not None:
         try:
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN count(*) AS cnt"
             )
             if rows:
@@ -137,9 +137,9 @@ async def api_overview(
     # 超边 & 社区统计
     hyperedge_count = 0
     community_count = 0
-    if deps.kuzu_store is not None:
+    if deps.graphlite_store is not None:
         try:
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (h:HyperedgeNode) RETURN count(*) AS cnt"
             )
             if rows:
@@ -152,7 +152,7 @@ async def api_overview(
         except Exception:
             pass
         try:
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (c:CommunityNode) RETURN count(*) AS cnt"
             )
             if rows:
@@ -192,12 +192,12 @@ async def api_memories(
     items: list[dict[str, Any]] = []
     total = 0
 
-    if deps.kuzu_store is not None:
+    if deps.graphlite_store is not None:
         try:
             # GraphLite 参数化 LIMIT 不生效 (实测返回超量) → 字面量插值 + int 校验
             _lim = int(limit)
             _off = int(offset)
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.id, e.content, "
                 "e.source, e.created_at, e.tau_initial "
                 f"ORDER BY e.created_at DESC LIMIT {_lim} OFFSET {_off}",
@@ -220,7 +220,7 @@ async def api_memories(
                         "tau": float(row[4]) if len(row) > 4 else 1.0,
                     })
             # 获取总数
-            count_rows = deps.kuzu_store.query_cypher(
+            count_rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN count(*) AS cnt"
             )
             if count_rows:

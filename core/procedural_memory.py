@@ -53,16 +53,16 @@ class ProceduralMemoryEngine:
     """
 
     def __init__(self, config: Optional[ProceduralMemoryConfig] = None,
-                 kuzu_store=None):
+                 graphlite_store=None):
         self.config = config or ProceduralMemoryConfig()
-        self._kuzu_store = kuzu_store
+        self._graphlite_store = graphlite_store
         # 滑动窗口缓存：{(agent, platform): [ActionEvent, ...]}
         self._windows: dict[tuple[str, str], list[ActionEvent]] = {}
         # 模式计数：{pattern_signature: count}
         self._pattern_counts: dict[str, dict] = {}
 
-    def set_kuzu_store(self, store) -> None:
-        self._kuzu_store = store
+    def set_graphlite_store(self, store) -> None:
+        self._graphlite_store = store
 
     def observe(self, event: ActionEvent) -> Optional[dict]:
         """观察一个行动事件，检测模式。
@@ -141,9 +141,9 @@ class ProceduralMemoryEngine:
             "last_matched_at": info["last_seen"],
         }
         
-        if self._kuzu_store is not None:
+        if self._graphlite_store is not None:
             try:
-                node_id = self._kuzu_store.create_procedural_node(node)
+                node_id = self._graphlite_store.create_procedural_node(node)
                 node["id"] = node_id
                 logger.info("程序记忆提升: %s (type=%s, freq=%d, conf=%.2f)",
                            pattern_name, pattern_type, info["count"], node["confidence"])
@@ -155,9 +155,9 @@ class ProceduralMemoryEngine:
     def query_patterns(self, min_confidence: float = None) -> list[dict]:
         """查询已知程序模式。"""
         min_c = min_confidence or self.config.min_confidence
-        if self._kuzu_store is not None:
+        if self._graphlite_store is not None:
             try:
-                return self._kuzu_store.find_procedural_patterns(min_c)
+                return self._graphlite_store.find_procedural_patterns(min_c)
             except Exception:
                 pass
         # 回退到内存模式

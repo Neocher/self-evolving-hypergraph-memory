@@ -38,7 +38,7 @@ dream:
   cpu_affinity_low_priority: true  # 低优先级 CPU 亲和性
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
 
-kuzu:
+graphlite:
   database_path: "./data/shm_graphlite_db"  # GraphLite 数据库文件路径
   buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
   max_threads: 4                 # 最大工作线程数

@@ -6,7 +6,7 @@
 
 架构：
 - 每个梦境候选保存为一个 JSON 文件在 dream_candidates/ 目录下
-- apply() 执行后在 Kuzu 上执行实际的 DETACH DELETE 和 CREATE
+- apply() 执行后在 GraphLite 上执行实际的 DETACH DELETE 和 CREATE
 """
 
 from __future__ import annotations
@@ -193,12 +193,12 @@ class DreamCandidateStore:
         candidates.sort(key=lambda c: c.created_at)
         return candidates
 
-    def apply_candidate(self, dream_id: str, kuzu_store) -> bool:
-        """将梦境候选应用到生产 Kuzu 数据库。
+    def apply_candidate(self, dream_id: str, graphlite_store) -> bool:
+        """将梦境候选应用到生产 GraphLite 数据库。
 
         执行实际的 PRUNE (DETACH DELETE) 和 Merge 操作。
 
-        Kuzu 事务说明：Kuzu 0.11.x 每个 execute() 自动提交，
+        GraphLite 事务说明：GraphLite 每个 execute() 自动提交，
         不支持显式事务（无 begin_write_transaction/commit/rollback API）。
         因此 PRUNE → MERGE 之间无法原子化；
         如果中间失败，已执行的 PRUNE 操作无法回滚。
@@ -224,7 +224,7 @@ class DreamCandidateStore:
             deleted_count = 0
             for op in candidate.prune_ops:
                 try:
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
                         {"id": op["node_id"]}
                     )
@@ -237,7 +237,7 @@ class DreamCandidateStore:
                 try:
                     target = op.get("target", "")
                     if target:
-                        source_rows = kuzu_store.query_cypher(
+                        source_rows = graphlite_store.query_cypher(
                             "MATCH (s:EpisodeNode {id: $id}) RETURN s.content AS content",
                             {"id": op["node_id"]}
                         )
@@ -248,12 +248,12 @@ class DreamCandidateStore:
                                 source_content = str(row[0])
                             elif isinstance(row, dict):
                                 source_content = str(row.get("content", ""))
-                        kuzu_store.query_cypher(
+                        graphlite_store.query_cypher(
                             "MATCH (target:EpisodeNode {id: $target}) "
                             "SET target.content = target.content + ' | merged: ' + $content",
                             {"target": target, "content": source_content}
                         )
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
                         {"id": op["node_id"]}
                     )
@@ -300,16 +300,16 @@ class DreamCandidateStore:
             logger.warning("Failed to mark candidate %s as applied: %s", dream_id, e)
 
     def _persist_community_nodes(
-        self, candidate: DreamCandidate, kuzu_store,
+        self, candidate: DreamCandidate, graphlite_store,
     ) -> int:
-        """从候选 data 创建 Kuzu CommunityNode + COMMUNITY_MEMBER 边。
+        """从候选 data 创建 GraphLite CommunityNode + COMMUNITY_MEMBER 边。
 
         先清理所有旧社区，再创建新的（最多 50 个最高质量的）。
         Returns: 创建的社区数
         """
         # 先清理旧社区
         try:
-            kuzu_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c", {})
+            graphlite_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c", {})
         except Exception:
             pass
         created = 0
@@ -325,7 +325,7 @@ class DreamCandidateStore:
                 continue
             report = (comm.get("report", "") or "")[:800]
             try:
-                kuzu_store.query_cypher(
+                graphlite_store.query_cypher(
                     "CREATE (c:CommunityNode {id: $id, name: $name, summary: $summary, "
                     "leiden_score: $score, created_at: $created_at})",
                     {
@@ -345,7 +345,7 @@ class DreamCandidateStore:
         )
         return created
 
-    def auto_apply_candidates(self, kuzu_store) -> tuple[int, int, int]:
+    def auto_apply_candidates(self, graphlite_store) -> tuple[int, int, int]:
         """自动审查并应用高质量的梦境候选。
 
         触发条件：
@@ -365,7 +365,7 @@ class DreamCandidateStore:
         Returns:
             (applied_count, community_created_count, file_deleted_count)
         """
-        if kuzu_store is None:
+        if graphlite_store is None:
             return (0, 0, 0)
 
         # 统计候选 JSON 文件数
@@ -415,7 +415,7 @@ class DreamCandidateStore:
             deleted_count = 0
             for op in candidate.prune_ops:
                 try:
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
                         {"id": op.get("node_id", "")},
                     )
@@ -424,7 +424,7 @@ class DreamCandidateStore:
                     pass
 
             # 2. 创建 CommunityNode
-            comm_created = self._persist_community_nodes(candidate, kuzu_store)
+            comm_created = self._persist_community_nodes(candidate, graphlite_store)
 
             # 3. 删除候选 JSON 文件（而不是标记 applied）
             filepath = self._candidate_path(candidate.dream_id)

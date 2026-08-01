@@ -167,19 +167,19 @@ class DreamScheduler:
     async def _run_dream(self, trigger_mode: Optional[TriggerMode]) -> None:
         """执行梦境管道（内部协程）。
         
-        在调用 pipeline_fn 之前，从 Kuzu 拉取节点数据和连接图。
+        在调用 pipeline_fn 之前，从 GraphLite 拉取节点数据和连接图。
         """
         logger.info("Dream triggered by %s mode", trigger_mode.value if trigger_mode else "unknown")
         try:
             if self.pipeline_fn:
-                # 【FIX】从Kuzu获取nodes和connections数据
+                # 【FIX】从GraphLite获取nodes和connections数据
                 nodes = []
                 connections = {}
-                kuzu_store = getattr(self, '_kuzu_store', None)
-                if kuzu_store is not None:
+                graphlite_store = getattr(self, '_graphlite_store', None)
+                if graphlite_store is not None:
                     try:
                         # 单次获取节点（6844节点，一次查询即可）
-                        rows = kuzu_store.query_cypher(
+                        rows = graphlite_store.query_cypher(
                             "MATCH (e:EpisodeNode) RETURN e.* "
                             "ORDER BY e.created_at DESC LIMIT 10000"
                         )
@@ -187,7 +187,7 @@ class DreamScheduler:
                             for row in rows:
                                 if isinstance(row, dict):
                                     # 【FIX v5.18】GraphLite 返回深层嵌套格式，需 flatten
-                                    flat = kuzu_store._flatten_row(row, "e")
+                                    flat = graphlite_store._flatten_row(row, "e")
                                     if flat:
                                         # 【FIX v5.18】GraphLite 所有属性为字符串，需类型转换
                                         try:
@@ -209,7 +209,7 @@ class DreamScheduler:
                                         "tau_initial": float(row[4]) if len(row) > 4 else 1.0,
                                     })
                         # 获取Hebbian连接
-                        edge_rows = kuzu_store.query_cypher(
+                        edge_rows = graphlite_store.query_cypher(
                             "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) "
                             "RETURN a.id AS src, b.id AS dst, r.weight AS w LIMIT 5000"
                         )
@@ -226,12 +226,12 @@ class DreamScheduler:
                     except Exception as src_exc:
                         logger.warning("Dream data sourcing failed, running with empty data: %s", src_exc)
                 
-                # 【FIX】正确传递nodes, connections, trigger_mode, kuzu_store, candidate_store
+                # 【FIX】正确传递nodes, connections, trigger_mode, graphlite_store, candidate_store
                 candidate_store = getattr(self, '_candidate_store', None)
                 report = await self.pipeline_fn(
                     nodes, connections,
                     trigger_mode.value if trigger_mode else "idle",
-                    kuzu_store=self._kuzu_store,
+                    graphlite_store=self._graphlite_store,
                     candidate_store=candidate_store,
                 )
 
@@ -261,9 +261,9 @@ class DreamScheduler:
             if trigger_mode == TriggerMode.CONFLICT_RESOLUTION:
                 self._unresolved_conflict_count = 0
             # 梦境完成后自动 apply 高质量候选
-            if candidate_store is not None and self._kuzu_store is not None:
+            if candidate_store is not None and self._graphlite_store is not None:
                 try:
-                    applied, communities, deleted = candidate_store.auto_apply_candidates(self._kuzu_store)
+                    applied, communities, deleted = candidate_store.auto_apply_candidates(self._graphlite_store)
                     if applied > 0:
                         logger.info("Dream auto-apply: %d candidates → %d communities (%d files cleaned)", applied, communities, deleted)
                 except Exception:
@@ -321,7 +321,7 @@ class DreamScheduler:
     # ─── 状态持久化 (P1-3) ──────────────────────────────────
 
     def save_state(self) -> dict:
-        """导出调度器运行时状态（供持久化到 Kuzu SystemNode）。"""
+        """导出调度器运行时状态（供持久化到 GraphLite SystemNode）。"""
         return {
             "last_run_time": self._last_run_time,
             "dream_run_count": self._dream_run_count,

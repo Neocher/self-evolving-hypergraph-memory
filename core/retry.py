@@ -1,7 +1,7 @@
 """
 [Harness Fix] 指数退避重试装饰器
 ===============================
-所有外部调用（Kuzu 查询、FAISS 搜索、LLM 调用）使用 @with_retry() 装饰。
+所有外部调用（GraphLite 查询、FAISS 搜索、LLM 调用）使用 @with_retry() 装饰。
 
 重试策略：
 - 最大尝试次数：3 次
@@ -45,7 +45,7 @@ def with_retry(
 
     Example:
         @with_retry()
-        def query_kuzu(...):
+        def query_graphlite(...):
             ...
 
         @with_retry(max_attempts=5, base_delay=0.5, backoff=1.5)

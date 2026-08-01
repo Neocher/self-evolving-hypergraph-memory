@@ -1,12 +1,12 @@
 """
-OntologyValidator — 轻量Kuzu本体验证层
+OntologyValidator — 轻量GraphLite本体验证层
 =======================================
 为 SHM v4 提供写时验证 + 读时验证，消除实体级事实矛盾导致的幻觉。
 
-写时验证: 新事实写入前，检查Kuzu中是否存在矛盾的已有事实
+写时验证: 新事实写入前，检查GraphLite中是否存在矛盾的已有事实
 读时验证: 检索结果返回前，做一致性交叉检验 + 置信度打分
 
-零新依赖（仅用已有的 Kuzu + FAISS + sckit-learn）。
+零新依赖（仅用已有的 GraphLite + FAISS + sckit-learn）。
 """
 
 from __future__ import annotations
@@ -177,11 +177,11 @@ class OntologyValidator:
 
     def __init__(
         self,
-        kuzu_store=None,
+        graphlite_store=None,
         encoder=None,
         config: Optional[OntologyConfig] = None,
     ):
-        self.kuzu = kuzu_store
+        self.graphlite = graphlite_store
         self.encoder = encoder
         self.config = config or OntologyConfig()
         self._ontology_synced = False  # lazy sync on first use
@@ -308,7 +308,7 @@ class OntologyValidator:
         "weaviate": "vector_database",
         "chromadb": "vector_database",
         "qdrant": "vector_database",
-        "kuzu": "graph_database",
+        "graphlite": "graph_database",
         "neo4j": "graph_database",
         "arangodb": "graph_database",
         "redis": "database",
@@ -595,29 +595,29 @@ class OntologyValidator:
         # 加权: 精确匹配权重高
         return round(0.6 * exact_ratio + 0.4 * cat_ratio, 3)
 
-    # ─── Phase 2: Kuzu 本体图同步 + 拓扑验证 ─────────────────────
+    # ─── Phase 2: GraphLite 本体图同步 + 拓扑验证 ─────────────────────
 
     def _ensure_ontology_schema(self) -> None:
-        """确保 Kuzu 中存在本体论节点/边表（幂等）。"""
-        if self.kuzu is None:
+        """确保 GraphLite 中存在本体论节点/边表（幂等）。"""
+        if self.graphlite is None:
             return
         try:
-            self.kuzu.execute_cypher(
+            self.graphlite.execute_cypher(
                 "CREATE NODE TABLE IF NOT EXISTS OntologyType ("
                 "name STRING, category STRING, PRIMARY KEY (name))",
                 {},
             )
-            self.kuzu.execute_cypher(
+            self.graphlite.execute_cypher(
                 "CREATE NODE TABLE IF NOT EXISTS OntologyEntity ("
                 "name STRING, type STRING, category STRING, PRIMARY KEY (name))",
                 {},
             )
-            self.kuzu.execute_cypher(
+            self.graphlite.execute_cypher(
                 "CREATE REL TABLE IF NOT EXISTS IS_A "
                 "(FROM OntologyEntity TO OntologyType)",
                 {},
             )
-            self.kuzu.execute_cypher(
+            self.graphlite.execute_cypher(
                 "CREATE REL TABLE IF NOT EXISTS RELATES_TO "
                 "(FROM OntologyEntity TO OntologyEntity, relation STRING)",
                 {},
@@ -625,12 +625,12 @@ class OntologyValidator:
         except Exception as e:
             logger.warning("Failed to create ontology schema: %s", e)
 
-    def sync_entity_types_to_kuzu(self) -> int:
-        """同步 ENTITY_TYPE_MAP 到 Kuzu，创建节类型/实体节点 + IS_A 边。
+    def sync_entity_types_to_graphlite(self) -> int:
+        """同步 ENTITY_TYPE_MAP 到 GraphLite，创建节类型/实体节点 + IS_A 边。
 
         Returns: 同步的实体数
         """
-        if self.kuzu is None:
+        if self.graphlite is None:
             return 0
         self._ensure_ontology_schema()
         count = 0
@@ -639,33 +639,33 @@ class OntologyValidator:
             try:
                 # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 + SET 更新属性。
                 # 注意 INSERT 对节点非幂等（同名不同属性会重复建节点），故必须先查再插。
-                if not self.kuzu.execute_cypher(
+                if not self.graphlite.execute_cypher(
                     "MATCH (t:OntologyType {name: $type}) RETURN t",
                     {"type": etype},
                 ):
-                    self.kuzu.execute_cypher(
+                    self.graphlite.execute_cypher(
                         "INSERT (t:OntologyType {name: $type})",
                         {"type": etype},
                     )
-                self.kuzu.execute_cypher(
+                self.graphlite.execute_cypher(
                     "MATCH (t:OntologyType {name: $type}) SET t.category = $cat",
                     {"type": etype, "cat": category},
                 )
-                if not self.kuzu.execute_cypher(
+                if not self.graphlite.execute_cypher(
                     "MATCH (e:OntologyEntity {name: $name}) RETURN e",
                     {"name": entity},
                 ):
-                    self.kuzu.execute_cypher(
+                    self.graphlite.execute_cypher(
                         "INSERT (e:OntologyEntity {name: $name})",
                         {"name": entity},
                     )
-                self.kuzu.execute_cypher(
+                self.graphlite.execute_cypher(
                     "MATCH (e:OntologyEntity {name: $name}) "
                     "SET e.type = $etype, e.category = $cat",
                     {"name": entity, "etype": etype, "cat": category},
                 )
                 # IS_A 边：MATCH 两节点 + INSERT（INSERT 对边幂等，无重复边）
-                self.kuzu.execute_cypher(
+                self.graphlite.execute_cypher(
                     "MATCH (e:OntologyEntity {name: $name}), "
                     "(t:OntologyType {name: $type}) "
                     "INSERT (e)-[:IS_A]->(t)",
@@ -674,7 +674,7 @@ class OntologyValidator:
                 count += 1
             except Exception as e:
                 logger.warning("Failed to sync entity %s→%s: %s", entity, etype, e)
-        logger.info("Ontology synced to Kuzu: %d entities", count)
+        logger.info("Ontology synced to GraphLite: %d entities", count)
         return count
 
     def _extract_entity_cooccurrence(self, content: str) -> List[str]:
@@ -701,11 +701,11 @@ class OntologyValidator:
 
         Returns: 新增的关系数
         """
-        if self.kuzu is None:
+        if self.graphlite is None:
             return 0
         self._ensure_ontology_schema()
         try:
-            rows = self.kuzu.execute_cypher(
+            rows = self.graphlite.execute_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 5000",
                 {},
             )
@@ -730,14 +730,14 @@ class OntologyValidator:
                 for j in range(i + 1, len(entities)):
                     try:
                         # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（INSERT 幂等，无重复边）
-                        exists = self.kuzu.execute_cypher(
+                        exists = self.graphlite.execute_cypher(
                             "MATCH (a:OntologyEntity {name: $a_name})"
                             "-[:RELATES_TO]->"
                             "(b:OntologyEntity {name: $b_name}) RETURN a",
                             {"a_name": entities[i], "b_name": entities[j]},
                         )
                         if not exists:
-                            self.kuzu.execute_cypher(
+                            self.graphlite.execute_cypher(
                                 "MATCH (a:OntologyEntity {name: $a_name}), "
                                 "(b:OntologyEntity {name: $b_name}) "
                                 "INSERT (a)-[:RELATES_TO {relation: 'co_occur'}]->(b), "
@@ -769,11 +769,11 @@ class OntologyValidator:
         每次新记忆写入时调用，确保拓扑图即时更新。
         Returns: 创建的关系数
         """
-        if self.kuzu is None:
+        if self.graphlite is None:
             return 0
         # lazy sync on first write
         if not self._ontology_synced:
-            self.sync_entity_types_to_kuzu()
+            self.sync_entity_types_to_graphlite()
             self._ontology_synced = True
         self._learn_candidate_entities(content)
         entities = self._extract_entity_cooccurrence(content)
@@ -784,14 +784,14 @@ class OntologyValidator:
             for j in range(i + 1, len(entities)):
                 try:
                     # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（INSERT 幂等，无重复边）
-                    exists = self.kuzu.execute_cypher(
+                    exists = self.graphlite.execute_cypher(
                         "MATCH (a:OntologyEntity {name: $a_name})"
                         "-[:RELATES_TO]->"
                         "(b:OntologyEntity {name: $b_name}) RETURN a",
                         {"a_name": entities[i], "b_name": entities[j]},
                     )
                     if not exists:
-                        self.kuzu.execute_cypher(
+                        self.graphlite.execute_cypher(
                             "MATCH (a:OntologyEntity {name: $a_name}), "
                             "(b:OntologyEntity {name: $b_name}) "
                             "INSERT (a)-[:RELATES_TO {relation: 'co_occur'}]->(b), "
@@ -898,11 +898,11 @@ class OntologyValidator:
         """拓扑验证：查询实体与结果实体的关系路径一致性。
 
         1. 从结果内容中提取实体
-        2. 对查询与结果中共同出现的实体对，检查 Kuzu 中是否有 RELATES_TO 路径
+        2. 对查询与结果中共同出现的实体对，检查 GraphLite 中是否有 RELATES_TO 路径
         3. 有路径 → 1.0（高度一致）；无路径 → 0.6（中性）
         Returns: 拓扑置信度 (0.0 ~ 1.0)
         """
-        if not query_entities or self.kuzu is None:
+        if not query_entities or self.graphlite is None:
             return 1.0
 
         result_entity_names = self._extract_entity_cooccurrence(result_content)
@@ -926,7 +926,7 @@ class OntologyValidator:
             for re_name in result_only:
                 total_checked += 1
                 try:
-                    result = self.kuzu.execute_cypher(
+                    result = self.graphlite.execute_cypher(
                         "MATCH (a:OntologyEntity {name: $a_name}) "
                         "MATCH (b:OntologyEntity {name: $b_name}) "
                         "MATCH (a)-[:RELATES_TO*1..3]-(b) "
@@ -947,7 +947,7 @@ class OntologyValidator:
             for j in range(i + 1, len(shared_list)):
                 total_checked += 1
                 try:
-                    result = self.kuzu.execute_cypher(
+                    result = self.graphlite.execute_cypher(
                         "MATCH (a:OntologyEntity {name: $a_name}) "
                         "MATCH (b:OntologyEntity {name: $b_name}) "
                         "OPTIONAL MATCH (a)-[:RELATES_TO*1..3]-(b) "
@@ -1089,7 +1089,7 @@ class OntologyValidator:
         entity_name = entities[0]
         result.entity_name = entity_name
 
-        if self.kuzu is not None and entity_name:
+        if self.graphlite is not None and entity_name:
             try:
                 rule = CONTRADICTION_RULES.get(
                     ONTOLOGY_TYPES.get(ontology_type, {}).get(
@@ -1099,14 +1099,14 @@ class OntologyValidator:
                 if not rule:
                     return result
 
-                # 执行Kuzu查询
+                # 执行GraphLite查询
                 params = {
                     "new_id": episode_id,
                     "ontology_type": ontology_type,
                     "entity_name": entity_name,
                     "new_value": result.entity_value,
                 }
-                conflicts = self.kuzu.execute_cypher(rule, params)
+                conflicts = self.graphlite.execute_cypher(rule, params)
 
                 if conflicts:
                     result.conflict_count = len(conflicts)
@@ -1168,9 +1168,9 @@ class OntologyValidator:
                 for r in results
             ]
 
-        # lazy: 首次调用时同步实体类型到 Kuzu 并建立关系图
+        # lazy: 首次调用时同步实体类型到 GraphLite 并建立关系图
         if not self._ontology_synced:
-            self.sync_entity_types_to_kuzu()
+            self.sync_entity_types_to_graphlite()
             rels = self._populate_relationships()
             logger.info("Ontology graph synced: %d relationships from content", rels)
             self._ontology_synced = True
@@ -1205,11 +1205,11 @@ class OntologyValidator:
             # 3. 计算类型一致性重叠度
             type_overlap = self._compute_type_overlap(query_types, result_types)
 
-            # 4. 检查 Kuzu 矛盾（原有逻辑，容错处理）
+            # 4. 检查 GraphLite 矛盾（原有逻辑，容错处理）
             ontology_conf = 1.0
             conflict_count = 0
 
-            if entities and self.kuzu is not None and len(entities) > 0:
+            if entities and self.graphlite is not None and len(entities) > 0:
                 try:
                     otype = self._classify_ontology_type(content, entities)
                     rule = CONTRADICTION_RULES.get(
@@ -1228,7 +1228,7 @@ class OntologyValidator:
                             "new_value": new_value,
                         }
                         if new_value:
-                            conflicts = self.kuzu.execute_cypher(rule, params)
+                            conflicts = self.graphlite.execute_cypher(rule, params)
                             if conflicts and isinstance(conflicts, list):
                                 conflict_count = len(conflicts)
                                 ontology_conf = max(
@@ -1236,7 +1236,7 @@ class OntologyValidator:
                                     1.0 - self.config.conflict_penalty_factor * conflict_count
                                 )
                 except Exception as e:
-                    # Kuzu 矛盾查询不可用时不阻塞类型一致性评分
+                    # GraphLite 矛盾查询不可用时不阻塞类型一致性评分
                     logger.debug("Contradiction query skipped (non-fatal): %s", e)
 
             # 5. 拓扑验证：检查查询与结果实体间的关系路径
@@ -1250,7 +1250,7 @@ class OntologyValidator:
             if not query_types:
                 adjusted = score * ontology_conf
             # 高置信度阈值：实体类型全匹配 + 拓扑有路径 → 直接给满分
-            elif confidence_bonus >= 0.95 and self.kuzu is not None:
+            elif confidence_bonus >= 0.95 and self.graphlite is not None:
                 adjusted = min(0.9999, score + 0.3)
             else:
                 # 乘法惩罚(不匹配时) + 保底(0.2)防止完全归零

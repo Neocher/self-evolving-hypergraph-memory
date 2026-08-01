@@ -5,7 +5,7 @@ BM25 中文检索测试
 后，中文语义词能够被正确召回，同时英文检索无回归。
 
 通过 __new__ 构造 QueryRouter（跳过真实引擎依赖），
-用 fake KuzuStore 提供语料，直接驱动 _build_bm25_index / _bm25_search。
+用 fake GraphLiteStore 提供语料，直接驱动 _build_bm25_index / _bm25_search。
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from unittest.mock import patch
 from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
 
 
-class FakeKuzuStore:
-    """仅提供 query_cypher 的假 KuzuStore。"""
+class FakeGraphLiteStore:
+    """仅提供 query_cypher 的假 GraphLiteStore。"""
 
     def __init__(self, rows: list[dict]):
         self.rows = rows
@@ -28,7 +28,7 @@ def _make_router(corpus: list[str]) -> QueryRouter:
     """用 __new__ 构造 QueryRouter，绕过真实引擎依赖。"""
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.kuzu_store = FakeKuzuStore(
+    router.graphlite_store = FakeGraphLiteStore(
         [
             {"node_id": f"n{i}", "content": content, "tau_value": 1.0}
             for i, content in enumerate(corpus)
@@ -69,7 +69,7 @@ def test_empty_corpus_no_crash() -> None:
     """空语料构建不崩溃（返回不抛异常）。"""
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.kuzu_store = FakeKuzuStore([])
+    router.graphlite_store = FakeGraphLiteStore([])
     router._bm25_doc_ids = []
     router._bm25_doc_contents = []
     router._bm25_doc_tau = []

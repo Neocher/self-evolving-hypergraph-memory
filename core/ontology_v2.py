@@ -44,7 +44,7 @@ class AttributeDef:
     name: str
     type: AttrType = AttrType.STRING
     required: bool = False
-    indexed: bool = False          # 是否在 Kuzu 中建索引
+    indexed: bool = False          # 是否在 GraphLite 中建索引
     description: str = ""
     default: Any = None
     min_value: Optional[float] = None   # 数值类型最小值
@@ -118,7 +118,7 @@ class WriteValidationResult:
 class OntologyService:
     """本体服务 — 管理实体类型、边类型、验证"""
 
-    # Kuzu 字段名保留集
+    # GraphLite 字段名保留集
     RESERVED_NAMES = {
         "id", "content", "embedding", "created_at",
         "tau_initial", "tau_value", "trust_score", "ontology_type", "source",
@@ -127,7 +127,7 @@ class OntologyService:
     def __init__(self):
         self.entity_types: Dict[str, EntityTypeDef] = {}
         self.edge_types: Dict[str, EdgeTypeDef] = {}
-        self._kuzu_store = None
+        self._graphlite_store = None
         # 启动时注入基础类型
         self._init_baseline()
 
@@ -416,7 +416,7 @@ class OntologyService:
             elif attr_def.type == AttrType.TEXT_EMBEDDING:
                 if not isinstance(value, str):
                     return False, f"Expected string for embedding, got {type(value).__name__}"
-            # ENTITY_REF: 运行时检查（需查询Kuzu），这里跳过
+            # ENTITY_REF: 运行时检查（需查询GraphLite），这里跳过
         except (ValueError, TypeError):
             return False, f"Cannot convert '{value}' to {attr_def.type.value}"
         return True, ""

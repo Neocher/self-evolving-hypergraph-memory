@@ -33,7 +33,7 @@ class TestExtractTypes:
         ("nvidia cuda toolkit", "nvidia", "hardware"),
         # 向量/图数据库
         ("FAISS vector search", "faiss", "vector_database"),
-        ("Kuzu graph query", "kuzu", "graph_database"),
+        ("GraphLite graph query", "graphlite", "graph_database"),
         # 中文互联网平台（P3新增）
         ("baidu search engine", "baidu", "company"),
         ("tencent cloud services", "tencent", "company"),
@@ -198,10 +198,10 @@ class TestEntityCooccurrence:
 
 
 class TestTopologyScore:
-    """Phase2: 拓扑路径验证（无Kuzu时返回1.0）。"""
+    """Phase2: 拓扑路径验证（无GraphLite时返回1.0）。"""
 
-    def test_no_kuzu_returns_1(self, validator):
-        """无Kuzu连接时拓扑置信度为1.0（跳过）。"""
+    def test_no_graphlite_returns_1(self, validator):
+        """无GraphLite连接时拓扑置信度为1.0（跳过）。"""
         score = validator._compute_topology_score(
             [{"entity": "pytorch", "type": "dl"}],
             "using pytorch on cpu",
@@ -228,8 +228,8 @@ class TestTopologyScore:
 class TestExtractAndRelate:
     """Phase3: 写入时实体关系提取。"""
 
-    def test_no_kuzu_returns_0(self, validator):
-        """无Kuzu时应返回0。"""
+    def test_no_graphlite_returns_0(self, validator):
+        """无GraphLite时应返回0。"""
         count = validator.extract_and_relate("PyTorch on CPU with FAISS")
         assert count == 0
 
@@ -258,7 +258,7 @@ class TestEntityMapCompleteness:
 
     def test_known_entities_exist(self, validator):
         """关键实体必须存在于映射中。"""
-        required = {"pytorch", "cpu", "gpu", "faiss", "kuzu",
+        required = {"pytorch", "cpu", "gpu", "faiss", "graphlite",
                     "baidu", "dns", "tencent", "bilibili"}
         missing = required - set(validator.ENTITY_TYPE_MAP.keys())
         assert not missing, f"Missing required entities: {missing}"

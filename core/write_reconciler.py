@@ -12,7 +12,7 @@
   3. ConflictLogger.record(...) → 记录冲突到 ring buffer
 
 使用方式：
-  reconciler = WriteReconciler(kuzu_store)
+  reconciler = WriteReconciler(graphlite_store)
   result = reconciler.resolve(node_id, incoming_data, expected_version, strategy=Strategy.MERGE)
 
 默认不启用现有写入路径，需手动调用 resolve()。
@@ -89,15 +89,15 @@ class ConflictDetector:
 
     @staticmethod
     def detect(
-        kuzu_store: Any,
+        graphlite_store: Any,
         node_id: str,
         expected_version: int,
     ) -> tuple[bool, Optional[dict], Optional[int]]:
         """
-        从 Kuzu 读取节点当前版本并检测冲突。
+        从 GraphLite 读取节点当前版本并检测冲突。
 
         Args:
-            kuzu_store: GraphLiteStore 实例。
+            graphlite_store: GraphLiteStore 实例。
             node_id: 目标节点 ID。
             expected_version: 写入方预期的版本号。
 
@@ -105,7 +105,7 @@ class ConflictDetector:
             (has_conflict, current_node, current_version)
             has_conflict=True 表示版本不一致。
         """
-        node = kuzu_store.get_episode(node_id)
+        node = graphlite_store.get_episode(node_id)
         if node is None:
             # 节点不存在，无法检查版本 — 视为「新建」场景，不冲突
             return False, None, None
@@ -307,10 +307,10 @@ class WriteReconciler:
     写入消解主入口。
 
     编排冲突检测 → 策略消解 → 日志记录 三步骤。
-    调用方需传入 kuzu_store 用于读取节点当前状态，resolve() 返回消解后的数据。
+    调用方需传入 graphlite_store 用于读取节点当前状态，resolve() 返回消解后的数据。
 
     典型用法：
-        reconciler = WriteReconciler(kuzu_store, conflict_logger)
+        reconciler = WriteReconciler(graphlite_store, conflict_logger)
         resolved = reconciler.resolve(
             node_id="ep_xxx",
             incoming_data={"content": "...", "created_at": 1234567890.0},
@@ -319,7 +319,7 @@ class WriteReconciler:
         )
         if resolved["conflict"]:
             # 版本冲突，resolved["data"] 是消解后的数据
-            kuzu_store.update_with_version(node_id, resolved["data"], expected_version=None)
+            graphlite_store.update_with_version(node_id, resolved["data"], expected_version=None)
         else:
             # 无冲突，正常写入
             ...
@@ -327,10 +327,10 @@ class WriteReconciler:
 
     def __init__(
         self,
-        kuzu_store: Any,
+        graphlite_store: Any,
         conflict_logger: Optional[ConflictLogger] = None,
     ):
-        self._kuzu_store = kuzu_store
+        self._graphlite_store = graphlite_store
         self._detector = ConflictDetector()
         self._resolver = StrategyResolver()
         self._logger = conflict_logger or ConflictLogger()
@@ -369,7 +369,7 @@ class WriteReconciler:
         """
         # 步骤 1: 版本检测
         has_conflict, current_node, current_version = self._detector.detect(
-            self._kuzu_store, node_id, expected_version,
+            self._graphlite_store, node_id, expected_version,
         )
 
         if not has_conflict or force:

@@ -28,13 +28,13 @@ def check():
         log(f"OK | dreams={s.get('dream_run_count', 0)} "
             f"| nodes={s.get('node_count', 0)} "
             f"| faiss={s.get('faiss_index_size', 0)} "
-            f"| kuzu={d.get('kuzu_connected')} "
+            f"| graphlite={d.get('graphlite_connected')} "
             f"| circuit={cb.get('state', '?')}")
 
         # 异常检测
         issues = []
-        if not d.get("kuzu_connected"):
-            issues.append("Kuzu disconnected")
+        if not d.get("graphlite_connected"):
+            issues.append("GraphLite disconnected")
         if cb.get("state") == "open":
             issues.append(f"Circuit breaker OPEN ({cb.get('success_rate', 0)}% success)")
         if not d.get("faiss_loaded"):

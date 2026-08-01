@@ -36,8 +36,8 @@ async def create_visual_memory(
         raise HTTPException(status_code=400, detail="image_base64 and caption required")
     if deps.encoder is None:
         raise HTTPException(status_code=503, detail="Encoder not available")
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     visual_id = str(uuid.uuid4())
     created_at = _now()
@@ -56,7 +56,7 @@ async def create_visual_memory(
         raise HTTPException(status_code=500, detail="Embedding failed")
     emb_array = emb.reshape(-1).astype(np.float32)
 
-    deps.kuzu_store.create_visual_node({
+    deps.graphlite_store.create_visual_node({
         "id": visual_id,
         "image_path": image_path,
         "caption": caption,
@@ -80,10 +80,10 @@ async def list_visual_memories(
     deps: Services = Depends(get_services),
 ) -> dict:
     """列出所有视觉记忆节点。"""
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    rows = deps.kuzu_store.get_visual_nodes(limit)
+    rows = deps.graphlite_store.get_visual_nodes(limit)
     items = []
     for r in rows:
         items.append({
@@ -102,10 +102,10 @@ async def get_visual_memory(
     deps: Services = Depends(get_services),
 ) -> dict:
     """查询单个视觉记忆节点详情，含 base64 image。"""
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    node = deps.kuzu_store.get_visual_node(visual_id)
+    node = deps.graphlite_store.get_visual_node(visual_id)
     if not node:
         raise HTTPException(status_code=404, detail="Visual node not found")
 
@@ -134,10 +134,10 @@ async def visualize_attention(
     当真实 vision encoder 就绪后，此端点将替换为 VLM 注意力软图。
     当前版本：基于 caption 分词 + 关键词 TF-IDF 权重生成合成热图区域。
     """
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    node = deps.kuzu_store.get_visual_node(visual_id)
+    node = deps.graphlite_store.get_visual_node(visual_id)
     if not node:
         raise HTTPException(status_code=404, detail="Visual node not found")
 

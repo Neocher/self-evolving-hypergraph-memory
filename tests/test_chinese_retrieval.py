@@ -97,7 +97,7 @@ class TestChineseEmbeddingRetrieval:
 
         from retrieval.query_router import QueryRouter, QueryRouterConfig as QRCfg, RetrievalLevel
         qr = QueryRouter(
-            kuzu_store=graphlite_store,
+            graphlite_store=graphlite_store,
             faiss_index=FakeFaiss(),
             tfidf_index=tfidf,
             encoder=FakeEncoder(),

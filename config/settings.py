@@ -69,7 +69,7 @@ class DreamConfig:
 
 
 @dataclass
-class KuzuConfig:
+class GraphLiteConfig:
     database_path: str = "./data/shm_graphlite_db"
     buffer_pool_size_mb: int = 256
     max_threads: int = 4
@@ -219,7 +219,7 @@ class Settings:
     hebbian: HebbianConfig = field(default_factory=HebbianConfig)
     ssm: SSMConfig = field(default_factory=SSMConfig)
     dream: DreamConfig = field(default_factory=DreamConfig)
-    kuzu: KuzuConfig = field(default_factory=KuzuConfig)
+    graphlite: GraphLiteConfig = field(default_factory=GraphLiteConfig)
     faiss: FAISSConfig = field(default_factory=FAISSConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -283,7 +283,7 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "hebbian": HebbianConfig,
         "ssm": SSMConfig,
         "dream": DreamConfig,
-        "kuzu": KuzuConfig,
+        "graphlite": GraphLiteConfig,
         "faiss": FAISSConfig,
         "retrieval": RetrievalConfig,
         "embedding": EmbeddingConfig,

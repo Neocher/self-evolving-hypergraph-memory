@@ -84,7 +84,7 @@ async def health_check(
 ) -> HealthStatus:
     """
     深度健康检查，覆盖所有核心组件：
-    - Kuzu 连接 + 断路器状态
+    - GraphLite 连接 + 断路器状态
     - FAISS 索引状态
     - BLAKE3 溯源链完整性
     - 梦境调度器状态
@@ -93,14 +93,14 @@ async def health_check(
     set_trace_id()
 
     checker = HealthChecker(
-        graph_store=deps.kuzu_store,
+        graph_store=deps.graphlite_store,
         faiss_index=deps.faiss_index,
         audit_chain=deps.audit_chain,
         dream_scheduler=deps.dream_scheduler,
     )
     health: HealthCheckResult = checker.check()
 
-    cb = getattr(deps.kuzu_store, "circuit_breaker", None)
+    cb = getattr(deps.graphlite_store, "circuit_breaker", None)
     if cb is not None:
         state_map = {"closed": 0, "half_open": 1, "open": 2}
         cb_state = cb.state.value if hasattr(cb.state, "value") else str(cb.state)
@@ -156,7 +156,7 @@ async def cypher_query(
         from fastapi import HTTPException as _HE
         raise _HE(status_code=400, detail=f"Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH/INSERT/LOAD CSV")
     try:
-        rows = deps.kuzu_store.query_cypher(req.query, req.params)
+        rows = deps.graphlite_store.query_cypher(req.query, req.params)
         return {"rows": rows, "count": len(rows)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -188,7 +188,7 @@ async def rebuild_index(
 ) -> dict:
     """
     重建 FAISS 向量索引：
-    1. 从 Kuzu 读取所有 EpisodeNode
+    1. 从 GraphLite 读取所有 EpisodeNode
     2. 对每个节点生成 embedding
     3. 重建 FAISS IndexIDMap(FlatL2)
     4. 返回重建结果统计
@@ -196,15 +196,15 @@ async def rebuild_index(
     start = _now()
     set_trace_id()
 
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
     if deps.encoder is None:
         raise HTTPException(status_code=503, detail="Text encoder not available")
 
     import numpy as np
     import faiss
 
-    rows = deps.kuzu_store.query_cypher(
+    rows = deps.graphlite_store.query_cypher(
         "MATCH (e:EpisodeNode) RETURN e.id, e.content LIMIT 10000"
     )
     if not rows:
@@ -282,7 +282,7 @@ async def rebuild_index(
     logger.info("Rebuilding Hebbian connections...")
     hebbian_count = 0
     try:
-        deps.kuzu_store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
+        deps.graphlite_store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
     except Exception:
         logger.exception("Failed to clear Hebbian connections")
     for i in range(len(node_ids)):
@@ -298,7 +298,7 @@ async def rebuild_index(
                     continue
                 nb_node_id = node_ids[np.where(faiss_ids == nb_idx)[0][0]]
                 try:
-                    deps.kuzu_store.query_cypher(
+                    deps.graphlite_store.query_cypher(
                         "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
                         "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
                         {"aid": node_ids[i], "bid": nb_node_id, "w": round(similarity, 4)}
@@ -338,7 +338,7 @@ async def list_procedural_patterns(
 ):
     """查询高频重复行动模式——程序记忆层。"""
     from core.procedural_memory import ProceduralMemoryEngine
-    engine = ProceduralMemoryEngine(kuzu_store=svc.kuzu_store)
+    engine = ProceduralMemoryEngine(graphlite_store=svc.graphlite_store)
     patterns = engine.query_patterns(min_confidence=min_confidence)
     return {"patterns": patterns, "total": len(patterns)}
 
@@ -351,7 +351,7 @@ async def list_concepts(
 ):
     """查询跨社区的抽象概念——概念记忆层。"""
     from core.conceptual_memory import ConceptualMemoryEngine
-    engine = ConceptualMemoryEngine(kuzu_store=svc.kuzu_store)
+    engine = ConceptualMemoryEngine(graphlite_store=svc.graphlite_store)
     concepts = engine.get_concepts(level=abstraction_level)
     return {"concepts": concepts, "total": len(concepts)}
 
@@ -363,7 +363,7 @@ async def analyze_concepts(
 ):
     """分析现有社区，自动发现跨社区概念。"""
     from core.conceptual_memory import ConceptualMemoryEngine
-    rows = svc.kuzu_store.query_cypher(
+    rows = svc.graphlite_store.query_cypher(
         "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC"
     )
     communities = []
@@ -382,6 +382,6 @@ async def analyze_concepts(
             "nodes": [],
         })
 
-    engine = ConceptualMemoryEngine(kuzu_store=svc.kuzu_store)
+    engine = ConceptualMemoryEngine(graphlite_store=svc.graphlite_store)
     concepts = engine.analyze_communities(communities)
     return {"concepts_found": len(concepts), "concepts": concepts}

@@ -68,7 +68,7 @@ def get_all_episodes() -> List[Dict[str, Any]]:
 # 2. 关系抽取（直接本地跑，不依赖 SHM 进程内的 module）
 # ──────────────────────────────────────────────────────────────
 # 直接复制 RELATION_PATTERNS 和抽取逻辑
-# （避免 import kuzu 冲突）
+# （避免 import graphlite 冲突）
 
 RELATION_PATTERNS = [
     # X founded Y
@@ -228,7 +228,7 @@ def main():
         logger.info(f"  ... 共 {len(all_triples)} 条")
     
     # Step 4: 写入
-    logger.info(f"\n[Step 3] 写入 {len(all_triples)} 条关系到 Kuzu...")
+    logger.info(f"\n[Step 3] 写入 {len(all_triples)} 条关系到 GraphLite...")
     written = 0
     errors = 0
     for i, (subj, rel, obj, attrs) in enumerate(all_triples):

@@ -44,20 +44,20 @@ def _init_services() -> Services:
             if _p not in _sys.path:
                 _sys.path.insert(0, _p)
         from graph.graphlite_store import GraphLiteStore
-        kuzu_cfg = type("cfg", (), {
-            "database_path": str(cfg.kuzu.database_path),
-            "max_threads": cfg.kuzu.max_threads,
+        graphlite_cfg = type("cfg", (), {
+            "database_path": str(cfg.graphlite.database_path),
+            "max_threads": cfg.graphlite.max_threads,
         })()
-        svc.kuzu_store = GraphLiteStore(config=kuzu_cfg)
-        svc.kuzu_store.connect()
-        logger.info("GraphLiteStore initialized", path=kuzu_cfg.database_path)
+        svc.graphlite_store = GraphLiteStore(config=graphlite_cfg)
+        svc.graphlite_store.connect()
+        logger.info("GraphLiteStore initialized", path=graphlite_cfg.database_path)
     except Exception as e:
         import traceback
         errors.append(f"GraphLiteStore: {e}")
         logger.warning("GraphLiteStore init failed", error=str(e), traceback=traceback.format_exc())
 
     # 2. FAISS 向量索引
-    if svc.kuzu_store is not None:
+    if svc.graphlite_store is not None:
         try:
             # ── 编码器初始化（三层降级架构） ──
             # Tier 1: Cloud API / Tier 2: Local sentence-transformers / Tier 3: TF-IDF
@@ -111,10 +111,10 @@ def _init_services() -> Services:
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))
 
     # 3. HyperedgeManager
-    if svc.kuzu_store is not None:
+    if svc.graphlite_store is not None:
         try:
             from graph.hyperedge import HyperedgeManager
-            svc.hyperedge_manager = HyperedgeManager(kuzu_store=svc.kuzu_store)
+            svc.hyperedge_manager = HyperedgeManager(graphlite_store=svc.graphlite_store)
             logger.info("HyperedgeManager initialized")
         except Exception as e:
             errors.append(f"HyperedgeManager: {e}")
@@ -171,11 +171,11 @@ def _init_services() -> Services:
         logger.warning("AdaptiveGate init failed", error=str(e))
 
     # 7b. 本体验证器（[Ontology] 写时+读时验证层）
-    if svc.kuzu_store is not None:
+    if svc.graphlite_store is not None:
         try:
             from core.ontology_validator import OntologyValidator
             svc.ontology_validator = OntologyValidator(
-                kuzu_store=svc.kuzu_store,
+                graphlite_store=svc.graphlite_store,
                 encoder=svc.encoder,
                 config=cfg.ontology,
             )
@@ -254,8 +254,8 @@ def _init_services() -> Services:
             config=dream_cfg,
             pipeline_fn=pipeline_fn,
         )
-        # 【FIX】注入Kuzu引用供梦境调度器拉取数据
-        svc.dream_scheduler._kuzu_store = svc.kuzu_store
+        # 【FIX】注入GraphLite引用供梦境调度器拉取数据
+        svc.dream_scheduler._graphlite_store = svc.graphlite_store
         # 注入FAISS引用供梦境后增量更新索引
         svc.dream_scheduler._faiss_index = svc.faiss_index
         svc.dream_scheduler._faiss_id_map = getattr(svc, "faiss_id_map", {})
@@ -304,7 +304,7 @@ def _init_services() -> Services:
         svc.tfidf_index = tfidf_index
 
         qr_kwargs = {
-            "kuzu_store": svc.kuzu_store,
+            "graphlite_store": svc.graphlite_store,
             "faiss_index": svc.faiss_index,
             "tfidf_index": tfidf_index,
             "encoder": svc.encoder,
@@ -334,7 +334,7 @@ def _init_services() -> Services:
         errors.append(f"QueryRouter: {e}")
         logger.warning("QueryRouter init failed", error=str(e))
 
-    # 10. 记忆投毒防御引擎（可独立于 Kuzu 运行）
+    # 10. 记忆投毒防御引擎（可独立于 GraphLite 运行）
     try:
         from core.defense import MemoryDefenseEngine, DefenseConfig as CoreDefenseConfig
         _dcfg = cfg.defense
@@ -363,23 +363,23 @@ def _init_services() -> Services:
         errors.append(f"DefenseEngine: {e}")
         logger.warning("DefenseEngine init failed (fallback: no defense)", error=str(e))
 
-    # 11. 隔离存储（依赖 Kuzu）
-    if svc.kuzu_store is not None:
+    # 11. 隔离存储（依赖 GraphLite）
+    if svc.graphlite_store is not None:
         try:
             from core.quarantine_store import QuarantineStore
-            svc.quarantine_store = QuarantineStore(graph_store=svc.kuzu_store)
-            # 启动时从 Kuzu 同步已有隔离节点
+            svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
+            # 启动时从 GraphLite 同步已有隔离节点
             q_count = svc.quarantine_store.refresh()
             logger.info("QuarantineStore initialized", quarantined_count=q_count)
         except Exception as e:
             errors.append(f"QuarantineStore: {e}")
             logger.warning("QuarantineStore init failed (fallback: in-memory only)", error=str(e))
     else:
-        # 无 Kuzu 时使用纯内存模式
+        # 无 GraphLite 时使用纯内存模式
         try:
             from core.quarantine_store import QuarantineStore
             svc.quarantine_store = QuarantineStore()
-            logger.info("QuarantineStore initialized (memory-only, no Kuzu)")
+            logger.info("QuarantineStore initialized (memory-only, no GraphLite)")
         except Exception as e:
             errors.append(f"QuarantineStore: {e}")
 
@@ -398,7 +398,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     configure_logging()
     app.state.config = load_settings()
     app.state.logger = logger
-    logger.info("SHM v4.0 starting up", config_path=str(get_settings().kuzu.database_path))
+    logger.info("SHM v4.0 starting up", config_path=str(get_settings().graphlite.database_path))
 
     # 初始化所有服务并注入
     svc = _init_services()
@@ -443,10 +443,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
     DREAM_POLL_INTERVAL = 60.0
 
-    # 【P1-3】从 Kuzu SystemNode 恢复梦境调度器状态
-    if svc.kuzu_store is not None and svc.dream_scheduler is not None:
+    # 【P1-3】从 GraphLite SystemNode 恢复梦境调度器状态
+    if svc.graphlite_store is not None and svc.dream_scheduler is not None:
         try:
-            rows = svc.kuzu_store.query_cypher(
+            rows = svc.graphlite_store.query_cypher(
                 "MATCH (s:SystemNode) WHERE s.id = 'dream_scheduler_state' "
                 "RETURN s.payload"
             )
@@ -494,20 +494,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                         logger.info("Dream triggered by poll loop")
                         # 【P1-3】梦境完成后保存状态
                         try:
-                            if svc.kuzu_store is not None:
+                            if svc.graphlite_store is not None:
                                 import json as _json
                                 state_json = _json.dumps(svc.dream_scheduler.save_state())
                                 # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT/SET
-                                if svc.kuzu_store.execute_cypher(
+                                if svc.graphlite_store.execute_cypher(
                                     "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) RETURN s"
                                 ):
-                                    svc.kuzu_store.execute_cypher(
+                                    svc.graphlite_store.execute_cypher(
                                         "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) "
                                         "SET s.payload = $payload",
                                         {"payload": state_json},
                                     )
                                 else:
-                                    svc.kuzu_store.execute_cypher(
+                                    svc.graphlite_store.execute_cypher(
                                         "INSERT (s:SystemNode {id: 'dream_scheduler_state', "
                                         "payload: $payload})",
                                         {"payload": state_json},
@@ -517,7 +517,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     # 自动 apply 梦境候选
                     if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
                         try:
-                            applied, communities, deleted = svc.dream_candidate_store.auto_apply_candidates(svc.kuzu_store)
+                            applied, communities, deleted = svc.dream_candidate_store.auto_apply_candidates(svc.graphlite_store)
                             if applied > 0:
                                 logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
                         except Exception:
@@ -537,9 +537,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         while True:
             try:
                 await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)
-                if svc.hyperedge_manager is not None and svc.kuzu_store is not None:
+                if svc.hyperedge_manager is not None and svc.graphlite_store is not None:
                     # 扫描长时间窗口内的同源节点
-                    rows = svc.kuzu_store.query_cypher(
+                    rows = svc.graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode) WHERE e.created_at >= $cutoff "
                         "RETURN e.id, e.source, e.content ORDER BY e.created_at DESC LIMIT 100",
                         {"cutoff": time.time() - 7200},
@@ -571,8 +571,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # shutdown
     poll_task.cancel()
     hyperedge_task.cancel()
-    if svc.kuzu_store:
-        svc.kuzu_store.close()
+    if svc.graphlite_store:
+        svc.graphlite_store.close()
     logger.info("SHM v4.0 shutting down")
 
 

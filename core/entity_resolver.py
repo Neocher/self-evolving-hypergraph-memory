@@ -10,7 +10,7 @@ Entity Resolver — 实体消歧 + 指代消解
             → "He" = "Elon Musk"
 
 用法:
-    resolver = EntityResolver(kuzu_store)
+    resolver = EntityResolver(graphlite_store)
     resolved = resolver.resolve("Elon Musk founded SpaceX. He later announced Starship.")
     # → "Elon Musk founded SpaceX. Elon later announced Starship."
 """
@@ -113,8 +113,8 @@ DISAMBIGUATION_CONTEXT: Dict[str, List[str]] = {
 class EntityResolver:
     """实体消歧 + 指代消解引擎"""
 
-    def __init__(self, kuzu_store=None):
-        self.kuzu_store = kuzu_store
+    def __init__(self, graphlite_store=None):
+        self.graphlite_store = graphlite_store
         # 最近的实体记录（用于指代消解）
         self._recent_entities: List[dict] = []
 
@@ -246,16 +246,16 @@ class EntityResolver:
         return result
 
     # ═══════════════════════════════════════════════════════════
-    # 别名合并（关联到 Kuzu）
+    # 别名合并（关联到 GraphLite）
     # ═══════════════════════════════════════════════════════════
 
     def link_aliases(self, entities: List[dict]) -> int:
-        """在 Kuzu 图中创建 ALIAS_OF 边
+        """在 GraphLite 图中创建 ALIAS_OF 边
 
         当检测到同一实体的不同表达时（如 "Elon" == "Elon Musk"），
         在图中创建 alias 链接。
         """
-        if self.kuzu_store is None or len(entities) < 2:
+        if self.graphlite_store is None or len(entities) < 2:
             return 0
 
         count = 0
@@ -268,13 +268,13 @@ class EntityResolver:
                 if self._is_same_entity(e1["name"], e2["name"]):
                     try:
                         # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-                        if not self.kuzu_store.execute_cypher(
+                        if not self.graphlite_store.execute_cypher(
                             "MATCH (a:OntologyEntity {name: $n1})"
                             "-[:ALIAS_OF]->"
                             "(b:OntologyEntity {name: $n2}) RETURN a",
                             {"n1": e1["name"], "n2": e2["name"]},
                         ):
-                            self.kuzu_store.execute_cypher(
+                            self.graphlite_store.execute_cypher(
                                 "MATCH (a:OntologyEntity {name: $n1}), "
                                 "(b:OntologyEntity {name: $n2}) "
                                 "INSERT (a)-[:ALIAS_OF]->(b)",

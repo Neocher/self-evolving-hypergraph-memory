@@ -85,7 +85,7 @@ router = APIRouter()
 class Services:
     """依赖注入服务容器，由 app.py 在启动时构造。"""
 
-    kuzu_store: Any = None
+    graphlite_store: Any = None
     faiss_index: Any = None
     faiss_dim: int = 512
     faiss_index_type: str = "IVFFlat"
@@ -141,7 +141,7 @@ def init_services(svc: Services) -> None:
     except Exception:
         logger.warning("DefenseEngine init failed (non-fatal)")
     try:
-        svc.quarantine_store = QuarantineStore(graph_store=svc.kuzu_store)
+        svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
     except Exception:
         logger.warning("QuarantineStore init failed (non-fatal)")
     _services = svc
@@ -219,7 +219,7 @@ def incremental_faiss_update(deps: Services, removed_node_ids: list[str]) -> int
 
     Args:
         deps: 服务容器
-        removed_node_ids: 从 Kuzu 删除的 EpisodeNode ID 列表
+        removed_node_ids: 从 GraphLite 删除的 EpisodeNode ID 列表
 
     Returns:
         实际从 FAISS 删除的向量数

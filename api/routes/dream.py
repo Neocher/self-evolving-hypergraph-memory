@@ -121,7 +121,7 @@ async def apply_dream_candidate(
     deps: Services = Depends(get_services),
 ):
     """
-    将梦境候选中的 PRUNE 和 MERGE 操作应用到生产 Kuzu 数据库。
+    将梦境候选中的 PRUNE 和 MERGE 操作应用到生产 GraphLite 数据库。
     操作不可逆，请先 review。
     """
     from api.models import DreamApplyResponse
@@ -130,10 +130,10 @@ async def apply_dream_candidate(
     if store is None:
         raise HTTPException(status_code=503, detail="Dream candidate store not available")
 
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    success = store.apply_candidate(dream_id, deps.kuzu_store)
+    success = store.apply_candidate(dream_id, deps.graphlite_store)
     if success:
         return DreamApplyResponse(success=True, dream_id=dream_id, message="Dream applied to production")
     else:

@@ -205,9 +205,9 @@ async def ontology_discover(
     engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
 
     contents = []
-    if deps.kuzu_store:
+    if deps.graphlite_store:
         try:
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
             )
             for r in rows:
@@ -261,9 +261,9 @@ async def ontology_discover_apply(
     engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
 
     contents = []
-    if deps.kuzu_store:
+    if deps.graphlite_store:
         try:
-            rows = deps.kuzu_store.query_cypher(
+            rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
             )
             for r in rows:
@@ -310,32 +310,32 @@ async def batch_relations(
 
         try:
             # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
-            if not deps.kuzu_store.execute_cypher(
+            if not deps.graphlite_store.execute_cypher(
                 "MATCH (a:OntologyEntity {name: $name}) RETURN a",
                 {"name": subj},
             ):
-                deps.kuzu_store.execute_cypher(
+                deps.graphlite_store.execute_cypher(
                     "INSERT (a:OntologyEntity {name: $name})",
                     {"name": subj},
                 )
-            if not deps.kuzu_store.execute_cypher(
+            if not deps.graphlite_store.execute_cypher(
                 "MATCH (a:OntologyEntity {name: $name}) RETURN a",
                 {"name": obj},
             ):
-                deps.kuzu_store.execute_cypher(
+                deps.graphlite_store.execute_cypher(
                     "INSERT (a:OntologyEntity {name: $name})",
                     {"name": obj},
                 )
 
             rel_type = item.get("edge_type", "RELATES_TO")
             # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-            if not deps.kuzu_store.execute_cypher(
+            if not deps.graphlite_store.execute_cypher(
                 f"MATCH (a:OntologyEntity {{name: $subj}})"
                 f"-[r:{rel_type}]->"
                 f"(b:OntologyEntity {{name: $obj}}) RETURN a",
                 {"subj": subj, "obj": obj},
             ):
-                deps.kuzu_store.execute_cypher(
+                deps.graphlite_store.execute_cypher(
                     f"MATCH (a:OntologyEntity {{name: $subj}}), "
                     f"(b:OntologyEntity {{name: $obj}}) "
                     f"INSERT (a)-[:{rel_type} {{relation: $rel}}]->(b)",

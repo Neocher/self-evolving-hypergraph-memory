@@ -92,7 +92,7 @@ class GatewayAPI:
                                     error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)")
         record_id = str(uuid.uuid4())
         created_at = time.time()
-        buf = getattr(self._svc.kuzu_store, "_sensory_buffer", None)
+        buf = getattr(self._svc.graphlite_store, "_sensory_buffer", None)
         buffer_usage = 0
 
         if buf is not None:
@@ -110,8 +110,8 @@ class GatewayAPI:
                 if self._svc.dream_scheduler:
                     await self._svc.dream_scheduler.on_node_created()
         else:
-            # 无环形缓冲区：直接写入 Kuzu EpisodeNode 作为兜底
-            self._svc.kuzu_store.create_episode({
+            # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
+            self._svc.graphlite_store.create_episode({
                 "id": record_id,
                 "content": content,
                 "source": source,
@@ -120,8 +120,8 @@ class GatewayAPI:
                 "tau_initial": 1.0,
             })
             if namespace:
-                self._svc.kuzu_store.ensure_session(namespace)
-                self._svc.kuzu_store.link_to_session(namespace, record_id)
+                self._svc.graphlite_store.ensure_session(namespace)
+                self._svc.graphlite_store.link_to_session(namespace, record_id)
             if self._svc.dream_scheduler:
                 await self._svc.dream_scheduler.on_node_created()
 
@@ -188,7 +188,7 @@ class GatewayAPI:
                 )
 
         # 持久化
-        self._svc.kuzu_store.create_episode({
+        self._svc.graphlite_store.create_episode({
             "id": episode_id,
             "content": content,
             "source": source,
@@ -199,8 +199,8 @@ class GatewayAPI:
 
         # 命名空间链接
         if namespace:
-            self._svc.kuzu_store.ensure_session(namespace)
-            self._svc.kuzu_store.link_to_session(namespace, episode_id)
+            self._svc.graphlite_store.ensure_session(namespace)
+            self._svc.graphlite_store.link_to_session(namespace, episode_id)
 
         # 通知梦境调度器
         if self._svc.dream_scheduler:
@@ -335,8 +335,8 @@ class GatewayAPI:
                 emb_384 = visual_emb @ proj
 
                 visual_node_id = str(uuid.uuid4())
-                if self._svc.kuzu_store is not None:
-                    self._svc.kuzu_store.create_visual_node({
+                if self._svc.graphlite_store is not None:
+                    self._svc.graphlite_store.create_visual_node({
                         "id": visual_node_id,
                         "image_path": media_paths[0] if media_paths else "",
                         "caption": merged_text[:1024],
@@ -348,7 +348,7 @@ class GatewayAPI:
                 self._logger.exception("VisualNode creation failed (non-fatal)")
 
         # 写入 EpisodeNode（文本索引）
-        if merged_text and self._svc.kuzu_store is not None:
+        if merged_text and self._svc.graphlite_store is not None:
             creds = _scan_credentials(merged_text)
             if creds:
                 self._logger.warning("Credential-like content REJECTED in store_multimodal: %s", creds)
@@ -357,7 +357,7 @@ class GatewayAPI:
                     transcription=transcription, created_at=created_at,
                     error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)",
                 )
-            self._svc.kuzu_store.create_episode({
+            self._svc.graphlite_store.create_episode({
                 "id": episode_id,
                 "content": merged_text,
                 "source": source,
@@ -366,8 +366,8 @@ class GatewayAPI:
                 "tau_initial": 1.0,
             })
             if namespace:
-                self._svc.kuzu_store.ensure_session(namespace)
-                self._svc.kuzu_store.link_to_session(namespace, episode_id)
+                self._svc.graphlite_store.ensure_session(namespace)
+                self._svc.graphlite_store.link_to_session(namespace, episode_id)
             if self._svc.dream_scheduler:
                 await self._svc.dream_scheduler.on_activity()
                 await self._svc.dream_scheduler.on_node_created()
@@ -413,7 +413,7 @@ class GatewayAPI:
         degraded = False
 
         # Cypher 兜底
-        if not results_raw and self._svc.kuzu_store is not None:
+        if not results_raw and self._svc.graphlite_store is not None:
             try:
                 words = [w.strip().lower() for w in query.split() if len(w.strip()) > 1]
                 if words:
@@ -425,7 +425,7 @@ class GatewayAPI:
                         f"MATCH (e:EpisodeNode) WHERE {conditions} "
                         f"RETURN e.id AS node_id, e.content AS content LIMIT 10"
                     )
-                    fallback_rows = self._svc.kuzu_store.query_cypher(cypher, params)
+                    fallback_rows = self._svc.graphlite_store.query_cypher(cypher, params)
                     degraded = True
                     for row in fallback_rows:
                         if isinstance(row, (list, tuple)):
@@ -438,7 +438,7 @@ class GatewayAPI:
                             "node_id": str(nid),
                             "content": str(c),
                             "score": 0.5,
-                            "level": "kuzu_fallback",
+                            "level": "graphlite_fallback",
                         })
             except Exception:
                 self._logger.exception("Cypher fallback failed")
@@ -448,9 +448,9 @@ class GatewayAPI:
             seen: set = set()
             deduped = []
             ns_set: Optional[set[str]] = None
-            if namespace and self._svc.kuzu_store is not None:
+            if namespace and self._svc.graphlite_store is not None:
                 try:
-                    ns_rows = self._svc.kuzu_store.query_cypher(
+                    ns_rows = self._svc.graphlite_store.query_cypher(
                         "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                         "RETURN e.id",
                         {"ns": namespace},
@@ -535,7 +535,7 @@ class GatewayAPI:
                 if not episode_id:
                     continue
                 try:
-                    node = self._svc.kuzu_store.get_episode(episode_id) if self._svc.kuzu_store else None
+                    node = self._svc.graphlite_store.get_episode(episode_id) if self._svc.graphlite_store else None
                     content = node.get("content", "") if node else ""
                 except Exception:
                     content = ""
@@ -580,7 +580,7 @@ class GatewayAPI:
         """深度健康检查，覆盖所有核心组件。"""
         start = time.time()
         checker = HealthChecker(
-            graph_store=self._svc.kuzu_store,
+            graph_store=self._svc.graphlite_store,
             faiss_index=self._svc.faiss_index,
             audit_chain=self._svc.audit_chain,
             dream_scheduler=self._svc.dream_scheduler,
@@ -661,7 +661,7 @@ class GatewayAPI:
             return {"error": "Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH/INSERT/LOAD CSV", "rows": [], "count": 0}
         params = params or {}
         try:
-            rows = self._svc.kuzu_store.query_cypher(query, params)
+            rows = self._svc.graphlite_store.query_cypher(query, params)
             return {"rows": rows, "count": len(rows)}
         except Exception as e:
             return {"error": str(e), "rows": [], "count": 0}
@@ -671,7 +671,7 @@ class GatewayAPI:
     async def list_communities(self, limit: int = 50, offset: int = 0) -> CommunityListResponse:
         """列出所有社区 (Layer3)。"""
         try:
-            rows = self._svc.kuzu_store.query_cypher(
+            rows = self._svc.graphlite_store.query_cypher(
                 "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
                 "LIMIT $limit",
                 {"offset": offset, "limit": limit},
@@ -727,7 +727,7 @@ class GatewayAPI:
 
         # 列出所有超边
         try:
-            rows = self._svc.kuzu_store.query_cypher(
+            rows = self._svc.graphlite_store.query_cypher(
                 "MATCH (h:HyperedgeNode) RETURN h.* ORDER BY h.created_at DESC LIMIT $limit",
                 {"limit": limit},
             )
@@ -745,7 +745,7 @@ class GatewayAPI:
             else:
                 continue
 
-            member_rows = self._svc.kuzu_store.query_cypher(
+            member_rows = self._svc.graphlite_store.query_cypher(
                 "MATCH (h:HyperedgeNode {id: $id})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id",
                 {"id": h["id"]},
             )

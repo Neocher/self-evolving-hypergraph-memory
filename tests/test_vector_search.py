@@ -29,12 +29,12 @@ def _make_app(svc: Services) -> FastAPI:
 
 
 def _make_episode(ep_id: str, content: str):
-    """模拟 KuzuStore.get_episode 返回的 dict。"""
+    """模拟 GraphLiteStore.get_episode 返回的 dict。"""
     return {"id": ep_id, "content": content, "created_at": 1000.0, "tau_initial": 1.0}
 
 
-class MockKuzuStore:
-    """模拟 KuzuStore，只提供 get_episode 方法。"""
+class MockGraphLiteStore:
+    """模拟 GraphLiteStore，只提供 get_episode 方法。"""
 
     def __init__(self):
         self.episodes: dict[str, dict] = {}
@@ -108,8 +108,8 @@ class MockEncoder:
 
 
 @pytest.fixture
-def mock_kuzu() -> MockKuzuStore:
-    return MockKuzuStore()
+def mock_graphlite() -> MockGraphLiteStore:
+    return MockGraphLiteStore()
 
 
 @pytest.fixture
@@ -123,8 +123,8 @@ def mock_enc() -> MockEncoder:
 
 
 @pytest.fixture
-def populated_faiss(mock_faiss: MockFaissIndex, mock_kuzu: MockKuzuStore) -> tuple[MockFaissIndex, dict[int, str], MockKuzuStore]:
-    """预填充 3 个向量的 FAISS 索引 + Kuzu 数据。"""
+def populated_faiss(mock_faiss: MockFaissIndex, mock_graphlite: MockGraphLiteStore) -> tuple[MockFaissIndex, dict[int, str], MockGraphLiteStore]:
+    """预填充 3 个向量的 FAISS 索引 + GraphLite 数据。"""
     faiss_id_map: dict[int, str] = {}
     rng = np.random.RandomState(42)
     for i in range(3):
@@ -133,8 +133,8 @@ def populated_faiss(mock_faiss: MockFaissIndex, mock_kuzu: MockKuzuStore) -> tup
         vec = rng.randn(384).astype(np.float32)
         mock_faiss.add_with_ids(vec.reshape(1, -1), np.array([faiss_id], dtype=np.int64))
         faiss_id_map[faiss_id] = ep_id
-        mock_kuzu.episodes[ep_id] = _make_episode(ep_id, f"Vector content {i}")
-    return mock_faiss, faiss_id_map, mock_kuzu
+        mock_graphlite.episodes[ep_id] = _make_episode(ep_id, f"Vector content {i}")
+    return mock_faiss, faiss_id_map, mock_graphlite
 
 
 # ─── 服务构建器 ────────────────────────────────────────────
@@ -143,13 +143,13 @@ def populated_faiss(mock_faiss: MockFaissIndex, mock_kuzu: MockKuzuStore) -> tup
 def _build_svc(
     encoder=None,
     faiss_index=None,
-    kuzu_store=None,
+    graphlite_store=None,
     faiss_id_map: dict | None = None,
 ) -> Services:
     svc = Services(
         encoder=encoder,
         faiss_index=faiss_index,
-        kuzu_store=kuzu_store,
+        graphlite_store=graphlite_store,
     )
     if faiss_id_map is not None:
         svc.faiss_id_map = faiss_id_map
@@ -162,15 +162,15 @@ def _build_svc(
 
 
 class TestVectorSearchNormal:
-    """正常路径测试：encoder + FAISS + Kuzu 全部可用。"""
+    """正常路径测试：encoder + FAISS + GraphLite 全部可用。"""
 
     def test_basic_search(self, populated_faiss, mock_enc):
         """常规搜索应返回评分排序结果。"""
-        mock_faiss, faiss_id_map, mock_kuzu = populated_faiss
+        mock_faiss, faiss_id_map, mock_graphlite = populated_faiss
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map=faiss_id_map,
         )
         app = _make_app(svc)
@@ -194,11 +194,11 @@ class TestVectorSearchNormal:
 
     def test_with_limit(self, populated_faiss, mock_enc):
         """limit 参数应限制返回数量。"""
-        mock_faiss, faiss_id_map, mock_kuzu = populated_faiss
+        mock_faiss, faiss_id_map, mock_graphlite = populated_faiss
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map=faiss_id_map,
         )
         app = _make_app(svc)
@@ -209,13 +209,13 @@ class TestVectorSearchNormal:
         assert data["total_found"] == 1
         assert len(data["results"]) == 1
 
-    def test_returns_kuzu_content(self, populated_faiss, mock_enc):
-        """返回的 content 应来自 Kuzu。"""
-        mock_faiss, faiss_id_map, mock_kuzu = populated_faiss
+    def test_returns_graphlite_content(self, populated_faiss, mock_enc):
+        """返回的 content 应来自 GraphLite。"""
+        mock_faiss, faiss_id_map, mock_graphlite = populated_faiss
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map=faiss_id_map,
         )
         app = _make_app(svc)
@@ -235,12 +235,12 @@ class TestVectorSearchNormal:
 class TestVectorSearchDegraded:
     """降级路径测试：encoder 或 FAISS 不可用。"""
 
-    def test_encoder_none_returns_degraded(self, mock_faiss, mock_kuzu):
+    def test_encoder_none_returns_degraded(self, mock_faiss, mock_graphlite):
         """encoder 为 None 时应降级返回空结果。"""
         svc = _build_svc(
             encoder=None,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
         )
         app = _make_app(svc)
         client = TestClient(app)
@@ -251,12 +251,12 @@ class TestVectorSearchDegraded:
         assert data["total_found"] == 0
         assert data["results"] == []
 
-    def test_faiss_none_returns_degraded(self, mock_enc, mock_kuzu):
+    def test_faiss_none_returns_degraded(self, mock_enc, mock_graphlite):
         """faiss_index 为 None 时应降级返回空结果。"""
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=None,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
         )
         app = _make_app(svc)
         client = TestClient(app)
@@ -266,12 +266,12 @@ class TestVectorSearchDegraded:
         assert data["degraded"] is True
         assert data["total_found"] == 0
 
-    def test_both_none_returns_degraded(self, mock_kuzu):
+    def test_both_none_returns_degraded(self, mock_graphlite):
         """encoder 和 faiss_index 都为 None 时应降级。"""
         svc = _build_svc(
             encoder=None,
             faiss_index=None,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
         )
         app = _make_app(svc)
         client = TestClient(app)
@@ -285,12 +285,12 @@ class TestVectorSearchDegraded:
 class TestVectorSearchEdgeCases:
     """边界情况测试。"""
 
-    def test_empty_faiss_returns_empty(self, mock_enc, mock_faiss, mock_kuzu):
+    def test_empty_faiss_returns_empty(self, mock_enc, mock_faiss, mock_graphlite):
         """FAISS 索引无数据时应返回空结果（非降级）。"""
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map={},
         )
         app = _make_app(svc)
@@ -302,9 +302,9 @@ class TestVectorSearchEdgeCases:
         assert data["total_found"] == 0
         assert data["results"] == []
 
-    def test_results_without_kuzu_entry(self, mock_enc, mock_faiss, mock_kuzu):
-        """FAISS 结果在 Kuzu 中找不到时应跳过。"""
-        # 填充 FAISS 但不填充 Kuzu
+    def test_results_without_graphlite_entry(self, mock_enc, mock_faiss, mock_graphlite):
+        """FAISS 结果在 GraphLite 中找不到时应跳过。"""
+        # 填充 FAISS 但不填充 GraphLite
         rng = np.random.RandomState(42)
         faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, "orphan").int & ((1 << 63) - 1))
         vec = rng.randn(384).astype(np.float32)
@@ -313,7 +313,7 @@ class TestVectorSearchEdgeCases:
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map={faiss_id: "orphan"},
         )
         app = _make_app(svc)
@@ -321,18 +321,18 @@ class TestVectorSearchEdgeCases:
         resp = client.post("/search/vector", json={"query": "orphan test", "limit": 5})
         assert resp.status_code == 200
         data = resp.json()
-        # orphan 在 Kuzu 中不存在，但 faiss_id_map 指向它，get_episode 返回 None
+        # orphan 在 GraphLite 中不存在，但 faiss_id_map 指向它，get_episode 返回 None
         # content 应为空字符串
         assert data["total_found"] == 1
         assert data["results"][0]["content"] == ""
 
     def test_latency_ms_is_positive(self, populated_faiss, mock_enc):
         """latency_ms 应为正数。"""
-        mock_faiss, faiss_id_map, mock_kuzu = populated_faiss
+        mock_faiss, faiss_id_map, mock_graphlite = populated_faiss
         svc = _build_svc(
             encoder=mock_enc,
             faiss_index=mock_faiss,
-            kuzu_store=mock_kuzu,
+            graphlite_store=mock_graphlite,
             faiss_id_map=faiss_id_map,
         )
         app = _make_app(svc)

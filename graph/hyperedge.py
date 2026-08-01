@@ -6,7 +6,7 @@
 - SemanticHyperedge:  连接多个概念节点指向抽象结论
 - TemporalHyperedge:  连接时间临近的多个节点
 
-Kuzu 原生不支持超边，编码为辅助节点 + Cypher 边连接。
+GraphLite 原生不支持超边，编码为辅助节点 + Cypher 边连接。
 
 [Harness Fix] 增加 member_ids 业务规则校验：至少 2 个成员节点。
 """
@@ -64,8 +64,8 @@ class HyperedgeManager:
     负责超边的 CRUD、查询和 SSM 门控状态维护。
     """
 
-    def __init__(self, kuzu_store) -> None:
-        self.store = kuzu_store
+    def __init__(self, graphlite_store) -> None:
+        self.store = graphlite_store
 
     def create_episode_hyperedge(self,
                                   member_ids: List[str],
@@ -141,7 +141,7 @@ class HyperedgeManager:
         return edge
 
     def _persist_hyperedge(self, edge: Hyperedge) -> None:
-        """将超边持久化到 Kuzu（辅助节点 + 批量 HYPEREDGE_MEMBER 边）。"""
+        """将超边持久化到 GraphLite（辅助节点 + 批量 HYPEREDGE_MEMBER 边）。"""
         import json
         self.store.create_hyperedge_node({
             "id": edge.id,
@@ -186,7 +186,7 @@ class HyperedgeManager:
         return result
 
     def _resolve_member_ids(self, hyperedge_id: str) -> List[str]:
-        """从 Kuzu 解析超边的成员节点 ID 列表。"""
+        """从 GraphLite 解析超边的成员节点 ID 列表。"""
         members = self.store.get_hyperedge_members(hyperedge_id)
         return [m["id"] for m in members]
 
@@ -297,7 +297,7 @@ class HyperedgeManager:
     def delete_hyperedge(self, hyperedge_id: str) -> bool:
         """删除超边及其所有关联边（DETACH DELETE）。
 
-        使用 Kuzu 的 DETACH DELETE 确保超边节点和 HYPEREDGE_MEMBER 边被级联清理，
+        使用 GraphLite 的 DETACH DELETE 确保超边节点和 HYPEREDGE_MEMBER 边被级联清理，
         避免删除超边后孤立边残留在图数据库中。
         """
         try:

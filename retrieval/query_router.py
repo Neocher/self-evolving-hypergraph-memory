@@ -3,14 +3,14 @@
 三路并行融合（向量 + BM25 + 实体匹配）：
   - VECTOR:    向量相似度检索（FAISS）
   - BM25:      关键词检索（sklearn TfidfVectorizer IDF + BM25 评分）
-  - ENTITY:    实体名称匹配（Kuzu Cypher CONTAINS）
+  - ENTITY:    实体名称匹配（GraphLite GQL CONTAINS）
 
 融合权重：vector=0.5, bm25=0.3, entity=0.2
 时序衰减：score = score * (1 + 1/(1 + exp(-τ/60)))
 去重策略：按 content[:100] 保留最高分
 
 向后兼容降级链：
-  L1 — HYPERGRAPH: 超图检索（Kuzu + FAISS 联合）
+  L1 — HYPERGRAPH: 超图检索（GraphLite + FAISS 联合）
   L2 — VECTOR:     纯向量检索（FAISS-only）
   L3 — KEYWORD:    关键词检索（TF-IDF）
 """
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 class RetrievalLevel(Enum):
     """三级检索级别 + 并行融合"""
 
-    HYPERGRAPH = "hypergraph"  # L1: 超图检索（Kuzu + FAISS）
+    HYPERGRAPH = "hypergraph"  # L1: 超图检索（GraphLite + FAISS）
     VECTOR = "vector"  # L2: 纯向量检索（FAISS-only）
     KEYWORD = "keyword"  # L3: 关键词检索（TF-IDF）
     FUSION = "fusion"  # F: 三路并行融合（向量+BM25+实体匹配）
@@ -82,20 +82,20 @@ class QueryRouter:
     融合模式（FUSION）— 三路并行融合（向量+BM25+实体匹配）：
       - 向量检索 (FAISS):   权重 0.5
       - BM25 关键词检索:     权重 0.3
-      - 实体名称匹配 (Kuzu): 权重 0.2
+      - 实体名称匹配 (GraphLite): 权重 0.2
 
     向后兼容降级链模式：
-      - 超图检索 (HYPERGRAPH): Kuzu + FAISS 联合检索
+      - 超图检索 (HYPERGRAPH): GraphLite + FAISS 联合检索
       - 向量检索 (VECTOR): FAISS-only 降级
       - 关键词检索 (KEYWORD): TF-IDF 最终兜底
 
-    当 Kuzu 断路器跳闸时自动降级到 VECTOR，
+    当 GraphLite 断路器跳闸时自动降级到 VECTOR，
     当 FAISS 不可用时自动降级到 KEYWORD。
     """
 
     def __init__(
         self,
-        kuzu_store,
+        graphlite_store,
         faiss_index,
         tfidf_index,
         encoder=None,
@@ -105,14 +105,14 @@ class QueryRouter:
     ) -> None:
         """
         Args:
-            kuzu_store: KuzuStore 实例
+            graphlite_store: GraphLiteStore 实例
             faiss_index: FAISS 向量索引
             tfidf_index: TF-IDF 关键词索引
             encoder: 文本嵌入编码器（可选）
             config: 路由配置
-            faiss_id_map: FAISS int id → Kuzu UUID string 映射（用于 L1 超图检索反查）
+            faiss_id_map: FAISS int id → GraphLite UUID string 映射（用于 L1 超图检索反查）
         """
-        self.kuzu_store = kuzu_store
+        self.graphlite_store = graphlite_store
         self.faiss_index = faiss_index
         self.tfidf_index = tfidf_index
         self.encoder = encoder
@@ -222,26 +222,26 @@ class QueryRouter:
     def _build_bm25_index(self) -> None:
         """构建 BM25 检索索引。
 
-        从 Kuzu Store 拉取所有 EpisodeNode 内容，使用 sklearn
+        从 GraphLite Store 拉取所有 EpisodeNode 内容，使用 sklearn
         TfidfVectorizer 计算 IDF，并预计算文档长度用于 BM25 评分。
         """
-        if self.kuzu_store is None:
-            logger.warning("BM25: kuzu_store unavailable, skipping index build")
+        if self.graphlite_store is None:
+            logger.warning("BM25: graphlite_store unavailable, skipping index build")
             return
 
         try:
-            rows = self.kuzu_store.query_cypher(
+            rows = self.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) "
                 "RETURN e.id AS node_id, e.content AS content, "
                 "e.tau_initial AS tau_value "
                 "ORDER BY e.created_at DESC"
             )
         except Exception:
-            logger.exception("BM25: failed to fetch corpus from Kuzu")
+            logger.exception("BM25: failed to fetch corpus from GraphLite")
             return
 
         if not rows:
-            logger.warning("BM25: empty corpus from Kuzu")
+            logger.warning("BM25: empty corpus from GraphLite")
             return
 
         self._bm25_doc_ids.clear()
@@ -382,7 +382,7 @@ class QueryRouter:
         """实体匹配检索。
 
         从查询中提取候选实体名（unigram + bigram），
-        逐一匹配 Kuzu 中的 EpisodeNode 内容。
+        逐一匹配 GraphLite 中的 EpisodeNode 内容。
 
         Args:
             query: 查询文本
@@ -391,8 +391,8 @@ class QueryRouter:
         Returns:
             [{"node_id", "content", "score", "tau_value", "level": "entity_match"}, ...]
         """
-        if self.kuzu_store is None:
-            logger.warning("Entity match: kuzu_store unavailable")
+        if self.graphlite_store is None:
+            logger.warning("Entity match: graphlite_store unavailable")
             return []
 
         tokens = [t.lower().strip() for t in query.split() if len(t.strip()) > 1]
@@ -431,7 +431,7 @@ class QueryRouter:
                 f"LIMIT $limit"
             )
             params["limit"] = k * 2
-            rows = self.kuzu_store.query_cypher(cypher, params)
+            rows = self.graphlite_store.query_cypher(cypher, params)
         except Exception:
             logger.exception("Entity match OR query failed")
             return []
@@ -640,15 +640,15 @@ class QueryRouter:
             self._tag_degraded(r, level="l2_empty")
             return r
 
-        # L3 keyword + L4 Kuzu fallback
+        # L3 keyword + L4 GraphLite fallback
         try:
             results = self._keyword_retrieve(query)
         except Exception as e:
-            return self._kuzu_text_fallback(query, str(e))
+            return self._graphlite_text_fallback(query, str(e))
         if results:
             return results
-        logger.info("L3 empty, trying L4 Kuzu fallback")
-        return self._kuzu_text_fallback(query, "L3 empty")
+        logger.info("L3 empty, trying L4 GraphLite fallback")
+        return self._graphlite_text_fallback(query, "L3 empty")
 
     def _fusion_retrieve(
         self,
@@ -707,11 +707,11 @@ class QueryRouter:
         self, query: str, query_embedding: Optional[np.ndarray] = None
     ) -> list[dict]:
         """
-        L1 超图检索 + L2 向量检索融合降级（Kuzu + FAISS 联合）。
+        L1 超图检索 + L2 向量检索融合降级（GraphLite + FAISS 联合）。
 
         1. 编码查询为向量
         2. FAISS 搜索最相关的 episode
-        3. 通过 Kuzu 回查获取节点详情
+        3. 通过 GraphLite 回查获取节点详情
         4. τ 值加权排序
         """
         if query_embedding is None:
@@ -733,14 +733,14 @@ class QueryRouter:
             for ep_id, _ in valid_pairs
         }
 
-        # Kuzu 批量回查获取节点详情
+        # GraphLite 批量回查获取节点详情
         node_uuids = list(uuid_map.values())
         episodes_dict: dict[str, dict] = {}
-        if node_uuids and self.kuzu_store is not None and hasattr(self.kuzu_store, 'get_episodes_batch'):
+        if node_uuids and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in self.kuzu_store.get_episodes_batch(node_uuids)
+                    for ep in self.graphlite_store.get_episodes_batch(node_uuids)
                 }
             except Exception:
                 episodes_dict = {}
@@ -769,9 +769,9 @@ class QueryRouter:
         self, query: str, query_embedding: Optional[np.ndarray] = None
     ) -> list[dict]:
         """
-        L2 纯向量检索（FAISS + Kuzu 回查）。
+        L2 纯向量检索（FAISS + GraphLite 回查）。
 
-        在节点向量空间中检索，通过 Kuzu 回查补充节点内容、tau 值等字段。
+        在节点向量空间中检索，通过 GraphLite 回查补充节点内容、tau 值等字段。
         参考 /search/vector 路由的实现方式。
 
         Raises:
@@ -790,27 +790,27 @@ class QueryRouter:
 
         valid_pairs = [(faiss_id, score) for faiss_id, score in node_scores if faiss_id >= 0]
 
-        # 通过 faiss_id_map 将 FAISS int ID → Kuzu UUID string
+        # 通过 faiss_id_map 将 FAISS int ID → GraphLite UUID string
         uuid_map: dict[int, str] = {}
         for faiss_id, _ in valid_pairs:
             uuid = self.faiss_id_map.get(faiss_id)
             if uuid:
                 uuid_map[faiss_id] = uuid
 
-        # 批量回查 Kuzu 获取节点详情（content、tau_value 等）
+        # 批量回查 GraphLite 获取节点详情（content、tau_value 等）
         episodes_dict: dict[str, dict] = {}
-        if uuid_map and self.kuzu_store is not None and hasattr(self.kuzu_store, 'get_episodes_batch'):
+        if uuid_map and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in self.kuzu_store.get_episodes_batch(list(uuid_map.values()))
+                    for ep in self.graphlite_store.get_episodes_batch(list(uuid_map.values()))
                 }
             except Exception:
                 logger.exception(
-                    "_vector_retrieve: Kuzu batch lookup failed, results will have empty content"
+                    "_vector_retrieve: GraphLite batch lookup failed, results will have empty content"
                 )
 
-        # 构建结果集：优先使用 Kuzu 回查的数据，fallback 到空 content
+        # 构建结果集：优先使用 GraphLite 回查的数据，fallback 到空 content
         results: list[dict] = []
         for faiss_id, score in valid_pairs:
             node_uuid = uuid_map.get(faiss_id, str(faiss_id))
@@ -858,22 +858,22 @@ class QueryRouter:
             )
         return results
 
-    def _kuzu_text_fallback(self, query: str, error_context: str = "") -> list[dict]:
+    def _graphlite_text_fallback(self, query: str, error_context: str = "") -> list[dict]:
         """
-        L4 Kuzu Cypher 全文兜底检索。
+        L4 GraphLite GQL 全文兜底检索。
 
-        当 FAISS 和 TF-IDF 均不可用时，直接查询 Kuzu 数据库，
+        当 FAISS 和 TF-IDF 均不可用时，直接查询 GraphLite 数据库，
         使用 Cypher CONTAINS 做文本匹配。
 
         Returns:
-            检索结果列表 [{"node_id", "content", "score", "level": "kuzu_fallback"}, ...]
+            检索结果列表 [{"node_id", "content", "score", "level": "graphlite_fallback"}, ...]
             失败时返回空列表（不抛异常）。
         """
-        if self.kuzu_store is None:
-            logger.warning("L4 fallback: kuzu_store unavailable")
+        if self.graphlite_store is None:
+            logger.warning("L4 fallback: graphlite_store unavailable")
             return []
 
-        logger.info("L4 fallback: querying Kuzu directly", query=query[:80])
+        logger.info("L4 fallback: querying GraphLite directly", query=query[:80])
         try:
             # 提取关键词（取前5个有意义的词）
             words = [w.strip().lower() for w in query.split() if len(w.strip()) > 1]
@@ -893,7 +893,7 @@ class QueryRouter:
                 "LIMIT $limit"
             )
             params["limit"] = self.config.top_k_keyword
-            rows = self.kuzu_store.query_cypher(cypher, params)
+            rows = self.graphlite_store.query_cypher(cypher, params)
             results = []
             for row in rows:
                 if isinstance(row, dict):
@@ -903,7 +903,7 @@ class QueryRouter:
                             "content": row.get("content", ""),
                             "score": 0.5,
                             "tau_value": row.get("tau_value", 0.0),
-                            "level": "kuzu_fallback",
+                            "level": "graphlite_fallback",
                         }
                     )
                 elif isinstance(row, (list, tuple)) and len(row) >= 2:
@@ -913,13 +913,13 @@ class QueryRouter:
                             "content": str(row[1]),
                             "score": 0.5,
                             "tau_value": float(row[2]) if len(row) > 2 else 0.0,
-                            "level": "kuzu_fallback",
+                            "level": "graphlite_fallback",
                         }
                     )
             logger.info("L4 fallback results", count=len(results))
             return results
         except Exception:
-            logger.exception("L4 Kuzu text fallback failed")
+            logger.exception("L4 GraphLite text fallback failed")
             return []
 
     def detect_strategy(self, query_text: str) -> RetrievalStrategy:

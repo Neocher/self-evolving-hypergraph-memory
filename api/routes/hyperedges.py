@@ -130,11 +130,11 @@ async def list_hyperedges(
     start = _now()
     set_trace_id()
 
-    if deps.hyperedge_manager is None or deps.kuzu_store is None:
+    if deps.hyperedge_manager is None or deps.graphlite_store is None:
         raise HTTPException(status_code=503, detail="Hyperedge system not available")
 
     try:
-        rows = deps.kuzu_store.query_cypher(
+        rows = deps.graphlite_store.query_cypher(
             "MATCH (h:HyperedgeNode) "
             "OPTIONAL MATCH (h)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) "
             "WITH h, collect(e.id) AS member_ids "

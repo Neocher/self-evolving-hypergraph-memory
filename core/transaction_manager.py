@@ -144,7 +144,7 @@ class MemoryTransaction:
                 "ops_count": len(self.operations)}
 
     def rollback(self) -> dict:
-        """回滚 — 从 Kuzu 清除暂存数据"""
+        """回滚 — 从 GraphLite 清除暂存数据"""
         self.status = TransactionStatus.ROLLED_BACK
         self._explicitly_closed = True
         if self._mgr is not None and self._mgr._graph_store is not None:
@@ -164,10 +164,10 @@ class MemoryTransaction:
                             "REMOVE n.tx_tag",
                             {"id": node_id, "tag": tx_tag}
                         )
-                logger.info("TX %s rollback: Kuzu cleanup complete for %d ops",
+                logger.info("TX %s rollback: GraphLite cleanup complete for %d ops",
                            self.tx_id[:8], len(self.operations))
             except Exception as e:
-                logger.warning("TX %s rollback Kuzu cleanup failed: %s",
+                logger.warning("TX %s rollback GraphLite cleanup failed: %s",
                               self.tx_id[:8], e)
         logger.info("TX %s rolled back: %d ops discarded",
                     self.tx_id[:8], len(self.operations))
@@ -229,7 +229,7 @@ class TransactionManager:
     ) -> bool:
         """
         OCC 版本检查 — 在 prepare 阶段调用。
-        内部从 Kuzu 获取实际版本，避免调用方传参不一致。
+        内部从 GraphLite 获取实际版本，避免调用方传参不一致。
 
         Args:
             expected_version: 事务开始时读取的版本号。

@@ -83,7 +83,7 @@ class TestRealChineseVectorRetrieval:
         faiss_id_map = {int(faiss_nums[i]): ids[i] for i in range(len(ids))}
 
         qr = QueryRouter(
-            kuzu_store=graphlite_store,
+            graphlite_store=graphlite_store,
             faiss_index=vs,
             tfidf_index=_make_tfidf(DOCS),
             encoder=_enc,

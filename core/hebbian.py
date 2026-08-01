@@ -29,7 +29,7 @@ class HebbianConfig:
     activation_threshold: float = 0.3  # 激活度阈值，低于此的不更新
     max_connections_per_node: int = 64  # 绝对上限，防止异常增长
     # v2.0: 持久化配置
-    persist_to_graph: bool = True  # 是否写回 Kuzu
+    persist_to_graph: bool = True  # 是否写回 GraphLite
     persist_every_n_updates: int = 1  # 每次更新都持久化，防止崩溃后短期记忆丢失
 
 
@@ -38,18 +38,18 @@ class SparseHebbianUpdater:
     稀疏 Hebbian 连接更新器 v2.0。
 
     只维护和更新 K 个最强连接 + 当前共现激活的边。
-    可选写入 KuzuStore 持久化。
+    可选写入 GraphLiteStore 持久化。
     """
 
     def __init__(self, config: Optional[HebbianConfig] = None,
-                 kuzu_store=None) -> None:
+                 graphlite_store=None) -> None:
         self.config = config or HebbianConfig()
-        self._kuzu_store = kuzu_store
+        self._graphlite_store = graphlite_store
         self._update_counter = 0
 
-    def set_kuzu_store(self, store) -> None:
+    def set_graphlite_store(self, store) -> None:
         """运行时注入 GraphLiteStore（用于启动后注入）。"""
-        self._kuzu_store = store
+        self._graphlite_store = store
 
     def update(
         self,
@@ -60,7 +60,7 @@ class SparseHebbianUpdater:
         """
         执行一次稀疏 Hebbian 更新。
         
-        v2.0: 可选持久化结果到 Kuzu。
+        v2.0: 可选持久化结果到 GraphLite。
 
         [P1] 加入本体层次距离调制：
             Δw = η · (a_i · a_j · d_ij - w · τ_decay)
@@ -122,35 +122,35 @@ class SparseHebbianUpdater:
                 pruned = heapq.nlargest(K, conns.items(), key=lambda x: x[1])
                 all_connections[nid] = dict(pruned)
 
-        # v2.0: 批量持久化到 Kuzu
+        # v2.0: 批量持久化到 GraphLite
         self._update_counter += 1
-        if self._kuzu_store is not None and self.config.persist_to_graph:
+        if self._graphlite_store is not None and self.config.persist_to_graph:
             if self._update_counter % self.config.persist_every_n_updates == 0:
                 self._persist_batch(updates)
 
         return all_connections
 
     def _persist_batch(self, updates: list[tuple[str, str, float]]) -> None:
-        """批量持久化 Hebbian 更新到 Kuzu。
+        """批量持久化 Hebbian 更新到 GraphLite。
 
         GraphLite 不支持 UNWIND/MERGE：改为循环逐条处理，
         边存在则 SET 权重，不存在则 INSERT（UPDATE 语义）。
         """
-        if not self._kuzu_store or not updates:
+        if not self._graphlite_store or not updates:
             return
         try:
             for src, dst, weight in updates:
-                if self._kuzu_store.execute_cypher(
+                if self._graphlite_store.execute_cypher(
                     "MATCH (a {id: $src})-[r:HEBBIAN_CONNECTION]->(b {id: $dst}) RETURN r",
                     {"src": src, "dst": dst},
                 ):
-                    self._kuzu_store.execute_cypher(
+                    self._graphlite_store.execute_cypher(
                         "MATCH (a {id: $src})-[r:HEBBIAN_CONNECTION]->(b {id: $dst}) "
                         "SET r.weight = $weight",
                         {"src": src, "dst": dst, "weight": weight},
                     )
                 else:
-                    self._kuzu_store.execute_cypher(
+                    self._graphlite_store.execute_cypher(
                         "MATCH (a {id: $src}), (b {id: $dst}) "
                         "INSERT (a)-[:HEBBIAN_CONNECTION {weight: $weight}]->(b)",
                         {"src": src, "dst": dst, "weight": weight},

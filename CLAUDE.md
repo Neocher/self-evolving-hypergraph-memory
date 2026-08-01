@@ -53,7 +53,7 @@ SHM v5.10 — 自演化超图记忆系统 (Self-evolving Hypergraph Memory v5.10
 
 ## 技术规范
 
-- Python 3.10+, Pydantic v2, FastAPI, RyuGraph (Kuzu fork), FAISS, BLAKE3
+- Python 3.10+, Pydantic v2, FastAPI, GraphLite, FAISS, BLAKE3
 - structlog 结构化日志, Prometheus 指标, asyncio 异步架构
 - 覆盖率 ≥ 80%, pytest + ruff + mypy
 

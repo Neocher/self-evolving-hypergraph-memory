@@ -132,11 +132,11 @@ class DreamPipeline:
     COMPRESS:   [Harness Fix] 压缩社区报告，限制 Token 预算
     PRUNE:      删除 τ 低于阈值且低连接度的节点
     RESOLVE:    矛盾检测与消歧
-    PERSIST:    写回结果到候选存储或 Kuzu
+    PERSIST:    写回结果到候选存储或 GraphLite
     AUDIT:      写入 BLAKE3 溯源链
 
     支持两种模式：
-    - 直接模式 (candidate_store=None): 直接修改 Kuzu 生产数据（原行为）
+    - 直接模式 (candidate_store=None): 直接修改 GraphLite 生产数据（原行为）
     - 候选模式 (candidate_store 有效): 写入临时候选区，供审查后上线
     """
 
@@ -178,7 +178,7 @@ class DreamPipeline:
         nodes: list[dict],
         connections: dict[str, dict[str, float]],
         trigger_mode: str = "explicit",
-        kuzu_store=None,  # 接收Kuzu引用，用于持久化结果
+        graphlite_store=None,  # 接收GraphLite引用，用于持久化结果
         candidate_store=None,  # 可选：DreamCandidateStore，启用候选模式
     ) -> DreamReport:
         """
@@ -190,7 +190,7 @@ class DreamPipeline:
         4. COMPRESS   → 报告限 500 token，前 20 TF-IDF 关键词，输出预算控制
         5. PRUNE      → TauDecayEngine + Hebbian 剪枝
         6. RESOLVE    → 检测同名/同事实的多版本冲突
-        7. PERSIST    → 【FIX】将结果写回Kuzu（CommunityNode/DELETE/合并/HyperedgeNode）
+        7. PERSIST    → 【FIX】将结果写回GraphLite（CommunityNode/DELETE/合并/HyperedgeNode）
         8. AUDIT      → AuditChain.append_block()
 
         Args:
@@ -276,7 +276,7 @@ class DreamPipeline:
         stats["updated"] += conflict_count
         logger.info("Dream %s: RESOLVE — %d conflicts resolved", dream_id, conflict_count)
 
-        # Step 7: PERSIST — 将结果写回Kuzu或候选存储
+        # Step 7: PERSIST — 将结果写回GraphLite或候选存储
         persist_created = 0
         persist_deleted = 0
         all_removed_ids: list[str] = []  # FAISS 增量更新用
@@ -308,17 +308,17 @@ class DreamPipeline:
                 },
             )
             logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
-        elif kuzu_store is not None:
+        elif graphlite_store is not None:
             # 直接模式（原行为）：直接修改生产数据
             persist_deleted, pruned_ids = await asyncio.to_thread(
-                self._persist_prune, kuzu_store, prune_ops)
+                self._persist_prune, graphlite_store, prune_ops)
             all_removed_ids.extend(pruned_ids)
             persist_created = await asyncio.to_thread(
-                self._persist_communities, kuzu_store, communities, dream_id)
+                self._persist_communities, graphlite_store, communities, dream_id)
             all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-            await asyncio.to_thread(self._persist_merge, kuzu_store, merge_ops)
+            await asyncio.to_thread(self._persist_merge, graphlite_store, merge_ops)
             await asyncio.to_thread(
-                self._persist_hyperedges, kuzu_store, communities, dream_id)
+                self._persist_hyperedges, graphlite_store, communities, dream_id)
             logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup",
                         dream_id, persist_created, persist_deleted, len(all_removed_ids))
         stats["created"] += persist_created
@@ -1085,10 +1085,10 @@ Text:
         remaining = [n for n in nodes if n["id"] not in merged]
         return remaining, ops
 
-    # ─── 【FIX】Kuzu持久化方法 ──────────────────────────────
+    # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
 
-    def _persist_communities(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
-        """将CLUSTER结果写回Kuzu CommunityNode。
+    def _persist_communities(self, graphlite_store, communities: list[dict], dream_id: str) -> int:
+        """将CLUSTER结果写回GraphLite CommunityNode。
 
         使用 MERGE ON id 增量 upsert，避免先 DETACH DELETE 全部再重建
         （若中途崩溃则所有社区数据永久丢失）。
@@ -1107,7 +1107,7 @@ Text:
                 for member_id in comm.get("members", []):
                     all_member_ids.add(member_id)
             for mid in all_member_ids:
-                kuzu_store.query_cypher(
+                graphlite_store.query_cypher(
                     "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) DELETE r",
                     {"eid": mid}
                 )
@@ -1123,18 +1123,18 @@ Text:
                     "score": 0.0,
                     "created_at": time.time(),
                 }
-                if kuzu_store.execute_cypher(
+                if graphlite_store.execute_cypher(
                     "MATCH (c:CommunityNode {id: $id}) RETURN c",
                     {"id": comm["id"]},
                 ):
-                    kuzu_store.execute_cypher(
+                    graphlite_store.execute_cypher(
                         "MATCH (c:CommunityNode {id: $id}) "
                         "SET c.name = $name, c.summary = $summary, "
                         "c.leiden_score = $score, c.created_at = $created_at",
                         comm_vals,
                     )
                 else:
-                    kuzu_store.execute_cypher(
+                    graphlite_store.execute_cypher(
                         "INSERT (c:CommunityNode {id: $id, name: $name, "
                         "summary: $summary, leiden_score: $score, "
                         "created_at: $created_at})",
@@ -1145,13 +1145,13 @@ Text:
                     member_set.add(member_id)
                     try:
                         # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-                        if not kuzu_store.execute_cypher(
+                        if not graphlite_store.execute_cypher(
                             "MATCH (c:CommunityNode {id: $cid})"
                             "-[:COMMUNITY_MEMBER]->"
                             "(e:EpisodeNode {id: $eid}) RETURN c",
                             {"cid": comm["id"], "eid": member_id},
                         ):
-                            kuzu_store.execute_cypher(
+                            graphlite_store.execute_cypher(
                                 "MATCH (c:CommunityNode {id: $cid}), "
                                 "(e:EpisodeNode {id: $eid}) "
                                 "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
@@ -1167,7 +1167,7 @@ Text:
         try:
             for cid, members in new_member_sets.items():
                 for mid in members:
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) "
                         "WHERE c.id <> $cid DELETE r",
                         {"cid": cid, "eid": mid}
@@ -1176,10 +1176,10 @@ Text:
             logger.warning("Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True)
         return created
 
-    def _persist_prune(self, kuzu_store, prune_ops: list) -> tuple[int, list[str]]:
-        """将PRUNE剪枝结果执行真实的Kuzu DELETE。
+    def _persist_prune(self, graphlite_store, prune_ops: list) -> tuple[int, list[str]]:
+        """将PRUNE剪枝结果执行真实的GraphLite DELETE。
 
-        先删边再删节点，避免Kuzu外键约束错误。
+        先删边再删节点，避免GraphLite外键约束错误。
         返回 (删除数量, 被删节点ID列表)
         """
         deleted = 0
@@ -1188,34 +1188,34 @@ Text:
             if op.op_type == "delete":
                 try:
                     # 先用 DETACH 删掉所有指向该节点的边
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
                         {"id": op.node_id}
                     )
                     deleted += 1
                     pruned_ids.append(op.node_id)
                 except Exception:
-                    logger.warning("Failed to DETACH DELETE pruned node from Kuzu", exc_info=True)
+                    logger.warning("Failed to DETACH DELETE pruned node from GraphLite", exc_info=True)
         return deleted, pruned_ids
 
-    def _persist_merge(self, kuzu_store, merge_ops: list) -> None:
-        """将RESOLVE合并结果写回Kuzu（打标记 + DETACH DELETE被合并节点）。"""
+    def _persist_merge(self, graphlite_store, merge_ops: list) -> None:
+        """将RESOLVE合并结果写回GraphLite（打标记 + DETACH DELETE被合并节点）。"""
         for op in merge_ops:
             if op.op_type == "update" and op.new_value:
                 try:
                     # 把被合并节点的内容保存到目标节点
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (target:EpisodeNode {id: $target}) "
                         "SET target.content = target.content + ' | merged: ' + $content",
                         {"target": op.new_value, "content": op.old_value or ""}
                     )
                     # 删除被合并节点（DETACH先删边）
-                    kuzu_store.query_cypher(
+                    graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
                         {"id": op.node_id}
                     )
                 except Exception:
-                    logger.warning("Failed to persist merge resolution in Kuzu", exc_info=True)
+                    logger.warning("Failed to persist merge resolution in GraphLite", exc_info=True)
 
     @staticmethod
     def _persist_merge_get_removed(merge_ops: list) -> list[str]:
@@ -1223,7 +1223,7 @@ Text:
         return [op.node_id for op in merge_ops
                 if op.op_type == "update" and op.node_id]
 
-    def _persist_hyperedges(self, kuzu_store, communities: list[dict], dream_id: str) -> int:
+    def _persist_hyperedges(self, graphlite_store, communities: list[dict], dream_id: str) -> int:
         """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。"""
         import json
         created = 0
@@ -1238,14 +1238,14 @@ Text:
                     "community_id": comm["id"],
                     "keywords": comm.get("keywords", []),
                 }, ensure_ascii=False)
-                kuzu_store.query_cypher(
+                graphlite_store.query_cypher(
                     "CREATE (h:HyperedgeNode {id: $id, type: 'semantic', "
                     "created_at: $created_at, gate_value: 1.0, metadata: $metadata})",
                     {"id": hyperedge_id, "created_at": time.time(), "metadata": metadata}
                 )
                 for member_id in members:
                     try:
-                        kuzu_store.query_cypher(
+                        graphlite_store.query_cypher(
                             "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: $eid}) "
                             "CREATE (h)-[:HYPEREDGE_MEMBER]->(e)",
                             {"hid": hyperedge_id, "eid": member_id}

@@ -26,12 +26,12 @@ def mock_services():
         return_value=(np.array([[0.5, 0.3, 0.1]]), np.array([[0, 1, 2]]))
     )
     svc.faiss_id_map = {0: "node_a", 1: "node_b", 2: "node_c"}
-    svc.kuzu_store = MagicMock()
-    svc.kuzu_store.query_cypher = MagicMock(return_value=[
+    svc.graphlite_store = MagicMock()
+    svc.graphlite_store.query_cypher = MagicMock(return_value=[
         {"id": "node_a", "content": "test content A", "tau_initial": 0.9, "source": "test"},
         {"id": "node_b", "content": "test content B", "tau_initial": 0.8, "source": "test"},
     ])
-    svc.kuzu_store.get_all_nodes.return_value = {}
+    svc.graphlite_store.get_all_nodes.return_value = {}
     svc.query_router = None
     svc.ontology_validator = None
     svc.ontology_v2 = None
@@ -91,7 +91,7 @@ class TestRetrieveEndpoint:
         mock_qr = MagicMock()
         mock_qr.retrieve.return_value = []
         mock_services.query_router = mock_qr
-        mock_services.kuzu_store.query_cypher.return_value = []
+        mock_services.graphlite_store.query_cypher.return_value = []
         response = client.post("/memories/retrieve", json={
             "query": "nonexistent content",
             "top_k": 5,
@@ -122,7 +122,7 @@ class TestSearchVectorEndpoint:
             np.array([[0.9, 0.5, 0.3]]),
             np.array([[0, 1, 2]]),
         )
-        mock_services.kuzu_store.get_episode = MagicMock(return_value={
+        mock_services.graphlite_store.get_episode = MagicMock(return_value={
             "content": "test content", "id": "node_a", "tau_initial": 0.9
         })
         response = client.post("/search/vector", json={

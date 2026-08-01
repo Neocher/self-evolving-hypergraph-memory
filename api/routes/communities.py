@@ -17,18 +17,18 @@ async def list_communities(
     offset: int = Query(default=0, ge=0),
     deps: Services = Depends(get_services),
 ) -> CommunityListResponse:
-    """列出 Kuzu 中所有 CommunityNode。"""
+    """列出 GraphLite 中所有 CommunityNode。"""
     start = _now()
     set_trace_id()
 
     try:
-        rows = deps.kuzu_store.query_cypher(
+        rows = deps.graphlite_store.query_cypher(
             "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
             "SKIP $offset LIMIT $limit",
             {"offset": offset, "limit": limit},
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Kuzu query failed: {e}")
+        raise HTTPException(status_code=503, detail=f"GraphLite query failed: {e}")
 
     def _to_dict(row):
         """将 query_cypher 返回的 tuple 转为 dict（列名已知）。"""
@@ -68,12 +68,12 @@ async def get_community(
     set_trace_id()
 
     try:
-        rows = deps.kuzu_store.query_cypher(
+        rows = deps.graphlite_store.query_cypher(
             "MATCH (c:CommunityNode) WHERE c.id = $id RETURN c.*",
             {"id": community_id},
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Kuzu query failed: {e}")
+        raise HTTPException(status_code=503, detail=f"GraphLite query failed: {e}")
 
     if not rows:
         raise HTTPException(status_code=404, detail=f"Community {community_id} not found")
@@ -99,11 +99,11 @@ async def list_conflicts(
     """列出所有冲突节点，扩展版本信息和 OCC 冲突日志统计。"""
     start = _now()
     set_trace_id()
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     resolved_filter = "" if include_resolved else "AND c.resolved = false"
-    rows = deps.kuzu_store.execute_cypher(
+    rows = deps.graphlite_store.execute_cypher(
         f"MATCH (c:ConflictNode) WHERE 1=1 {resolved_filter} "
         "RETURN c.id, c.episode_a, c.episode_b, c.rule_id, "
         "c.detected_at, c.resolved ORDER BY c.detected_at DESC LIMIT $limit",
@@ -121,9 +121,9 @@ async def list_conflicts(
             all_episode_ids.add(e_b)
 
     episode_map = {}
-    if all_episode_ids and deps.kuzu_store is not None:
+    if all_episode_ids and deps.graphlite_store is not None:
         try:
-            ep_rows = deps.kuzu_store.query_cypher(
+            ep_rows = deps.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.id, e.version",
                 {"ids": list(all_episode_ids)}
             )
@@ -170,10 +170,10 @@ async def resolve_conflict(
     """标记指定冲突为已解决。"""
     start = _now()
     set_trace_id()
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    deps.kuzu_store.execute_cypher(
+    deps.graphlite_store.execute_cypher(
         "MATCH (c:ConflictNode) WHERE c.id = $id "
         "SET c.resolved = true",
         {"id": conflict_id}
@@ -190,10 +190,10 @@ async def resolve_all_conflicts(
     """标记所有未解决冲突为已解决。"""
     start = _now()
     set_trace_id()
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    deps.kuzu_store.execute_cypher(
+    deps.graphlite_store.execute_cypher(
         "MATCH (c:ConflictNode) WHERE c.resolved = false "
         "SET c.resolved = true",
         {}
@@ -264,7 +264,7 @@ async def reconcile_conflict(
                 # 桥接 tx_manager 的 conflict_log 到 logger
                 pass  # WriteReconciler 有自己的 ConflictLogger
             reconciler = WriteReconciler(
-                kuzu_store=deps.kuzu_store,
+                graphlite_store=deps.graphlite_store,
                 conflict_logger=conflict_logger,
             )
         except Exception as e:
@@ -286,7 +286,7 @@ async def reconcile_conflict(
                          if k in ("content", "source", "visibility")}
             write_data["id"] = node_id
             # 使用 update_with_version 确保写入原子性
-            deps.kuzu_store.update_with_version(
+            deps.graphlite_store.update_with_version(
                 node_id=node_id,
                 updates=write_data,
                 expected_version=result["current_version"] if not force else None,

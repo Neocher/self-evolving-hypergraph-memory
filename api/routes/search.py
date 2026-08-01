@@ -44,7 +44,7 @@ async def retrieve(
         raise HTTPException(status_code=500, detail=str(exc))
 
     # 当所有上游检索都返回空时，直接 Cypher 兜底
-    if not results_raw and deps.kuzu_store is not None:
+    if not results_raw and deps.graphlite_store is not None:
         try:
             words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
             if words:
@@ -53,7 +53,7 @@ async def retrieve(
                 cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                           "AND (e.quarantine IS NULL OR e.quarantine = false) "
                           f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
-                fallback_rows = deps.kuzu_store.query_cypher(cypher, params)
+                fallback_rows = deps.graphlite_store.query_cypher(cypher, params)
                 degraded = True
                 for row in fallback_rows:
                     if isinstance(row, (list, tuple)):
@@ -66,7 +66,7 @@ async def retrieve(
                         "node_id": str(nid),
                         "content": str(content),
                         "score": 0.5,
-                        "level": "kuzu_fallback",
+                        "level": "graphlite_fallback",
                     })
                 logger.info("Cypher fallback provided %d results", len(results_raw))
         except Exception:
@@ -90,9 +90,9 @@ async def retrieve(
         deduped = []
         # 如果指定了命名空间，预取该空间下的所有 node_id
         ns_set: set[str] | None = None
-        if req.namespace and deps.kuzu_store is not None:
+        if req.namespace and deps.graphlite_store is not None:
             try:
-                ns_rows = deps.kuzu_store.query_cypher(
+                ns_rows = deps.graphlite_store.query_cypher(
                     "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                     "RETURN e.id",
                     {"ns": req.namespace}
@@ -194,10 +194,10 @@ async def delete_namespace(
     deps: Services = Depends(get_services),
 ) -> dict:
     """删除指定命名空间下的所有 EpisodeNode + SessionNode。"""
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
     try:
-        count = deps.kuzu_store.delete_namespace(namespace)
+        count = deps.graphlite_store.delete_namespace(namespace)
         return {"deleted": count, "namespace": namespace, "status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -208,7 +208,7 @@ async def search_vector(
     req: SearchVectorRequest,
     deps: Services = Depends(get_services),
 ) -> SearchVectorResponse:
-    """使用 FAISS 向量索引执行纯向量检索，回查 Kuzu 获取节点详情。
+    """使用 FAISS 向量索引执行纯向量检索，回查 GraphLite 获取节点详情。
 
     当 encoder 或 FAISS 索引不可用时自动降级返回空结果。
     """
@@ -255,7 +255,7 @@ async def search_vector(
 
         distances, indices = deps.faiss_index.search(emb_array, k)
 
-        # 3. 回查 Kuzu 获取节点详情
+        # 3. 回查 GraphLite 获取节点详情
         results: list[SearchVectorResult] = []
         faiss_id_map = getattr(deps, "faiss_id_map", {}) or {}
         for rank in range(len(indices[0])):
@@ -272,9 +272,9 @@ async def search_vector(
             if not episode_id:
                 continue
 
-            # 从 Kuzu 获取节点详情
+            # 从 GraphLite 获取节点详情
             try:
-                node = deps.kuzu_store.get_episode(episode_id) if deps.kuzu_store else None
+                node = deps.graphlite_store.get_episode(episode_id) if deps.graphlite_store else None
                 content = node.get("content", "") if node else ""
             except Exception:
                 content = ""
@@ -312,10 +312,10 @@ async def get_session_memories(
     start = _now()
     set_trace_id()
 
-    if deps.kuzu_store is None:
-        raise HTTPException(status_code=503, detail="Kuzu store not available")
+    if deps.graphlite_store is None:
+        raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    rows = deps.kuzu_store.get_session_memories(session_id, limit)
+    rows = deps.graphlite_store.get_session_memories(session_id, limit)
     memories = []
     for r in rows:
         memories.append({
@@ -330,13 +330,13 @@ async def get_session_memories(
 
 
 @router.post("/sessions/{session_id}/working-memory",
-             summary="写入工作记忆（会话级临时上下文，不持久化到Kuzu）")
+             summary="写入工作记忆（会话级临时上下文，不持久化到GraphLite）")
 async def write_session_memory(
     session_id: str,
     body: SessionMemoryCreate,
     svc: Services = Depends(get_services),
 ):
-    """写入一条工作记忆。工作记忆是会话级临时上下文，不持久化到Kuzu图数据库。
+    """写入一条工作记忆。工作记忆是会话级临时上下文，不持久化到GraphLite图数据库。
     
     用于追踪当前任务中的Agent状态、正在处理的上下文。
     类比 Human-Inspired Memory Architecture 的「工作记忆」层。

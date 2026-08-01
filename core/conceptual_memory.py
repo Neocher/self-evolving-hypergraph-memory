@@ -43,13 +43,13 @@ class ConceptualMemoryEngine:
     """
 
     def __init__(self, config: Optional[ConceptualMemoryConfig] = None,
-                 kuzu_store=None, llm_client=None):
+                 graphlite_store=None, llm_client=None):
         self.config = config or ConceptualMemoryConfig()
-        self._kuzu_store = kuzu_store
+        self._graphlite_store = graphlite_store
         self._llm_client = llm_client
 
-    def set_kuzu_store(self, store) -> None:
-        self._kuzu_store = store
+    def set_graphlite_store(self, store) -> None:
+        self._graphlite_store = store
 
     def analyze_communities(self, communities: list[dict]) -> list[dict]:
         """分析多个社区，发现跨社区概念。
@@ -82,15 +82,15 @@ class ConceptualMemoryEngine:
                 if concept:
                     concepts.append(concept)
 
-        # 持久化到 Kuzu
+        # 持久化到 GraphLite
         for concept in concepts:
-            if self._kuzu_store is not None:
+            if self._graphlite_store is not None:
                 try:
-                    node_id = self._kuzu_store.create_conceptual_node(concept)
+                    node_id = self._graphlite_store.create_conceptual_node(concept)
                     concept["id"] = node_id
                     # 链接到源社区
                     for comm in concept.get("_source_communities", []):
-                        self._kuzu_store.link_conceptual_framework(
+                        self._graphlite_store.link_conceptual_framework(
                             node_id, comm.get("id", ""), weight=concept["confidence"]
                         )
                 except Exception as e:
@@ -139,15 +139,15 @@ class ConceptualMemoryEngine:
 
     def get_concepts(self, level: str = None) -> list[dict]:
         """查询概念记忆。"""
-        if self._kuzu_store is None:
+        if self._graphlite_store is None:
             return []
         try:
             if level:
-                return self._kuzu_store.get_concepts_by_level(level)
+                return self._graphlite_store.get_concepts_by_level(level)
             # 全部层级
             results = []
             for lv in ABSTRACTION_LEVELS:
-                results.extend(self._kuzu_store.get_concepts_by_level(lv))
+                results.extend(self._graphlite_store.get_concepts_by_level(lv))
             return results
         except Exception:
             return []

@@ -1,7 +1,7 @@
 """
 SHM v4.0 测试基础设施
 ====================
-共享 Fixtures: 临时 Kuzu 数据库、Mock FAISS、Mock Encoder。
+共享 Fixtures: 临时 GraphLite 数据库、Mock FAISS、Mock Encoder。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 def temp_db_path() -> Generator[Path, None, None]:
     """提供临时数据库路径，测试后清理。"""
     tmpdir = tempfile.mkdtemp(prefix="shm_test_")
-    db_path = Path(tmpdir) / "test_kuzu"
+    db_path = Path(tmpdir) / "test_graphlite"
     yield db_path
     # 清理
     import shutil
@@ -33,7 +33,7 @@ def temp_db_path() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def kuzu_store(temp_db_path: Path):
+def mock_graphlite_store(temp_db_path: Path):
     """图存储 mock（旧 RyuStore 已删除，引擎为 GraphLite）。
 
     真实 GraphLiteStore 集成测试请直接构造 GraphLiteStore 实例；

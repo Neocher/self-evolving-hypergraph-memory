@@ -30,7 +30,7 @@ async def write_sensory(
     set_trace_id()
 
     record_id = str(uuid.uuid4())
-    buf = getattr(deps.kuzu_store, "_sensory_buffer", None)
+    buf = getattr(deps.graphlite_store, "_sensory_buffer", None)
     buffer_usage = 0
 
     if buf is not None:
@@ -44,8 +44,8 @@ async def write_sensory(
             if deps.dream_scheduler:
                 await deps.dream_scheduler.on_node_created()
     else:
-        # 无环形缓冲区：直接写入 Kuzu EpisodeNode 作为兜底
-        deps.kuzu_store.create_episode({
+        # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
+        deps.graphlite_store.create_episode({
             "id": record_id,
             "content": record.content,
             "source": record.source,
@@ -55,8 +55,8 @@ async def write_sensory(
         })
         # 命名空间链接
         if record.namespace:
-            deps.kuzu_store.ensure_session(record.namespace)
-            deps.kuzu_store.link_to_session(record.namespace, record_id)
+            deps.graphlite_store.ensure_session(record.namespace)
+            deps.graphlite_store.link_to_session(record.namespace, record_id)
         if deps.dream_scheduler:
             await deps.dream_scheduler.on_node_created()
 
@@ -190,8 +190,8 @@ async def write_multimodal(
             emb_384 = visual_emb @ proj  # (512,) @ (512, 384) → (384,)
 
             visual_node_id = str(uuid.uuid4())
-            if deps.kuzu_store is not None:
-                deps.kuzu_store.create_visual_node({
+            if deps.graphlite_store is not None:
+                deps.graphlite_store.create_visual_node({
                     "id": visual_node_id,
                     "image_path": media_paths[0] if media_paths else "",
                     "caption": merged_text[:1024],
@@ -203,8 +203,8 @@ async def write_multimodal(
             logger.exception("VisualNode creation failed (non-fatal)")
 
     # ── 写入 EpisodeNode（文本索引）──
-    if merged_text and deps.kuzu_store is not None:
-        deps.kuzu_store.create_episode({
+    if merged_text and deps.graphlite_store is not None:
+        deps.graphlite_store.create_episode({
             "id": episode_id,
             "content": merged_text,
             "source": req.source,
@@ -213,8 +213,8 @@ async def write_multimodal(
             "tau_initial": 1.0,
         })
         if req.namespace:
-            deps.kuzu_store.ensure_session(req.namespace)
-            deps.kuzu_store.link_to_session(req.namespace, episode_id)
+            deps.graphlite_store.ensure_session(req.namespace)
+            deps.graphlite_store.link_to_session(req.namespace, episode_id)
 
         # 通知梦境调度器
         if deps.dream_scheduler:
@@ -278,7 +278,7 @@ async def create_episode(
                                    created_at=created_at,  # 【FIX】缺 created_at → 500
                                    content=req.content, source=req.source)
 
-    # [Defense] 记忆投毒预检（在 Kuzu 写入前执行）
+    # [Defense] 记忆投毒预检（在 GraphLite 写入前执行）
     defense_verdict = None
     defense_reason = ""
     if deps.defense_engine and deps.defense_engine.config.enabled:
@@ -313,11 +313,11 @@ async def create_episode(
                     conflict_id = c.get("conflict_id", "")
                     conflict_node_id = f"conflict_{episode_id}_{conflict_id}"
                     # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
-                    if not deps.kuzu_store.execute_cypher(
+                    if not deps.graphlite_store.execute_cypher(
                         "MATCH (c:ConflictNode {id: $id}) RETURN c",
                         {"id": conflict_node_id},
                     ):
-                        deps.kuzu_store.execute_cypher(
+                        deps.graphlite_store.execute_cypher(
                             "INSERT (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
                             "rule_id: $rule, detected_at: $t, resolved: false})",
                             {"id": conflict_node_id,
@@ -347,7 +347,7 @@ async def create_episode(
             episode_data["entity_name"] = val_result.entity_name
         if val_result.entity_value:
             episode_data["entity_value"] = val_result.entity_value
-    deps.kuzu_store.create_episode(episode_data)
+    deps.graphlite_store.create_episode(episode_data)
 
     # [Defense] 隔离标记：QUARANTINE 判定的节点写入后标记隔离
     if defense_verdict is not None and defense_verdict.value == "quarantine":
@@ -357,8 +357,8 @@ async def create_episode(
 
     # 命名空间链接
     if req.namespace:
-        deps.kuzu_store.ensure_session(req.namespace)
-        deps.kuzu_store.link_to_session(req.namespace, episode_id)
+        deps.graphlite_store.ensure_session(req.namespace)
+        deps.graphlite_store.link_to_session(req.namespace, episode_id)
 
     # [Ontology v2] 写时类型验证
     if deps.ontology_v2 is not None:
@@ -370,9 +370,9 @@ async def create_episode(
         except Exception:
             logger.exception("Ontology v2 write validation error (non-fatal)")
 
-    # [Step 1] 关系抽取：批量 Kuzu 操作（减少 3N→2 次往返）
+    # [Step 1] 关系抽取：批量 GraphLite 操作（减少 3N→2 次往返）
     triples = None
-    if deps.kuzu_store is not None and len(req.content) > 50:
+    if deps.graphlite_store is not None and len(req.content) > 50:
         try:
             from core.relation_extractor import RelationExtractor
             rext = RelationExtractor()
@@ -386,23 +386,23 @@ async def create_episode(
                             continue  # 空串守卫：避免写入哨兵节点
                         if entity_name not in seen_entities:
                             seen_entities.add(entity_name)
-                            if not deps.kuzu_store.execute_cypher(
+                            if not deps.graphlite_store.execute_cypher(
                                 "MATCH (n:OntologyEntity {name: $name}) RETURN n",
                                 {"name": entity_name},
                             ):
-                                deps.kuzu_store.execute_cypher(
+                                deps.graphlite_store.execute_cypher(
                                     "INSERT (n:OntologyEntity {name: $name, type: 'discovered'})",
                                     {"name": entity_name},
                                 )
                 # 批量创建关系边（GraphLite 不支持 MERGE：MATCH 边存在性 + INSERT）
                 for t in triples:
-                    if not deps.kuzu_store.execute_cypher(
+                    if not deps.graphlite_store.execute_cypher(
                         "MATCH (a:OntologyEntity {name: $subj})"
                         "-[:RELATES_TO]->"
                         "(b:OntologyEntity {name: $obj}) RETURN a",
                         {"subj": t.subject, "obj": t.obj},
                     ):
-                        deps.kuzu_store.execute_cypher(
+                        deps.graphlite_store.execute_cypher(
                             "MATCH (a:OntologyEntity {name: $subj}), "
                             "(b:OntologyEntity {name: $obj}) "
                             "INSERT (a)-[:RELATES_TO {relation: $rel}]->(b)",
@@ -426,10 +426,10 @@ async def create_episode(
             logger.exception("Evidence tracker error (non-fatal)")
 
     # [Step 3] 实体消歧 — 仅对有一定信息量的内容执行
-    if deps.kuzu_store is not None and len(req.content) > 80:
+    if deps.graphlite_store is not None and len(req.content) > 80:
         try:
             from core.entity_resolver import EntityResolver
-            resolver = EntityResolver(kuzu_store=deps.kuzu_store)
+            resolver = EntityResolver(graphlite_store=deps.graphlite_store)
             result = resolver.process(req.content)
             if result.get("alias_count", 0) > 0:
                 logger.info("Entity resolver: %d alias edges, %d entities",
@@ -466,12 +466,12 @@ async def create_episode(
     # 【P0-①】会话观测节点：通过 X-Session-Id header 关联记忆到同一会话
     try:
         session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
-        if session_id and deps.kuzu_store is not None:
-            session_node_id = deps.kuzu_store.get_or_create_session(
+        if session_id and deps.graphlite_store is not None:
+            session_node_id = deps.graphlite_store.get_or_create_session(
                 session_id, metadata=json.dumps({"source": req.source})
             )
             if session_node_id:
-                deps.kuzu_store.link_session_member(session_node_id, episode_id)
+                deps.graphlite_store.link_session_member(session_node_id, episode_id)
     except Exception:
         logger.exception("Session memory link failed for episode %s", episode_id)
 
@@ -494,7 +494,7 @@ async def get_episode(
     start = _now()
     set_trace_id()
 
-    node = deps.kuzu_store.get_episode(episode_id)
+    node = deps.graphlite_store.get_episode(episode_id)
     if node is None:
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
 
@@ -524,15 +524,15 @@ async def promote_to_episode(
     if deps.tau_engine:
         tau = deps.tau_engine.compute_strength(created_at)
 
-    # 尝试从 Kuzu 查找原始记录内容
+    # 尝试从 GraphLite 查找原始记录内容
     content = ""
-    existing = deps.kuzu_store.get_episode(req.sensory_record_id)
+    existing = deps.graphlite_store.get_episode(req.sensory_record_id)
     if existing:
         content = existing.get("content", "")
     else:
         content = "promoted_record"
 
-    deps.kuzu_store.create_episode({
+    deps.graphlite_store.create_episode({
         "id": episode_id,
         "content": content,
         "source": "promoted",
@@ -587,9 +587,9 @@ def _process_embed_queue(deps: Services) -> int:
                 with deps._faiss_buffer_lock:
                     deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
                 try:
-                    if deps.hebbian_updater and deps.kuzu_store:
+                    if deps.hebbian_updater and deps.graphlite_store:
                         deps.hebbian_updater.update(
-                            {episode_id: 1.0}, deps.kuzu_store.get_all_connections()
+                            {episode_id: 1.0}, deps.graphlite_store.get_all_connections()
                         )
                 except Exception:
                     logger.exception("Hebbian update failed for %s", episode_id)
@@ -612,7 +612,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
     - 时态超边：同一 source 在 300s 内写入的节点
     - 情节超边：同一 source 在 3600s 内连续写入的节点
     """
-    if deps.hyperedge_manager is None or deps.kuzu_store is None:
+    if deps.hyperedge_manager is None or deps.graphlite_store is None:
         return 0
 
     try:
@@ -620,7 +620,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         now = _now()
 
         # 时态超边：最近 300s 内的同源节点
-        recent_rows = deps.kuzu_store.query_cypher(
+        recent_rows = deps.graphlite_store.query_cypher(
             "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
             "AND e.created_at >= $cutoff "
             "RETURN e.id ORDER BY e.created_at DESC LIMIT 5",
@@ -651,7 +651,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
             logger.info("Auto-created TEMPORAL hyperedge (pair): source=%s", source)
 
         # 情节超边：同一 source 在 3600s 内的节点池
-        window_rows = deps.kuzu_store.query_cypher(
+        window_rows = deps.graphlite_store.query_cypher(
             "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
             "AND e.created_at >= $cutoff_window "
             "RETURN e.id ORDER BY e.created_at DESC LIMIT 20",

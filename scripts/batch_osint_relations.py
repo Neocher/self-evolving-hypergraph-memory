@@ -1,7 +1,7 @@
 """
 SHM v5.8.1 — OSINT 数据结构化关系抽取
 =======================================
-从域名/URL/IP 数据中提取语义关系，写入 Kuzu 图数据库。
+从域名/URL/IP 数据中提取语义关系，写入 GraphLite 图数据库。
 
 抽取的关系类型:
   SUBDOMAIN_OF  — ns2.baidu.com → baidu.com
@@ -210,7 +210,7 @@ def extract_org_relations(triples: List[Tuple]) -> List[Tuple[str, str, str, Dic
     return extra
 
 # ──────────────────────────────────────────────────────────────
-# 3. 写入 Kuzu
+# 3. 写入 GraphLite
 # ──────────────────────────────────────────────────────────────
 def write_to_graph(triples: List[Tuple]) -> Dict[str, int]:
     """通过 API 写入关系边（使用 episodes 触发自动建实体+边）"""
@@ -294,7 +294,7 @@ def main():
         logger.info(f"  {t[0]:40s} ──{t[1]:15s}──> {t[2]}")
 
     # Step 3: 写入
-    logger.info(f"\n[Step 3/4] 写入 Kuzu ({len(all_triples)} 条)...")
+    logger.info(f"\n[Step 3/4] 写入 GraphLite ({len(all_triples)} 条)...")
     stats = write_to_graph(all_triples)
 
     # Step 4: 验证
@@ -308,7 +308,7 @@ def main():
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             d = json.loads(resp.read())
-            logger.info("Kuzu 关系边统计 (抽样):")
+            logger.info("GraphLite 关系边统计 (抽样):")
             for row in d.get("rows", [])[:10]:
                 r = row[0] if isinstance(row, list) else ""
                 c = row[1] if isinstance(row, list) and len(row) > 1 else 0
