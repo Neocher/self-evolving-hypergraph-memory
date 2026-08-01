@@ -26,6 +26,17 @@ def _decode_b64(s: str) -> str:
     return s
 
 
+def _memory_status(rss_mb, warning_mb: int, critical_mb: int) -> str:
+    """根据 RSS 阈值返回内存状态 (ok/warning/critical/unknown)。"""
+    if rss_mb is None:
+        return "unknown"
+    if rss_mb > critical_mb:
+        return "critical"
+    if rss_mb > warning_mb:
+        return "warning"
+    return "ok"
+
+
 @router.get("/memories/audit/{node_id}", summary="查询节点溯源链")
 async def get_audit_trail(
     node_id: str,
@@ -95,6 +106,16 @@ async def health_check(
         cb_state = cb.state.value if hasattr(cb.state, "value") else str(cb.state)
         record_circuit_breaker("ryu", state_map.get(cb_state, 0))
 
+    memory: Dict[str, Any] = dict(health.details.get("memory_usage", {}))
+    try:
+        from config.settings import get_settings
+        hcfg = get_settings().health
+        memory["memory_status"] = _memory_status(
+            memory.get("rss_mb"), hcfg.memory_warning_mb, hcfg.memory_critical_mb
+        )
+    except Exception:
+        memory["memory_status"] = "unknown"
+
     stats: Dict[str, Any] = {
         "version": __version__,
         "version_name": __version_name__,
@@ -106,7 +127,7 @@ async def health_check(
         "last_dream_time": health.last_dream_time,
         "dream_run_count": health.dream_run_count,
         "circuit_breaker": health.details.get("circuit_breaker", {}),
-        "memory": health.details.get("memory_usage", {}),
+        "memory": memory,
     }
 
     record_request("GET", "/health", "200", _now() - start)

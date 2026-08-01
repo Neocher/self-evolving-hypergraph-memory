@@ -14,30 +14,54 @@ SHM_GRAPH = "default"
 def _now() -> float:
     return time.time()
 
+def _gql_value(v: Any) -> Optional[str]:
+    """Encode a single Python value to GQL literal (UTF-8-safe). None if unsupported."""
+    from base64 import b64encode
+    if isinstance(v, str):
+        # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
+        try:
+            v.encode('ascii')
+            v = v.replace("\\", "\\\\").replace("'", "\\'")
+            return f"'{v}'"
+        except UnicodeEncodeError:
+            # Non-ASCII: store as b64 with prefix
+            b64 = b64encode(v.encode('utf-8')).decode('ascii')
+            return f"'{{b64}}{b64}'"
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return f"'{json.dumps(v, ensure_ascii=False)}'"
+    return None
+
+
 def _dict_to_gql_values(d: dict, skip_keys: set = None) -> str:
     """Convert Python dict to GQL literal syntax, handling UTF-8 safely."""
-    from base64 import b64encode
     skip = skip_keys or set()
     parts = []
     for k, v in d.items():
         if k in skip or v is None:
             continue
-        if isinstance(v, str):
-            # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
-            try:
-                v.encode('ascii')
-                v = v.replace("\\", "\\\\").replace("'", "\\'")
-                parts.append(f"{k}: '{v}'")
-            except UnicodeEncodeError:
-                # Non-ASCII: store as b64 with prefix
-                b64 = b64encode(v.encode('utf-8')).decode('ascii')
-                parts.append(f"{k}: '{{b64}}{b64}'")
-        elif isinstance(v, bool):
-            parts.append(f"{k}: {str(v).lower()}")
-        elif isinstance(v, (int, float)):
-            parts.append(f"{k}: {v}")
-        elif isinstance(v, list):
-            parts.append(f"{k}: '{json.dumps(v, ensure_ascii=False)}'")
+        lit = _gql_value(v)
+        if lit is not None:
+            parts.append(f"{k}: {lit}")
+    return ", ".join(parts)
+
+
+def _dict_to_gql_set_values(d: dict, skip_keys: set = None) -> str:
+    """Convert Python dict to GQL SET clause (e.key = value, ...).
+
+    逐字段直接构建 (不复用 split), 值含 ', ' (如 content="a, b") 不会拆坏 SQL。
+    """
+    skip = skip_keys or set()
+    parts = []
+    for k, v in d.items():
+        if k in skip or v is None:
+            continue
+        lit = _gql_value(v)
+        if lit is not None:
+            parts.append(f"e.{k} = {lit}")
     return ", ".join(parts)
 
 
@@ -104,11 +128,20 @@ class GraphLiteStore:
     # ─── Episode CRUD ───────────────────────────────
 
     def create_episode(self, episode: dict) -> str:
-        """INSERT EpisodeNode. Returns id."""
+        """INSERT EpisodeNode. Returns id.
+
+        注意: GraphLite INSERT 不能直接带 version 字段 (会 QUERY_ERROR)，
+        必须先 INSERT 再 SET version。
+        """
         eid = episode.get("id", str(uuid.uuid4()))
-        vals = _dict_to_gql_values(episode, skip_keys={"id"})
+        vals = _dict_to_gql_values(episode, skip_keys={"id", "version"})
         gql = f"INSERT (e:EpisodeNode {{id: '{eid}', {vals}}})"
         self._session.execute(gql)
+        # 乐观锁基线: 无 version 时置 1 (INSERT 带 version 会 QUERY_ERROR, 故后置 SET)
+        ver = episode.get("version", 1)
+        self._session.execute(
+            f"MATCH (e:EpisodeNode {{id: '{eid}'}}) SET e.version = {int(ver)}"
+        )
         return eid
 
     def get_episode(self, node_id: str) -> Optional[dict]:
@@ -155,20 +188,41 @@ class GraphLiteStore:
             return []
 
     def update_with_version(self, node_id: str, updates: dict, expected_version: int) -> bool:
-        """Optimistic lock update. GQL SET syntax."""
-        sets = _dict_to_gql_values(updates, skip_keys={"id"})
-        if not sets:
+        """Optimistic lock update (两步法: 查 version → 匹配 SET + version 递增).
+
+        expected_version=None 时跳过版本检查 (force 写入)。
+        节点不存在 / version 不匹配 / 旧数据无 version → False。
+        """
+        set_clause = _dict_to_gql_set_values(updates, skip_keys={"id", "version"})
+        if not set_clause:
             return True
-        # SET 需要 e. 前缀 + 等号: SET e.content = 'x'
-        # (_dict_to_gql_values 返回 INSERT 冒号格式, 需转换)
-        set_parts = sets.split(", ")
-        set_clause = ", ".join(
-            f"e.{p.replace(': ', ' = ', 1) if ': ' in p else p}"
-            for p in set_parts
-        )
-        gql = f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET {set_clause}"
+        # Step 1: 读当前 version
         try:
-            self._session.execute(gql)
+            result = self._session.query(
+                f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) RETURN e.version AS v"
+            )
+        except Exception:
+            return False
+        if not result.rows:
+            return False  # 节点不存在
+        v = result.rows[0].get("v") if isinstance(result.rows[0], dict) else None
+        next_version = None
+        if expected_version is not None:
+            if v is None:
+                return False  # 旧数据无 version 字段
+            try:
+                if int(v) != int(expected_version):
+                    return False
+                next_version = int(expected_version) + 1
+            except (TypeError, ValueError):
+                return False
+        # Step 2: 版本匹配 (或跳过检查) → SET 更新 + version 递增
+        if next_version is not None:
+            set_clause = f"{set_clause}, e.version = {next_version}"
+        try:
+            self._session.execute(
+                f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET {set_clause}"
+            )
             return True
         except Exception:
             return False

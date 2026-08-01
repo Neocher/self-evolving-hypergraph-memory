@@ -70,17 +70,81 @@ class TestEpisodeWritePath:
         assert got["content"] == "新内容"
         assert abs(float(got["trust_score"]) - 0.95) < 1e-6
 
-    def test_update_nonexistent_returns_true(self, gstore):
-        """GraphLite 对不存在的节点 SET 静默成功 (返回 status 行, 无副作用)。
+    def test_update_nonexistent_returns_false(self, gstore):
+        """乐观锁: 不存在节点 → False (两步法可区分不存在与成功)。
 
-        GraphLite 语义: MATCH 无匹配时 SET 不报错, 返回 status 行。
-        乐观锁版本检查 (WHERE version = expected) 在此引擎下不可靠
-        (WHERE 不匹配时 SET 静默跳过但返回 status), 故不承诺 False。
+        修复前: MATCH 无匹配时 SET 静默返回 status 行, 无法区分不存在。
+        修复后: 先 MATCH 查 version, 无 rows 直接返回 False。
         """
         ok = gstore.update_with_version(
             str(uuid.uuid4()), {"content": "x"}, expected_version=1
         )
+        assert ok is False
+
+    def test_create_episode_sets_version_1(self, gstore):
+        """create_episode 后 version 应为 1 (乐观锁基线)。"""
+        ep = _make_episode("基线测试")
+        eid = gstore.create_episode(ep)
+        got = gstore.get_episode(eid)
+        assert int(got["version"]) == 1
+
+    def test_optimistic_lock_success(self, gstore):
+        """version 匹配 → 更新成功, version +1。"""
+        ep = _make_episode("v1 内容")
+        eid = gstore.create_episode(ep)
+        ok = gstore.update_with_version(eid, {"content": "v2 内容"}, expected_version=1)
         assert ok is True
+        got = gstore.get_episode(eid)
+        assert got["content"] == "v2 内容"
+        assert int(got["version"]) == 2
+
+    def test_optimistic_lock_stale(self, gstore):
+        """version 不匹配 (stale) → 返回 False, 内容不变。"""
+        ep = _make_episode("原始")
+        eid = gstore.create_episode(ep)
+        ok = gstore.update_with_version(eid, {"content": "不应写入"}, expected_version=99)
+        assert ok is False
+        got = gstore.get_episode(eid)
+        assert got["content"] == "原始"
+        assert int(got["version"]) == 1
+
+    def test_optimistic_lock_nonexistent(self, gstore):
+        """不存在节点 → 返回 False。"""
+        ok = gstore.update_with_version(
+            str(uuid.uuid4()), {"content": "x"}, expected_version=1
+        )
+        assert ok is False
+
+    def test_optimistic_lock_chinese(self, gstore):
+        """中文更新带 version 递增 (b64 编解码路径)。"""
+        ep = _make_episode("中文原始")
+        eid = gstore.create_episode(ep)
+        ok = gstore.update_with_version(
+            eid, {"content": "中文更新后的内容"}, expected_version=1
+        )
+        assert ok is True
+        got = gstore.get_episode(eid)
+        assert got["content"] == "中文更新后的内容"
+        assert int(got["version"]) == 2
+
+    def test_optimistic_lock_force_skip_check(self, gstore):
+        """expected_version=None → 跳过版本检查直接写入 (force 路径)。"""
+        ep = _make_episode("force 原始")
+        eid = gstore.create_episode(ep)
+        ok = gstore.update_with_version(eid, {"content": "force 覆盖"}, expected_version=None)
+        assert ok is True
+        got = gstore.get_episode(eid)
+        assert got["content"] == "force 覆盖"
+
+    def test_update_with_version_comma_value(self, gstore):
+        """值含 ', ' (ASCII 直存) 不拆坏 SET 子句 (修复前 split(', ') 会损坏 SQL)。"""
+        ep = _make_episode("original")
+        eid = gstore.create_episode(ep)
+        ok = gstore.update_with_version(eid, {"content": "a, b"}, expected_version=1)
+        assert ok is True
+        got = gstore.get_episode(eid)
+        assert got["content"] == "a, b"
+        assert int(got["version"]) == 2
 
     def test_ontology_fields_roundtrip(self, gstore):
         """本体独立字段 (ontology_type/entity_name/entity_value) 写入 → 读回 闭环 (b64 根治基础)。"""

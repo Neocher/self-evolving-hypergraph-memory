@@ -288,7 +288,7 @@ async def reconcile_conflict(
             # 使用 update_with_version 确保写入原子性
             deps.kuzu_store.update_with_version(
                 node_id=node_id,
-                data=write_data,
+                updates=write_data,
                 expected_version=result["current_version"] if not force else None,
             )
         except Exception as e:

@@ -319,7 +319,7 @@ class WriteReconciler:
         )
         if resolved["conflict"]:
             # 版本冲突，resolved["data"] 是消解后的数据
-            kuzu_store.update_with_version(node_id, resolved["data"], version=None)
+            kuzu_store.update_with_version(node_id, resolved["data"], expected_version=None)
         else:
             # 无冲突，正常写入
             ...
