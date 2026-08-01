@@ -70,7 +70,16 @@ class TestEpisodeWritePath:
         assert got["content"] == "新内容"
         assert abs(float(got["trust_score"]) - 0.95) < 1e-6
 
-    def test_update_nonexistent_returns_false(self, gstore):
+    def test_create_with_chinese_list(self, gstore):
+        """中文 list 字段写入/读回 (b64 防 PANIC)。"""
+        ep = _make_episode("带标签的内容")
+        ep["tags"] = ["张三", "李四"]
+        eid = gstore.create_episode(ep)
+        got = gstore.get_episode(eid)
+        assert got is not None
+        assert got.get("tags") == '["张三", "李四"]'
+
+    def test_update_nonexistent_returns_true(self, gstore):
         """乐观锁: 不存在节点 → False (两步法可区分不存在与成功)。
 
         修复前: MATCH 无匹配时 SET 静默返回 status 行, 无法区分不存在。

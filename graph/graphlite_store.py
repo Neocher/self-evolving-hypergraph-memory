@@ -32,7 +32,9 @@ def _gql_value(v: Any) -> Optional[str]:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
-        return f"'{json.dumps(v, ensure_ascii=False)}'"
+        # JSON 序列化后统一 b64 (GraphLite lexer UTF-8 bug: 中文 list 直插 PANIC)
+        b64 = b64encode(json.dumps(v, ensure_ascii=False).encode('utf-8')).decode('ascii')
+        return f"'{chr(123)}b64{chr(125)}{b64}'"
     return None
 
 
