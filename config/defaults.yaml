@@ -117,3 +117,7 @@ shm_client:
   base_url: "http://127.0.0.1:8000"  # SHM 服务地址（MCP/CLI/SDK 连接用）
   timeout: 15.0                     # 客户端超时
   mcp_http_port: 8222               # MCP HTTP 服务器端口
+
+health:
+  memory_warning_mb: 2048           # RSS 超过此值 → memory_status=warning
+  memory_critical_mb: 3072          # RSS 超过此值 → memory_status=critical

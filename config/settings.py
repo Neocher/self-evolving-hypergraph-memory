@@ -205,6 +205,13 @@ class SHMClientConfig:
 
 
 @dataclass
+class HealthConfig:
+    """健康检查阈值（内存监控）"""
+    memory_warning_mb: int = 2048
+    memory_critical_mb: int = 3072
+
+
+@dataclass
 class Settings:
     """SHM v4.0 全局配置聚合。"""
 
@@ -224,6 +231,7 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     defense: DefenseConfig = field(default_factory=DefenseConfig)
     shm_client: SHMClientConfig = field(default_factory=SHMClientConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
 
 
 def _env_override(raw: dict[str, Any], prefix: str = "SHM") -> dict[str, Any]:
@@ -287,6 +295,7 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "llm": LLMConfig,
         "shm_client": SHMClientConfig,
         "defense": DefenseConfig,
+        "health": HealthConfig,
     }
     kwargs: dict[str, Any] = {}
     for section, cls in section_map.items():
