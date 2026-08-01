@@ -250,7 +250,7 @@ class DreamCandidateStore:
                                 source_content = str(row.get("content", ""))
                         kuzu_store.query_cypher(
                             "MATCH (target:EpisodeNode {id: $target}) "
-                            "SET target.content = target.content + ' | merged: ' || $content",
+                            "SET target.content = target.content + ' | merged: ' + $content",
                             {"target": target, "content": source_content}
                         )
                     kuzu_store.query_cypher(
