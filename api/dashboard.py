@@ -194,11 +194,13 @@ async def api_memories(
 
     if deps.kuzu_store is not None:
         try:
+            # GraphLite 参数化 LIMIT 不生效 (实测返回超量) → 字面量插值 + int 校验
+            _lim = int(limit)
+            _off = int(offset)
             rows = deps.kuzu_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.id, e.content, "
                 "e.source, e.created_at, e.tau_initial "
-                "ORDER BY e.created_at DESC LIMIT $limit OFFSET $offset",
-                {"limit": limit, "offset": offset},
+                f"ORDER BY e.created_at DESC LIMIT {_lim} OFFSET {_off}",
             )
             for row in rows:
                 if isinstance(row, dict):

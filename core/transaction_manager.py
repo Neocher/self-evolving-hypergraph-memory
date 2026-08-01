@@ -115,10 +115,21 @@ class MemoryTransaction:
                 node_id = op.data.get("id") or op.data.get("node_id", "")
                 if node_id and op.op in (OpType.UPDATE_NODE, OpType.DELETE_NODE):
                     if self._mgr._graph_store is not None:
-                        self._mgr._graph_store.query_cypher(
-                            "MATCH (e:EpisodeNode {id: $id}) SET e.version = COALESCE(e.version, 1) + 1",
+                        # GraphLite 不支持 COALESCE: 两步法 (查 version → 存在+1 / 不存在置 1)
+                        cur = self._mgr._graph_store.query_cypher(
+                            "MATCH (e:EpisodeNode {id: $id}) RETURN e.version AS v",
                             {"id": node_id}
                         )
+                        if cur and cur[0].get("v") is not None:
+                            self._mgr._graph_store.query_cypher(
+                                "MATCH (e:EpisodeNode {id: $id}) SET e.version = $v",
+                                {"id": node_id, "v": int(cur[0]["v"]) + 1}
+                            )
+                        else:
+                            self._mgr._graph_store.query_cypher(
+                                "MATCH (e:EpisodeNode {id: $id}) SET e.version = 1",
+                                {"id": node_id}
+                            )
 
         self.status = TransactionStatus.COMMITTED
         self._explicitly_closed = True

@@ -122,12 +122,13 @@ class QuarantineStore:
                 for eid in list(self._quarantined_ids)[:limit]
             ]
         try:
+            # GraphLite 参数化 LIMIT 不生效 (实测返回超量) → 字面量插值 + int 校验
+            _lim = int(limit)
             rows = self._graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.quarantine = true "
                 "RETURN e.id, e.content, e.quarantine_reason, "
                 "e.quarantine_source, e.quarantined_at "
-                "ORDER BY e.quarantined_at DESC LIMIT $limit",
-                {"limit": limit},
+                f"ORDER BY e.quarantined_at DESC LIMIT {_lim}",
             )
             result = []
             for row in rows:
