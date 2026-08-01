@@ -192,7 +192,8 @@ class GraphLiteStore:
     def update_with_version(self, node_id: str, updates: dict, expected_version: int) -> bool:
         """Optimistic lock update (两步法: 查 version → 匹配 SET + version 递增).
 
-        expected_version=None 时跳过版本检查 (force 写入)。
+        expected_version=None 时跳过版本检查 (force 写入, 不递增 version —
+        语义选择: force 后旧 expected_version 仍可通过校验, 调用方需自行保证时序)。
         节点不存在 / version 不匹配 / 旧数据无 version → False。
         """
         set_clause = _dict_to_gql_set_values(updates, skip_keys={"id", "version"})
