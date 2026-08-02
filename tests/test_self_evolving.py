@@ -173,6 +173,21 @@ class TestSelfEvolvingRetrieval:
         print(f"演化状态: {s}")
         assert s["total_calls"] == 10
 
+    def test_retrieve_exception_returns_list(self):
+        """P1-1 回归测试：底层检索抛异常时 retrieve() 必须返回 []（list），
+        不能返回 dict —— 下游 search.py/gateway_api.py 按 list 遍历，
+        dict 会触发 AttributeError → 500（曾导致线上故障）。"""
+        class RaisingRouter(MockRouter):
+            def retrieve(self, q):
+                raise RuntimeError("simulated retrieval failure")
+
+        se = SelfEvolvingRetrieval(RaisingRouter())
+        result = se.retrieve("hello")
+        assert isinstance(result, list)
+        assert result == []
+        # 失败不应计入成功调用统计
+        assert se.state()["total_calls"] == 0
+
     def test_params_synced(self):
         """验证演化后参数同步到 QueryRouter"""
         se = SelfEvolvingRetrieval(MockRouter())

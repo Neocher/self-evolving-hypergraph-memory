@@ -43,6 +43,12 @@ async def retrieve(
         record_request("POST", "/memories/retrieve", "500", _now() - start)
         raise HTTPException(status_code=500, detail=str(exc))
 
+    # 【Defense】类型守卫：上游若返回非 list，置空避免下游 AttributeError
+    if not isinstance(results_raw, list):
+        logger.warning("Retrieval returned non-list type %s, resetting to []",
+                       type(results_raw).__name__)
+        results_raw = []
+
     # 当所有上游检索都返回空时，直接 Cypher 兜底
     if not results_raw and deps.graphlite_store is not None:
         try:

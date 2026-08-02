@@ -474,7 +474,7 @@ class SelfEvolvingRetrieval:
             raw = self._qr.retrieve(query)
         except Exception as e:
             logger.error("检索失败: %s", e)
-            return {"results": [], "total_found": 0, "evolved": False}
+            return []
 
         elapsed = (time.perf_counter() - start) * 1000
 
