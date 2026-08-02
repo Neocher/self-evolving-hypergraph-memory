@@ -33,3 +33,13 @@ venv/
 .vscode/
 *.wal
 smart-router-solution.tar.gz
+
+# ── 非 SHM 组件：不入库（本地运行保留）──
+acp_bridge.py
+shm_bridge.py
+codex_bridge.py
+transcribe_audio.py
+workweave-router
+direct-proxy/
+Dockerfile.go-router
+smart-router-solution/
