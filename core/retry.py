@@ -9,13 +9,38 @@
 - 退避因子：2.0（1s → 2s → 4s）
 - 可重试异常：ConnectionError, TimeoutError（可扩展）
 - max_total_timeout：全局超时保护（0.0 = 不限制）
+
+[Fix] 双模式支持：装饰同步函数返回同步包装器（time.sleep / time.monotonic），
+装饰异步函数返回异步包装器（asyncio.sleep / loop.time）。同步包装器无需
+运行中的事件循环，可安全用于 GraphLiteStore 等同步 API 的重试。
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
-from typing import Tuple, Type
+import time
+from typing import Callable, Optional, Tuple, Type
+
+
+def _retry_delay(
+    attempt: int,
+    clock: Callable[[], float],
+    start_time: Optional[float],
+    max_total_timeout: float,
+    base_delay: float,
+    backoff: float,
+) -> float:
+    """计算第 attempt 次的退避延迟（秒）；超出全局预算则抛 TimeoutError。"""
+    delay = base_delay * (backoff ** attempt)
+    if start_time is not None:
+        remaining = max_total_timeout - (clock() - start_time)
+        delay = min(delay, max(0.1, remaining - 0.5))
+        if delay <= 0:
+            raise TimeoutError(
+                f"with_retry total timeout {max_total_timeout}s exceeded"
+            )
+    return delay
 
 
 def with_retry(
@@ -57,35 +82,56 @@ def with_retry(
             ...
     """
     def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                last_exception = None
+                loop_time = asyncio.get_running_loop().time
+                start_time = loop_time() if max_total_timeout > 0 else None
+                for attempt in range(max_attempts):
+                    if start_time is not None:
+                        elapsed = loop_time() - start_time
+                        if elapsed >= max_total_timeout:
+                            raise TimeoutError(
+                                f"with_retry total timeout {max_total_timeout}s exceeded "
+                                f"after {attempt} attempts ({elapsed:.1f}s)"
+                            )
+                    try:
+                        return await func(*args, **kwargs)
+                    except retryable_exceptions as e:
+                        last_exception = e
+                        if attempt < max_attempts - 1:
+                            delay = _retry_delay(
+                                attempt, loop_time, start_time,
+                                max_total_timeout, base_delay, backoff,
+                            )
+                            await asyncio.sleep(delay)
+                raise last_exception  # type: ignore[misc]
+            return async_wrapper
+
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        def sync_wrapper(*args, **kwargs):
             last_exception = None
-            loop_time = asyncio.get_running_loop().time
-            start_time = loop_time() if max_total_timeout > 0 else None
+            clock = time.monotonic
+            start_time = clock() if max_total_timeout > 0 else None
             for attempt in range(max_attempts):
                 if start_time is not None:
-                    elapsed = loop_time() - start_time
+                    elapsed = clock() - start_time
                     if elapsed >= max_total_timeout:
                         raise TimeoutError(
                             f"with_retry total timeout {max_total_timeout}s exceeded "
                             f"after {attempt} attempts ({elapsed:.1f}s)"
                         )
                 try:
-                    if asyncio.iscoroutinefunction(func):
-                        return await func(*args, **kwargs)
                     return func(*args, **kwargs)
                 except retryable_exceptions as e:
                     last_exception = e
                     if attempt < max_attempts - 1:
-                        delay = base_delay * (backoff ** attempt)
-                        if start_time is not None:
-                            remaining = max_total_timeout - (loop_time() - start_time)
-                            delay = min(delay, max(0.1, remaining - 0.5))
-                            if delay <= 0:
-                                raise TimeoutError(
-                                    f"with_retry total timeout {max_total_timeout}s exceeded"
-                                )
-                        await asyncio.sleep(delay)
+                        delay = _retry_delay(
+                            attempt, clock, start_time,
+                            max_total_timeout, base_delay, backoff,
+                        )
+                        time.sleep(delay)
             raise last_exception  # type: ignore[misc]
-        return wrapper
+        return sync_wrapper
     return decorator

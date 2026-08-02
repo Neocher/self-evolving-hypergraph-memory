@@ -25,6 +25,7 @@ from api.routes import router, init_services, Services
 from observability.metrics import record_request
 from observability.logger import get_logger, configure_logging
 from api.dashboard import dashboard_router
+from graph.graphlite_store import CircuitBreakerOpen
 
 logger = get_logger(__name__)
 
@@ -625,6 +626,14 @@ def create_app() -> FastAPI:
         record_request(request.method, request.url.path, response.status_code, duration)
         response.headers["X-Trace-Id"] = trace_id
         return response
+
+    # 熔断器 open → 503 而非 500（P2-C: 未防护调用方如 communities.py:106
+    # 读路径直接用 execute_cypher，跳闸时抛出 CircuitBreakerOpen）
+    @app.exception_handler(CircuitBreakerOpen)
+    async def _circuit_breaker_open_handler(
+        request: Request, exc: CircuitBreakerOpen
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": "circuit_open"})
 
     app.include_router(router)
     app.include_router(dashboard_router)

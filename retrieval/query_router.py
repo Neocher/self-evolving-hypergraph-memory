@@ -742,6 +742,8 @@ class QueryRouter:
                     ep["id"]: ep
                     for ep in self.graphlite_store.get_episodes_batch(node_uuids)
                 }
+            except CircuitBreakerOpen:
+                raise  # 熔断跳闸：向上传播，由 retrieve() L613 级联到 L2
             except Exception:
                 episodes_dict = {}
 
@@ -805,6 +807,8 @@ class QueryRouter:
                     ep["id"]: ep
                     for ep in self.graphlite_store.get_episodes_batch(list(uuid_map.values()))
                 }
+            except CircuitBreakerOpen:
+                episodes_dict = {}  # 熔断降级：静默跳过回查（内容为空，不刷异常日志）
             except Exception:
                 logger.exception(
                     "_vector_retrieve: GraphLite batch lookup failed, results will have empty content"

@@ -1,5 +1,6 @@
 """GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器（当前图引擎）。"""
-import json, shutil, os, time, uuid, sys, tempfile
+import json, shutil, os, time, threading, uuid, sys, tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Any
 
@@ -7,9 +8,32 @@ sys.path.insert(0, "/home/admin/GraphLite/bindings/python")
 sys.path.insert(0, "/home/admin/GraphLite/sdk-python/src")
 
 from graphlite_sdk import GraphLite, Session
+from graphlite_sdk.error import (
+    ConnectionError as GraphLiteConnectionError,
+    QueryError,
+)
+
+from core.retry import with_retry
 
 SHM_SCHEMA = "/shm"
 SHM_GRAPH = "default"
+
+# 熔断器计数的「基础设施异常」集合（P0: 异常类型不匹配 → 熔断器死代码）:
+# - SDK 层: GraphLiteConnectionError / QueryError 是 graphlite_sdk.error 自有的异常
+#   （GraphLiteError 子类），与内置 ConnectionError 无继承关系。connection.py 的
+#   query()/execute() 把所有底层异常统一包装成 QueryError —— 生产环境下连接失败/
+#   超时只会以 QueryError 形式出现，因此必须显式纳入。
+# - P2-1: 显式枚举，不纳入 GraphLiteError 基类——基类过宽，SerializationError/
+#   NotFoundError 等数据/业务错误会被误计为基础设施故障。
+# - 内置 ConnectionError/TimeoutError 保留以兼容测试 mock。
+# 折中（SDK 未区分「连接失败」与「坏 GQL 语法」——均为 QueryError）: 两者都计数，
+# 比 P0 前永不跳闸（死代码）好；代价是坏查询可能污染窗口（写路径由 P2-2 缓解）。
+_INFRA_EXCEPTIONS = (
+    GraphLiteConnectionError,
+    QueryError,
+    ConnectionError,
+    TimeoutError,
+)
 
 def _now() -> float:
     return time.time()
@@ -72,14 +96,150 @@ class CircuitBreakerOpen(Exception):
     pass
 
 
+class CircuitBreakerState(str, Enum):
+    """断路器状态: closed → open → half_open。"""
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitBreaker:
+    """滑动窗口失败率断路器状态机（closed → open → half_open）。
+
+    - 默认参数与 config/settings.CircuitBreakerConfig / config/defaults.yaml 一致；
+      不强制 import settings（避免循环依赖），config 缺失字段回落默认值。
+    - record_success / record_failure 维护滑动窗口 _window（list[bool]，长度 ≤ window_size）。
+    - 窗口满（window_size 条样本）后计算失败率，≥ failure_threshold → open。
+      窗口不满时不跳闸，避免单次瞬时故障切断整个图存储。
+    - open 后 recovery_timeout 秒自动迁移 half_open。
+    - half_open 放行 half_open_max_requests 个探测请求，成功 → closed，失败 → open。
+    - 跳闸（进入 open）时 raise CircuitBreakerOpen 供上层降级。
+    """
+
+    def __init__(self, config: Optional[Any] = None):
+        cfg = config or type("cfg", (), {})()
+        self.failure_threshold: float = float(getattr(cfg, "failure_threshold", 0.5))
+        self.recovery_timeout: float = float(getattr(cfg, "recovery_timeout", 30.0))
+        self.half_open_max_requests: int = int(getattr(cfg, "half_open_max_requests", 1))
+        self.window_size: int = int(getattr(cfg, "window_size", 10))
+        # 并发访问保护: GraphLiteStore 单例被事件循环 + to_thread + ThreadPool 共享
+        self._lock = threading.RLock()
+        # 滑动窗口: True=成功, False=失败（长度 ≤ window_size）
+        self._window: list[bool] = []
+        self._state = CircuitBreakerState.CLOSED
+        self._opened_at: float = 0.0
+        self._half_open_probes: int = 0
+        self._half_open_last_probe_at: float = 0.0  # P1-2 探针时间戳（配额重新武装用）
+
+    # ─── 状态机 ───────────────────────────────
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        """当前状态；open 后经过 recovery_timeout 自动迁移 half_open。"""
+        with self._lock:
+            if self._state == CircuitBreakerState.OPEN and (
+                time.time() - self._opened_at >= self.recovery_timeout
+            ):
+                self._state = CircuitBreakerState.HALF_OPEN
+                self._half_open_probes = 0
+                self._half_open_last_probe_at = 0.0
+            return self._state
+
+    def is_open(self) -> bool:
+        """是否处于 open（拒绝请求）；half_open 放行探测请求。"""
+        with self._lock:
+            return self.state == CircuitBreakerState.OPEN
+
+    def allow_request(self) -> bool:
+        """请求门控: open → 拒绝；half_open → 放行 half_open_max_requests 个探测。
+
+        P1-2: half_open 下探针配额按时间重新武装——距上次探测超过
+        recovery_timeout / half_open_max_requests 即重置配额，防止探针被消耗
+        但未触发 record_* 时永久卡在 half_open。
+        """
+        with self._lock:
+            st = self.state
+            if st == CircuitBreakerState.CLOSED:
+                return True
+            if st == CircuitBreakerState.HALF_OPEN:
+                now = time.time()
+                if self._half_open_probes >= self.half_open_max_requests:
+                    interval = self.recovery_timeout / max(1, self.half_open_max_requests)
+                    if now - self._half_open_last_probe_at >= interval:
+                        self._half_open_probes = 0
+                    else:
+                        return False
+                self._half_open_probes += 1
+                self._half_open_last_probe_at = now
+                return True
+            return False
+
+    # ─── 事件记录 ─────────────────────────────
+
+    def record_success(self) -> None:
+        """请求成功：写入窗口；half_open 探测成功 → 复位 closed。"""
+        with self._lock:
+            self._window.append(True)
+            if len(self._window) > self.window_size:
+                self._window.pop(0)
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.CLOSED
+                self._half_open_probes = 0
+                self._half_open_last_probe_at = 0.0
+                self._window = []
+
+    def record_failure(self, exc: Optional[BaseException] = None) -> None:
+        """请求失败：写入窗口；触发跳闸时 raise CircuitBreakerOpen（from exc 保留原始异常链）。
+
+        只对基础设施错误计数（_INFRA_EXCEPTIONS: SDK QueryError/ConnectionError +
+        内置 ConnectionError/TimeoutError）；应用错误（RuntimeError 等）不计数，
+        避免坏查询反复调用 10 次后污染整个窗口导致全图熔断。
+        exc=None 视为显式失败信号，计数。
+        折中: SDK 把连接失败与坏 GQL 语法统一包装成 QueryError（无子类区分），
+        两者都计数——比 P0 前（SDK QueryError 永远匹配不到内置类 → 熔断器永不
+        跳闸的死代码）更好。
+        """
+        if exc is not None and not isinstance(exc, _INFRA_EXCEPTIONS):
+            return
+        with self._lock:
+            self._window.append(False)
+            if len(self._window) > self.window_size:
+                self._window.pop(0)
+            st = self.state  # 触发 open → half_open 自动迁移
+            if st == CircuitBreakerState.HALF_OPEN:
+                self._trip()
+                raise CircuitBreakerOpen("half-open probe failed, circuit re-opened") from exc
+            if st == CircuitBreakerState.CLOSED and len(self._window) == self.window_size \
+                    and self._failure_rate() >= self.failure_threshold:
+                self._trip()
+                raise CircuitBreakerOpen(
+                    f"failure rate {self._failure_rate():.0%} >= "
+                    f"threshold {self.failure_threshold:.0%}, circuit opened"
+                ) from exc
+
+    # ─── Helpers ──────────────────────────────
+
+    def _failure_rate(self) -> float:
+        if not self._window:
+            return 0.0
+        return sum(1 for r in self._window if not r) / len(self._window)
+
+    def _trip(self) -> None:
+        self._state = CircuitBreakerState.OPEN
+        self._opened_at = time.time()
+        self._half_open_probes = 0
+        self._half_open_last_probe_at = 0.0
+
+
 class GraphLiteStore:
     """GraphLite-backed graph store, current graph engine."""
 
-    def __init__(self, config: Optional[Any] = None):
+    def __init__(self, config: Optional[Any] = None, cb_config: Optional[Any] = None):
         self._db: Optional[GraphLite] = None
         self._session: Optional[Session] = None
         self._db_path: str = ""
         self.config = config or type("cfg", (), {"database_path": "", "max_threads": 4})()
+        self.circuit_breaker = CircuitBreaker(cb_config)
 
     @property
     def conn(self):
@@ -158,16 +318,52 @@ class GraphLiteStore:
             return None
         return None
 
-    def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
-        """Batch GET by ids."""
-        if not node_ids:
-            return []
+    @with_retry(
+        max_attempts=2, base_delay=0.2, backoff=2.0,
+        retryable_exceptions=_INFRA_EXCEPTIONS,
+    )
+    def _get_episodes_batch_retryable(self, node_ids: list[str]) -> list[dict]:
+        """底层批量查询（熔断门控 + 重试）：成功返回 episodes。
+
+        - open 状态 raise CircuitBreakerOpen（query_router L1 超图检索的
+          传播链入口——L613 级联 L2；L2 向量检索静默降级）
+        - 基础设施错误（_INFRA_EXCEPTIONS）直接抛出交给 with_retry 重试；
+          失败计数由 get_episodes_batch 在重试耗尽后统一记录一次（P2-D）
+        - 应用错误不计数、不重试，返回 []
+        """
+        if not self.circuit_breaker.allow_request():
+            raise CircuitBreakerOpen("circuit breaker open, batch lookup rejected")
         ids = ", ".join(f"'{i}'" for i in node_ids)
         gql = f"MATCH (e:EpisodeNode) WHERE e.id IN [{ids}] RETURN e"
         try:
             result = self._session.query(gql)
-            return [self._flatten_row(r, "e") for r in result.rows]
+        except _INFRA_EXCEPTIONS:
+            raise  # 交给 with_retry 重试；失败计数由 get_episodes_batch 重试耗尽后统一记录
         except Exception:
+            return []  # 应用错误不计数、不重试
+        self.circuit_breaker.record_success()
+        return [self._flatten_row(r, "e") for r in result.rows]
+
+    def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
+        """Batch GET by ids.
+
+        P0-1: 熔断门控——open 状态 raise CircuitBreakerOpen（query_router
+        L1 超图检索的传播链入口）；基础设施错误由 _get_episodes_batch_retryable
+        重试（最多 2 次），重试耗尽后统一计 1 次失败（窗口按查询结果计数，
+        与 query_cypher 一致，P2-D）；跳闸时抛 CircuitBreakerOpen 供上层级联，
+        否则返回 []。应用错误不计数并返回 []。
+        """
+        if not node_ids:
+            return []
+        try:
+            return self._get_episodes_batch_retryable(node_ids)
+        except _INFRA_EXCEPTIONS as e:
+            try:
+                self.circuit_breaker.record_failure(e)  # 重试耗尽 → 统一计失败
+            except CircuitBreakerOpen:
+                raise CircuitBreakerOpen(
+                    "circuit breaker open, batch lookup rejected"
+                ) from e
             return []
 
     def get_active_episodes(self, time_window_seconds: float = 1800) -> list[dict]:
@@ -307,19 +503,74 @@ class GraphLiteStore:
     # ─── Direct GQL ─────────────────────────────────
 
     def execute_cypher(self, query: str, params: Optional[dict] = None) -> list:
-        """Execute GQL directly, return list of row dicts (MATCH/DML results)."""
-        q = self._interpolate(query, params)
-        result = self._session.query(q)
-        return list(result.rows)
+        """Execute GQL directly, return list of row dicts (MATCH/DML results).
 
-    def query_cypher(self, query: str, params: Optional[dict] = None) -> list:
-        """Query GQL, return list of dicts."""
+        熔断门控 + 不吞异常：
+        - open 状态 raise CircuitBreakerOpen（写路径需显式失败）
+        - 不加 @with_retry —— 写操作（INSERT/CREATE/SET）不自动重试，
+          避免非幂等双重执行；读路径 query_cypher 保留重试。
+        - P2-2: 写路径对熔断窗口完全中立（既不 record_success 也不
+          record_failure）——只参与 allow_request 门控；坏 GQL/连接失败不污染
+          窗口，写流量也不稀释读失败率（否则写流量 ≥ 2× 读失败时熔断永不
+          跳闸）；熔断完全由读路径驱动，写失败原样上抛，由调用方处理。
+        """
+        if not self.circuit_breaker.allow_request():
+            raise CircuitBreakerOpen("circuit breaker open, query rejected")
         q = self._interpolate(query, params)
         try:
             result = self._session.query(q)
-            return list(result.rows)
         except Exception:
+            raise
+        return list(result.rows)
+
+    @with_retry(
+        max_attempts=2, base_delay=0.2, backoff=2.0,
+        retryable_exceptions=_INFRA_EXCEPTIONS,
+    )
+    def _query_retryable(self, query: str, params: Optional[dict] = None) -> list:
+        """底层查询（熔断门控 + 重试）：成功返回 rows。
+
+        - open 状态返回 []（不抛，由 query_cypher 保持永不抛异常契约）
+        - 基础设施错误（_INFRA_EXCEPTIONS: SDK QueryError 等 + 内置类）直接抛出，
+          交给 with_retry 重试；失败计数由 query_cypher 在重试耗尽后统一记录一次
+          ——窗口按「查询结果」计数而非「attempt」（P2-B: 重试成功 F→T 的查询
+          不污染窗口，否则 5 个需重试的查询后窗口 50% 可能误跳闸）
+        - 应用错误（GQL 语法等）不计数、不重试，返回 []
+        - P3-1: 成功路径（record_success + rows 构造）在 try 内——畸形数据
+          （如 result 无 rows）不逃出永不抛异常契约，按应用错误防御性返回 []
+        """
+        if not self.circuit_breaker.allow_request():
             return []
+        q = self._interpolate(query, params)
+        try:
+            result = self._session.query(q)
+            self.circuit_breaker.record_success()
+            return list(result.rows)
+        except _INFRA_EXCEPTIONS:
+            raise  # 交给 with_retry 重试；失败计数由 query_cypher 重试耗尽后统一记录
+        except Exception:
+            return []  # 应用错误不计数、不重试
+
+    def query_cypher(self, query: str, params: Optional[dict] = None) -> list:
+        """Query GQL, return list of dicts. 永不抛异常契约（P0-2 关键设计决策）。
+
+        - open 状态返回 []（静默降级；query_router 通过显式 is_open() 检查级联，
+          而非异常传播）——~25 个调用方无需处理 CircuitBreakerOpen
+        - 基础设施错误（_INFRA_EXCEPTIONS: SDK QueryError 等 + 内置类）由
+          _query_retryable 重试（最多 2 次，base_delay=0.2s，避免同步重试冻结
+          async 事件循环）；重试耗尽后统一计 1 次失败（窗口按查询结果计数，
+          P2-B）→ 返回 []；跳闸（record_failure raise CircuitBreakerOpen）时
+          静默返回 []，保持永不抛异常契约
+        - 应用错误（GQL 语法等）不计数、不重试，返回 []
+        """
+        try:
+            return self._query_retryable(query, params)
+        except _INFRA_EXCEPTIONS as e:
+            try:
+                self.circuit_breaker.record_failure(e)  # 重试耗尽 → 统一计失败
+            except CircuitBreakerOpen:
+                pass  # 跳闸 → 静默返回 []（永不抛异常契约）
+            return []  # 重试耗尽 → 静默降级
 
     # ─── Helpers ────────────────────────────────────
 
