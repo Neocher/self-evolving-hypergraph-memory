@@ -1,33 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.19.6"
-__version_info__ = (5, 19, 6)
-__version_name__ = "GraphLite-GQL-complete"
-__release_date__ = "2026-08-01"
+__version__ = "5.20.0"
+__version_info__ = (5, 20, 0)
+__version_name__ = "CircuitBreaker-Fused"
+__release_date__ = "2026-08-03"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — GraphLite GQL 兼容性全打通 (2026-08-01):
-  • BM25 中文检索: char_wb ngram(2,4) + raw_query 传原始中文
-    (token_pattern 对 CJK 边界失效 + normalize 映射导致生产链路召回为空)
-  • TfidfSearchIndex: char_wb 兼容中文单字, 移除重复 fit
-  • 本体矛盾检测恢复: execute_cypher 返回 rows + _interpolate b64 编码中文
-    (GraphLite Rust lexer UTF-8 bug, 中文直插 PANIC → 静默漏检)
-  • 清除全部 GQL MERGE 残留 (10 处): GraphLite 不支持 MERGE,
-    MATCH 存在性 + INSERT 逗号分隔替代 (社区/Hebbian/本体/ALIAS_OF 边)
-  • 4 个真实引擎测试恢复 (271 passed + 0 skipped)
+核心变更 — 熔断器+重试落地 (2026-08-03):
+  • CircuitBreaker 状态机: closed→open→half_open, 滑动窗口+
+    threading.RLock+探针时间武装 (graphlite_store.py)
+  • SDK 异常适配: _INFRA_EXCEPTIONS 匹配 SDK 自有 QueryError/
+    GraphLiteConnectionError (与内置类无继承关系, 此前熔断永不触发)
+  • with_retry 双模式: 同步/异步包装器, 读路径重试 2 次
+  • 写路径中立: execute_cypher 不计数, 坏 GQL 不污染读窗口
+  • 全局 CircuitBreakerOpen→503 handler, L1→L2 级联可触发
+  • SE 检索失败类型契约修复: 异常返回 [] 而非 dict (消除 500 路径)
 
 📌 验证:
-  • 本体矛盾检测实测: 张三 1990 → 2000 检测 1 冲突, confidence 0.5
-  • RELATES_TO/ALIAS_OF/Hebbian 边全部实测创建成功
-  • SHM 重启 0 错误 0 警告, nodes=800+
-  • 全量测试 271 passed (原 267+4skip)
-
-📌 前置 (v5.19.x):
-  • v5.19.5: 梦境聚类 Leiden 最优算法 (leidenalg)
-  • v5.19.4: GraphLite 全新库初始化 + 双名兼容
-  • v5.19.3: 写入链路 SSM 门控修复 (await + GraphLite 别名/b64)
-  • v5.19.2: structlog 日志 + FAISS GraphLite 兼容
+  • 全量测试 334 passed (300 基线 + 34 新增)
+  • 真实 SDK QueryError 计数/重试/跳闸/恢复/级联闭环
+  • health 显示 circuit_breaker=CLOSED (原 not_configured)
+  • 变异验证证明测试真实守护 P1-1 (改坏代码测试即失败)
   • v5.19.1: cdlib 社区检测兼容
 
 ⚙️ 部署: deploy.sh 一键部署 | Docker 就绪"""
