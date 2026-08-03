@@ -457,6 +457,10 @@ class MultimodalResponse(BaseModel):
     visual_node_id: Optional[str] = Field(default=None, description="视觉节点 ID（有图像时）")
     text: Optional[str] = Field(default=None, description="文本内容（裁剪后）")
     media_paths: List[str] = Field(default_factory=list, description="存储的媒体文件路径列表")
+    unembedded_paths: List[str] = Field(
+        default_factory=list,
+        description="已保存但嵌入失败/超时的媒体文件（文件保留，未嵌入索引）",
+    )
     transcription: Optional[str] = Field(default=None, description="音频转录文本")
     created_at: float = Field(..., description="创建时间戳")
     error: Optional[str] = Field(default=None, description="拒绝原因（写入被拒绝时非空）")

@@ -22,6 +22,7 @@ import logging
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Optional
@@ -29,6 +30,20 @@ from typing import Any, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# 【M2-a】R2 专用小池：asyncio.to_thread 使用默认执行器会在写路径重新引入
+# 池 DoS（与 M3 想隔离的媒体池问题同源）。卡死的 R2 线程被隔离在本池内，
+# 不占用默认池（检索 to_thread 同样依赖默认池）。
+_R2_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shm-defense-r2")
+
+# 【M2-b】R2 执行超时（秒）：编码器卡死时先超时 R2 本身（fail-closed →
+# QUARANTINE），不占用外层 wait_for 预算内的锁等待时间。
+_R2_TIMEOUT = 7.0
+
+# 【M2-b】锁等待独立短超时（秒）：并发写入下 asyncio.Lock 排队不计入 R2
+# 预算 → 正常慢写入不被误隔离（修复前 10s 预算覆盖 R2 执行 + 锁排队）。
+_LOCK_WAIT_TIMEOUT = 2.0
 
 
 # ─── 枚举 ──────────────────────────────────────────────────
@@ -223,11 +238,34 @@ class MemoryDefenseEngine:
         verdict = MemoryDefenseVerdict.ALLOW
 
         # R2 编码移出锁范围（避免编码器阻塞锁内其他规则）
-        r2_pass, r2_reason, r2_flag = self._check_r2(source, content)
+        # 【M2-a】R2 走专用小池 _R2_EXECUTOR（max_workers=2）而非默认执行器：
+        # asyncio.to_thread 用默认池会与检索 to_thread 争抢，卡死的 R2 线程
+        # 反复占用默认池 → 写路径重新引入 M3 想隔离的池 DoS。
+        # 【M2-b】R2 套独立超时：编码器挂起时先超时 R2 本身（fail-closed →
+        # QUARANTINE），不占用外层 wait_for 预算、不挤掉锁等待时间。
+        try:
+            loop = asyncio.get_running_loop()
+            r2_pass, r2_reason, r2_flag = await asyncio.wait_for(
+                loop.run_in_executor(_R2_EXECUTOR, self._check_r2, source, content),
+                timeout=_R2_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Defense R2 timed out after %.1fs, quarantining write",
+                           _R2_TIMEOUT)
+            return MemoryDefenseVerdict.QUARANTINE, "defense_timeout"
         if not r2_pass:
             reasons.append(r2_reason)
 
-        async with self._lock:
+        # 【M2-b】锁等待用独立短超时（不算入 R2 执行预算）：高并发写入下
+        # asyncio.Lock 串行化 R1/R3/R4/R5，正常慢写入不再因排队耗尽外层预算
+        # 而被误隔离；超时同样 fail-closed → QUARANTINE（独立 reason 便于运营区分）。
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=_LOCK_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("Defense lock wait timed out after %.1fs, quarantining write",
+                           _LOCK_WAIT_TIMEOUT)
+            return MemoryDefenseVerdict.QUARANTINE, "defense_lock_timeout"
+        try:
             # 锁内只做计数器状态操作（R1/R3/R4/R5）
             # R1 — 写入频率尖峰（含本次写入的预计算）
             r1_pass, r1_reason, r1_flag = self._check_r1(source, include_pending=True)
@@ -282,6 +320,8 @@ class MemoryDefenseEngine:
                     self.config.initial_trust,
                     current_trust + recovery_rate,
                 )
+        finally:
+            self._lock.release()
 
         # 静默模式：BLOCK 降级为 QUARANTINE（在锁外，不影响状态）
         if verdict == MemoryDefenseVerdict.BLOCK and self.config.silent:

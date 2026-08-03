@@ -2,7 +2,11 @@
 记忆写入路由 (sensory, episodes, promote)
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+from core.defense import MemoryDefenseVerdict
 
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
@@ -15,6 +19,19 @@ from api.routes._deps import (
     EpisodeCreate, EpisodeResponse,
     PromoteRequest, PromoteResponse,
 )
+
+# 【P1-3】外部调用超时（秒）：防御预检 / CLIP 图像嵌入 / Whisper 转录
+_EXTERNAL_CALL_TIMEOUT = 10.0
+
+# 【M3-a】冷启动 warmup 超时（秒）：CLIP/Whisper 模型首次加载常 >10s，
+# 首个媒体写入若用 10s 预算会超时。首次嵌入放宽到 30s，完成后切回常规超时。
+_MEDIA_WARMUP_TIMEOUT = 30.0
+
+# 【M3】媒体嵌入专用线程池（私有实例，max_workers=2，不共享默认 ThreadPoolExecutor）。
+# wait_for 超时无法取消已运行的线程：若与 search 共用默认池，反复超时会把池占满，
+# 导致检索 to_thread(retrieve) 被排到卡死 worker 之后 → 新 DoS 向量。
+# 独占小池将卡死线程隔离在媒体嵌入路径内，不影响读路径。
+_MEDIA_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shm-media-embed")
 
 
 @router.post("/memories/sensory", summary="写入感觉缓冲区 (Layer1)")
@@ -82,6 +99,7 @@ async def write_multimodal(
     episode_id = str(uuid.uuid4())
     created_at = _now()
     media_paths: list[str] = []
+    unembedded_paths: list[str] = []  # 【M3-a】已落盘但嵌入失败/超时的媒体（保留文件）
     transcription: Optional[str] = None
     visual_node_id: Optional[str] = None
     text = req.text
@@ -115,8 +133,19 @@ async def write_multimodal(
             logger.exception("MediaStore init failed")
             store = None
 
+    # 【M3-a】冷启动 warmup：首个媒体嵌入尝试放宽超时（模型加载常 >10s），
+    # 避免首写被误超时 → 修复前超时会删除已落盘的用户媒体文件（数据丢失）。
+    media_timeout = (_MEDIA_WARMUP_TIMEOUT
+                     if not getattr(deps, "_media_warmup_done", False)
+                     else _EXTERNAL_CALL_TIMEOUT)
+
     # ── 处理图像 ──
     image_embeddings: list[np.ndarray] = []
+    # 【B-复审】warmup 预算消耗跟踪：仅在实际尝试过媒体嵌入/转录后置位
+    # _media_warmup_done。纯文本 multimodal（无 images/audio/video）不消耗
+    # 预算，首个真实媒体写入仍保留 30s 模型加载超时（原无条件置位导致
+    # 纯文本首请求后首个媒体写入退化到 10s 常规超时）。
+    media_warmup_consumed = False
     for b64_str in req.images:
         try:
             if len(b64_str) > 10 * 1024 * 1024:  # 10MB max per media item
@@ -125,11 +154,27 @@ async def write_multimodal(
             img_bytes = base64.b64decode(b64_str)
         except Exception:
             continue
+        saved_path: Optional[str] = None
         if store is not None:
-            path = store.save_image(img_bytes)
-            media_paths.append(path)
+            saved_path = store.save_image(img_bytes)
+            media_paths.append(saved_path)
         if clip is not None:
-            emb = clip.embed_image(img_bytes)
+            media_warmup_consumed = True
+            try:
+                # 【M3】专用线程池（_MEDIA_EXECUTOR）执行嵌入，不占默认池
+                # 【M3-a】使用 warmup/常规超时（首次放宽到 30s）
+                loop = asyncio.get_running_loop()
+                emb = await asyncio.wait_for(
+                    loop.run_in_executor(_MEDIA_EXECUTOR, clip.embed_image, img_bytes),
+                    timeout=media_timeout,
+                )
+            except Exception:
+                # 【P1-3】【M3】【M3-a】超时/失败降级：跳过该图像嵌入，但保留
+                # 已落盘文件（仅标记"未嵌入"）——瞬时故障不导致用户媒体数据丢失
+                logger.warning("CLIP embed_image failed or timed out, skipping image")
+                emb = None
+                if saved_path is not None and saved_path in media_paths:
+                    unembedded_paths.append(saved_path)
             if emb is not None:
                 image_embeddings.append(emb)
 
@@ -143,11 +188,27 @@ async def write_multimodal(
             aud_bytes = base64.b64decode(b64_str)
         except Exception:
             continue
+        saved_path: Optional[str] = None
         if store is not None:
-            path = store.save_audio(aud_bytes)
-            media_paths.append(path)
+            saved_path = store.save_audio(aud_bytes)
+            media_paths.append(saved_path)
         if whisper is not None:
-            seg = whisper.transcribe(aud_bytes)
+            media_warmup_consumed = True
+            try:
+                # 【M3】专用线程池执行转录，不占默认池
+                # 【M3-a】使用 warmup/常规超时（首次放宽到 30s）
+                loop = asyncio.get_running_loop()
+                seg = await asyncio.wait_for(
+                    loop.run_in_executor(_MEDIA_EXECUTOR, whisper.transcribe, aud_bytes),
+                    timeout=media_timeout,
+                )
+            except Exception:
+                # 【P1-3】【M3】【M3-a】超时/失败降级：跳过该音频转录，但保留
+                # 已落盘文件（仅标记"未嵌入"），不删除用户文件
+                logger.warning("Whisper transcribe failed or timed out, skipping audio")
+                seg = None
+                if saved_path is not None and saved_path in media_paths:
+                    unembedded_paths.append(saved_path)
             if seg:
                 audio_texts.append(seg)
 
@@ -163,6 +224,11 @@ async def write_multimodal(
         if store is not None:
             path = store.save_video(vid_bytes)
             media_paths.append(path)
+
+    # 【M3-a】嵌入尝试完成（成功/失败）→ 冷启动 warmup 结束，后续用常规超时
+    # 【B-复审】仅实际尝试过嵌入/转录才置位：纯文本请求不消耗 warmup 预算
+    if media_warmup_consumed:
+        deps._media_warmup_done = True
 
     # ── 合并文本 ──
     text_parts: list[str] = []
@@ -233,6 +299,7 @@ async def write_multimodal(
         media_paths=media_paths,
         transcription=transcription,
         created_at=created_at,
+        unembedded_paths=unembedded_paths,
     )
 
 
@@ -283,9 +350,21 @@ async def create_episode(
     defense_reason = ""
     if deps.defense_engine and deps.defense_engine.config.enabled:
         # 【FIX】pre_check 是 async 函数，缺 await 导致 TypeError: cannot unpack coroutine
-        verdict, reason = await deps.defense_engine.pre_check(
-            content=req.content, source=req.source, created_at=created_at,
-        )
+        try:
+            verdict, reason = await asyncio.wait_for(
+                deps.defense_engine.pre_check(
+                    content=req.content, source=req.source, created_at=created_at,
+                ),
+                timeout=_EXTERNAL_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # 【M2】超时降级改为 QUARANTINE（fail-closed 而非 fail-open）：
+            # fail-open 是投毒窗口——高并发写入下 pre_check 内 asyncio.Lock 串行化
+            # R1/R3/R4/R5，锁等待超时若放行（ALLOW）可被攻击者绕过 R1 限流/
+            # R4 防重复/R5 信任衰减；降级为 QUARANTINE 使超时写入只隔离不放行。
+            logger.warning("Defense pre_check timed out after %.1fs, quarantining write",
+                           _EXTERNAL_CALL_TIMEOUT)
+            verdict, reason = MemoryDefenseVerdict.QUARANTINE, "defense_timeout"
         defense_verdict = verdict
         defense_reason = reason
         if verdict.value == "block":

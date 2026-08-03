@@ -9,6 +9,7 @@ BM25 中文检索测试
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
@@ -127,3 +128,127 @@ def test_retrieve_chinese_mapped_word_recalls() -> None:
     assert results, "retrieve() 完整入口下中文查询未召回任何文档"
     assert any("记忆" in r["content"] for r in results)
     assert all(r["score"] > 0 for r in results)
+
+
+class FailingThenWorkingStore(FakeGraphLiteStore):
+    """query_cypher 先抛异常、后恢复正常（模拟 GraphLite 短暂故障恢复）。"""
+
+    def __init__(self, rows: list[dict]):
+        super().__init__(rows)
+        self.fail = True
+
+    def query_cypher(self, *args, **kwargs) -> list[dict]:
+        if self.fail:
+            raise RuntimeError("GraphLite down")
+        return self.rows
+
+
+def _make_bare_router(store) -> QueryRouter:
+    router = QueryRouter.__new__(QueryRouter)
+    router.config = QueryRouterConfig()
+    router.graphlite_store = store
+    router._bm25_doc_ids = []
+    router._bm25_doc_contents = []
+    router._bm25_doc_tau = []
+    router._bm25_built = False
+    router._bm25_ready = False
+    router._bm25_last_attempt = 0.0
+    return router
+
+
+def test_bm25_build_failure_retryable() -> None:
+    """【M1】构建失败不置位 _bm25_built → 保留重试机会（修复前永久降级）。
+
+    修复前 _bm25_built=True 在函数入口提前置位：query_cypher 异常后
+    _bm25_built=True / _bm25_ready=False → 永不重建。
+    """
+    store = FailingThenWorkingStore(
+        [{"node_id": "n1", "content": "记忆系统测试", "tau_value": 1.0}]
+    )
+    router = _make_bare_router(store)
+
+    # 第一次构建失败：不得置位 _bm25_built
+    router._build_bm25_index()
+    assert router._bm25_built is False, "构建失败不应置位 _bm25_built"
+    assert router._bm25_ready is False
+
+    # 故障恢复后重试成功：_bm25_built/_bm25_ready 置位，检索可用
+    store.fail = False
+    router._build_bm25_index()
+    assert router._bm25_built is True
+    assert router._bm25_ready is True
+    assert router._bm25_search("记忆"), "恢复后 BM25 应能正常检索"
+
+
+def test_bm25_lazy_build_retries_after_failure() -> None:
+    """【M1】懒构建路径（_bm25_search 内）失败后保留重试机会。
+
+    修复前 _bm25_search 懒路径先置位 _bm25_built 再构建 → 失败即永久降级。
+    """
+    store = FailingThenWorkingStore(
+        [{"node_id": "n1", "content": "记忆系统测试", "tau_value": 1.0}]
+    )
+    router = _make_bare_router(store)
+
+    # 懒构建失败：返回空但不置位 _bm25_built
+    assert router._bm25_search("记忆") == []
+    assert router._bm25_built is False, "懒构建失败不应置位 _bm25_built"
+
+    # 故障恢复（冷却窗口重置为 0）→ 懒构建重试成功
+    store.fail = False
+    router._bm25_last_attempt = 0.0  # 模拟冷却窗口已过
+    results = router._bm25_search("记忆")
+    assert router._bm25_ready is True
+    assert results, "懒构建重试后应能正常检索"
+
+
+class GrowingStore(FakeGraphLiteStore):
+    """语料从空到有（模拟空库部署后新数据累积写入）。"""
+
+    def __init__(self):
+        self.rows = []
+
+    def query_cypher(self, *args, **kwargs) -> list[dict]:
+        return self.rows
+
+
+def test_empty_corpus_not_terminal_rebuilds_after_data() -> None:
+    """【B-复审】空语料构建不置位 _bm25_built（非终态）→ 新数据写入后可重建。
+
+    修复前（M1-a）空语料置 _bm25_built=True 为终态 + 启动 prewarm_bm25()
+    空库预热置位 → 空库部署 BM25 进程内永久失效，即使语料已累积也不再重建。
+    """
+    store = GrowingStore()
+    router = _make_bare_router(store)
+
+    # 空库构建：不得置位 _bm25_built（保留冷却重试机会）
+    router._build_bm25_index()
+    assert router._bm25_built is False, "空语料不应置位 _bm25_built（非终态）"
+    assert router._bm25_ready is False
+
+    # 语料累积后重建成功：_bm25_built/_bm25_ready 置位，检索可用
+    store.rows = [{"node_id": "n1", "content": "记忆系统测试", "tau_value": 1.0}]
+    router._build_bm25_index()
+    assert router._bm25_built is True, "新数据写入后应能重建 BM25"
+    assert router._bm25_ready is True
+    assert router._bm25_search("记忆"), "重建后应能正常检索"
+
+
+def test_prewarm_empty_corpus_does_not_set_terminal() -> None:
+    """【B-复审】prewarm_bm25 空库预热不置位 _bm25_built（进程内不永久失效）。
+
+    修复前空库预热置 _bm25_built=True → 首个查询/后续写入永不触发重建。
+    """
+    router = QueryRouter.__new__(QueryRouter)
+    router.config = QueryRouterConfig()
+    router.graphlite_store = FakeGraphLiteStore([])
+    router._bm25_doc_ids = []
+    router._bm25_doc_contents = []
+    router._bm25_doc_tau = []
+    router._bm25_built = False
+    router._bm25_ready = False
+    router._bm25_last_attempt = 0.0
+
+    asyncio.run(router.prewarm_bm25())
+    assert router._bm25_built is False, "prewarm 空库不应置位 _bm25_built"
+    assert router._bm25_ready is False

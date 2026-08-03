@@ -17,9 +17,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -73,6 +75,7 @@ class QueryRouterConfig:
     bm25_b: float = 0.75  # BM25 b 参数
     top_k_fusion: int = 30  # 融合检索总 top-K
     max_bm25_corpus: int = 50000  # BM25 索引最大语料数
+    bm25_build_timeout: float = 30.0  # BM25 索引构建超时（秒），超时静默降级
 
 
 class QueryRouter:
@@ -190,7 +193,9 @@ class QueryRouter:
         self._bm25_doc_lens: np.ndarray = None  # (n_docs,) 每个文档的 term 数
         self._bm25_avgdl: float = 0.0  # 平均文档长度
         self._bm25_ready: bool = False  # BM25 索引是否就绪
-        self._bm25_built: bool = False  # 标记是否已尝试构建
+        self._bm25_built: bool = False  # 标记构建是否成功（仅成功路径置位）
+        self._bm25_last_attempt: float = 0.0  # 上次构建尝试时间（失败后冷却重试）
+        self._bm25_build_lock = threading.Lock()  # 【P1-2】BM25 构建锁（防并发构建竞态）
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -220,10 +225,42 @@ class QueryRouter:
     # ──────────────────────────────
 
     def _build_bm25_index(self) -> None:
-        """构建 BM25 检索索引。
+        """构建 BM25 检索索引（防并发构建竞态 + 空语料冷却重试）。
 
-        从 GraphLite Store 拉取所有 EpisodeNode 内容，使用 sklearn
-        TfidfVectorizer 计算 IDF，并预计算文档长度用于 BM25 评分。
+        【M1-a】改进（对比 P1-2 的阻塞锁）：
+          - 先无锁快速检查 _bm25_built/_bm25_ready：已构建/已就绪则直接返回
+          - try-acquire（非阻塞）：拿不到锁说明已有构建进行中（可能被 prewarm
+            超时遗留的 zombie 线程持有）→ 直接返回，不阻塞查询线程
+          - 持锁后二次检查：等锁期间另一线程可能已完成构建 → 杜绝并发双重构建
+        """
+        if getattr(self, "_bm25_built", False) or getattr(self, "_bm25_ready", False):
+            return
+        lock = getattr(self, "_bm25_build_lock", None)
+        if lock is None:
+            self._bm25_last_attempt = time.time()
+            self._build_bm25_index_core()
+            return
+        # 非阻塞 try-acquire：zombie 持锁时跳过本次构建，不卡住查询线程
+        if not lock.acquire(blocking=False):
+            logger.debug("BM25: build already in progress (or lock held), skipping")
+            return
+        try:
+            # 持锁后二次检查：等待期间另一线程可能已完成构建
+            if getattr(self, "_bm25_built", False) or getattr(self, "_bm25_ready", False):
+                return
+            self._bm25_last_attempt = time.time()
+            self._build_bm25_index_core()
+        finally:
+            lock.release()
+
+    def _build_bm25_index_core(self) -> None:
+        """BM25 索引构建核心逻辑（调用方需持有 _bm25_build_lock）。
+
+        从 GraphLite Store 拉取 EpisodeNode 内容（LIMIT 下推到数据库侧），
+        使用 sklearn TfidfVectorizer 计算 IDF，并预计算文档长度用于 BM25 评分。
+
+        【M1】_bm25_built 仅在成功路径置位：query_cypher 异常/空语料/
+        TfidfVectorizer 异常时保留重试机会，避免"失败一次即永久降级"。
         """
         if self.graphlite_store is None:
             logger.warning("BM25: graphlite_store unavailable, skipping index build")
@@ -234,7 +271,9 @@ class QueryRouter:
                 "MATCH (e:EpisodeNode) "
                 "RETURN e.id AS node_id, e.content AS content, "
                 "e.tau_initial AS tau_value "
-                "ORDER BY e.created_at DESC"
+                "ORDER BY e.created_at DESC "
+                "LIMIT $limit",  # 【P1-2】LIMIT 下推数据库侧，避免全库拉取 OOM
+                {"limit": self.config.max_bm25_corpus},
             )
         except Exception:
             logger.exception("BM25: failed to fetch corpus from GraphLite")
@@ -242,6 +281,9 @@ class QueryRouter:
 
         if not rows:
             logger.warning("BM25: empty corpus from GraphLite")
+            # 【B-复审】空语料非终态：不置位 _bm25_built/_bm25_ready，
+            # 由 _bm25_search 的冷却窗口（bm25_build_timeout）自然重试。
+            # 修复前（M1-a）空库 prewarm 置终态 → 语料累积后进程内永不重建。
             return
 
         self._bm25_doc_ids.clear()
@@ -270,6 +312,7 @@ class QueryRouter:
 
         if not corpus:
             logger.warning("BM25: no valid documents in corpus")
+            # 【B-复审】同空语料：无有效文档非终态，不置位 → 冷却窗口后重试
             return
 
         # 限制语料大小，防 OOM
@@ -303,7 +346,9 @@ class QueryRouter:
             self._bm25_idf = idf
             self._bm25_doc_lens = doc_lens
             self._bm25_avgdl = avgdl
+            # 【M1】成功路径末尾置位：失败（上方各 return/except）不置位，保留重试机会
             self._bm25_ready = True
+            self._bm25_built = True
             logger.info(
                 "BM25 index built",
                 num_docs=len(corpus),
@@ -312,6 +357,24 @@ class QueryRouter:
             )
         except Exception:
             logger.exception("BM25: TfidfVectorizer failed")
+
+    async def prewarm_bm25(self) -> None:
+        """异步预热 BM25 索引（启动时调用，不阻塞事件循环）。
+
+        - 构建放到线程池执行（asyncio.to_thread），避免阻塞事件循环
+        - 受 bm25_build_timeout 超时保护；超时/失败静默降级（_bm25_ready=False），
+          首个查询走延迟构建或直接返回空，不影响启动
+        """
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._build_bm25_index),
+                timeout=self.config.bm25_build_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("BM25: prewarm timed out after %.1fs, degrading silently",
+                           self.config.bm25_build_timeout)
+        except Exception:
+            logger.exception("BM25: prewarm failed, degrading silently")
 
     def _bm25_search(self, query: str, k: int = 20) -> list[dict]:
         """BM25 关键词检索。
@@ -326,9 +389,13 @@ class QueryRouter:
         Returns:
             [{"node_id", "content", "score", "tau_value", "level": "bm25"}, ...]
         """
+        # 【M1】懒构建：失败不置位 _bm25_built → 保留重试机会；
+        # 以 bm25_build_timeout 为冷却窗口，避免失败后每次检索都触发全量重建
         if not self._bm25_built:
-            self._bm25_built = True
-            self._build_bm25_index()
+            last_attempt = getattr(self, "_bm25_last_attempt", 0.0)
+            if (last_attempt == 0.0
+                    or time.time() - last_attempt >= self.config.bm25_build_timeout):
+                self._build_bm25_index()
         if not self._bm25_ready or self._bm25_vectorizer is None:
             logger.warning("BM25: index not ready")
             return []

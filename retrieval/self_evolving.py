@@ -130,7 +130,9 @@ class FailureLogger:
     def log(self, snapshot: RetrievalSnapshot) -> bool:
         """记录一次快照，返回是否需要触发诊断"""
         self.snapshots.append(snapshot)
-        poor = [s for s in self.snapshots if s.quality() < self._quality_threshold]
+        # 【H1】快照拷贝遍历：避免并发 retrieve 下 deque.append 后遍历时
+        # "deque mutated during iteration" RuntimeError
+        poor = [s for s in list(self.snapshots) if s.quality() < self._quality_threshold]
         if len(poor) >= self._min_snapshots:
             logger.warning("触发诊断: %d 次低质量检索 (共 %d 条快照)",
                            len(poor), len(self.snapshots))
@@ -138,14 +140,16 @@ class FailureLogger:
         return False
 
     def recent_poor(self, n: int = 5) -> list[RetrievalSnapshot]:
-        return [s for s in self.snapshots if s.quality() < self._quality_threshold][-n:]
+        return [s for s in list(self.snapshots) if s.quality() < self._quality_threshold][-n:]
 
     def state(self) -> dict:
-        good = sum(1 for s in self.snapshots if s.quality() >= self._quality_threshold)
-        poor = len(self.snapshots) - good
-        return {"total": len(self.snapshots), "good": good, "poor": poor,
-                "avg_quality": (sum(s.quality() for s in self.snapshots) /
-                                max(1, len(self.snapshots)))}
+        # 【H1】快照拷贝遍历：避免并发修改下迭代 RuntimeError
+        snapshots = list(self.snapshots)
+        good = sum(1 for s in snapshots if s.quality() >= self._quality_threshold)
+        poor = len(snapshots) - good
+        return {"total": len(snapshots), "good": good, "poor": poor,
+                "avg_quality": (sum(s.quality() for s in snapshots) /
+                                max(1, len(snapshots)))}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -344,15 +348,17 @@ class EvolutionGuard:
 
     def report_quality(self, quality: float):
         """报告当前配置下的检索质量，用于验证"""
-        # 始终更新历史中最后一个非回滚版本的质量
-        for v in reversed(self.history):
+        # 【H1】快照拷贝遍历：guard.history 可能在并发线程被 append/改写，
+        # 直接 reversed(self.history) 会触发 "list changed size during iteration"
+        history = list(self.history)
+        for v in reversed(history):
             if not v.reverted:
                 v.avg_quality_after = (
                     (v.avg_quality_after * 0.7) + (quality * 0.3)
                 )
                 break
         # 如果没有历史记录，创建初始版本
-        if not self.history:
+        if not history:
             self.history.append(ConfigVersion(
                 version=0,
                 params=deepcopy(self.params),
@@ -462,14 +468,24 @@ class SelfEvolvingRetrieval:
         self._vector_store: Optional[BaseVectorStore] = None
 
     def retrieve(self, query: str):
-        """执行检索 + 质量评估 + 自演化"""
+        """执行检索 + 质量评估 + 自演化（线程安全）。
+
+        【H1-a】锁粒度收窄：不再用方法级大锁包裹整个 _qr.retrieve
+        （FAISS + GraphLite + encoder 100-500ms，全部检索被串行化；
+        且 asyncio.wait_for 超时无法取消 to_thread 线程，超时后 zombie
+        线程仍持有大锁 → 后续请求阻塞等锁 → 默认池耗尽 → 永久楔死）。
+        改为：
+          1. 无锁调用底层 _qr.retrieve(query)（只读检索，不触碰共享状态）
+          2. 仅在短锁段内更新 _total_calls/logger/guard（共享状态变更段）
+        共享 QueryRouterConfig 的 setattr 在 GIL 下原子，检索读操作无需互斥。
+        """
         params_before = self.guard.current().snapshot()
         start = time.perf_counter()
 
-        # 应用当前演化参数
+        # 应用当前演化参数（GIL 下 setattr 原子；guard 变更在下方短锁段内完成）
         self._sync_params()
 
-        # 执行检索
+        # 无锁执行检索（读操作，可并发执行，不再串行化）
         try:
             raw = self._qr.retrieve(query)
         except Exception as e:
@@ -496,26 +512,29 @@ class SelfEvolvingRetrieval:
             degraded=len(results) == 0,
         )
 
-        # 日志 + 演化触发
-        self._total_calls += 1
-        needs_diagnosis = self.logger.log(snapshot)
+        # 【H1-a】短锁段：仅保护共享状态变更（_total_calls/logger/guard），
+        # 不包裹检索本身 → 并发检索不再串行化；锁持有时间微秒级
+        with self._lock:
+            # 日志 + 演化触发
+            self._total_calls += 1
+            needs_diagnosis = self.logger.log(snapshot)
 
-        # 报告质量给回滚守卫
-        self.guard.report_quality(snapshot.quality())
+            # 报告质量给回滚守卫
+            self.guard.report_quality(snapshot.quality())
 
-        # 检查回滚
-        reverted, reason = self.guard.check_revert()
-        if reverted:
-            self._sync_params()
-            logger.info("回滚生效，参数已重置")
+            # 检查回滚
+            reverted, reason = self.guard.check_revert()
+            if reverted:
+                self._sync_params()
+                logger.info("回滚生效，参数已重置")
 
-        # 仅在诊断周期检查停滞，而非每次 retrieve
-        if needs_diagnosis:
-            self.guard._explore_if_stagnant()
+            # 仅在诊断周期检查停滞，而非每次 retrieve
+            if needs_diagnosis:
+                self.guard._explore_if_stagnant()
 
-        # 触发诊断
-        if needs_diagnosis and (time.time() - self._last_diagnosis > 60):
-            self._evolve()
+            # 触发诊断
+            if needs_diagnosis and (time.time() - self._last_diagnosis > 60):
+                self._evolve()
 
         # 返回结果 + 演化元数据
         if isinstance(raw, dict):
@@ -562,9 +581,11 @@ class SelfEvolvingRetrieval:
                         result.confidence, len(result.suggested))
 
     def state(self) -> dict:
-        return {
-            "total_calls": self._total_calls,
-            "logger": self.logger.state(),
-            "guard": self.guard.state(),
-            "params": self.guard.current().snapshot(),
-        }
+        # 【H1】读侧同样加锁：避免与并发 retrieve 的写操作竞争
+        with self._lock:
+            return {
+                "total_calls": self._total_calls,
+                "logger": self.logger.state(),
+                "guard": self.guard.state(),
+                "params": self.guard.current().snapshot(),
+            }

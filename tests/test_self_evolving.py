@@ -194,3 +194,105 @@ class TestSelfEvolvingRetrieval:
         se.guard.apply({"weight_fusion_vector": 0.6})
         se._sync_params()
         assert se._qr.config.weight_fusion_vector == 0.6
+
+
+class TestSelfEvolvingRetrievalConcurrency:
+    """【H1】多线程并发 retrieve 回归测试
+
+    to_thread 改造后多请求在独立线程并发执行：若 retrieve() 不加锁，
+    _sync_params 的 setattr / _total_calls += 1 / deque、list 迭代中并发修改
+    会引发 RuntimeError（deque/list mutated during iteration）或计数丢失。
+    """
+
+    def test_concurrent_retrieve_no_race(self):
+        import threading
+
+        class SlowRouter(MockRouter):
+            def retrieve(self, q):
+                time.sleep(0.002)  # 拉大并发交错窗口
+                return [{"content": f"result_{q}", "score": 0.7}]
+
+        se = SelfEvolvingRetrieval(SlowRouter())
+        errors: list[Exception] = []
+        N_THREADS, N_CALLS = 10, 20
+
+        def worker():
+            try:
+                for i in range(N_CALLS):
+                    r = se.retrieve(f"w{i}")
+                    assert isinstance(r, list)
+                    assert r, "retrieve 应返回非空结果"
+            except Exception as e:  # pragma: no cover - 失败时记录
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(N_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"并发 retrieve 抛异常: {errors}"
+        # 计数正确：无丢失更新
+        assert se.state()["total_calls"] == N_THREADS * N_CALLS
+
+    def test_concurrent_retrieve_low_quality_evolves_safely(self):
+        """低质量并发检索触发演化路径（guard.apply/回滚/探索）也不抛异常"""
+        import threading
+
+        class BadRouter(MockRouter):
+            def retrieve(self, q):
+                time.sleep(0.001)
+                return []  # 空结果 → 低质量 → 触发诊断/演化
+
+        se = SelfEvolvingRetrieval(BadRouter(), evolve_interval=2, quality_threshold=0.5)
+        errors: list[Exception] = []
+
+        def worker():
+            try:
+                for i in range(10):
+                    se.retrieve(f"q{i}")
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"并发演化路径抛异常: {errors}"
+        assert se.state()["total_calls"] == 100
+
+    def test_concurrent_retrieve_not_serialized(self):
+        """【H1-a】锁粒度收窄：并发 retrieve 不再被方法级大锁串行化。
+
+        修复前方法级大锁包裹整个 _qr.retrieve（含 FAISS+GraphLite+encoder，
+        100-500ms）：10 并发 × 100ms 检索 → 串行耗时 ~1s，且超时 zombie 线程
+        持锁会楔死后续请求。修复后仅锁共享状态变更段，检索读操作可并行。
+        """
+        import threading
+        import time as _time
+
+        class SlowRouter(MockRouter):
+            def retrieve(self, q):
+                _time.sleep(0.1)  # 模拟 100ms 检索
+                return [{"content": f"result_{q}", "score": 0.7}]
+
+        se = SelfEvolvingRetrieval(SlowRouter())
+        N_THREADS = 10
+
+        def worker():
+            se.retrieve("q")
+
+        start = _time.monotonic()
+        threads = [threading.Thread(target=worker) for _ in range(N_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = _time.monotonic() - start
+
+        # 串行化时 ~1.0s；并行应远低于此（0.6s 阈值留足 CI 余量）
+        assert elapsed < 0.6, f"并发检索被串行化: {elapsed:.2f}s (期望 < 0.6s)"
+        # 锁内更新计数正确（无丢失更新）
+        assert se.state()["total_calls"] == N_THREADS

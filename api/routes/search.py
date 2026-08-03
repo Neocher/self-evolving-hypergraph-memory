@@ -2,6 +2,8 @@
 检索路由 (retrieve, vector, cypher, namespace, sessions, working-memory)
 """
 
+import asyncio
+
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     _result_cache, _result_cache_lock, _result_cache_max,
@@ -12,6 +14,15 @@ from api.routes._deps import (
     SearchVectorRequest, SearchVectorResult, SearchVectorResponse,
     SessionMemoryCreate, SessionMemoryItem, SessionMemoryListResponse,
 )
+
+# 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
+# 超时返回空结果而非无限挂起 + 线程泄漏（与写路径超时对称）
+_RETRIEVE_TIMEOUT = 15.0
+
+# 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
+# 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
+# 超时即跳过该降级分支（短于主检索超时，兜底只做尽力而为的补充）。
+_DEGRADE_TIMEOUT = 10.0
 
 
 @router.post("/memories/retrieve", summary="粗到精三级检索（带降级）")
@@ -38,7 +49,17 @@ async def retrieve(
         raise HTTPException(status_code=503, detail="Query router not available")
 
     try:
-        results_raw = deps.query_router.retrieve(req.query)
+        # 【P1-3】全同步检索链路（FAISS/sklearn/GraphLite）移到线程池，避免阻塞事件循环
+        # 【H2】外层 wait_for：GraphLite/FAISS 挂起时超时返回空结果（降级），不无限挂起
+        results_raw = await asyncio.wait_for(
+            asyncio.to_thread(deps.query_router.retrieve, req.query),
+            timeout=_RETRIEVE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Retrieval timed out after %.1fs, returning empty results",
+                       _RETRIEVE_TIMEOUT)
+        results_raw = []
+        degraded = True
     except Exception as exc:
         record_request("POST", "/memories/retrieve", "500", _now() - start)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -59,7 +80,17 @@ async def retrieve(
                 cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                           "AND (e.quarantine IS NULL OR e.quarantine = false) "
                           f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
-                fallback_rows = deps.graphlite_store.query_cypher(cypher, params)
+                # 【H2】【H2-a】Cypher 兜底移入线程池 + 套 wait_for：
+                # GraphLite 卡死时超时即跳过兜底，不再无限挂起
+                try:
+                    fallback_rows = await asyncio.wait_for(
+                        asyncio.to_thread(deps.graphlite_store.query_cypher, cypher, params),
+                        timeout=_DEGRADE_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Cypher fallback timed out after %.1fs, skipping",
+                                   _DEGRADE_TIMEOUT)
+                    fallback_rows = []
                 degraded = True
                 for row in fallback_rows:
                     if isinstance(row, (list, tuple)):
@@ -80,7 +111,20 @@ async def retrieve(
 
     # 【Defense】隔离节点排除
     if results_raw and deps.quarantine_store is not None:
-        quarantined_ids = deps.quarantine_store.get_quarantined_ids()
+        # 【H2】【H2-a】隔离 ID 拉取移入线程池 + 套 wait_for：GraphLite 卡死时
+        # 超时跳过隔离过滤（结果可能多带隔离节点，但不挂起读路径）
+        try:
+            quarantined_ids = await asyncio.wait_for(
+                asyncio.to_thread(deps.quarantine_store.get_quarantined_ids),
+                timeout=_DEGRADE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Quarantine ID fetch timed out after %.1fs, skipping filter",
+                           _DEGRADE_TIMEOUT)
+            quarantined_ids = set()
+        except Exception:
+            logger.exception("Quarantine ID fetch failed")
+            quarantined_ids = set()
         if quarantined_ids:
             before = len(results_raw)
             results_raw = [
@@ -98,12 +142,21 @@ async def retrieve(
         ns_set: set[str] | None = None
         if req.namespace and deps.graphlite_store is not None:
             try:
-                ns_rows = deps.graphlite_store.query_cypher(
-                    "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
-                    "RETURN e.id",
-                    {"ns": req.namespace}
+                # 【H2】【H2-a】命名空间预取移入线程池 + 套 wait_for：
+                # GraphLite 卡死时超时跳过命名空间过滤，不挂起
+                ns_rows = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        deps.graphlite_store.query_cypher,
+                        "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                        "RETURN e.id",
+                        {"ns": req.namespace},
+                    ),
+                    timeout=_DEGRADE_TIMEOUT,
                 )
                 ns_set = {row[0] for row in ns_rows} if ns_rows else set()
+            except asyncio.TimeoutError:
+                logger.warning("Namespace prefetch timed out after %.1fs, skipping filter",
+                               _DEGRADE_TIMEOUT)
             except Exception:
                 logger.warning("Namespace query failed, skipping namespace filter")
         for r in results_raw:

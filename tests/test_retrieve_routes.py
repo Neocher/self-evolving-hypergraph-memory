@@ -6,6 +6,8 @@
 运行: python -m pytest tests/test_retrieve_routes.py -v
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
@@ -173,6 +175,38 @@ class TestDegradationScenarios:
         with _result_cache_lock:
             _result_cache["test:5"] = "cached_result"
         assert _result_cache.get("test:5") == "cached_result"
+
+
+class TestDegradePathTimeout:
+    """【H2-a】降级分支超时保护：Cypher 兜底不再无限挂起（超时即跳过）"""
+
+    def test_cypher_fallback_timeout_skips_and_returns_empty(self, client, mock_services):
+        """GraphLite 卡死时：主检索空 → Cypher 兜底超时 → 跳过兜底返回空，而非挂起。
+
+        修复前兜底 to_thread 无 wait_for：若挂的是 GraphLite，主检索超时后
+        兜底查询再次无限挂起（H2 超时保护被兜底路径击穿）→ 兜底结果会被返回。
+        修复后超时即跳过兜底分支 → 结果为 []。
+        """
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = []  # 主检索空 → 触发 Cypher 兜底
+        mock_services.query_router = mock_qr
+        mock_services.quarantine_store = None  # 隔离过滤不参与本用例
+
+        def slow_cypher(*args, **kwargs):
+            time.sleep(0.3)  # 模拟 GraphLite 挂死（远超兜底超时 0.1s）
+            return [("n1", "content 1")]
+
+        mock_services.graphlite_store.query_cypher = MagicMock(side_effect=slow_cypher)
+
+        with patch("api.routes.search._DEGRADE_TIMEOUT", 0.1):
+            # 唯一 query 避免命中其他用例写入的 _result_cache 缓存键
+            resp = client.post("/memories/retrieve", json={
+                "query": "h2a-timeout-probe-query",
+                "top_k": 5,
+            })
+
+        assert resp.status_code == 200
+        assert resp.json()["results"] == [], "兜底超时应跳过并返回空结果"
 
 
 class TestEmbedQueue:
