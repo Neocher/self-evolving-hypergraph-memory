@@ -55,6 +55,8 @@ class DreamReport:
     calibrator_flagged: int = 0
     calibrator_high_consolidation: int = 0
     calibrator_tracked: int = 0
+    # 【H5】PERSIST 阶段部分完成标记（半写状态，下次梦境可修复）
+    degraded: bool = False
 
 
 # ─── P2 SSM 梦境深度升级 ──────────────────────────────
@@ -279,6 +281,7 @@ class DreamPipeline:
         # Step 7: PERSIST — 将结果写回GraphLite或候选存储
         persist_created = 0
         persist_deleted = 0
+        persist_degraded = False  # 【H5】默认正常，PERSIST 部分失败时置 True
         all_removed_ids: list[str] = []  # FAISS 增量更新用
         
         # 先计算统计信息（用于候选存储和 report）
@@ -310,17 +313,27 @@ class DreamPipeline:
             logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
         elif graphlite_store is not None:
             # 直接模式（原行为）：直接修改生产数据
-            persist_deleted, pruned_ids = await asyncio.to_thread(
-                self._persist_prune, graphlite_store, prune_ops)
-            all_removed_ids.extend(pruned_ids)
-            persist_created = await asyncio.to_thread(
-                self._persist_communities, graphlite_store, communities, dream_id)
-            all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-            await asyncio.to_thread(self._persist_merge, graphlite_store, merge_ops)
-            await asyncio.to_thread(
-                self._persist_hyperedges, graphlite_store, communities, dream_id)
-            logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup",
-                        dream_id, persist_created, persist_deleted, len(all_removed_ids))
+            # 【H5】GraphLite 无跨语句事务（TransactionManager 的 rollback 仅做
+            # tx_tag 清理，无法撤销裸 GQL 的 CREATE/DELETE），故不做伪事务包装；
+            # 改为：任一步骤抛异常 → 打 degraded 标记，下次梦境通过 upsert 修复
+            persist_degraded = False
+            try:
+                persist_deleted, pruned_ids = await asyncio.to_thread(
+                    self._persist_prune, graphlite_store, prune_ops)
+                all_removed_ids.extend(pruned_ids)
+                persist_created = await asyncio.to_thread(
+                    self._persist_communities, graphlite_store, communities, dream_id)
+                all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
+                await asyncio.to_thread(self._persist_merge, graphlite_store, merge_ops)
+                await asyncio.to_thread(
+                    self._persist_hyperedges, graphlite_store, communities, dream_id)
+            except Exception as persist_exc:
+                persist_degraded = True
+                logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
+                             dream_id, persist_exc)
+            logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup%s",
+                        dream_id, persist_created, persist_deleted, len(all_removed_ids),
+                        " [DEGRADED]" if persist_degraded else "")
         stats["created"] += persist_created
 
         # Step 8: AUDIT — 写入溯源链
@@ -357,6 +370,7 @@ class DreamPipeline:
             calibrator_flagged=calibrator_flagged,
             calibrator_high_consolidation=calibrator_high,
             calibrator_tracked=calibrator_tracked,
+            degraded=persist_degraded,
         )
 
     # ─── Step 1: GATHER ───────────────────────────────────

@@ -251,9 +251,36 @@ def _init_services() -> Services:
         pipeline_fn = None
         if svc.dream_pipeline is not None and hasattr(svc.dream_pipeline, "run"):
             pipeline_fn = svc.dream_pipeline.run
+
+        def _persist_dream_state(state: dict) -> None:
+            """【H4】将调度器状态写入 GraphLite SystemNode（由调度器在触发/完成时回调）。"""
+            if svc.graphlite_store is None:
+                return
+            try:
+                import json as _json
+                state_json = _json.dumps(state)
+                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT/SET
+                if svc.graphlite_store.execute_cypher(
+                    "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) RETURN s"
+                ):
+                    svc.graphlite_store.execute_cypher(
+                        "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) "
+                        "SET s.payload = $payload",
+                        {"payload": state_json},
+                    )
+                else:
+                    svc.graphlite_store.execute_cypher(
+                        "INSERT (s:SystemNode {id: 'dream_scheduler_state', "
+                        "payload: $payload})",
+                        {"payload": state_json},
+                    )
+            except Exception:
+                logger.warning("Dream scheduler state persist failed (non-fatal)")
+
         svc.dream_scheduler = DreamScheduler(
             config=dream_cfg,
             pipeline_fn=pipeline_fn,
+            state_persist_fn=_persist_dream_state,
         )
         # 【FIX】注入GraphLite引用供梦境调度器拉取数据
         svc.dream_scheduler._graphlite_store = svc.graphlite_store
@@ -420,6 +447,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception as e:
             logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
 
+        # 【P1-2】启动异步预热 BM25 索引（超时保护；失败静默降级，不阻塞启动）
+        qr = svc.query_router
+        # SelfEvolvingRetrieval 包装时取内层 QueryRouter（_qr 为私有包装目标）
+        inner_qr = getattr(qr, "_qr", qr) if qr is not None else None
+        if inner_qr is not None and hasattr(inner_qr, "prewarm_bm25"):
+            try:
+                await inner_qr.prewarm_bm25()
+                logger.info("Startup: BM25 prewarm complete")
+            except Exception as e:
+                logger.warning("Startup BM25 prewarm skipped (non-fatal): %s", e)
+
     async def _cleanup_dream_candidates() -> None:
         """启动时清理过期的梦境候选文件（保留最近50个）。"""
         try:
@@ -462,6 +500,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 if payload_str:
                     state = _json.loads(payload_str)
                     svc.dream_scheduler.load_state(state)
+                    # 【H5】重启 reconcile：若上次梦境运行中（崩溃中断），标记 interrupted 并允许下次触发
+                    svc.dream_scheduler.reconcile_after_restart()
                     logger.info("Dream scheduler state restored: %s", {
                         k: v for k, v in state.items() if k != "saved_at"})
         except Exception as e:
@@ -493,28 +533,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     triggered = await svc.dream_scheduler.check_and_trigger()
                     if triggered:
                         logger.info("Dream triggered by poll loop")
-                        # 【P1-3】梦境完成后保存状态
-                        try:
-                            if svc.graphlite_store is not None:
-                                import json as _json
-                                state_json = _json.dumps(svc.dream_scheduler.save_state())
-                                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT/SET
-                                if svc.graphlite_store.execute_cypher(
-                                    "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) RETURN s"
-                                ):
-                                    svc.graphlite_store.execute_cypher(
-                                        "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) "
-                                        "SET s.payload = $payload",
-                                        {"payload": state_json},
-                                    )
-                                else:
-                                    svc.graphlite_store.execute_cypher(
-                                        "INSERT (s:SystemNode {id: 'dream_scheduler_state', "
-                                        "payload: $payload})",
-                                        {"payload": state_json},
-                                    )
-                        except Exception:
-                            pass
+                        # 【H4】状态保存已移至调度器内部（_run_dream finally 保存最新状态），
+                        # 此处不再立即保存"梦境运行前"状态
                     # 自动 apply 梦境候选
                     if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
                         try:

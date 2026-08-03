@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
@@ -56,15 +57,19 @@ class DreamScheduler:
         self,
         config: Optional[DreamSchedulerConfig] = None,
         pipeline_fn: Optional[Callable[[], None]] = None,
+        state_persist_fn: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self.config = config or DreamSchedulerConfig()
         self.pipeline_fn = pipeline_fn
+        self._state_persist_fn = state_persist_fn  # 【H4】状态持久化回调（由 app.py 注入）
         self._last_run_time: float = 0.0
         self._is_running: bool = False
+        self._current_dream_id: Optional[str] = None  # 【H5】当前梦境 ID（崩溃后可 reconcile）
         self._new_node_count: int = 0
         self._last_activity_time: float = time.time()
         self._lock = asyncio.Lock()
         self._dream_run_count: int = 0  # 【FIX】梦境执行计数器
+        self._dream_fail_count: int = 0  # 【H3】梦境失败/超时统计
         # FAISS 增量更新引用（由 app.py 注入）
         self._faiss_index = None
         self._faiss_id_map: dict = {}
@@ -151,7 +156,10 @@ class DreamScheduler:
 
             if should_run:
                 self._is_running = True
+                self._current_dream_id = str(uuid.uuid4())  # 【H5】追踪本次梦境
                 asyncio.create_task(self._run_dream(trigger_mode))
+                # 【H5】触发即持久化 is_running=true + dream_id（崩溃后可检测中断梦境）
+                self._persist_state()
                 return True
         return False
 
@@ -161,7 +169,10 @@ class DreamScheduler:
             if self._is_running:
                 return False
             self._is_running = True
+            self._current_dream_id = str(uuid.uuid4())  # 【H5】追踪本次梦境
             asyncio.create_task(self._run_dream(TriggerMode.EXPLICIT))
+            # 【H5】显式触发同样持久化运行状态
+            self._persist_state()
             return True
 
     async def _run_dream(self, trigger_mode: Optional[TriggerMode]) -> None:
@@ -228,12 +239,27 @@ class DreamScheduler:
                 
                 # 【FIX】正确传递nodes, connections, trigger_mode, graphlite_store, candidate_store
                 candidate_store = getattr(self, '_candidate_store', None)
-                report = await self.pipeline_fn(
-                    nodes, connections,
-                    trigger_mode.value if trigger_mode else "idle",
-                    graphlite_store=self._graphlite_store,
-                    candidate_store=candidate_store,
-                )
+                graphlite_store = getattr(self, '_graphlite_store', None)
+                # 【H3】max_dream_duration 强制：超时中止梦境并计入失败统计
+                try:
+                    report = await asyncio.wait_for(
+                        self.pipeline_fn(
+                            nodes, connections,
+                            trigger_mode.value if trigger_mode else "idle",
+                            graphlite_store=graphlite_store,
+                            candidate_store=candidate_store,
+                        ),
+                        timeout=self.config.max_dream_duration_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    self._dream_fail_count += 1
+                    logger.error(
+                        "Dream %s timed out after %d s (max_dream_duration_seconds=%d); counted as failed",
+                        self._current_dream_id,
+                        self.config.max_dream_duration_seconds,
+                        self.config.max_dream_duration_seconds,
+                    )
+                    return
 
                 # FAISS 增量更新：移除 PRUNE/RESOLVE 中删除的节点
                 if report and hasattr(report, "pruned_node_ids"):
@@ -269,9 +295,14 @@ class DreamScheduler:
                 except Exception:
                     logger.exception("Dream auto-apply failed (non-fatal)")
         except Exception:
+            self._dream_fail_count += 1
             logger.exception("Dream pipeline failed")
         finally:
             self._is_running = False
+            self._current_dream_id = None  # 【H5】梦境结束，清空运行中标记
+            # 【H4】完成/失败/超时后保存最新状态（含更新后的计数），
+            # 显式触发路径同样走此保存
+            self._persist_state()
 
     def compute_priority(
         self,
@@ -312,6 +343,8 @@ class DreamScheduler:
     def force_stop(self) -> None:
         """强制停止当前梦境（设置为空闲状态）"""
         self._is_running = False
+        self._current_dream_id = None  # 【H5】清空运行中标记
+        self._persist_state()
         logger.info("Dream pipeline force-stopped")
 
     @property
@@ -320,14 +353,44 @@ class DreamScheduler:
 
     # ─── 状态持久化 (P1-3) ──────────────────────────────────
 
+    def _persist_state(self) -> None:
+        """【H4】将最新状态写入持久层（回调由 app.py 注入，写 GraphLite SystemNode）。"""
+        if self._state_persist_fn is not None:
+            try:
+                self._state_persist_fn(self.save_state())
+            except Exception:
+                logger.exception("Dream scheduler state persist failed")
+
+    def reconcile_after_restart(self) -> bool:
+        """【H5】重启恢复：若上次状态标记梦境运行中（is_running=true 且无完成记录），
+        标记为 interrupted 并允许下次触发。
+
+        Returns:
+            True 如果检测到并标记了中断的梦境。
+        """
+        if self._is_running:
+            logger.warning(
+                "Dream scheduler: previous dream %s interrupted (no completion record); "
+                "marked interrupted, next trigger allowed",
+                self._current_dream_id or "unknown",
+            )
+            self._is_running = False
+            self._current_dream_id = None
+            self._persist_state()
+            return True
+        return False
+
     def save_state(self) -> dict:
         """导出调度器运行时状态（供持久化到 GraphLite SystemNode）。"""
         return {
             "last_run_time": self._last_run_time,
             "dream_run_count": self._dream_run_count,
+            "dream_fail_count": self._dream_fail_count,
             "new_node_count": self._new_node_count,
             "unresolved_conflict_count": self._unresolved_conflict_count,
             "last_activity_time": self._last_activity_time,
+            "is_running": self._is_running,
+            "current_dream_id": self._current_dream_id,
             "saved_at": time.time(),
         }
 
@@ -335,6 +398,9 @@ class DreamScheduler:
         """从持久化状态恢复调度器运行时状态。"""
         self._last_run_time = state.get("last_run_time", 0.0)
         self._dream_run_count = state.get("dream_run_count", 0)
+        self._dream_fail_count = state.get("dream_fail_count", 0)
         self._new_node_count = state.get("new_node_count", 0)
         self._unresolved_conflict_count = state.get("unresolved_conflict_count", 0)
         self._last_activity_time = state.get("last_activity_time", time.time())
+        self._is_running = bool(state.get("is_running", False))
+        self._current_dream_id = state.get("current_dream_id") or None
