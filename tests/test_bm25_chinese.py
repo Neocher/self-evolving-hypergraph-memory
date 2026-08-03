@@ -252,3 +252,84 @@ def test_prewarm_empty_corpus_does_not_set_terminal() -> None:
     asyncio.run(router.prewarm_bm25())
     assert router._bm25_built is False, "prewarm 空库不应置位 _bm25_built"
     assert router._bm25_ready is False
+
+
+def test_bm25_retry_cooldown_gates_rebuild() -> None:
+    """【遗留项】冷却窗口（bm25_retry_cooldown）生效：冷却期内不重建，过期后重建。
+
+    验证 _bm25_search 懒构建路径受 _bm25_last_attempt 冷却门控：
+    - 构建失败后 _bm25_last_attempt 置位 → 冷却期内重复检索不触发全量重建
+    - 冷却窗口过期（或 last_attempt 重置为 0）→ 触发重建
+    """
+    calls = {"build": 0}
+    store = GrowingStore()
+    router = _make_bare_router(store)
+    router.config = QueryRouterConfig()
+    router.config.bm25_retry_cooldown = 60.0  # 显式冷却窗口 60s
+
+    orig_core = router._build_bm25_index_core
+
+    def counting_core():
+        calls["build"] += 1
+        orig_core()
+
+    router._build_bm25_index_core = counting_core  # type: ignore[method-assign]
+
+    # 空库首次构建（失败，不置位）
+    router._bm25_search("记忆")
+    assert calls["build"] == 1
+    assert router._bm25_built is False
+
+    # 冷却期内（_bm25_last_attempt 刚置位）再次检索 → 不重建
+    router._bm25_search("记忆")
+    assert calls["build"] == 1, "冷却期内不应重复触发重建"
+
+    # 冷却窗口过期 → 重建
+    router._bm25_last_attempt = 0.0
+    router._bm25_search("记忆")
+    assert calls["build"] == 2, "冷却窗口过期后应触发重建"
+
+
+def test_bm25_empty_corpus_log_noise_reduced() -> None:
+    """【遗留项】空语料日志降噪：进程内首次 warning，重复触发只打 debug。
+
+    修复前空库每次 _build_bm25_index_core 都 logger.warning
+    （冷却窗口内每 30s 刷一次），现改为首次 warning + 后续 debug。
+    """
+    import logging
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = lambda r: records.append(r)  # type: ignore[method-assign]
+
+    logger = logging.getLogger("retrieval.query_router")
+    old_level = logger.level
+    old_handlers = list(logger.handlers)
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        store = GrowingStore()
+        router = _make_bare_router(store)
+        # 空库构建两次：第一次 warning，第二次 debug
+        router._build_bm25_index()
+        router._build_bm25_index()
+
+        empty_msgs = [r.getMessage() for r in records if "empty corpus" in r.getMessage()]
+        warnings = [m for m in empty_msgs if "corpus" in m]
+        # 只有首次是 WARNING 级别；后续为 DEBUG
+        warn_count = sum(
+            1 for r in records
+            if "empty corpus" in r.getMessage() and r.levelno == logging.WARNING
+        )
+        debug_count = sum(
+            1 for r in records
+            if "empty corpus" in r.getMessage() and r.levelno == logging.DEBUG
+        )
+        assert warn_count == 1, f"空语料 warning 应只有 1 次（进程内首次），实际 {warn_count}"
+        assert debug_count >= 1, "后续空语料应打 debug 降噪"
+    finally:
+        logger.setLevel(old_level)
+        for h in old_handlers:
+            logger.addHandler(h)
+        logger.removeHandler(handler)
+

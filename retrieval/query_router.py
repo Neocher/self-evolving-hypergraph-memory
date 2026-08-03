@@ -78,6 +78,7 @@ class QueryRouterConfig:
     top_k_fusion: int = 30  # 融合检索总 top-K
     max_bm25_corpus: int = 50000  # BM25 索引最大语料数
     bm25_build_timeout: float = 30.0  # BM25 索引构建超时（秒），超时静默降级
+    bm25_retry_cooldown: float = 30.0  # BM25 构建失败后重试冷却窗口（秒），避免失败后每次检索都全量重建
 
 
 class QueryRouter:
@@ -282,10 +283,15 @@ class QueryRouter:
             return
 
         if not rows:
-            logger.warning("BM25: empty corpus from GraphLite")
             # 【B-复审】空语料非终态：不置位 _bm25_built/_bm25_ready，
-            # 由 _bm25_search 的冷却窗口（bm25_build_timeout）自然重试。
-            # 修复前（M1-a）空库 prewarm 置终态 → 语料累积后进程内永不重建。
+            # 由 _bm25_search 的冷却窗口（bm25_retry_cooldown）自然重试。
+            # 【日志降噪】空库是启动期/无数据期的正常状态：进程内首次 warning
+            # 提示一次（_bm25_empty_warned 标志），后续只打 debug，避免刷屏。
+            if not getattr(self, "_bm25_empty_warned", False):
+                self._bm25_empty_warned = True
+                logger.warning("BM25: empty corpus from GraphLite")
+            else:
+                logger.debug("BM25: empty corpus from GraphLite (will retry after cooldown)")
             return
 
         self._bm25_doc_ids.clear()
@@ -313,8 +319,13 @@ class QueryRouter:
             corpus.append(content)
 
         if not corpus:
-            logger.warning("BM25: no valid documents in corpus")
             # 【B-复审】同空语料：无有效文档非终态，不置位 → 冷却窗口后重试
+            # 【日志降噪】首次 warning 提示（_bm25_empty_warned），后续 debug
+            if not getattr(self, "_bm25_empty_warned", False):
+                self._bm25_empty_warned = True
+                logger.warning("BM25: no valid documents in corpus")
+            else:
+                logger.debug("BM25: no valid documents in corpus (will retry after cooldown)")
             return
 
         # 限制语料大小，防 OOM
@@ -392,14 +403,15 @@ class QueryRouter:
             [{"node_id", "content", "score", "tau_value", "level": "bm25"}, ...]
         """
         # 【M1】懒构建：失败不置位 _bm25_built → 保留重试机会；
-        # 以 bm25_build_timeout 为冷却窗口，避免失败后每次检索都触发全量重建
+        # 以 bm25_retry_cooldown 为冷却窗口，避免失败后每次检索都触发全量重建
         if not self._bm25_built:
             last_attempt = getattr(self, "_bm25_last_attempt", 0.0)
             if (last_attempt == 0.0
-                    or time.time() - last_attempt >= self.config.bm25_build_timeout):
+                    or time.time() - last_attempt >= self.config.bm25_retry_cooldown):
                 self._build_bm25_index()
         if not self._bm25_ready or self._bm25_vectorizer is None:
-            logger.warning("BM25: index not ready")
+            # 【日志降噪】索引未就绪（空库/构建中）是正常状态，debug 即可
+            logger.debug("BM25: index not ready")
             return []
 
         cfg = self.config
