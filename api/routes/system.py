@@ -300,7 +300,7 @@ async def rebuild_index(
                 try:
                     deps.graphlite_store.query_cypher(
                         "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                        "CREATE (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
+                        "INSERT (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
                         {"aid": node_ids[i], "bid": nb_node_id, "w": round(similarity, 4)}
                     )
                     hebbian_count += 1

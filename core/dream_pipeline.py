@@ -1261,11 +1261,11 @@ Text:
                     try:
                         graphlite_store.query_cypher(
                             "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: $eid}) "
-                            "CREATE (h)-[:HYPEREDGE_MEMBER]->(e)",
+                            "INSERT (h)-[:HYPEREDGE_MEMBER]->(e)",
                             {"hid": hyperedge_id, "eid": member_id}
                         )
                     except Exception:
-                        logger.warning("Failed to CREATE HYPEREDGE_MEMBER edge", exc_info=True)
+                        logger.warning("Failed to INSERT HYPEREDGE_MEMBER edge", exc_info=True)
                 created += 1
             except Exception as e:
                 logger.warning("Hyperedge persist failed: %s", e)

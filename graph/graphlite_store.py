@@ -1,5 +1,6 @@
 """GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器（当前图引擎）。"""
 import json, shutil, os, time, threading, uuid, sys, tempfile
+import numpy as np
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Any
@@ -655,6 +656,10 @@ class GraphLiteStore:
                         result = result.replace(f"${k}", f"'{{b64}}{b64}'")
             elif isinstance(v, (int, float)):
                 result = result.replace(f"${k}", str(v))
+            elif isinstance(v, (np.integer, np.floating)):
+                # numpy 标量（如 FAISS 搜索返回的 np.float32）不是 int/float 实例，
+                # 直接 str() 会带类型前缀；统一转 Python 标量
+                result = result.replace(f"${k}", str(v.item()))
             elif v is None:
                 result = result.replace(f"${k}", "NULL")
         return result

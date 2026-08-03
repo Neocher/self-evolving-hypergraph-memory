@@ -154,12 +154,13 @@ class HyperedgeManager:
             "source_timestamp": edge.source_timestamp,
             "supersession_of": edge.supersession_of,
         })
-        self.store.query_cypher(
-            "UNWIND $member_ids AS mid "
-            "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: mid}) "
-            "CREATE (h)-[:HYPEREDGE_MEMBER]->(e)",
-            {"hid": edge.id, "member_ids": edge.member_ids},
-        )
+        # GraphLite 不支持 UNWIND：改为循环逐条 INSERT（官方 GQL 语法）
+        for mid in edge.member_ids:
+            self.store.query_cypher(
+                "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: $eid}) "
+                "INSERT (h)-[:HYPEREDGE_MEMBER]->(e)",
+                {"hid": edge.id, "eid": mid},
+            )
 
     def get_hyperedges_by_node(self, node_id: str) -> List[Hyperedge]:
         """查询包含指定节点的所有超边。"""
