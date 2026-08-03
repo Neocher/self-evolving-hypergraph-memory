@@ -598,32 +598,16 @@ class OntologyValidator:
     # ─── Phase 2: GraphLite 本体图同步 + 拓扑验证 ─────────────────────
 
     def _ensure_ontology_schema(self) -> None:
-        """确保 GraphLite 中存在本体论节点/边表（幂等）。"""
+        """GraphLite schemaless 引擎无需预建节点/边表，本方法为 no-op。
+
+        Kuzu 遗留的 CREATE NODE TABLE / CREATE REL TABLE 语法在 GraphLite
+        下会 QUERY_ERROR（每次启动刷 WARNING，且让 ontology 校验静默失效）。
+        GraphLite 中直接 INSERT 节点/关系即隐式创建 label，MATCH 不存在的
+        label 返回空集而非报错（已实测验证），故保留空实现以兼容调用方。
+        """
         if self.graphlite is None:
             return
-        try:
-            self.graphlite.execute_cypher(
-                "CREATE NODE TABLE IF NOT EXISTS OntologyType ("
-                "name STRING, category STRING, PRIMARY KEY (name))",
-                {},
-            )
-            self.graphlite.execute_cypher(
-                "CREATE NODE TABLE IF NOT EXISTS OntologyEntity ("
-                "name STRING, type STRING, category STRING, PRIMARY KEY (name))",
-                {},
-            )
-            self.graphlite.execute_cypher(
-                "CREATE REL TABLE IF NOT EXISTS IS_A "
-                "(FROM OntologyEntity TO OntologyType)",
-                {},
-            )
-            self.graphlite.execute_cypher(
-                "CREATE REL TABLE IF NOT EXISTS RELATES_TO "
-                "(FROM OntologyEntity TO OntologyEntity, relation STRING)",
-                {},
-            )
-        except Exception as e:
-            logger.warning("Failed to create ontology schema: %s", e)
+        # GraphLite schemaless：无需 CREATE NODE TABLE / CREATE REL TABLE
 
     def sync_entity_types_to_graphlite(self) -> int:
         """同步 ENTITY_TYPE_MAP 到 GraphLite，创建节类型/实体节点 + IS_A 边。
