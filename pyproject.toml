@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "5.11.1"
+version = "5.20.1"
 description = "SHM — 自演化超图记忆系统 (Self-evolving Hypergraph Memory)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,7 +22,12 @@ classifiers = [
 
 requires-python = ">=3.10"
 dependencies = [
-    "ryugraph>=25.9",
+    # ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) 不在 PyPI:
+    #   git clone https://github.com/GraphLite-AI/GraphLite ~/GraphLite
+    #   cd ~/GraphLite && cargo build --release -p graphlite-ffi
+    #   export GRAPHLITE_BINDINGS=~/GraphLite/bindings/python
+    #   export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
+    #   详见 README「Installation」章节。
     "faiss-cpu>=1.7.4",
     "numpy>=1.24.0",
     "sentence-transformers>=2.2.0",
@@ -30,10 +35,12 @@ dependencies = [
     "prometheus-client>=0.17.0",
     "fastapi>=0.104.0",
     "httpx>=0.27.0",
-    "mcp>=1.0.0",
+    "mcp>=2.0.0",
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.5.0",
     "scikit-learn>=1.3.0",
+    "cdlib>=0.4.1",
+    "leidenalg>=0.10.0",
     "blake3>=1.0.0",
     "pyyaml>=6.0",
 ]

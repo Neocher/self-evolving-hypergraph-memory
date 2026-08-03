@@ -89,7 +89,7 @@ def execute_task(task: dict) -> tuple[str, str, str]:
                 ["claude", "-p", "-", "--print"],
                 input=full_prompt.encode(),
                 capture_output=True, text=True, timeout=50,
-                cwd="/home/admin/shm",
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 env=_minimal_env(),
             )
             if result.returncode == 0:
@@ -101,7 +101,7 @@ def execute_task(task: dict) -> tuple[str, str, str]:
                 ["codex", "exec", "-c", "approval=never",
                  "-c", 'sandbox_permissions=["full"]', full_prompt],
                 capture_output=True, text=True, timeout=50,
-                cwd="/home/admin/shm",
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 env=_minimal_env(),
             )
             if result.returncode == 0:

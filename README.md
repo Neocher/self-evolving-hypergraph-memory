@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.19.6** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.20.1** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-ready-orange)](https://modelcontextprotocol.io)
 [![A2A](https://img.shields.io/badge/A2A-ready-blueviolet)](https://github.com/google/A2A)
-[![Tests](https://img.shields.io/badge/tests-45%2F45-green)]()
+[![Tests](https://img.shields.io/badge/tests-357%2F357-green)]()
 
 ---
 
@@ -157,11 +157,47 @@ results = await api.retrieve("What did I learn today?")
 
 ---
 
+## 🚀 Installation
+
+### 1. Build the GraphLite engine (required)
+
+SHM's storage engine is [GraphLite](https://github.com/GraphLite-AI/GraphLite)
+(Apache-2.0), an embedded graph database written in Rust. Its Python SDK is **not
+published on PyPI** — clone and build it first:
+
+```bash
+git clone https://github.com/GraphLite-AI/GraphLite ~/GraphLite
+cd ~/GraphLite && source ~/.cargo/env && cargo build --release -p graphlite-ffi
+```
+
+Then make the SDK discoverable (add to your shell profile):
+
+```bash
+export GRAPHLITE_BINDINGS=~/GraphLite/bindings/python
+export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
+```
+
+### 2. Install Python dependencies
+
+```bash
+pip install -r requirements.txt   # or: pip install -e .
+```
+
+### 3. Run
+
+```bash
+shm-server                     # starts API on :8000
+# or
+python3 run_server.py
+```
+
+---
+
 ## 🧪 Tests
 
 ```bash
 python -m pytest tests/ -q
-# 45/45 passing (4 kuzu pre-existing)
+# 357/357 passing
 ```
 
 ---

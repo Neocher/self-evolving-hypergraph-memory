@@ -14,7 +14,7 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-cd /home/admin/shm/hermes-df
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 1. 创建 Docker 网络
 echo "📦 步骤1: 创建 hermes-df 网络..."

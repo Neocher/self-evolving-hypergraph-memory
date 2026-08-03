@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.20.0"
-__version_info__ = (5, 20, 0)
-__version_name__ = "CircuitBreaker-Fused"
+__version__ = "5.20.1"
+__version_info__ = (5, 20, 1)
+__version_name__ = "OpenSource-Ready"
 __release_date__ = "2026-08-03"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})

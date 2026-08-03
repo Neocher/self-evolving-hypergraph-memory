@@ -1,15 +1,16 @@
 [Unit]
-Description=SHM — Self-evolving Hypergraph Memory v5.8
+Description=SHM — Self-evolving Hypergraph Memory
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
 User=admin
-WorkingDirectory=/home/admin/shm
-Environment="PATH=/home/admin/shm/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=/home/admin/shm/.env
-ExecStart=/home/admin/shm/.venv/bin/python run_server.py
+# 模板：部署时用 install.sh 安装，以下路径会被 INSTALL_DIR 替换
+WorkingDirectory=/opt/shm
+Environment="PATH=/opt/shm/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/opt/shm/.env
+ExecStart=/opt/shm/.venv/bin/python run_server.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10

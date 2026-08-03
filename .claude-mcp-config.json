@@ -2,9 +2,9 @@
   "mcpServers": {
     "shm-tools": {
       "command": "python3",
-      "args": ["/home/admin/shm/mcp_server.py"],
+      "args": ["./mcp_server.py"],
       "env": {
-        "PYTHONPATH": "/home/admin/shm"
+        "PYTHONPATH": "."
       }
     }
   }

@@ -9,19 +9,19 @@ volumes:
     driver: local
     driver_opts:
       type: none
-      device: /home/admin/.hermes
+      device: ${HERMES_HOME:-${HOME}/.hermes}
       o: bind
   hermes-skills:
     driver: local
     driver_opts:
       type: none
-      device: /home/admin/.hermes/skills
+      device: ${HERMES_HOME:-${HOME}/.hermes}/skills
       o: bind
   hermes-scripts:
     driver: local
     driver_opts:
       type: none
-      device: /home/admin/shm
+      device: ${SHM_ROOT:-..}
       o: bind
   go-cache:
     driver: local
@@ -45,7 +45,7 @@ services:
     volumes:
       - hermes-home:/home/hermes/.hermes:ro
       - hermes-skills:/home/hermes/.hermes/skills
-      - hermes-scripts:/home/admin/shm
+      - hermes-scripts:/repo
       - go-cache:/root/go/pkg/mod
     cap_drop:
       - ALL

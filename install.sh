@@ -5,7 +5,9 @@
 set -e
 
 SERVICE_NAME="shm"
-INSTALL_DIR="/home/admin/shm"
+# 默认安装目录 = 脚本所在目录（可被环境变量 INSTALL_DIR 覆盖）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
 
 if [ "$(id -u)" != "0" ]; then
     echo "Please run as root: sudo bash install.sh"
@@ -14,8 +16,9 @@ fi
 
 echo "=== Installing SHM systemd service ==="
 
-# Copy service file
-cp "${INSTALL_DIR}/shm.service" /etc/systemd/system/${SERVICE_NAME}.service
+# Copy service file (模板路径 /opt/shm 替换为实际 INSTALL_DIR)
+sed "s|/opt/shm|${INSTALL_DIR}|g" "${INSTALL_DIR}/shm.service" \
+    > "/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Create .env if not exists
 if [ ! -f "${INSTALL_DIR}/.env" ]; then

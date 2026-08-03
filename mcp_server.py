@@ -11,7 +11,7 @@ MCP (Model Context Protocol) 共享工具服务器 — mcp SDK 2.0.0 版
 - get_project_info: 获取项目结构信息
 
 使用方式 (mcp SDK >= 2.0.0):
-  mcp run /home/user/self-evolving-hypergraph-memory/mcp_server.py
+  mcp run mcp_server.py
   或 python mcp_server.py
 """
 

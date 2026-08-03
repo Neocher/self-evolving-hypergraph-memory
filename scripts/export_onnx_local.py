@@ -6,7 +6,8 @@ MODEL_SNAPSHOT = os.path.expanduser(
     "~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/"
     "snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
 )
-OUTPUT_DIR = "/home/admin/shm/data/all-MiniLM-L6-v2-int8"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(REPO_ROOT, "data", "all-MiniLM-L6-v2-int8")
 
 def main():
     print(f"Source: {MODEL_SNAPSHOT}")

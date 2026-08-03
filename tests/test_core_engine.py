@@ -3,7 +3,7 @@
 ===============
 覆盖 τ衰减·Hebbian连接·SSM门控 — SHM 的记忆理论三大支柱。
 
-运行: cd /home/admin/shm && source .venv/bin/activate && python -m pytest tests/test_core_engine.py -v
+运行: cd <repo-root> && source .venv/bin/activate && python -m pytest tests/test_core_engine.py -v
 """
 
 import math

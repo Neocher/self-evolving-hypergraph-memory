@@ -39,9 +39,18 @@ jobs:
       - name: Check version consistency
         run: |
           python3 -c "
-          import sys; sys.path.insert(0, '.')
+          import sys, tomllib
+          sys.path.insert(0, '.')
           from shm._version import __version__
-          print(f'SHM version: {__version__}')
+          with open('pyproject.toml', 'rb') as f:
+              pyproject_version = tomllib.load(f)['project']['version']
+          with open('VERSION') as f:
+              version_file = f.read().strip()
+          assert __version__ == pyproject_version, \
+              f'mismatch: _version.py={__version__} pyproject.toml={pyproject_version}'
+          assert __version__ == version_file, \
+              f'mismatch: _version.py={__version__} VERSION={version_file}'
+          print(f'SHM version consistent: {__version__}')
           "
 
   docker:
