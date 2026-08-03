@@ -4,8 +4,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Any
 
-sys.path.insert(0, "/home/admin/GraphLite/bindings/python")
-sys.path.insert(0, "/home/admin/GraphLite/sdk-python/src")
+sys.path.insert(0, os.environ.get("GRAPHLITE_BINDINGS", os.path.expanduser("~/GraphLite/bindings/python")))
+sys.path.insert(0, os.environ.get("GRAPHLITE_SDK", os.path.expanduser("~/GraphLite/sdk-python/src")))
 
 from graphlite_sdk import GraphLite, Session
 from graphlite_sdk.error import (
@@ -482,6 +482,25 @@ class GraphLiteStore:
         except Exception:
             pass  # 连接查询失败时返回空字典（与 get_all_hebbian_connections 一致）
         return conns
+
+    def ensure_session(self, session_id: str) -> None:
+        """确保 SessionNode 存在（不存在则创建），供 link_to_session 前置调用。
+
+        注意: GraphLite 是 schemaless 图库，无 MERGE（Kuzu 语法）也无主键冲突，
+        重复 INSERT 会创建重复节点 —— 必须用 查询-插入 两段式保证幂等。
+        """
+        try:
+            result = self._session.query(
+                f"MATCH (s:SessionNode {{id: '{session_id}'}}) RETURN s.id"
+            )
+            if result.rows:
+                return  # 已存在
+        except Exception:
+            pass  # 查询失败（如表不存在）时走创建路径
+        self._session.execute(
+            f"INSERT (s:SessionNode {{id: '{session_id}', "
+            f"created_at: {int(time.time())}, last_seen: {int(time.time())}}})"
+        )
 
     def link_to_session(self, session_id: str, episode_id: str) -> None:
         """Link episode to session node."""

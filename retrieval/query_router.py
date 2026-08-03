@@ -32,7 +32,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from graph.graphlite_store import CircuitBreakerOpen
 
-logger = logging.getLogger(__name__)
+from observability.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class RetrievalLevel(Enum):

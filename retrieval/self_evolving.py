@@ -38,8 +38,9 @@ from typing import Optional
 
 # 可插拔向量存储工厂
 from retrieval.vector_store import VectorStoreFactory, BaseVectorStore
+from observability.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════

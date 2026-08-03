@@ -62,7 +62,7 @@ retrieval:
 
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5" # 中文 embedding 模型（512维，离线加载）
-  device: "cpu"                  # 推理设备 (cpu/cuda) — 服务器无 GPU 必须 cpu
+  device: "cuda"                 # 推理设备 (cpu/cuda) — RTX 2060 GPU 加速
 
 api:
   host: "127.0.0.1"             # 服务监听地址（生产环境使用 0.0.0.0）

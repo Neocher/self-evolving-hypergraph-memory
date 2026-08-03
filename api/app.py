@@ -32,6 +32,7 @@ logger = get_logger(__name__)
 
 def _init_services() -> Services:
     """初始化所有服务组件，单个组件失败不影响整体启动。"""
+    import os
     cfg = get_settings()
     svc = Services()
     errors = []
@@ -39,8 +40,8 @@ def _init_services() -> Services:
     # 1. GraphLite 图数据库 (替换RyuGraph)
     try:
         import sys as _sys
-        _bindings = "/home/admin/GraphLite/bindings/python"
-        _sdk = "/home/admin/GraphLite/sdk-python/src"
+        _bindings = os.environ.get("GRAPHLITE_BINDINGS", os.path.expanduser("~/GraphLite/bindings/python"))
+        _sdk = os.environ.get("GRAPHLITE_SDK", os.path.expanduser("~/GraphLite/sdk-python/src"))
         for _p in [_bindings, _sdk]:
             if _p not in _sys.path:
                 _sys.path.insert(0, _p)
