@@ -1,16 +1,18 @@
+#!/usr/bin/env python3
 """
-MCP (Model Context Protocol) 共享工具服务器
-========================================
+MCP (Model Context Protocol) 共享工具服务器 — mcp SDK 2.0.0 版
+================================================================
 所有 Agent (Claude Code / OpenCode / Codex) 通过此 MCP 服务器共享工具。
 
 当前提供:
 - read_file: 读取文件内容
 - search_files: 搜索文件内容或文件名
-- terminal: 执行shell命令
+- terminal: 执行shell命令 (白名单限制)
 - get_project_info: 获取项目结构信息
 
-使用方式:
-  python mcp_server.py
+使用方式 (mcp SDK >= 2.0.0):
+  mcp run /home/user/self-evolving-hypergraph-memory/mcp_server.py
+  或 python mcp_server.py
 """
 
 from __future__ import annotations
@@ -20,31 +22,65 @@ import logging
 import os
 import shlex
 import subprocess
-import sys
 from pathlib import Path
 
+from mcp.server import MCPServer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("mcp-server")
+logger = logging.getLogger("shm-mcp-server")
 
 # 工作目录
 WORKDIR = Path(__file__).parent
 
+ALLOWED_COMMANDS = {
+    "ls", "cat", "head", "tail", "wc", "find", "grep", "rg",
+    "python", "python3", "pytest", "ruff", "mypy",
+    "git", "make", "tree", "du", "df", "file", "stat",
+    "pip", "pip3", "npm", "node",
+}
 
-def handle_read_file(path: str) -> dict:
-    """读取文件"""
+
+def _minimal_env() -> dict[str, str]:
+    safe_keys = {"PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL"}
+    return {k: v for k, v in os.environ.items()
+            if k in safe_keys and not k.endswith("_API_KEY")}
+
+
+mcp = MCPServer(
+    "shm-mcp-server",
+    version="2.0.0",
+    instructions=(
+        "SHM 项目共享工具服务器。read_file/search_files/terminal 均以 "
+        "项目根目录为基准路径。terminal 仅允许白名单命令。"
+    ),
+)
+
+
+@mcp.tool()
+def read_file(path: str) -> str:
+    """读取项目中的文件内容。
+
+    Args:
+        path: 相对于项目根目录的文件路径
+    """
     full_path = WORKDIR / path
     if not full_path.exists() or not full_path.is_file():
-        return {"error": f"File not found: {path}"}
+        return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
     try:
         content = full_path.read_text(encoding="utf-8", errors="replace")
-        return {"content": content, "path": str(full_path)}
+        return json.dumps({"content": content, "path": str(full_path)}, ensure_ascii=False)
     except Exception as e:
-        return {"error": str(e)}
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def handle_search_files(pattern: str, target: str = "content") -> dict:
-    """搜索文件"""
+@mcp.tool()
+def search_files(pattern: str, target: str = "content") -> str:
+    """在项目中搜索文件内容或按文件名查找。
+
+    Args:
+        pattern: 搜索模式 (content 模式为正则, files 模式为文件名 glob)
+        target: content=搜内容, files=按文件名查找
+    """
     try:
         if target == "content":
             result = subprocess.run(
@@ -57,175 +93,57 @@ def handle_search_files(pattern: str, target: str = "content") -> dict:
                 capture_output=True, text=True, timeout=10,
             )
         lines = [l for l in result.stdout.split("\n") if l.strip()]
-        return {"matches": lines[:50], "total": len(lines)}
+        return json.dumps({"matches": lines[:50], "total": len(lines)}, ensure_ascii=False)
     except subprocess.TimeoutExpired:
-        return {"error": "search timed out"}
+        return json.dumps({"error": "search timed out"}, ensure_ascii=False)
     except Exception as e:
-        return {"error": str(e)}
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-ALLOWED_COMMANDS = {
-    "ls", "cat", "head", "tail", "wc", "find", "grep", "rg",
-    "python", "python3", "pytest", "ruff", "mypy",
-    "git", "make", "tree", "du", "df", "file", "stat",
-    "pip", "pip3", "npm", "node",
-}
+@mcp.tool()
+def terminal(command: str, timeout: int = 15) -> str:
+    """在项目目录中执行shell命令（受白名单限制）。
 
-def _minimal_env() -> dict[str, str]:
-    safe_keys = {"PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL"}
-    return {k: v for k, v in os.environ.items()
-            if k in safe_keys and not k.endswith("_API_KEY")}
-
-
-def handle_terminal(command: str, timeout: int = 15) -> dict:
-    """执行命令（受白名单限制）"""
+    Args:
+        command: 要执行的命令, 首个词必须在白名单内
+        timeout: 超时秒数 (默认 15)
+    """
     try:
         cmd_parts = shlex.split(command)
         if not cmd_parts:
-            return {"error": "empty command"}
+            return json.dumps({"error": "empty command"}, ensure_ascii=False)
         base = os.path.basename(cmd_parts[0])
         if base not in ALLOWED_COMMANDS:
-            return {"error": f"command not allowed: {base}"}
+            return json.dumps({"error": f"command not allowed: {base}"}, ensure_ascii=False)
         result = subprocess.run(
             cmd_parts, capture_output=True, text=True,
             timeout=timeout, cwd=str(WORKDIR),
             env=_minimal_env(),
         )
-        return {
+        return json.dumps({
             "stdout": result.stdout[-2000:],
             "stderr": result.stderr[-1000:],
             "exit_code": result.returncode,
-        }
+        }, ensure_ascii=False)
     except subprocess.TimeoutExpired:
-        return {"error": f"command timed out after {timeout}s"}
+        return json.dumps({"error": f"command timed out after {timeout}s"}, ensure_ascii=False)
     except Exception as e:
-        return {"error": str(e)}
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def handle_project_info() -> dict:
-    """获取项目信息"""
+@mcp.tool()
+def get_project_info() -> str:
+    """获取当前项目的基本信息（目录结构、文件数量）。"""
     py_files = list(WORKDIR.rglob("*.py"))
     dirs = set(f.parent.relative_to(WORKDIR) for f in py_files)
-    return {
+    return json.dumps({
         "root": str(WORKDIR),
         "python_files": len(py_files),
         "directories": sorted(str(d) for d in dirs if str(d) != "."),
         "directory_count": len(dirs),
-    }
-
-
-TOOLS = {
-    "read_file": {
-        "description": "读取项目中的文件内容",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-        },
-        "handler": handle_read_file,
-    },
-    "search_files": {
-        "description": "在项目中搜索文件内容或按文件名查找",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "target": {"type": "string", "enum": ["content", "files"]},
-            },
-            "required": ["pattern"],
-        },
-        "handler": handle_search_files,
-    },
-    "terminal": {
-        "description": "在项目目录中执行shell命令",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "timeout": {"type": "integer", "default": 15},
-            },
-            "required": ["command"],
-        },
-        "handler": handle_terminal,
-    },
-    "get_project_info": {
-        "description": "获取当前项目的基本信息（目录结构、文件数量）",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": handle_project_info,
-    },
-}
-
-
-def handle_request(request: dict) -> dict:
-    """处理 JSON-RPC 请求"""
-    req_id = request.get("id", 0)
-    method = request.get("method", "")
-    params = request.get("params", {})
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                },
-                "serverInfo": {
-                    "name": "shm-mcp-server",
-                    "version": "1.0.0",
-                },
-            },
-        }
-    elif method == "tools/list":
-        tool_list = [
-            {
-                "name": name,
-                "description": info["description"],
-                "inputSchema": info["input_schema"],
-            }
-            for name, info in TOOLS.items()
-        ]
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"tools": tool_list},
-        }
-    elif method == "tools/call":
-        tool_name = params.get("name", "")
-        arguments = params.get("arguments", {})
-        if tool_name in TOOLS:
-            result = TOOLS[tool_name]["handler"](**arguments)
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
-            }
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
-        }
-
-    return {"jsonrpc": "2.0", "id": req_id, "result": None}
-
-
-def main():
-    """MCP 服务器主循环 (stdio 模式)"""
-    logger.info("SHM MCP Server starting (stdio mode)...")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-            response = handle_request(request)
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
+    }, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    main()
+    logger.info("SHM MCP Server starting (stdio mode, mcp SDK 2.0.0)...")
+    mcp.run()
