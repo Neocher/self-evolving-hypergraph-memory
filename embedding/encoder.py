@@ -99,15 +99,26 @@ def _cloud_embed(
 # ─── Tier 2: 本地 sentence-transformers ────────────────────
 
 
-def _find_bge_snapshot() -> Optional[str]:
-    """定位 bge-small-zh-v1.5 的 HF 缓存 snapshot 路径（离线，不访问网络）。"""
+def _find_model_snapshot(model_name: str) -> Optional[str]:
+    """定位任意 HF 模型的缓存 snapshot 路径（离线，不访问网络）。
+
+    HF hub 缓存目录名将 '/' → '--'（如 BAAI/bge-m3 → models--BAAI--bge-m3）。
+    返回最新 snapshot，无缓存返回 None。
+    """
     import glob
 
-    snapshots = sorted(glob.glob(os.path.join(
-        os.path.expanduser("~"), ".cache", "huggingface", "hub",
-        "models--BAAI--bge-small-zh-v1.5", "snapshots", "*",
-    )), key=os.path.getmtime)
+    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    model_dir = os.path.join(cache_dir, "models--" + model_name.replace("/", "--"))
+    snapshots = sorted(
+        glob.glob(os.path.join(model_dir, "snapshots", "*")),
+        key=os.path.getmtime,
+    )
     return snapshots[-1] if snapshots else None
+
+
+def _find_bge_snapshot() -> Optional[str]:
+    """兼容旧接口：定位 bge-small-zh-v1.5 的 HF 缓存 snapshot 路径（离线，不访问网络）。"""
+    return _find_model_snapshot("BAAI/bge-small-zh-v1.5")
 
 
 class TextEncoder:
@@ -177,7 +188,26 @@ class TextEncoder:
         _os.environ.setdefault("HF_HUB_OFFLINE", "1")
         _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-        # ── 优先: bge-small-zh-v1.5（中文专用，512维，本地缓存 snapshot，不访问 huggingface.co）──
+        # ── 优先: 配置的 model_name（中文 bge-small-zh 或升级 bge-m3，本地缓存 snapshot，不访问网络）──
+        snapshot = _find_model_snapshot(self.model_name)
+        if snapshot is not None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading Chinese embedding model (%s): %s", self.model_name, snapshot)
+                try:
+                    self._model = SentenceTransformer(snapshot, device=self.device)
+                except Exception:
+                    # CUDA 不可用时自动降级 CPU（如 "Torch not compiled with CUDA enabled"）
+                    logger.warning("embedding device=%s failed, retry on cpu", self.device)
+                    self._model = SentenceTransformer(snapshot, device="cpu")
+                    self.device = "cpu"
+                logger.info("Local embedding model loaded: model=%s dim=%d", self.model_name, self.dimension)
+                return
+            except Exception as e:
+                logger.warning("%s load failed, fallback to bge-small/ONNX/ST: %s", self.model_name, e)
+                self._model = None
+
+        # ── 次优先: bge-small-zh-v1.5（中文专用，512维，本地缓存 snapshot）──
         bge_snapshot = _find_bge_snapshot()
         if bge_snapshot is not None:
             try:
