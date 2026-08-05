@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.20.1** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.21.0** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-ready-orange)](https://modelcontextprotocol.io)
 [![A2A](https://img.shields.io/badge/A2A-ready-blueviolet)](https://github.com/google/A2A)
-[![Tests](https://img.shields.io/badge/tests-357%2F357-green)]()
+[![Tests](https://img.shields.io/badge/tests-358%2F359-green)]()
 
 ---
 
