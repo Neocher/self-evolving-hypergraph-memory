@@ -1,7 +1,7 @@
 [Unit]
 Description=SHM — Self-evolving Hypergraph Memory
-After=network.target
-Wants=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,6 +10,9 @@ User=admin
 WorkingDirectory=/opt/shm
 Environment="PATH=/opt/shm/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/opt/shm/.env
+# GraphLite SDK (v5.19.6+ engine; 模板路径, 由 install.sh 按 INSTALL_DIR 替换)
+Environment=GRAPHLITE_BINDINGS=/opt/shm/GraphLite/bindings/python
+Environment=GRAPHLITE_SDK=/opt/shm/GraphLite/sdk-python/src
 ExecStart=/opt/shm/.venv/bin/python run_server.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

@@ -191,6 +191,28 @@ shm-server                     # starts API on :8000
 python3 run_server.py
 ```
 
+### 4. Run as a systemd service (optional, recommended)
+
+Two deployment modes — pick one:
+
+```bash
+# A. User-level (no root, desktop). Crash auto-restart + start at boot:
+bash install.sh --user
+systemctl --user status shm-server      # verify
+journalctl --user -u shm-server -f      # logs
+
+# B. System-level (root, multi-user server):
+sudo bash install.sh
+systemctl status shm
+```
+
+User mode defaults: `SHM_EMBEDDING__DEVICE=cuda` (GPU), GraphLite SDK at
+`$HOME/GraphLite`, linger enabled. Override with env vars, e.g.:
+
+```bash
+SHM_EMBEDDING__DEVICE=cpu bash install.sh --user   # no-GPU machine
+```
+
 ---
 
 ## 🧪 Tests
