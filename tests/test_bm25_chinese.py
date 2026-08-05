@@ -298,6 +298,10 @@ def test_bm25_empty_corpus_log_noise_reduced() -> None:
     """
     import logging
 
+    # structlog 默认 PrintLogger 不走 stdlib logging，先 configure 路由到 stdlib
+    from observability.logger import configure_logging
+    configure_logging("DEBUG")
+
     records = []
     handler = logging.Handler()
     handler.emit = lambda r: records.append(r)  # type: ignore[method-assign]

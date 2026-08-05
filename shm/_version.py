@@ -1,9 +1,9 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.0"
-__version_info__ = (5, 21, 0)
+__version__ = "5.21.1"
+__version_info__ = (5, 21, 1)
 __version_name__ = "BM25-Harden"
-__release_date__ = "2026-08-04"
+__release_date__ = "2026-08-05"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -15,6 +15,12 @@ VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
   • Embedding 升级 BAAI/bge-m3 (1024维, 多语言, 中文C-MTEB领先):
     encoder 支持任意 HF 缓存模型 (通用 _find_model_snapshot),
     FAISS 维度动态适配 (512→1024, 启动自动重建索引)
+
+v5.21.1 (2026-08-05) 修复:
+  • test_bm25_empty_corpus_log_noise_reduced 缺 configure_logging()
+    调用 — structlog 默认 PrintLogger 不走 stdlib logging,
+    测试 handler 捕获不到日志 (358 passed + 1 env skip)
+  • pyproject.toml / README 版本号同步 (5.20.1 → 5.21.1)
 
 📌 验证:
   • 全量测试 359 passed (357 基线 + 2 新增)
