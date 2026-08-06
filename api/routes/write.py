@@ -324,7 +324,11 @@ async def create_episode(
             raise HTTPException(status_code=400, detail="τ below threshold; use force_promote=true")
 
     # SSM门控过滤：低价值内容跳过持久化
-    if deps.ssm_gate is not None and deps.tau_engine is not None:
+    # 【FIX 2026-08-06】force_promote=true 应绕过 gate — "强制提升"语义即无条件持久化。
+    # 原实现 gate 不认 force_promote, warmup 后随机初始化权重输出 ≈0.45 < 0.5
+    # 阈值导致所有正常写入被过滤(记忆系统静默丢记忆, benchmark 复现)。
+    if (deps.ssm_gate is not None and deps.tau_engine is not None
+            and not req.force_promote):
         features = np.array([
             float(len(req.content)),            # 内容长度
             float(created_at - time.time()),    # 时间衰减信号
