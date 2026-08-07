@@ -17,7 +17,7 @@ from api.routes._deps import (
 
 # 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
 # 超时返回空结果而非无限挂起 + 线程泄漏（与写路径超时对称）
-_RETRIEVE_TIMEOUT = 15.0
+_RETRIEVE_TIMEOUT = 3.0  # 【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边遍历超时立即降级返回向量结果, 不空等
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
