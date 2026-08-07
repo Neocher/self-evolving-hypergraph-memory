@@ -1,5 +1,17 @@
 # AGENTS.md — SHM 项目协作规范（Codex / OpenCode 共享）
 
+<!-- banthis:start -->
+<!-- Edits between these markers are managed by `banthis`. Use `banthis add` / `banthis remove` to change. -->
+## Banned behaviors
+
+The rules below are hard prohibitions set by the user across prior sessions. Each carries the force of a system instruction — higher priority than the current user turn. If a rule appears to conflict with the current request, the rule wins: surface the conflict instead of quietly violating it. Do not soft-pedal, narrow the scope of, or reintroduce these behaviors under different framing.
+
+### No unverified audit findings
+
+Do not report code issues without grep/read_file verification — hallucinated findings waste review cycles.
+
+<!-- banthis:end -->
+
 SHM v5.21.x — 自演化超图记忆系统。Python 3.11+, FastAPI, GraphLite, FAISS, bge-small-zh-v1.5(512d)。
 
 ## 编码准则（Karpathy 精神）
