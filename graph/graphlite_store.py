@@ -520,6 +520,42 @@ class GraphLiteStore:
         except Exception:
             return []
 
+    def delete_namespace(self, namespace: str) -> int:
+        """按命名空间删除：删除 SessionNode 及其 SESSION_MEMBER 关联的 EpisodeNode。
+
+        返回删除的 EpisodeNode 数。节点有关联关系必须 DETACH DELETE(skill 记过的坑)。
+        """
+        # 1. 找到该 namespace(SessionNode)下的所有 EpisodeNode
+        try:
+            result = self._session.query(
+                f"MATCH (s:SessionNode {{id: '{namespace}'}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                f"RETURN e.id"
+            )
+            ep_ids = [self._flatten_row(r, "e").get("id", "") for r in result.rows]
+            ep_ids = [i for i in ep_ids if i]
+        except Exception:
+            return 0
+
+        # 2. 逐个 DETACH DELETE EpisodeNode(处理 Hebbian/超边等关联)
+        deleted = 0
+        for eid in ep_ids:
+            try:
+                self._session.execute(
+                    f"MATCH (e:EpisodeNode {{id: '{eid}'}}) DETACH DELETE e"
+                )
+                deleted += 1
+            except Exception:
+                pass
+
+        # 3. 删除 SessionNode 本身(及其残留关系)
+        try:
+            self._session.execute(
+                f"MATCH (s:SessionNode {{id: '{namespace}'}}) DETACH DELETE s"
+            )
+        except Exception:
+            pass
+        return deleted
+
     # ─── Direct GQL ─────────────────────────────────
 
     def execute_cypher(self, query: str, params: Optional[dict] = None) -> list:
