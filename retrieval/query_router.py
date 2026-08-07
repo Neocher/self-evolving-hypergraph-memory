@@ -1022,6 +1022,12 @@ class QueryRouter:
             return RetrievalStrategy.TAU_FIRST
         if len(query_text) > 50:
             return RetrievalStrategy.VECTOR_FIRST
+        # 【PERF 2026-08-07】纯英文/ASCII 查询直接走 VECTOR_FIRST:
+        # HYBRID 的实体匹配通道(CONTAINS 全表扫描)对英文 bigram 收益低且大库下
+        # 拖慢整条检索(1946 节点实测卡死, benchmark 验证 vector 通道 recall 0.9)。
+        # 中文查询保持 HYBRID(实体匹配对中文有区分度)。
+        if not any('\u4e00' <= ch <= '\u9fff' for ch in query_text):
+            return RetrievalStrategy.VECTOR_FIRST
         return RetrievalStrategy.HYBRID
 
     def hybrid_score(self, tau_score: float, vector_score: float) -> float:
