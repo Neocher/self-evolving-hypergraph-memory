@@ -1,6 +1,6 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.1"
+__version__ = "5.21.2"
 __version_info__ = (5, 21, 1)
 __version_name__ = "BM25-Harden"
 __release_date__ = "2026-08-05"

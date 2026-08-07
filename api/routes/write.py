@@ -665,6 +665,13 @@ async def promote_to_episode(
         "tau_initial": tau,
     })
 
+    # 【FIX 2026-08-07】promote 后必须入 embedding 队列，否则提升的 episode
+    # 永远不会进 FAISS 向量索引（检索链路 L1/L2 全空，数据不可检索）。
+    # 对齐 episodes/batch 路由的异步队列写法（poll loop 每 5s flush）。
+    if content and content != "promoted_record":
+        with _embed_queue_lock:
+            _embed_queue.append((episode_id, content, created_at))
+
     count = 0
     if deps.hebbian_updater and deps.dream_scheduler:
         count = 1
