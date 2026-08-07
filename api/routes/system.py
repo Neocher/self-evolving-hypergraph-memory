@@ -285,6 +285,10 @@ async def rebuild_index(
         deps.graphlite_store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
     except Exception:
         logger.exception("Failed to clear Hebbian connections")
+    # 【PERF 2026-08-07】faiss_id → node_id 预建 dict, 避免逐条 np.where O(n) 查找
+    # 原实现 np.where(faiss_ids == nb_idx) 在循环内 O(n²), 1174 节点下即 130 万+ 次比较,
+    # 加上逐条 GraphLite 事务 → Hebbian 重建 20+ 分钟, 服务启动卡死。
+    faiss_to_node = {int(fid): node_ids[i] for i, fid in enumerate(faiss_ids.tolist())}
     for i in range(len(node_ids)):
         query_vec = embeddings[i:i+1].astype(np.float32)
         try:
@@ -296,7 +300,9 @@ async def rebuild_index(
                 similarity = max(0.0, 1.0 - float(distances[0][rank]) / 2.0)
                 if similarity < 0.3:
                     continue
-                nb_node_id = node_ids[np.where(faiss_ids == nb_idx)[0][0]]
+                nb_node_id = faiss_to_node.get(nb_idx)
+                if nb_node_id is None:
+                    continue
                 try:
                     deps.graphlite_store.query_cypher(
                         "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
