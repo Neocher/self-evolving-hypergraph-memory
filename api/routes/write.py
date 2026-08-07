@@ -568,6 +568,48 @@ async def create_episode(
     )
 
 
+@router.post("/memories/episodes/batch", summary="批量创建情节节点 (Layer2)")
+async def create_episodes_batch(
+    reqs: list[EpisodeCreate],
+    deps: Services = Depends(get_services),
+) -> dict:
+    """批量创建情节节点。逐条调用核心写入逻辑, 返回每条结果。
+
+    用于 benchmark/数据导入等批量场景(比逐条 HTTP 调用少 RTT 开销)。
+    注意: 仍受服务端编码速度限制(CPU embedding 1.4s/条)。
+    """
+    start = _now()
+    set_trace_id()
+    results: list[dict] = []
+    for req in reqs:
+        episode_id = str(uuid.uuid4())
+        created_at = _now()
+        tau_initial = 1.0
+        try:
+            if deps.graphlite_store is not None:
+                deps.graphlite_store.create_episode({
+                    "id": episode_id, "content": req.content, "source": req.source,
+                    "visibility": req.visibility, "created_at": created_at,
+                    "tau_initial": tau_initial,
+                    "metadata": req.metadata,
+                })
+            # namespace 关联(同单条逻辑)
+            if req.namespace and deps.graphlite_store is not None:
+                deps.graphlite_store.ensure_session(req.namespace)
+                deps.graphlite_store.link_to_session(req.namespace, episode_id)
+            # 超边创建(批量场景也触发, 保持行为一致)
+            try:
+                await _auto_create_hyperedges(episode_id, req.source, req.content, deps)
+            except Exception:
+                pass
+            results.append({"episode_id": episode_id, "status": "created"})
+        except Exception as e:
+            results.append({"episode_id": episode_id, "status": "error", "error": str(e)})
+
+    record_request("POST", "/memories/episodes/batch", "200", _now() - start)
+    return {"status": "ok", "count": len(results), "results": results}
+
+
 @router.get("/memories/episodes/{episode_id}", summary="查询情节节点")
 async def get_episode(
     episode_id: str,
