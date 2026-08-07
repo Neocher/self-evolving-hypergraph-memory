@@ -289,6 +289,10 @@ async def rebuild_index(
     # 原实现 np.where(faiss_ids == nb_idx) 在循环内 O(n²), 1174 节点下即 130 万+ 次比较,
     # 加上逐条 GraphLite 事务 → Hebbian 重建 20+ 分钟, 服务启动卡死。
     faiss_to_node = {int(fid): node_ids[i] for i, fid in enumerate(faiss_ids.tolist())}
+    # 【PERF 2026-08-07】批量 INSERT(GraphLite 分号分隔多语句, 实测上限 ~50 条带 MATCH)
+    # 逐条事务 73ms/条 → 批量 50 条 ~0.002s, 695 节点重建 13.5min → 预计 <1min
+    HEBBIAN_BATCH = 50
+    pending: list[str] = []
     for i in range(len(node_ids)):
         query_vec = embeddings[i:i+1].astype(np.float32)
         try:
@@ -303,17 +307,25 @@ async def rebuild_index(
                 nb_node_id = faiss_to_node.get(nb_idx)
                 if nb_node_id is None:
                     continue
-                try:
-                    deps.graphlite_store.query_cypher(
-                        "MATCH (a:EpisodeNode {id: $aid}), (b:EpisodeNode {id: $bid}) "
-                        "INSERT (a)-[:HEBBIAN_CONNECTION {weight: $w}]->(b)",
-                        {"aid": node_ids[i], "bid": nb_node_id, "w": round(similarity, 4)}
-                    )
-                    hebbian_count += 1
-                except Exception:
-                    logger.exception("Hebbian connection creation failed for node %s", node_ids[i])
+                pending.append(
+                    f"MATCH (a:EpisodeNode {{id: '{node_ids[i]}'}}), "
+                    f"(b:EpisodeNode {{id: '{nb_node_id}'}}) "
+                    f"INSERT (a)-[:HEBBIAN_CONNECTION {{weight: {round(similarity, 4)}}}]->(b)"
+                )
+                hebbian_count += 1
+                if len(pending) >= HEBBIAN_BATCH:
+                    try:
+                        deps.graphlite_store.query_cypher("; ".join(pending))
+                    except Exception:
+                        logger.exception("Hebbian batch creation failed (%d stmts)", len(pending))
+                    pending = []
         except Exception:
             logger.exception("FAISS search failed for Hebbian rebuild at index %d", i)
+    if pending:
+        try:
+            deps.graphlite_store.query_cypher("; ".join(pending))
+        except Exception:
+            logger.exception("Hebbian batch creation failed (%d stmts)", len(pending))
 
     record_request("POST", "/index/rebuild", "200", _now() - start)
     logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",
