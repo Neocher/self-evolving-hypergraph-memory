@@ -31,6 +31,17 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# LLM-NER 每社区节点数上限：超出的节点跳过 LLM 由调用方正则降级
+# 防单社区节点多时串行 await（每节点 ~2.5s）→ SYNTHESIZE 阶段超时死循环
+_NER_MAX_NODES_PER_COMMUNITY = 5
+
+# 全局 LLM-NER 总调用数预算（per dream run）：超预算后剩余社区全部走正则
+# 防 123 社区 × 5 节点 = 615 次调用超预算
+_MAX_LLM_NER_TOTAL = 100
+
+# NER 连续失败阈值：达到后 skip LLM → 正则（跨社区 fail-fast）
+_NER_FAIL_FAST_THRESHOLD = 3
+
 
 @dataclass
 class DreamReport:
@@ -610,10 +621,17 @@ class DreamPipeline:
 
         引入 fail-fast 计数器：连续 3 个 LLM 超时 → 整个 synthesize 切换到模板回退，
         避免后续所有社区等待直到全部超时。
+
+        NER 全局预算：_MAX_LLM_NER_TOTAL 次 LLM-NER 调用后，剩余社区实体提取走正则。
+        NER fail-fast：连续 _NER_FAIL_FAST_THRESHOLD 次 NER 失败后 skip LLM。
         """
         sem = asyncio.Semaphore(5)
         _llm_fail_fast_counter = 0
         _llm_fail_fast_threshold = 3
+
+        # LLM-NER 全局预算 & fail-fast 计数器（mutable list wrapper 跨方法传递）
+        ner_budget = [_MAX_LLM_NER_TOTAL]
+        ner_fails = [0]
 
         async def _llm_summarize(community: dict, contents: list[str]) -> dict:
             nonlocal _llm_fail_fast_counter
@@ -662,7 +680,9 @@ class DreamPipeline:
                 {"id": n["id"], "content": n.get("content", "")[:200]} for n in nodes
             ]
             community["topics"] = self._extract_topics(nodes)
-            community["entity_links"] = await self._entity_linking_step(nodes)
+            community["entity_links"] = await self._entity_linking_step(
+                nodes, ner_budget=ner_budget, ner_fails=ner_fails
+            )
         return communities
 
     def _build_community_feature(self, community: dict) -> np.ndarray:
@@ -716,13 +736,21 @@ class DreamPipeline:
 
     # ─── 实体链接 ──────────────────────────────────────────
 
-    async def _entity_linking_step(self, nodes: list[dict]) -> list[dict]:
+    async def _entity_linking_step(
+        self,
+        nodes: list[dict],
+        ner_budget: Optional[list[int]] = None,
+        ner_fails: Optional[list[int]] = None,
+    ) -> list[dict]:
         """
         实体链接：提取命名实体并在社区节点间交叉匹配。
 
         两步策略:
         1. 用 LLM 做命名实体识别（降级：正则提取大写词和引号内专名）
         2. 跨节点匹配相同实体，生成实体链接关系
+
+        ner_budget: 全局 NER 调用预算（传给 _extract_entities_from_nodes）
+        ner_fails: 连续失败计数器（传给 _extract_entities_from_nodes）
 
         Args:
             nodes: 社区内节点列表
@@ -732,8 +760,10 @@ class DreamPipeline:
             按出现次数降序排列，失败时返回空列表
         """
         try:
-            # Step 1: 提取实体 — 统一入口，优先 LLM 降级到正则
-            entity_map = await self._extract_entities_from_nodes(nodes)
+            # Step 1: 提取实体 — LLM 优先 + 正则兜底（受 budget / fail-fast 约束）
+            entity_map = await self._extract_entities_from_nodes(
+                nodes, ner_budget=ner_budget, ner_fails=ner_fails
+            )
             if not entity_map:
                 return []
 
@@ -757,22 +787,29 @@ class DreamPipeline:
             logger.exception("Entity linking failed, skipping")
             return []  # 降级：异常时返回空列表
 
-    async def _extract_entities_from_nodes(self, nodes: list[dict]) -> dict[str, list[str]]:
+    async def _extract_entities_from_nodes(
+        self,
+        nodes: list[dict],
+        ner_budget: Optional[list[int]] = None,
+        ner_fails: Optional[list[int]] = None,
+    ) -> dict[str, list[str]]:
         """
         统一实体提取入口。
 
-        优先用 LLM 做命名实体识别，失败时降级到正则提取。
+        优先用 LLM 做命名实体识别（受预算和 fail-fast 约束），
+        LLM 未覆盖的节点（cap 外 / 单节点失败 / 预算耗尽）降级到正则提取。
         返回 {node_id: [entity_name, ...], ...}
-        """
-        # 先尝试 LLM
-        llm_result = await self._ner_with_llm(nodes)
-        if llm_result:
-            return llm_result
 
-        # 降级：正则提取
-        result: dict[str, list[str]] = {}
+        LLM 结果优先；正则兜底保证所有节点都有机会提取实体。
+        """
+        llm_result = await self._ner_with_llm(nodes, ner_budget=ner_budget, ner_fails=ner_fails)
+
+        # Merge: LLM 结果优先，正则填补空缺（cap 外 + LLM 失败 + 预算耗尽节点）
+        result: dict[str, list[str]] = dict(llm_result) if llm_result else {}
         for node in nodes:
             nid = node.get("id", "")
+            if nid in result:
+                continue  # LLM 已覆盖
             content = node.get("content", "")
             if content:
                 entities = self._extract_entities_regex(content)
@@ -820,32 +857,8 @@ class DreamPipeline:
 
         return sorted(entities)
 
-    async def _ner_with_llm(self, nodes: list[dict]) -> dict[str, list[str]]:
-        """
-        用 LLM 从节点内容中提取命名实体。
-
-        使用 self.llm_client（已配置 DEEPSEEK_API_KEY），
-        LLM 不可用或调用失败时返回空 dict（触发降级到正则提取）。
-
-        Args:
-            nodes: 社区内节点列表
-
-        Returns:
-            {node_id: [entity_name, ...], ...} 或 {}（失败时）
-        """
-        if not self.llm_client or not self.llm_client.api_key:
-            return {}
-        llm = self.llm_client
-
-        result: dict[str, list[str]] = {}
-        for node in nodes:
-            nid = node.get("id", "")
-            content = node.get("content", "")
-
-            if not content or len(content.strip()) < 5:
-                continue
-
-            prompt = f"""Extract named entities from the following text. Return ONLY a JSON array of entity names (people, organizations, technologies, products, locations, projects).
+    def _build_ner_prompt(self, content: str) -> str:
+        return f"""Extract named entities from the following text. Return ONLY a JSON array of entity names (people, organizations, technologies, products, locations, projects).
 
 Rules:
 - Include proper nouns, technical terms, project names, organization names
@@ -856,25 +869,101 @@ Rules:
 Text:
 {content[:500]}"""
 
-            try:
-                response = await llm.chat(
+    def _parse_ner_response(self, response: str) -> list[str]:
+        parsed = json.loads(response)
+        if isinstance(parsed, dict):
+            entities = parsed.get("entities", [])
+            if isinstance(entities, list):
+                return [str(e).strip() for e in entities if str(e).strip()]
+        if isinstance(parsed, list):
+            return [str(e).strip() for e in parsed if str(e).strip()]
+        return []
+
+    async def _ner_single_node(self, nid: str, content: str, sem: asyncio.Semaphore) -> tuple[str, list[str]]:
+        prompt = self._build_ner_prompt(content)
+        async with sem:
+            response = await asyncio.wait_for(
+                self.llm_client.chat(
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
                     max_tokens=256,
                     response_format={"type": "json_object"},
-                )
-                if response:
-                    parsed = json.loads(response)
-                    if isinstance(parsed, dict):
-                        entities = parsed.get("entities", [])
-                        if isinstance(entities, list):
-                            result[nid] = [str(e).strip() for e in entities if str(e).strip()]
-                    elif isinstance(parsed, list):
-                        result[nid] = [str(e).strip() for e in parsed if str(e).strip()]
-            except Exception:
-                continue  # 单节点失败不中断整体流程
+                ),
+                timeout=15.0,
+            )
+        if response:
+            return (nid, self._parse_ner_response(response))
+        return (nid, [])
 
-        return result
+    async def _ner_with_llm(
+        self,
+        nodes: list[dict],
+        ner_budget: Optional[list[int]] = None,
+        ner_fails: Optional[list[int]] = None,
+    ) -> dict[str, list[str]]:
+        """
+        用 LLM 从节点内容中并行提取命名实体（Semaphore(5) 限流）。
+
+        节点数超过 _NER_MAX_NODES_PER_COMMUNITY 时仅处理内容最长的前 N 个，
+        其余节点跳过 LLM，由 _extract_entities_from_nodes 的正则降级覆盖。
+        单节点失败不中断其他节点。
+
+        ner_budget: 全局 NER 调用预算计数器 (list[int])，每调用减 1；0 时跳过 LLM
+        ner_fails: 连续失败计数器 (list[int])，达 _NER_FAIL_FAST_THRESHOLD 时跳过 LLM
+
+        Returns:
+            {node_id: [entity_name, ...], ...} 或 {}（LLM 不可用时）
+        """
+        if not self.llm_client or not self.llm_client.api_key:
+            return {}
+
+        # 预算耗尽或 fail-fast 触发 → 跳过 LLM
+        if ner_budget is not None and ner_budget[0] <= 0:
+            return {}
+        if ner_fails is not None and ner_fails[0] >= _NER_FAIL_FAST_THRESHOLD:
+            return {}
+
+        eligible = [
+            (node.get("id", ""), node.get("content", ""))
+            for node in nodes
+            if node.get("content", "") and len(node.get("content", "").strip()) >= 5
+        ]
+        if not eligible:
+            return {}
+
+        eligible.sort(key=lambda x: len(x[1]), reverse=True)
+        max_nodes = _NER_MAX_NODES_PER_COMMUNITY
+        if ner_budget is not None:
+            max_nodes = min(max_nodes, ner_budget[0])
+        capped = eligible[:max_nodes]
+
+        sem = asyncio.Semaphore(5)
+        tasks = [
+            self._ner_single_node(nid, content, sem)
+            for nid, content in capped
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 扣除预算
+        if ner_budget is not None:
+            ner_budget[0] -= len(capped)
+
+        # 跟踪失败计数（用于 fail-fast）
+        n_failed = sum(1 for item in results if isinstance(item, Exception))
+        if ner_fails is not None:
+            if n_failed > 0:
+                ner_fails[0] += n_failed
+            else:
+                ner_fails[0] = 0  # 全部成功 → 重置
+
+        entity_map: dict[str, list[str]] = {}
+        for item in results:
+            if isinstance(item, Exception):
+                continue
+            nid, entities = item
+            if entities:
+                entity_map[nid] = entities
+        return entity_map
 
     def _extract_topics(self, nodes: list[dict]) -> list[str]:
         """从社区节点中提取主题关键词。"""

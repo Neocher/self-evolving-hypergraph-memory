@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.9"
-__version_info__ = (5, 21, 9)
-__version_name__ = "Write-Perf"
+__version__ = "5.21.10"
+__version_info__ = (5, 21, 10)
+__version_name__ = "Dream-Fix"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})

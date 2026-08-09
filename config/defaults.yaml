@@ -34,7 +34,7 @@ dream:
   idle_timeout_seconds: 300      # 空闲触发等待时间（秒），5分钟
   accum_threshold: 200           # 累积新节点触发阈值（原20过激：批量写入时每分钟触发梦境+LLM调用抢资源）
   min_interval_seconds: 60       # 最小梦境间隔（秒）
-  max_dream_duration_seconds: 300  # 单次梦境最长执行时间（秒）
+  max_dream_duration_seconds: 450  # 单次梦境最长执行时间（秒）
   cpu_affinity_low_priority: true  # 低优先级 CPU 亲和性
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
 

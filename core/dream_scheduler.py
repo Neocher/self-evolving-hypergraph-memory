@@ -39,7 +39,7 @@ class DreamSchedulerConfig:
     idle_timeout_seconds: int = 300  # 空闲 5 分钟后触发
     accum_threshold: int = 100  # 累积 100 个新节点触发
     min_interval_seconds: int = 60  # 最小间隔（防止频繁触发）
-    max_dream_duration_seconds: int = 300  # 单次梦境最长 5 分钟
+    max_dream_duration_seconds: int = 450  # 单次梦境最长 7.5 分钟
     cpu_affinity_low_priority: bool = True  # 低优先级 CPU 亲和性
     memory_limit_mb: int = 256  # 梦境线程内存限制
     conflict_accum_threshold: int = 5  # P2: 累积 5 个未解决冲突触发矛盾驱动梦境

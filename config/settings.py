@@ -63,7 +63,7 @@ class DreamConfig:
     idle_timeout_seconds: int = 300
     accum_threshold: int = 100
     min_interval_seconds: int = 60
-    max_dream_duration_seconds: int = 300
+    max_dream_duration_seconds: int = 450
     cpu_affinity_low_priority: bool = True
     memory_limit_mb: int = 256
 
