@@ -1114,17 +1114,25 @@ Text:
         import json
         created = 0
         new_member_sets: dict[str, set[str]] = {}
-        # 先清理所有涉及成员的旧 COMMUNITY_MEMBER 边
+        # 收集所有成员 ID（用于后续阶段）
+        all_member_ids: set[str] = set()
+        for comm in communities:
+            for member_id in comm.get("members", []):
+                all_member_ids.add(member_id)
+
+        # 先清理自己社区的旧 COMMUNITY_MEMBER 边（不碰外部社区）
+        # 【FIX 2026-08-09】原实现 MATCH (c:CommunityNode) 无社区过滤 →
+        # 对每个 dream 成员删除所有社区（含外部）指向它的边（实证 EXT→epX 被删）。
+        # 修复：限定 {id: $cid}，与 dream_candidate_store.py L368-376 一致。
         try:
-            all_member_ids = set()
             for comm in communities:
                 for member_id in comm.get("members", []):
-                    all_member_ids.add(member_id)
-            for mid in all_member_ids:
-                graphlite_store.query_cypher(
-                    "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) DELETE r",
-                    {"eid": mid}
-                )
+                    graphlite_store.query_cypher(
+                        "MATCH (c:CommunityNode {id: $cid})"
+                        "-[r:COMMUNITY_MEMBER]->"
+                        "(e:EpisodeNode {id: $eid}) DELETE r",
+                        {"cid": comm["id"], "eid": member_id},
+                    )
         except Exception:
             logger.warning("Failed to clean before community upsert", exc_info=True)
         for comm in communities:
@@ -1177,15 +1185,35 @@ Text:
                 created += 1
             except Exception as e:
                 logger.warning("Community persist failed: %s", e)
-        # 清理旧社区中被新社区覆盖的成员的旧关系
+        # 【FIX 2026-08-09】同源湮灭 bug：原实现用 WHERE c.id <> $cid DELETE r
+        # 对每个 (cid, member) 删其他所有社区的边（含外部社区）→ 共享成员被互删
+        # → 孤儿（属零个社区）。新实现：按 member_count 倒序，每成员只保留最大
+        # 社区的边，只删自己社区的边，不动外部社区。
+        # 与 dream_candidate_store.py 修复一致。
+        #
+        # 阶段 3a：按 member_count 倒序建 max_community_by_member 映射
+        max_community_by_member: dict[str, str] = {}
+        sorted_cids = sorted(
+            new_member_sets.keys(),
+            key=lambda cid: len(new_member_sets[cid]),
+            reverse=True,
+        )
+        for cid in sorted_cids:
+            for mid in new_member_sets[cid]:
+                if mid not in max_community_by_member:
+                    max_community_by_member[mid] = cid
+
+        # 阶段 3b：只删自己社区到非最大成员的边（不动外部社区）
         try:
             for cid, members in new_member_sets.items():
                 for mid in members:
-                    graphlite_store.query_cypher(
-                        "MATCH (c:CommunityNode)-[r:COMMUNITY_MEMBER]->(e:EpisodeNode {id: $eid}) "
-                        "WHERE c.id <> $cid DELETE r",
-                        {"cid": cid, "eid": mid}
-                    )
+                    if max_community_by_member.get(mid, cid) != cid:
+                        graphlite_store.query_cypher(
+                            "MATCH (c:CommunityNode {id: $cid})"
+                            "-[r:COMMUNITY_MEMBER]->"
+                            "(e:EpisodeNode {id: $eid}) DELETE r",
+                            {"cid": cid, "eid": mid}
+                        )
         except Exception:
             logger.warning("Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True)
         return created

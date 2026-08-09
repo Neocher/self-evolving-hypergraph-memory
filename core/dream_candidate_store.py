@@ -86,6 +86,7 @@ class DreamCandidateStore:
             summary = {
                 "id": c.get("id", ""),
                 "member_count": len(c.get("members", [])),
+                "member_ids": c.get("members", []),
                 "report": (c.get("report", "") or "")[:500],
                 "keywords": c.get("keywords", [])[:10],
                 "topics": c.get("topics", [])[:5],
@@ -304,15 +305,14 @@ class DreamCandidateStore:
     ) -> int:
         """从候选 data 创建 GraphLite CommunityNode + COMMUNITY_MEMBER 边。
 
-        先清理所有旧社区，再创建新的（最多 50 个最高质量的）。
+        使用 MATCH 存在性判断 + INSERT/SET 的 upsert 模式（GraphLite 不支持 MERGE）。
+        边操作分三阶段：按成员清旧边 → 建新边 → 清理跨社区成员旧边。
+        按 member_count 倒序，只创建 top-50 最高质量社区。
         Returns: 创建的社区数
         """
-        # 先清理旧社区
-        try:
-            graphlite_store.query_cypher("MATCH (c:CommunityNode) DETACH DELETE c", {})
-        except Exception:
-            pass
         created = 0
+        new_member_sets: dict[str, set[str]] = {}
+
         # 按 member_count 倒序，只创建 top-50
         sorted_comms = sorted(
             candidate.community_summaries,
@@ -324,21 +324,107 @@ class DreamCandidateStore:
             if not comm_id:
                 continue
             report = (comm.get("report", "") or "")[:800]
+            comm_vals = {
+                "id": comm_id,
+                "name": f"dream_{candidate.dream_id[:8]}_comm_{created}",
+                "summary": report,
+                "score": 0.0,
+                "created_at": time.time(),
+            }
             try:
-                graphlite_store.query_cypher(
-                    "CREATE (c:CommunityNode {id: $id, name: $name, summary: $summary, "
-                    "leiden_score: $score, created_at: $created_at})",
-                    {
-                        "id": comm_id,
-                        "name": f"dream_{candidate.dream_id[:8]}_comm_{created}",
-                        "summary": report,
-                        "score": 0.0,
-                        "created_at": time.time(),
-                    },
-                )
+                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT / SET
+                if graphlite_store.execute_cypher(
+                    "MATCH (c:CommunityNode {id: $id}) RETURN c",
+                    {"id": comm_id},
+                ):
+                    graphlite_store.execute_cypher(
+                        "MATCH (c:CommunityNode {id: $id}) "
+                        "SET c.name = $name, c.summary = $summary, "
+                        "c.leiden_score = $score, c.created_at = $created_at",
+                        comm_vals,
+                    )
+                else:
+                    graphlite_store.execute_cypher(
+                        "INSERT (c:CommunityNode {id: $id, name: $name, "
+                        "summary: $summary, leiden_score: $score, "
+                        "created_at: $created_at})",
+                        comm_vals,
+                    )
+
+                # 处理 COMMUNITY_MEMBER 边
+                member_ids = comm.get("member_ids", [])
+                if not member_ids:
+                    # 旧格式候选兼容：无 member_ids → 只建节点不建边
+                    logger.warning(
+                        "Community %s from dream %s has no member_ids "
+                        "(old format), skipping COMMUNITY_MEMBER edges",
+                        comm_id, candidate.dream_id[:12],
+                    )
+                else:
+                    member_set: set[str] = set()
+                    for member_id in member_ids:
+                        member_set.add(member_id)
+                        try:
+                            # 阶段 1：按成员 ID 清旧边
+                            graphlite_store.execute_cypher(
+                                "MATCH (c:CommunityNode {id: $cid})"
+                                "-[r:COMMUNITY_MEMBER]->"
+                                "(e:EpisodeNode {id: $mid}) DELETE r",
+                                {"cid": comm_id, "mid": member_id},
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            # 阶段 2：建新边（成员不存在 → MATCH 无行 → 天然安全）
+                            graphlite_store.execute_cypher(
+                                "MATCH (c:CommunityNode {id: $cid}), "
+                                "(e:EpisodeNode {id: $mid}) "
+                                "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
+                                {"cid": comm_id, "mid": member_id},
+                            )
+                        except Exception:
+                            # MATCH 失败自然跳过（EpisodeNode 不存在等）
+                            pass
+                    new_member_sets[comm_id] = member_set
+
                 created += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Community persist failed for %s: %s", comm_id, e)
+
+        # 最终清理：防同一 EpisodeNode 属两个社区
+        # 【FIX 2026-08-09】原实现用 WHERE c.id <> $cid DELETE r 对每个 (cid, member)
+        # 删其他社区的边 → 共享成员被 C3/C4 互删 → 孤儿（属零个社区）。
+        # 新实现：每成员只保留最大社区的边，只删自己的边，不碰外部社区。
+        #
+        # 阶段 3a：按 member_count 倒序建 max_community_by_member 映射
+        # （new_member_sets 按 sorted_comms 插入 → Python 字典保序，大社区先到）
+        max_community_by_member: dict[str, str] = {}
+        for cid, members in new_member_sets.items():
+            for mid in members:
+                if mid not in max_community_by_member:
+                    max_community_by_member[mid] = cid
+
+        # 阶段 3b：只删自己社区到非最大成员的边（不动外部社区）
+        try:
+            for cid, members in new_member_sets.items():
+                for mid in members:
+                    if max_community_by_member.get(mid, cid) != cid:
+                        # 该成员属于更大的社区 → 只删自己社区的边
+                        graphlite_store.execute_cypher(
+                            "MATCH (c:CommunityNode {id: $cid})"
+                            "-[r:COMMUNITY_MEMBER]->"
+                            "(e:EpisodeNode {id: $mid}) DELETE r",
+                            {"cid": cid, "mid": mid},
+                        )
+        except Exception:
+            logger.warning(
+                "Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True,
+            )
+
+        # ✅ Phase 1 + Phase 3 同源湮灭 bug 已在 dream_pipeline.py 同步修复：
+        #    - Phase 1 (L1117-1127): MATCH 限定 {id: $cid}，不碰外部社区边
+        #    - Phase 3 (L1180-1210): 按 member_count 倒序 max_community_by_member，只删自己社区的边
+
         logger.info(
             "Persisted %d community nodes from dream %s",
             created, candidate.dream_id[:12],

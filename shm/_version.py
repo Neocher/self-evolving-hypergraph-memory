@@ -1,13 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.5"
-__version_info__ = (5, 21, 5)
-__version_name__ = "Fallback-Fix"
+__version__ = "5.21.6"
+__version_info__ = (5, 21, 6)
+__version_name__ = "Dream-Integrity"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — LLM fallback 轮转修复 (2026-08-09):
+核心变更 — 梦境候选孤儿社区修复 (2026-08-09):
+  • _persist_community_nodes 重写: 删 DETACH DELETE 全删 + 增量 upsert
+    + COMMUNITY_MEMBER 边 (双阶段, 只删自己边) + execute_cypher 写路径
+  • dream_pipeline 同源湮灭修复: Phase 1 限定 cid + Phase 3 max_community_by_member
+  • F1 共享成员湮灭 + F2 外部边误删 双路径闭环
+  • 测试: 398 passed (dream 15/15 + 幂等 + 外部边存活)
+
+v5.21.5 (2026-08-09) Fallback-Fix:
+  • LLM fallback 轮转 9→12 (openrouter 不再永不触达)
+
   • fallback 循环 range 9→12 (4端点×3次), url_idx 覆盖全部端点
   • 最后一个端点 openrouter 不再永不触达 ([3,3,3,0]→[3,3,3,3])
   • 日志计数 3→12 修正 + 4 个轮转测试 (序列/401/403/主端点)
