@@ -188,7 +188,7 @@ class TextEncoder:
         _os.environ.setdefault("HF_HUB_OFFLINE", "1")
         _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-        # ── 优先: 配置的 model_name（中文 bge-small-zh 或升级 bge-m3，本地缓存 snapshot，不访问网络）──
+        # ── 优先: 配置的 model_name（中文 bge-small-zh-v1.5，本地缓存 snapshot，不访问网络）──
         snapshot = _find_model_snapshot(self.model_name)
         if snapshot is not None:
             try:

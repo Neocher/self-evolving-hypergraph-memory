@@ -1,13 +1,18 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.7"
-__version_info__ = (5, 21, 7)
-__version_name__ = "CB-Config"
+__version__ = "5.21.8"
+__version_info__ = (5, 21, 8)
+__version_name__ = "Embed-Drift"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 熔断配置注入 (2026-08-09):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+核心变更 — 修正 embedding 声明漂移 (2026-08-09):
+  • 修正：EmbeddingConfig.model_name 默认值 bge-m3→bge-small-zh-v1.5
+    （YAML 早已回退，代码默认未同步）；FAISS 无"动态适配"（dimension 恒 512）
+
+v5.21.7 (2026-08-09) CB-Config:
+  • 熔断配置注入 (2026-08-09):
   • GraphLiteStore 构造传 cb_config=cfg.circuit_breaker
     (YAML/默认配置不再死配置, 熔断阈值可调)
   • conftest fixture cb_config 透传 + 注入断言测试
