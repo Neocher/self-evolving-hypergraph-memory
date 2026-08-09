@@ -2,6 +2,8 @@
 系统路由 (health, metrics, audit, index, procedural, conceptual)
 """
 
+import threading
+
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     set_trace_id, record_request, get_metrics, record_circuit_breaker,
@@ -13,6 +15,20 @@ from api.routes._deps import (
     __version__, __version_name__,
     Dict, Any,
 )
+
+# TTL 缓存：graph_store 相关统计（node_count/hyperedge_count），避免每次 /health 全扫描
+_HEALTH_STATS_CACHE: Dict[str, int] = {"node_count": 0, "hyperedge_count": 0}
+_HEALTH_STATS_CACHE_TIME: float = 0.0
+_HEALTH_STATS_CACHE_LOCK = threading.Lock()
+_HEALTH_STATS_TTL: float = 5.0
+
+
+def _recompute_status(result: HealthCheckResult) -> str:
+    if not result.graph_connected:
+        return "error"
+    if not result.chain_verified or not result.faiss_loaded:
+        return "degraded"
+    return "ok"
 
 
 def _decode_b64(s: str) -> str:
@@ -88,7 +104,11 @@ async def health_check(
     - FAISS 索引状态
     - BLAKE3 溯源链完整性
     - 梦境调度器状态
+
+    node_count / hyperedge_count 使用 5s TTL 缓存，避免每次全扫描 COUNT(*)。
     """
+    global _HEALTH_STATS_CACHE, _HEALTH_STATS_CACHE_TIME
+
     start = _now()
     set_trace_id()
 
@@ -98,7 +118,55 @@ async def health_check(
         audit_chain=deps.audit_chain,
         dream_scheduler=deps.dream_scheduler,
     )
-    health: HealthCheckResult = checker.check()
+
+    # 检查 TTL 缓存：5s 内跳过昂贵的 COUNT(*) 查询
+    with _HEALTH_STATS_CACHE_LOCK:
+        cache_hit = (start - _HEALTH_STATS_CACHE_TIME) < _HEALTH_STATS_TTL
+
+    if cache_hit:
+        # 临时置空 graph_store → check() 跳过 COUNT(*) 全扫描
+        checker.graph_store = None
+        health: HealthCheckResult = checker.check()
+
+        # 恢复缓存的统计值
+        with _HEALTH_STATS_CACHE_LOCK:
+            health.node_count = _HEALTH_STATS_CACHE["node_count"]
+            health.hyperedge_count = _HEALTH_STATS_CACHE["hyperedge_count"]
+
+        # 用快速 RETURN 1 验证图连接（COUNT(*) 全扫描的 1/10 以内延迟）
+        # P2 fix: query_cypher 永不抛异常，必须检查返回值
+        if deps.graphlite_store is not None:
+            try:
+                rows = deps.graphlite_store.query_cypher("RETURN 1 AS test")
+                health.graph_connected = bool(rows)
+            except Exception:
+                health.graph_connected = False
+
+        # P1 fix: checker.graph_store=None 导致 _check_circuit_breaker()
+        # 返回 {"state":"unknown"}。此处从 deps.graphlite_store 重建。
+        cb = getattr(deps.graphlite_store, "circuit_breaker", None)
+        if cb is not None:
+            window = getattr(cb, "_window", [])
+            ws = len(window)
+            rf = sum(1 for r in window if not r) if ws > 0 else 0
+            health.details["circuit_breaker"] = {
+                "state": cb.state.value if hasattr(cb.state, "value") else str(cb.state),
+                "window_size": ws,
+                "recent_failures": rf,
+                "success_rate": ((ws - rf) / ws * 100) if ws > 0 else 100.0,
+            }
+        elif deps.graphlite_store is not None:
+            health.details["circuit_breaker"] = {"state": "not_configured"}
+
+        # 重算整体状态（check() 在 graph_store=None 时将 status 误判为 error）
+        health.status = _recompute_status(health)
+    else:
+        health: HealthCheckResult = checker.check()
+        # 刷新缓存
+        with _HEALTH_STATS_CACHE_LOCK:
+            _HEALTH_STATS_CACHE["node_count"] = health.node_count
+            _HEALTH_STATS_CACHE["hyperedge_count"] = health.hyperedge_count
+            _HEALTH_STATS_CACHE_TIME = start
 
     cb = getattr(deps.graphlite_store, "circuit_breaker", None)
     if cb is not None:

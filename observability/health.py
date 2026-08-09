@@ -148,12 +148,16 @@ class HealthChecker:
         return result
 
     def _check_graph(self) -> bool:
-        """检查 RyuGraph 连接状态。"""
+        """检查 RyuGraph 连接状态。
+
+        query_cypher 永不抛异常（graphlite_store.py:658 契约），因此通过
+        检查返回值是否有行来判定图连通性，而非 try/except。
+        """
         if self.graph_store is None:
             return False
         try:
-            self.graph_store.query_cypher("RETURN 1 AS test")
-            return True
+            rows = self.graph_store.query_cypher("RETURN 1 AS test")
+            return bool(rows)
         except Exception:
             return False
 
