@@ -65,9 +65,6 @@ class EvolvableParams:
     # — BM25 —
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
-    # — 决策参数 —
-    gate_threshold: float = 0.5
-
     def validate(self) -> list[str]:
         errs = []
         for w in ["weight_fusion_vector", "weight_fusion_bm25", "weight_fusion_entity"]:
@@ -560,8 +557,6 @@ class SelfEvolvingRetrieval:
         cfg.top_k_vector = p.top_k_vector
         cfg.bm25_k1 = p.bm25_k1
         cfg.bm25_b = p.bm25_b
-        # also update the QueryRouter instance vars
-        self._qr.gate_threshold = p.gate_threshold
 
     def _evolve(self):
         """执行一轮演化：诊断 → 应用 → 记录"""

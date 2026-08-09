@@ -1,13 +1,21 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.3"
-__version_info__ = (5, 21, 3)
-__version_name__ = "P0-Stability"
+__version__ = "5.21.4"
+__version_info__ = (5, 21, 4)
+__version_name__ = "Param-Cleanup"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — P0 静默失败修复 (2026-08-09):
+核心变更 — gate_threshold 死参数清理 (2026-08-09):
+  • EvolvableParams.gate_threshold 纯死参数删除 (从不被 _evolve 调节,
+    同步目标 QueryRouter 无此属性) — LSP 静默断裂修复
+  • SSM gate 阈值演化不受影响 (dual_gate.adapt_threshold 独立)
+  • 测试: 386 passed 1 skipped
+
+v5.21.3 (2026-08-09) P0-Stability:
+  • SSM gate learn 闭环 + 5 幽灵方法 + toLower 契约
+
   • SSM gate learn 闭环: 写路径接线 learn() 正负信号 (outcome-gate_value
     方向) + reward 连续非负 + alpha 上界 clamp + fail-open 容差 ≤1e-9 —
     修复 warmup 后约半数正常写入被静默过滤 (数据丢失)

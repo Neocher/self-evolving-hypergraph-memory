@@ -141,7 +141,6 @@ class MockRouter:
         bm25_k1 = 1.5
         bm25_b = 0.75
     config = Config()
-    gate_threshold = 0.5
 
     def retrieve(self, q):
         return [{"content": f"result_{q}", "score": 0.7}]
