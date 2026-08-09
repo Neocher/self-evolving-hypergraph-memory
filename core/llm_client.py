@@ -184,12 +184,9 @@ class LLMClient:
 
         last_error = None
         # 先尝试主端点，再逐个尝试 fallback 端点
-        for attempt in range(1 + (_MAX_RETRIES * len(self._base_urls))):
+        for attempt in range(len(self._base_urls) * (1 + _MAX_RETRIES)):
             url_idx = attempt // (1 + _MAX_RETRIES)
-            if url_idx < len(self._base_urls):
-                endpoint = self._base_urls[url_idx]
-            else:
-                endpoint = self._base_urls[-1]
+            endpoint = self._base_urls[url_idx]
 
             # 如果切换了端点，重建 client（使用锁防止竞态条件）
             if endpoint != self._client.base_url:
@@ -229,7 +226,7 @@ class LLMClient:
                 last_error = str(e)
                 logger.warning("LLMClient error (attempt %d): %s", attempt + 1, last_error)
 
-        logger.error("LLMClient: all %d attempts failed: %s", 1 + _MAX_RETRIES, last_error)
+        logger.error("LLMClient: all %d attempts failed: %s", len(self._base_urls) * (1 + _MAX_RETRIES), last_error)
         return None
 
     async def summarize_community(

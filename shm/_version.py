@@ -1,13 +1,21 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.4"
-__version_info__ = (5, 21, 4)
-__version_name__ = "Param-Cleanup"
+__version__ = "5.21.5"
+__version_info__ = (5, 21, 5)
+__version_name__ = "Fallback-Fix"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — gate_threshold 死参数清理 (2026-08-09):
+核心变更 — LLM fallback 轮转修复 (2026-08-09):
+  • fallback 循环 range 9→12 (4端点×3次), url_idx 覆盖全部端点
+  • 最后一个端点 openrouter 不再永不触达 ([3,3,3,0]→[3,3,3,3])
+  • 日志计数 3→12 修正 + 4 个轮转测试 (序列/401/403/主端点)
+  • 测试: 390 passed 1 skipped
+
+v5.21.4 (2026-08-09) Param-Cleanup:
+  • gate_threshold 死参数删除 (LSP 静默断裂修复)
+
   • EvolvableParams.gate_threshold 纯死参数删除 (从不被 _evolve 调节,
     同步目标 QueryRouter 无此属性) — LSP 静默断裂修复
   • SSM gate 阈值演化不受影响 (dual_gate.adapt_threshold 独立)
