@@ -46,14 +46,18 @@ class BlockingDefenseEngine:
 
 def _make_svc(**overrides) -> Services:
     svc = Services()
-    svc.graphlite_store = MagicMock()
-    svc.graphlite_store.create_episode = MagicMock(return_value=None)
-    svc.graphlite_store.execute_cypher = MagicMock(return_value=False)
-    svc.graphlite_store.ensure_session = MagicMock()
-    svc.graphlite_store.link_to_session = MagicMock()
-    svc.graphlite_store.get_episode = MagicMock(return_value=None)
-    svc.graphlite_store.get_or_create_session = MagicMock(return_value=None)
-    svc.graphlite_store.link_session_member = MagicMock()
+    # 【P0-2】显式 mock 替代裸 MagicMock：裸 MagicMock 对任意未声明方法（如
+    # get_or_create_session）自动返回 truthy → `if session_node_id:` 恒真假绿。
+    # 显式覆盖关键方法 return_value=""，防止未声明方法自动返回 truthy。
+    gstore = MagicMock()
+    gstore.create_episode = MagicMock(return_value=None)
+    gstore.execute_cypher = MagicMock(return_value=False)
+    gstore.ensure_session = MagicMock()
+    gstore.link_to_session = MagicMock()
+    gstore.get_episode = MagicMock(return_value=None)
+    # 显式覆盖：任何未 mock 的方法调用返回空字符串/None（非 truthy）
+    gstore.get_or_create_session = MagicMock(return_value="")
+    svc.graphlite_store = gstore
     svc.quarantine_store = MagicMock()
     svc.quarantine_store.quarantine = MagicMock()
     for k, v in overrides.items():

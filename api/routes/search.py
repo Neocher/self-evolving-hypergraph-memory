@@ -76,7 +76,9 @@ async def retrieve(
             words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
             if words:
                 params = {f"w{i}": w for i, w in enumerate(words[:5])}
-                conditions = " OR ".join(f"toLower(e.content) CONTAINS $w{i}" for i in range(len(words[:5])))
+                # 【P0-3】中文 CONTAINS 不可用：GraphLite b64 编码无子串保持性，
+                # 中文查询的 Cypher 兜底不保证命中；依赖向量/BM25 主通道。
+                conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words[:5])))
                 cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                           "AND (e.quarantine IS NULL OR e.quarantine = false) "
                           f"RETURN e.id AS node_id, e.content AS content LIMIT 10")

@@ -32,11 +32,15 @@ class TestDualAdaptiveGate:
         assert 0.0 <= gate_value <= 1.0
 
     def test_should_keep_uses_config_threshold(self, gate: DualAdaptiveGate):
-        """should_keep: 冷启动期(warmup_steps 内)默认放行, 之后按阈值。"""
+        """should_keep: 冷启动期内放行; 无学习信号 fail-open; 有学习后按阈值（P0-1）。"""
         # 冷启动期：即使门控值低也放行
         assert gate.should_keep(0.2) is True
-        # 超过 warmup 后按阈值
+        # 超过 warmup 但无学习信号 → fail-open
         gate._step_count = gate.config.warmup_steps + 1
+        assert gate.should_keep(0.8) is True
+        assert gate.should_keep(0.2) is True  # fail-open: _total_reward == 0
+        # 有学习信号后按阈值
+        gate._total_reward = 0.1
         assert gate.should_keep(0.8) is True
         assert gate.should_keep(0.2) is False
 
@@ -130,3 +134,72 @@ class TestDualAdaptiveGate:
         assert A[0, 0] < 0
         # 检查下三角: 前 N 行存在非零下三角元素
         assert np.any(A[:N, :N] != 0)
+
+    def test_learn_direction_positive_outcome_raises_mlp_gate(self, gate: DualAdaptiveGate):
+        """P0-1 方向断言：正样本 learn 后 MLP gate 升高（不降）。
+
+        实证发现 grad_signal 符号反转 → outcome=1 时 gate 不升反降。
+        修复后正样本（outcome=1.0）学习应推高 MLP 门控值。
+        注：alpha 会因预算充裕向 SSM 偏移，融合 gate 可能降，但 MLP gate 必须升。
+        """
+        features = np.ones(gate.config.input_dim) * 0.9
+        h = np.zeros(gate.config.hidden_dim)
+        new_h, _ = gate.step(h, features)
+
+        mlp_before = gate.mlp.forward(new_h)
+
+        for _ in range(50):
+            gate_mlp = gate.mlp.forward(new_h)
+            gate.learn(gate_mlp, 1.0, new_h)
+
+        mlp_after = gate.mlp.forward(new_h)
+        assert mlp_after >= mlp_before - 0.001, (
+            f"正样本学习后 MLP gate 应不降: before={mlp_before:.4f} after={mlp_after:.4f}"
+        )
+
+    def test_learn_direction_negative_outcome_lowers_mlp_gate(self, gate: DualAdaptiveGate):
+        """P0-1 方向断言：负样本 learn 后 MLP gate 降低。
+
+        outcome=0 → 梯度压低 gate → MLP 门控值应下降。
+        """
+        features = np.ones(gate.config.input_dim) * 0.9
+        h = np.zeros(gate.config.hidden_dim)
+        new_h, _ = gate.step(h, features)
+
+        mlp_before = gate.mlp.forward(new_h)
+
+        for _ in range(50):
+            gate_mlp = gate.mlp.forward(new_h)
+            gate.learn(gate_mlp, 0.0, new_h)
+
+        mlp_after = gate.mlp.forward(new_h)
+        assert mlp_after <= mlp_before + 0.001, (
+            f"负样本学习后 MLP gate 应不升: before={mlp_before:.4f} after={mlp_after:.4f}"
+        )
+
+    def test_alpha_clamp_after_many_learns(self, gate: DualAdaptiveGate):
+        """learn 多次后 alpha < 1.0 且 fused gate 不为负。
+
+        alpha 由三股力推拉：reward 触发 alpha_learning_decay →
+        budget_ratio 偏移 → SSM 熵校准提升。任一股力都不能突破
+        alpha_max - 1e-9 上界，否则 (1-alpha) 变负，MLP 贡献反转。
+        """
+        features = np.ones(gate.config.input_dim) * 0.5
+        h = np.zeros(gate.config.hidden_dim)
+
+        for i in range(200):
+            new_h, gv = gate.step(h, features)
+            h = new_h
+            # 交替正/负反馈 + 高奖励 → 触发学习衰减
+            outcome = 1.0 if i % 2 == 0 else 0.0
+            gate.learn(gv, outcome, new_h)
+
+        assert gate.alpha < 1.0, f"alpha 应保持 < 1.0，实际 {gate.alpha}"
+        assert gate.alpha >= gate.config.alpha_min, (
+            f"alpha 应 >= alpha_min={gate.config.alpha_min}，实际 {gate.alpha}"
+        )
+
+        # fused gate 非负：alpha∈[alpha_min, 1.0) + g_ssm/g_mlp∈(0,1) → g ≥ 0
+        _, gv = gate.step(h, features)
+        assert gv >= 0.0, f"fused gate 应非负，实际 {gv}"
+        assert gv <= 1.0, f"fused gate 应 ≤ 1.0，实际 {gv}"

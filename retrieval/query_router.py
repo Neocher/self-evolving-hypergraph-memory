@@ -465,6 +465,10 @@ class QueryRouter:
         从查询中提取候选实体名（unigram + bigram），
         逐一匹配 GraphLite 中的 EpisodeNode 内容。
 
+        【P0-3】中文子串匹配不可用：GraphLite Rust lexer 不支持 UTF-8，
+        _gql_value 对非 ASCII 文本做 b64 块编码——无子串保持性，
+        CONTAINS 对中文不保证命中。中文检索主通道依赖向量（FAISS）/ BM25。
+
         Args:
             query: 查询文本
             k: 每个实体的匹配上限，总结果聚合去重
@@ -503,7 +507,7 @@ class QueryRouter:
             for i, term in enumerate(candidates):
                 pkey = f"t{i}"
                 params[pkey] = term.lower()
-                conditions.append(f"toLower(e.content) CONTAINS ${pkey}")
+                conditions.append(f"e.content CONTAINS ${pkey}")
             where_clause = " OR ".join(conditions)
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE {where_clause} "
@@ -950,9 +954,12 @@ class QueryRouter:
         当 FAISS 和 TF-IDF 均不可用时，直接查询 GraphLite 数据库，
         使用 Cypher CONTAINS 做文本匹配。
 
+        【P0-3】中文子串匹配不可用：b64 块编码无子串保持性，
+        CONTAINS 对中文不保证命中。中文检索主通道依赖向量/BM25，L4 仅英文有效。
+
         Returns:
             检索结果列表 [{"node_id", "content", "score", "level": "graphlite_fallback"}, ...]
-            失败时返回空列表（不抛异常）。
+             失败时返回空列表（不抛异常）。
         """
         if self.graphlite_store is None:
             logger.warning("L4 fallback: graphlite_store unavailable")
@@ -970,7 +977,7 @@ class QueryRouter:
             # 构建多个 CONTAINS 条件（大小写不敏感）
             params = {f"w{i}": w.lower() for i, w in enumerate(search_terms)}
             conditions = " OR ".join(
-                f"toLower(e.content) CONTAINS $w{i}" for i in range(len(search_terms))
+                f"e.content CONTAINS $w{i}" for i in range(len(search_terms))
             )
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE {conditions} "

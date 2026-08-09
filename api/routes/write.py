@@ -341,10 +341,18 @@ async def create_episode(
             deps.ssm_gate.hidden_state
         except AttributeError:
             deps.ssm_gate.hidden_state = deps.ssm_gate.reset_state()
-        hidden, gate_value = deps.ssm_gate.step(deps.ssm_gate.hidden_state, features)
+        hidden_prev = deps.ssm_gate.hidden_state
+        hidden, gate_value = deps.ssm_gate.step(hidden_prev, features)
         deps.ssm_gate.hidden_state = hidden
         if not deps.ssm_gate.should_keep(gate_value):
             logger.debug("SSM gate filtered episode", content_len=len(req.content), gate=float(gate_value))
+            # 【FIX 2026-08-09】过滤 → 负信号学习，防止"写入越多门越松"退化（P0-1）
+            # 【P0-1】用 hidden(决策时 SSM 状态)而非 hidden_prev(step 前状态)：
+            # step() 内 MLP.forward(hidden) 做决策，learn() 必须重放同一状态。
+            try:
+                deps.ssm_gate.learn(gate_value, 0.0, hidden)
+            except Exception:
+                logger.warning("SSM gate learn failed (non-fatal)", exc_info=True)
             return EpisodeResponse(episode_id=episode_id, status="filtered", tau_initial=0.0,
                                    created_at=created_at,  # 【FIX】缺 created_at → 500
                                    content=req.content, source=req.source)
@@ -431,6 +439,16 @@ async def create_episode(
         if val_result.entity_value:
             episode_data["entity_value"] = val_result.entity_value
     deps.graphlite_store.create_episode(episode_data)
+
+    # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
+    # 【P0-1】用 hidden(决策时 SSM 状态)而非 hidden_prev:
+    # step() 内 MLP.forward(hidden) 做决策，learn() 重放同一状态.
+    if (deps.ssm_gate is not None and deps.tau_engine is not None
+            and not req.force_promote):
+        try:
+            deps.ssm_gate.learn(gate_value, 1.0, hidden)
+        except Exception:
+            logger.warning("SSM gate learn failed (non-fatal)", exc_info=True)
 
     # [Defense] 隔离标记：QUARANTINE 判定的节点写入后标记隔离
     if defense_verdict is not None and defense_verdict.value == "quarantine":

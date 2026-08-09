@@ -221,14 +221,19 @@ class TestDualAdaptiveGate:
         assert state.shape == (128,)
 
     def test_should_keep_above_threshold(self):
-        """门控值高于阈值时应保留 (冷启动期默认放行, 过 warmup 后按阈值)"""
+        """门控值高于阈值时应保留; 无学习信号期 fail-open（P0-1）"""
         gate = DualAdaptiveGate()
         # 冷启动期：低值也放行 (fail-open)
         assert gate.should_keep(0.9)
         assert gate.should_keep(0.1)
 
-        # 过 warmup 后按阈值
+        # 过 warmup 后但无学习信号 → fail-open（P0-1 第二道防线）
         gate._step_count = gate.config.warmup_steps + 1
+        assert gate.should_keep(0.9)
+        assert gate.should_keep(0.1)  # fail-open: _total_reward == 0
+
+        # 有学习信号后按阈值判断
+        gate._total_reward = 0.1
         assert gate.should_keep(0.9)
         assert not gate.should_keep(0.1)
 
@@ -236,6 +241,7 @@ class TestDualAdaptiveGate:
         config = DualGateConfig(gate_threshold=0.5)
         gate2 = DualAdaptiveGate(config)
         gate2._step_count = gate2.config.warmup_steps + 1
+        gate2._total_reward = 0.1  # simulate learned
         assert gate2.should_keep(0.5001)
         assert not gate2.should_keep(0.4999)
 

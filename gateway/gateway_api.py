@@ -177,11 +177,17 @@ class GatewayAPI:
                 _ = self._svc.ssm_gate.hidden_state
             except AttributeError:
                 self._svc.ssm_gate.hidden_state = self._svc.ssm_gate.reset_state()
+            hidden_prev = self._svc.ssm_gate.hidden_state
             hidden, gate_value = self._svc.ssm_gate.step(
-                self._svc.ssm_gate.hidden_state, features
+                hidden_prev, features
             )
             self._svc.ssm_gate.hidden_state = hidden
             if not self._svc.ssm_gate.should_keep(gate_value):
+                # 【FIX 2026-08-09】过滤 → 负信号学习，防止"写入越多门越松"退化（P0-1）
+                try:
+                    self._svc.ssm_gate.learn(gate_value, 0.0, hidden)
+                except Exception:
+                    pass
                 return EpisodeResponse(
                     episode_id=episode_id, status="filtered", tau_initial=0.0,
                     content=content, source=source,
@@ -196,6 +202,13 @@ class GatewayAPI:
             "created_at": created_at,
             "tau_initial": tau_initial,
         })
+
+        # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
+        if self._svc.ssm_gate is not None and self._svc.tau_engine is not None:
+            try:
+                self._svc.ssm_gate.learn(gate_value, 1.0, hidden)
+            except Exception:
+                pass
 
         # 命名空间链接
         if namespace:
@@ -418,8 +431,10 @@ class GatewayAPI:
                 words = [w.strip().lower() for w in query.split() if len(w.strip()) > 1]
                 if words:
                     params = {f"w{i}": w for i, w in enumerate(words[:5])}
+                    # 【P0-3】中文 CONTAINS 不可用：GraphLite b64 编码无子串保持性。
+                    # 中文查询的 Cypher 兜底不保证命中；依赖向量/BM25 主通道。
                     conditions = " OR ".join(
-                        f"toLower(e.content) CONTAINS $w{i}" for i in range(len(words[:5]))
+                        f"e.content CONTAINS $w{i}" for i in range(len(words[:5]))
                     )
                     cypher = (
                         f"MATCH (e:EpisodeNode) WHERE {conditions} "

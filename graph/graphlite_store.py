@@ -520,6 +520,54 @@ class GraphLiteStore:
         except Exception:
             return []
 
+    # ─── Session/Visual CRUD（P0-2 幽灵方法实现）───────────────
+
+    def get_or_create_session(self, session_id: str, metadata: Optional[str] = None) -> str:
+        """获取或创建 SessionNode，返回 session_id（两段式幂等，参照 ensure_session）。"""
+        self.ensure_session(session_id)
+        if metadata:
+            self._session.execute(
+                f"MATCH (s:SessionNode {{id: '{session_id}'}}) "
+                f"SET s.metadata = '{metadata}'"
+            )
+        return session_id
+
+    def link_session_member(self, session_node_id: str, episode_id: str) -> None:
+        """Link episode to session node（参照 link_to_session 的 MATCH + INSERT）。"""
+        gql = (
+            f"MATCH (s:SessionNode {{id: '{session_node_id}'}}), "
+            f"(e:EpisodeNode {{id: '{episode_id}'}}) "
+            f"INSERT (s)-[:SESSION_MEMBER]->(e)"
+        )
+        self._session.execute(gql)
+
+    def create_visual_node(self, node: dict) -> str:
+        """INSERT VisualNode。id 为必填；embedding 是 list，_gql_value 自动 b64 序列化。"""
+        vid = node.get("id", str(uuid.uuid4()))
+        vals = _dict_to_gql_values(node, skip_keys={"id"})
+        self._session.execute(f"INSERT (v:VisualNode {{id: '{vid}', {vals}}})")
+        return vid
+
+    def get_visual_node(self, visual_id: str) -> Optional[dict]:
+        """MATCH VisualNode by id（参照 get_episode）。"""
+        gql = f"MATCH (v:VisualNode {{id: '{visual_id}'}}) RETURN v"
+        try:
+            result = self._session.query(gql)
+            if result.rows:
+                return self._flatten_row(result.rows[0], "v")
+        except Exception:
+            return None
+        return None
+
+    def get_visual_nodes(self, limit: int = 50) -> list[dict]:
+        """列出 VisualNode（flatten 后含 b64 解码的 caption）。"""
+        gql = f"MATCH (v:VisualNode) RETURN v LIMIT {limit}"
+        try:
+            result = self._session.query(gql)
+            return [self._flatten_row(r, "v") for r in result.rows]
+        except Exception:
+            return []
+
     def delete_namespace(self, namespace: str) -> int:
         """按命名空间删除：删除 SessionNode 及其 SESSION_MEMBER 关联的 EpisodeNode。
 

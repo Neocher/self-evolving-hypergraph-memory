@@ -252,7 +252,12 @@ class MLPGate:
         """
         策略梯度在线学习。
 
-        梯度: ∇ ∝ R · (g - outcome) · h_ssm
+        梯度: ∇ ∝ R · (outcome - gate_value) · h_ssm
+
+        【P0-1】reward 必须非负：它是学习速率缩放因子，不是方向信号。
+        方向由 (outcome - gate_value) 给出。原 reward=-1(决策错误)翻转梯度方向，
+        使门控学反方向。改用连续型 reward = 1 - |gate - outcome|：
+        gate 越接近 outcome，reward 越高，学习速率越快。
 
         Args:
             gate_value: MLP 当时输出的门控值
@@ -265,14 +270,13 @@ class MLPGate:
         if not self.config.mlp_enable_online_learning:
             return 0.0
 
-        decision = 1.0 if gate_value > self.config.gate_threshold else 0.0
-        reward = 1.0 if abs(decision - outcome) < 0.5 else -1.0
+        # 【P0-1】连续型 reward：非负，保梯度方向由 (outcome - gate) 决定
+        reward = 1.0 - abs(gate_value - outcome)
 
         self._total_reward = self.config.mlp_reward_decay * self._total_reward + reward
 
-        # 策略梯度 (经过隐层传播)
         lr = self.config.mlp_learning_rate
-        grad_signal = reward * (gate_value - outcome)
+        grad_signal = reward * (outcome - gate_value)
 
         h = np.tanh(self.W_h @ ssm_state + self.b_h)
         h_2d = h.reshape(-1, 1)
@@ -358,6 +362,12 @@ class DualAdaptiveGate:
         # 【FIX】冷启动保护：未训练够 warmup_steps 之前默认放行（fail-open）
         if self._step_count <= self.config.warmup_steps:
             return True
+        # 【FIX 2026-08-09】无学习信号期 fail-open：累计 reward≈0 说明 learn() 从未被接线，
+        # 随机初始化权重不具判别力，放行避免重演静默丢写（P0-1 第二道防线）
+        # 【P0-4】<= 1e-9 容差替换精确 == 0.0：浮点衰减（reward_decay * 0.0）可能永远
+        # 不归精确零，若走精确等值则 fail-open 永久生效 → 门控废铁。
+        if abs(self._total_reward) <= 1e-9:
+            return True
         return gate_value > self.config.gate_threshold
 
     def compute_input_features(self, hyperedge_data: dict) -> np.ndarray:
@@ -418,6 +428,9 @@ class DualAdaptiveGate:
 
         # 限制 α 范围 [alpha_min, alpha_max)
         self.alpha = max(self.config.alpha_min, self.alpha)
+        # 【P0-1】上界必须强制：alpha > 1 使 (1-alpha) 为负，MLP 贡献反转 → 门控值可为负。
+        # 预算偏移和熵校准可能累积推高 alpha，仅靠 alpha_min 下界不足。
+        self.alpha = min(self.alpha, self.config.alpha_max - 1e-9)
 
         self._total_reward = self.config.mlp_reward_decay * self._total_reward + reward
         return reward

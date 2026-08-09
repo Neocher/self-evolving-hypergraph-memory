@@ -43,3 +43,9 @@ workweave-router
 direct-proxy/
 Dockerfile.go-router
 smart-router-solution/
+
+# 非 SHM 组件/设计文档（不入库）
+design_herdr*.md
+design_p0_fix*.md
+tests/test_acp_bridge_herdr.py
+*.docx
