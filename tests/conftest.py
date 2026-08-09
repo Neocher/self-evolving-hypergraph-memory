@@ -47,12 +47,17 @@ def mock_graphlite_store(temp_db_path: Path):
 
 
 @pytest.fixture
-def graphlite_store(temp_db_path: Path):
-    """真实 GraphLiteStore 临时库（本体矛盾检测等集成测试用）。"""
+def graphlite_store(temp_db_path: Path, request):
+    """真实 GraphLiteStore 临时库（本体矛盾检测等集成测试用）。
+
+    支持 indirect parametrize 注入 cb_config：
+        @pytest.mark.parametrize('graphlite_store', [cb_cfg], indirect=True)
+    """
     from graph.graphlite_store import GraphLiteStore
 
     config = type("cfg", (), {"database_path": str(temp_db_path), "max_threads": 4})()
-    store = GraphLiteStore(config=config)
+    cb_config = getattr(request, 'param', None)
+    store = GraphLiteStore(config=config, cb_config=cb_config)
     store.connect()
     yield store
     store.close()

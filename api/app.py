@@ -50,7 +50,7 @@ def _init_services() -> Services:
             "database_path": str(cfg.graphlite.database_path),
             "max_threads": cfg.graphlite.max_threads,
         })()
-        svc.graphlite_store = GraphLiteStore(config=graphlite_cfg)
+        svc.graphlite_store = GraphLiteStore(config=graphlite_cfg, cb_config=cfg.circuit_breaker)
         svc.graphlite_store.connect()
         logger.info("GraphLiteStore initialized", path=graphlite_cfg.database_path)
     except Exception as e:

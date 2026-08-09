@@ -1,13 +1,21 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.6"
-__version_info__ = (5, 21, 6)
-__version_name__ = "Dream-Integrity"
+__version__ = "5.21.7"
+__version_info__ = (5, 21, 7)
+__version_name__ = "CB-Config"
 __release_date__ = "2026-08-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 梦境候选孤儿社区修复 (2026-08-09):
+核心变更 — 熔断配置注入 (2026-08-09):
+  • GraphLiteStore 构造传 cb_config=cfg.circuit_breaker
+    (YAML/默认配置不再死配置, 熔断阈值可调)
+  • conftest fixture cb_config 透传 + 注入断言测试
+  • 测试: 398 passed
+
+v5.21.6 (2026-08-09) Dream-Integrity:
+  • 梦境候选孤儿社区 + 共享成员湮灭 + 外部边误删 双路径闭环
+
   • _persist_community_nodes 重写: 删 DETACH DELETE 全删 + 增量 upsert
     + COMMUNITY_MEMBER 边 (双阶段, 只删自己边) + execute_cypher 写路径
   • dream_pipeline 同源湮灭修复: Phase 1 限定 cid + Phase 3 max_community_by_member

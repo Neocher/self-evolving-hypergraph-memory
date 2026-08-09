@@ -502,3 +502,32 @@ class TestWithRetryDualMode:
 
         with pytest.raises(ConnectionError):
             always_fails()
+
+
+class TestCircuitBreakerConfigInjection:
+    """验证 cb_config 从 GraphLiteStore 构造函数透传到 CircuitBreaker。"""
+
+    def test_cb_config_propagates_to_circuit_breaker(self, temp_db_path):
+        """注入非默认 cb_config → store.circuit_breaker 属性来自配置而非默认值。"""
+        from config.settings import CircuitBreakerConfig
+        from graph.graphlite_store import GraphLiteStore
+
+        cb_cfg = CircuitBreakerConfig(
+            failure_threshold=0.3,
+            recovery_timeout=15.0,
+            half_open_max_requests=2,
+            window_size=20,
+        )
+        config = type("cfg", (), {
+            "database_path": str(temp_db_path),
+            "max_threads": 4,
+        })()
+        store = GraphLiteStore(config=config, cb_config=cb_cfg)
+        store.connect()
+        try:
+            assert store.circuit_breaker.failure_threshold == 0.3
+            assert store.circuit_breaker.recovery_timeout == 15.0
+            assert store.circuit_breaker.half_open_max_requests == 2
+            assert store.circuit_breaker.window_size == 20
+        finally:
+            store.close()
