@@ -577,7 +577,7 @@ class GraphLiteStore:
         try:
             result = self._session.query(
                 f"MATCH (s:SessionNode {{id: '{namespace}'}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
-                f"RETURN e.id"
+                f"RETURN e"
             )
             ep_ids = [self._flatten_row(r, "e").get("id", "") for r in result.rows]
             ep_ids = [i for i in ep_ids if i]
