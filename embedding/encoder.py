@@ -121,6 +121,61 @@ def _find_bge_snapshot() -> Optional[str]:
     return _find_model_snapshot("BAAI/bge-small-zh-v1.5")
 
 
+# ─── 推理设备解析（auto/cpu/cuda 自适应）────────────────────
+
+# 模型名子串 → 估算显存占用 (GB)；不含 PyTorch 运行时上下文 (~0.5GB)
+_ESTIMATED_MEMORY_GB = {
+    "bge-m3": 2.6,
+    "bge-small": 0.6,
+}
+_DEFAULT_ESTIMATED_MEMORY_GB = 1.5
+_CUDA_CONTEXT_OVERHEAD_GB = 0.5
+
+
+def _cuda_memory_ok(model_name: str) -> bool:
+    """显存预检：空闲显存 > 模型估算 + 上下文开销才返回 True（防 OOM）。
+
+    torch 缺失 / 未编译 CUDA / 驱动异常 → 一律 False（走 CPU）。
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        free_bytes, _ = torch.cuda.mem_get_info()
+        estimate = _ESTIMATED_MEMORY_GB.get(
+            next((k for k in _ESTIMATED_MEMORY_GB if k in model_name), ""),
+            _DEFAULT_ESTIMATED_MEMORY_GB,
+        )
+        return free_bytes / (1024**3) > estimate + _CUDA_CONTEXT_OVERHEAD_GB
+    except Exception:
+        return False  # torch 缺失/未编译 CUDA/驱动异常 → 一律 CPU
+
+
+def _resolve_device(requested: str, model_name: str) -> str:
+    """设备解析：auto/cpu/cuda → 实际推理设备。
+
+    - "auto"（默认）：cuda 可用且显存充足 → "cuda"，否则 "cpu"
+    - "cpu"：强制 cpu（不触发 torch import，纯 CPU 环境零副作用）
+    - "cuda"：强制 cuda；不可用（未编译 CUDA / 无卡）→ 降级 "cpu"
+    - torch import 失败 / 异常 → "cpu"
+    """
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    # requested == "auto"
+    if torch.cuda.is_available() and _cuda_memory_ok(model_name):
+        return "cuda"
+    return "cpu"
+
+
 class TextEncoder:
     """
     文本嵌入编码器（Tier 2）。
@@ -187,6 +242,14 @@ class TextEncoder:
         # 进程内强制离线（SentenceTransformer 不支持 local_files_only 参数）
         _os.environ.setdefault("HF_HUB_OFFLINE", "1")
         _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+        # 【Device】加载前解析一次实际推理设备（auto/cpu/cuda 自适应），
+        # 三处 SentenceTransformer 构造共用 resolved，避免重复 CUDA 初始化；
+        # 现有异常降级兜底保留，作为运行期失败的最后防线
+        resolved = _resolve_device(self.device, self.model_name)
+        if resolved != self.device:
+            logger.info("Embedding device resolved: requested=%s → %s", self.device, resolved)
+        self.device = resolved
 
         # ── 优先: 配置的 model_name（中文 bge-small-zh-v1.5，本地缓存 snapshot，不访问网络）──
         snapshot = _find_model_snapshot(self.model_name)

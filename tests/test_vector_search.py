@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -356,3 +357,31 @@ class TestVectorSearchEdgeCases:
         client = TestClient(app)
         resp = client.post("/search/vector", json={"query": "", "limit": 5})
         assert resp.status_code == 422
+
+
+class TestVectorSearchBatchLookup:
+    """search_vector 回查走批量路径：get_episodes_batch 一次查询，不再逐条 get_episode。"""
+
+    def test_uses_batch_lookup_not_per_episode(self, populated_faiss, mock_enc):
+        mock_faiss, faiss_id_map, _ = populated_faiss
+        store = MagicMock()
+        store.get_episode = MagicMock(side_effect=AssertionError("should not be called"))
+        store.get_episodes_batch = MagicMock(return_value=[
+            {"id": ep, "content": f"content {i}"}
+            for i, ep in enumerate(faiss_id_map.values())
+        ])
+        svc = _build_svc(
+            encoder=mock_enc,
+            faiss_index=mock_faiss,
+            graphlite_store=store,
+            faiss_id_map=faiss_id_map,
+        )
+        app = _make_app(svc)
+        resp = TestClient(app).post("/search/vector", json={"query": "test", "limit": 5})
+        assert resp.status_code == 200
+        store.get_episodes_batch.assert_called_once()
+        store.get_episode.assert_not_called()
+        # 结果顺序与 FAISS 排名一致，content 来自批量回查
+        data = resp.json()
+        assert data["total_found"] == 3
+        assert {r["content"] for r in data["results"]} == {"content 0", "content 1", "content 2"}
