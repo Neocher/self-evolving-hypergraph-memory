@@ -59,30 +59,34 @@ def test_connect_new_db_creates_graph(tmp_path):
     # 全新库无 schema：2 个候选的探测 + 创建流程里的 SET SCHEMA，共 3 次
     assert session.calls.count("SESSION SET SCHEMA /shm") == 3
     # 创建顺序：CREATE SCHEMA → SESSION SET SCHEMA → CREATE GRAPH → SESSION SET GRAPH
+    # （P1-2: 末尾追加 EpisodeNode 复合索引，尽力而为）
     creates = [c for c in session.calls if c.startswith("CREATE")]
-    assert creates == ["CREATE SCHEMA /shm", "CREATE GRAPH /shm"]
-    assert session.calls[-1] == "SESSION SET GRAPH /shm"
+    assert creates == [
+        "CREATE SCHEMA /shm",
+        "CREATE GRAPH /shm",
+        "CREATE INDEX IF NOT EXISTS idx_episode_src_ts ON EpisodeNode (source, created_at)",
+    ]
     assert store._db_path.endswith("test_graphlite_db")
 
 
 def test_connect_existing_default_graph(tmp_path):
-    """旧生产库：已有 default graph → 直接连上，不执行任何 CREATE。"""
+    """旧生产库：已有 default graph → 直接连上，仅追加 P1-2 索引，无其他 CREATE。"""
     session = FakeGraphLiteSession(schema_exists=True, graphs={"default"})
     store = _make_store(tmp_path, session)
 
     assert store._graph_name == "default"
-    assert not [c for c in session.calls if c.startswith("CREATE")]
-    assert session.calls[-1] == "SESSION SET GRAPH default"
+    assert not [c for c in session.calls if c.startswith("CREATE") and "CREATE INDEX" not in c]
+    assert "CREATE INDEX IF NOT EXISTS idx_episode_src_ts ON EpisodeNode (source, created_at)" in session.calls
 
 
 def test_connect_existing_slash_shm_graph(tmp_path):
-    """新格式库：default 不存在但 /shm 存在 → 连 /shm，不执行任何 CREATE。"""
+    """新格式库：default 不存在但 /shm 存在 → 连 /shm，仅追加 P1-2 索引。"""
     session = FakeGraphLiteSession(schema_exists=True, graphs={"/shm"})
     store = _make_store(tmp_path, session)
 
     assert store._graph_name == "/shm"
-    assert not [c for c in session.calls if c.startswith("CREATE")]
-    assert session.calls[-1] == "SESSION SET GRAPH /shm"
+    assert not [c for c in session.calls if c.startswith("CREATE") and "CREATE INDEX" not in c]
+    assert "CREATE INDEX IF NOT EXISTS idx_episode_src_ts ON EpisodeNode (source, created_at)" in session.calls
 
 
 def test_connect_schema_exists_no_graph(tmp_path):
@@ -94,8 +98,8 @@ def test_connect_schema_exists_no_graph(tmp_path):
     creates = [c for c in session.calls if c.startswith("CREATE")]
     # CREATE SCHEMA 可能被尝试但失败（已存在被 pass 吞掉），不得出现第二次
     assert creates.count("CREATE SCHEMA /shm") <= 1
-    # 最终连上新 graph
-    assert session.calls[-1] == "SESSION SET GRAPH /shm"
+    # 最终连上新 graph（P1-2 索引在其后追加）
+    assert session.calls[-1].startswith("CREATE INDEX IF NOT EXISTS")
 
 
 def test_get_all_connections_format():

@@ -1,13 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.12"
-__version_info__ = (5, 21, 12)
-__version_name__ = "Dream-Fix"
-__release_date__ = "2026-08-10"
+__version__ = "5.22.0"
+__version_info__ = (5, 22, 0)
+__version_name__ = "Write-Perf"
+__release_date__ = "2026-08-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 修正 embedding 声明漂移 (2026-08-09):
+核心变更 — 写路径性能优化 (2026-08-11):
+  • P0-1: R2 参考 embedding 缓存 (content_hash → embedding, FIFO LRU 512 条)
+    —— 同 source 连续写入省 200ms+/条
+  • P0-2: defense 锁拆细 — asyncio.Lock → threading.Lock 短临界区 + 专用小池,
+    并发写吞吐 0.4 → 数十 req/s; fail-closed 两处 QUARANTINE 原样保留
+  • P1-1: 批量接口真正批量化 — 超边创建按 source 合并, 每 source 2 次 MATCH
+    (原逐条 2n 次), 批量写均摊 ≤100ms/条
+  • P1-2: EpisodeNode (source, created_at) 复合索引 (尽力而为, 失败仅日志)
+  • P2-1: 梦境调度写入压力感知 — 持续写入推迟梦境触发, 消除批量写偶发超时
+
+v5.21.12 (2026-08-10) Dream-Fix:
   • 修正：EmbeddingConfig.model_name 默认值 bge-m3→bge-small-zh-v1.5
     （YAML 早已回退，代码默认未同步）；FAISS 无"动态适配"（dimension 恒 512）
 

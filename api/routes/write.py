@@ -599,6 +599,7 @@ async def create_episodes_batch(
     start = _now()
     set_trace_id()
     results: list[dict] = []
+    created_entries: list[tuple[str, str]] = []
     for req in reqs:
         episode_id = str(uuid.uuid4())
         created_at = _now()
@@ -615,14 +616,27 @@ async def create_episodes_batch(
             if req.namespace and deps.graphlite_store is not None:
                 deps.graphlite_store.ensure_session(req.namespace)
                 deps.graphlite_store.link_to_session(req.namespace, episode_id)
-            # 超边创建(批量场景也触发, 保持行为一致)
-            try:
-                await _auto_create_hyperedges(episode_id, req.source, req.content, deps)
-            except Exception:
-                pass
+            # 【P1-1】超边创建改为批量合并 (循环外每 source 2 次查询),
+            # 不再逐条触发 (原: 每项 2 次 MATCH 全表扫描)。
+            created_entries.append((episode_id, req.source))
+            # 【P1-1·6.1】补入 embedding 队列 (原批量路径缺失 → 批量导入数据
+            # 不进 FAISS、检索全空)。µs 级入队, 编码由 poll loop 异步消费;
+            # 隔离节点由 _process_embed_queue 的 quarantined_set 跳过。
+            with _embed_queue_lock:
+                _embed_queue.append((episode_id, req.content, created_at))
+            # 梦境通知 (批量写入计入写压力/累积计数, 与单条路径一致)
+            if deps.dream_scheduler is not None:
+                await deps.dream_scheduler.on_activity()
+                await deps.dream_scheduler.on_node_created()
             results.append({"episode_id": episode_id, "status": "created"})
         except Exception as e:
             results.append({"episode_id": episode_id, "status": "error", "error": str(e)})
+
+    # 【P1-1】批量超边创建: 每 source 只查 1 次 recent 窗口
+    try:
+        await _auto_create_hyperedges_batch(created_entries, deps)
+    except Exception:
+        logger.exception("Batch hyperedge creation failed (non-fatal)")
 
     record_request("POST", "/memories/episodes/batch", "200", _now() - start)
     return {"status": "ok", "count": len(results), "results": results}
@@ -826,4 +840,68 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         return created
     except Exception as e:
         logger.warning("Auto-hyperedge creation failed (non-fatal): %s", e)
+        return 0
+
+
+async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Services) -> int:
+    """P1-1: 批量超边创建 — 每 source 只查 1 次 recent 窗口, 聚合创建超边。
+
+    原批量路径逐条调 _auto_create_hyperedges (每项 2 次 MATCH, n=30 共 60 次查询)。
+    改为每 source 2 次 MATCH (时态窗口 + 情节窗口), 创建 ≤1 条时态 + ≤1 条情节超边。
+    entries: [(episode_id, source), ...]
+    """
+    if deps.hyperedge_manager is None or deps.graphlite_store is None or not entries:
+        return 0
+    from collections import defaultdict
+    by_source: dict[str, list[str]] = defaultdict(list)
+    for eid, src in entries:
+        by_source[src].append(str(eid))
+    created = 0
+    now = _now()
+    try:
+        for src, new_ids in by_source.items():
+            # 时态超边: 一次性查 recent 300s 窗口 (每 source 1 次)
+            recent_rows = deps.graphlite_store.query_cypher(
+                "MATCH (e:EpisodeNode) WHERE e.source = $src "
+                "AND e.created_at >= $cutoff "
+                "RETURN e.id ORDER BY e.created_at DESC LIMIT 5",
+                {"src": src, "cutoff": now - 300},
+            )
+            recent_ids: list[str] = []
+            for row in recent_rows:
+                if isinstance(row, (list, tuple)):
+                    recent_ids.append(str(row[0]))
+                elif isinstance(row, dict):
+                    recent_ids.append(str(row.get("id", "")))
+            # 合并本批新节点去重 (批内节点已落库, 查询可能已含它们)
+            merged = list(dict.fromkeys(recent_ids + new_ids))[:5]
+            if len(merged) >= 2:
+                deps.hyperedge_manager.create_temporal_hyperedge(
+                    member_ids=merged, start_time=now - 300, end_time=now,
+                )
+                created += 1
+                logger.info("Batch TEMPORAL hyperedge: %d members (source=%s)", len(merged), src)
+            # 情节超边: 3600s 窗口 (每 source 1 次)
+            window_rows = deps.graphlite_store.query_cypher(
+                "MATCH (e:EpisodeNode) WHERE e.source = $src "
+                "AND e.created_at >= $cutoff "
+                "RETURN e.id ORDER BY e.created_at DESC LIMIT 20",
+                {"src": src, "cutoff": now - 3600},
+            )
+            window_ids: list[str] = []
+            for row in window_rows:
+                if isinstance(row, (list, tuple)):
+                    window_ids.append(str(row[0]))
+                elif isinstance(row, dict):
+                    window_ids.append(str(row.get("id", "")))
+            merged_w = list(dict.fromkeys(window_ids + new_ids))[:8]
+            if len(merged_w) >= 4:
+                deps.hyperedge_manager.create_episode_hyperedge(
+                    member_ids=merged_w, topic=f"batch_{src}_{int(now)}",
+                )
+                created += 1
+                logger.info("Batch EPISODE hyperedge: %d members (source=%s)", len(merged_w), src)
+        return created
+    except Exception as e:
+        logger.warning("Batch auto-hyperedge creation failed (non-fatal): %s", e)
         return 0

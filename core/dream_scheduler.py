@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
@@ -43,6 +44,10 @@ class DreamSchedulerConfig:
     cpu_affinity_low_priority: bool = True  # 低优先级 CPU 亲和性
     memory_limit_mb: int = 256  # 梦境线程内存限制
     conflict_accum_threshold: int = 5  # P2: 累积 5 个未解决冲突触发矛盾驱动梦境
+    # P2-1: 写入压力感知 — 最近 write_pressure_window_seconds 内写请求数
+    # 达到 write_pressure_threshold 时推迟自动梦境触发 (消除梦境与批量写竞争超时)
+    write_pressure_window_seconds: float = 30.0
+    write_pressure_threshold: int = 15
 
 
 class DreamScheduler:
@@ -67,6 +72,8 @@ class DreamScheduler:
         self._current_dream_id: Optional[str] = None  # 【H5】当前梦境 ID（崩溃后可 reconcile）
         self._new_node_count: int = 0
         self._last_activity_time: float = time.time()
+        # P2-1: 最近写入时间戳滑动窗口 (写压力感知, 不持久化)
+        self._recent_write_times: deque[float] = deque(maxlen=4096)
         self._lock = asyncio.Lock()
         self._dream_run_count: int = 0  # 【FIX】梦境执行计数器
         self._dream_fail_count: int = 0  # 【H3】梦境失败/超时统计
@@ -96,6 +103,15 @@ class DreamScheduler:
     async def on_node_created(self) -> None:
         """节点创建通知，增加累积计数。"""
         self._new_node_count += 1
+        self._recent_write_times.append(time.time())  # P2-1: 写压力信号
+
+    def _under_write_pressure(self) -> bool:
+        """P2-1: 最近 write_pressure_window_seconds 内写请求数是否达到阈值。"""
+        now = time.time()
+        cutoff = now - self.config.write_pressure_window_seconds
+        while self._recent_write_times and self._recent_write_times[0] < cutoff:
+            self._recent_write_times.popleft()
+        return len(self._recent_write_times) >= self.config.write_pressure_threshold
 
     async def check_and_trigger(self) -> bool:
         """
@@ -153,6 +169,19 @@ class DreamScheduler:
                             )
                 except OSError:
                     pass
+
+            # P2-1: 写入压力感知 — 持续写入时推迟梦境 (批处理导入与梦境 LLM
+            # 串行调用竞争是写路径偶发超时主因)。推迟不丢候选: 节点累积计数
+            # 与候选文件保留, 下次 poll 重新评估。
+            if should_run and self._under_write_pressure():
+                logger.info(
+                    "Dream deferred: %d writes in last %.0fs >= threshold %d "
+                    "(write pressure)",
+                    len(self._recent_write_times),
+                    self.config.write_pressure_window_seconds,
+                    self.config.write_pressure_threshold,
+                )
+                return False
 
             if should_run:
                 self._is_running = True
