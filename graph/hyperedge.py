@@ -156,6 +156,10 @@ class HyperedgeManager:
          保证唯一（重复 INSERT 同一 id 为无操作）。
          调用方应通过 delete_hyperedge + 重建保证一致性，或依赖每次生成新 UUID
          （如 create_episode_hyperedge）天然幂等。
+
+         【R3/静默失败专项】边 INSERT 用 execute_cypher（不吞异常）而非
+         query_cypher（永不抛异常契约）——边写入失败必须上抛，调用方不得
+         误判成功（Codex F2）。熔断 open 时上抛 CircuitBreakerOpen。
         """
         import json
         self.store.create_hyperedge_node({
@@ -182,7 +186,8 @@ class HyperedgeManager:
             match_parts.append(f"(e{i}:EpisodeNode {{id: ${eid_key}}})")
             insert_parts.append(f"(h)-[:HYPEREDGE_MEMBER]->(e{i})")
         query = f"MATCH {', '.join(match_parts)} INSERT {', '.join(insert_parts)}"
-        self.store.query_cypher(query, params)
+        # R3: execute_cypher 不吞异常（query_cypher 静默返回 [] → 调用方误判成功）
+        self.store.execute_cypher(query, params)
 
     def get_hyperedges_by_node(self, node_id: str) -> List[Hyperedge]:
         """查询包含指定节点的所有超边。"""

@@ -58,6 +58,16 @@ def _init_services() -> Services:
         errors.append(f"GraphLiteStore: {e}")
         logger.warning("GraphLiteStore init failed", error=str(e), traceback=traceback.format_exc())
 
+    # 1b. 【v5.23】写串行化队列（所有 GraphLite 写调用收敛到专用写线程串行执行，
+    # 事件循环不再被同步写阻塞；队列不可用时写路径回退同步直调）
+    try:
+        from core.write_queue import WriteQueue
+        svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0)
+        logger.info("WriteQueue initialized", max_pending=100, wait_timeout=30.0)
+    except Exception as e:
+        errors.append(f"WriteQueue: {e}")
+        logger.warning("WriteQueue init failed (fallback: sync direct writes)", error=str(e))
+
     # 2. FAISS 向量索引
     if svc.graphlite_store is not None:
         try:
@@ -593,6 +603,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # shutdown
     poll_task.cancel()
     hyperedge_task.cancel()
+    # 【v5.23】先 drain 写队列（在途写全部落库），再关 GraphLite——
+    # 反序会导致在途写挂在已关闭的 session 上
+    if getattr(svc, "write_queue", None) is not None:
+        try:
+            svc.write_queue.shutdown(drain=True)
+            logger.info("WriteQueue drained and shut down")
+        except Exception:
+            logger.exception("WriteQueue drain failed (non-fatal)")
     if svc.graphlite_store:
         svc.graphlite_store.close()
     logger.info("SHM v4.0 shutting down")

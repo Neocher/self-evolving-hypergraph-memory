@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -66,6 +67,7 @@ from observability.logger import get_logger, set_trace_id
 from core.defense import MemoryDefenseEngine, DefenseConfig, MemoryDefenseVerdict
 from core.quarantine_store import QuarantineStore
 from core.write_reconciler import WriteReconciler, ConflictLogger, Strategy
+from core.write_queue import WriteQueueClosedError, WriteQueueFullError
 from observability.metrics import (
     get_metrics,
     record_circuit_breaker,
@@ -125,6 +127,8 @@ class Services:
     # 记忆投毒防御系统
     defense_engine: Any = None
     quarantine_store: Any = None
+    # v5.23: 写串行化队列（由 app.py 注入；None 时写路径回退同步直调）
+    write_queue: Any = None
 
 
 _services: Optional[Services] = None
@@ -152,6 +156,24 @@ async def get_services() -> Services:
     if _services is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
     return _services
+
+
+async def qsubmit(deps: Services, fn, *args, **kwargs) -> Any:
+    """【v5.23】经写串行化队列提交同步 GraphLite 写调用。
+
+    - 队列存在 → await WriteQueue.submit（写线程串行执行，不阻塞事件循环）
+    - 队列不存在（测试/降级）→ 同步直调，行为与改造前一致
+    - 队列满 / 已关闭 / 等待超时 → HTTPException 503（背压拒绝；超时后任务仍会落库，
+      调用方不应安全重试——写入均以 uuid 主键天然幂等）
+    """
+    q = getattr(deps, "write_queue", None)
+    if q is None:
+        return fn(*args, **kwargs)
+    try:
+        return await q.submit(fn, *args, **kwargs)
+    except (WriteQueueFullError, WriteQueueClosedError, asyncio.TimeoutError) as e:
+        logger.warning("Write queue rejected (status=503): %s", e)
+        raise HTTPException(status_code=503, detail=f"write queue busy: {e}") from e
 
 
 # ─── 辅助函数 ──────────────────────────────────────────────

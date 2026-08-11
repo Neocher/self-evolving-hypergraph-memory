@@ -1,13 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.22.0"
-__version_info__ = (5, 22, 0)
-__version_name__ = "Write-Perf"
+__version__ = "5.23.0"
+__version_info__ = (5, 23, 0)
+__version_name__ = "Write-Serialized"
 __release_date__ = "2026-08-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 写路径性能优化 (2026-08-11):
+核心变更 — 写串行化队列 (2026-08-11):
+  • 写串行化队列 core/write_queue.py — 所有 GraphLite 写调用收敛到专用写线程
+    串行执行（queue.Queue + 单 worker executor 桥接 + concurrent Future），
+    事件循环不再被同步写阻塞: 8 并发写 3.2s/条 → 排队 + 写, 读请求不受影响
+  • 集成: write.py 全部 GraphLite 写调用 (create_episode / ensure_session /
+    link_to_session / create_visual_node / execute_cypher / 超边创建) 经
+    qsubmit 入队; MATCH 检查+INSERT 幂等对组闭包整体入队 (写线程内原子)
+  • 背压: max_pending=100 满则拒新写 (503); 单写等待 30s 超时; 队列满/超时
+    由 qsubmit 转 HTTPException 503; 迟到完成语义 (超时后任务仍落库, 不重试)
+  • 生命周期: app startup 创建单例, shutdown 先 drain 在途写再关 GraphLite
+  • 测试: FIFO 顺序 / 异常传播 / 超时迟到完成 / 队列满拒绝 / 写线程重入直连 /
+    读不受写影响 / 8 并发写 80 条吞吐基准
+
+v5.22.0 (2026-08-11) Write-Perf:
   • P0-1: R2 参考 embedding 缓存 (content_hash → embedding, FIFO LRU 512 条)
     —— 同 source 连续写入省 200ms+/条
   • P0-2: defense 锁拆细 — asyncio.Lock → threading.Lock 短临界区 + 专用小池,

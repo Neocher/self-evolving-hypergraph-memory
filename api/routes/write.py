@@ -11,7 +11,7 @@ from core.defense import MemoryDefenseVerdict
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     _embed_queue, _embed_queue_lock, flush_faiss_buffer,
-    set_trace_id, record_request,
+    set_trace_id, record_request, qsubmit,
     Depends, Request, JSONResponse, HTTPException,
     uuid, np, base64, json, time,
     SensoryResponse, SensoryRecord,
@@ -32,6 +32,57 @@ _MEDIA_WARMUP_TIMEOUT = 30.0
 # 导致检索 to_thread(retrieve) 被排到卡死 worker 之后 → 新 DoS 向量。
 # 独占小池将卡死线程隔离在媒体嵌入路径内，不影响读路径。
 _MEDIA_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shm-media-embed")
+
+
+# ─── 【v5.23】写串行化：MATCH 存在性检查 + INSERT 组合闭包 ────────────────
+# GraphLite 无 MERGE。原"MATCH + INSERT"两段式若拆成两个 submit，读入队会
+# 消耗单写者额度且可能读到不一致快照；包成单个闭包整体入队，在写线程内
+# 同步完成"检查→写入"，顺序天然正确且不阻塞事件循环（对齐 .trio-plan §3.4）。
+
+
+def _upsert_conflict_node(store, conflict_node_id: str, episode_id: str, conflict_id: str) -> None:
+    """ConflictNode 幂等 upsert：MATCH 存在性检查 + INSERT（写线程内原子）。"""
+    if store.execute_cypher(
+        "MATCH (c:ConflictNode {id: $id}) RETURN c",
+        {"id": conflict_node_id},
+    ):
+        return
+    store.execute_cypher(
+        "INSERT (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
+        "rule_id: $rule, detected_at: $t, resolved: false})",
+        {"id": conflict_node_id,
+         "a": episode_id, "b": conflict_id,
+         "rule": "write_validate", "t": _now()})
+
+
+def _upsert_ontology_entity(store, entity_name: str) -> None:
+    """OntologyEntity 幂等 upsert（写线程内原子）。"""
+    if store.execute_cypher(
+        "MATCH (n:OntologyEntity {name: $name}) RETURN n",
+        {"name": entity_name},
+    ):
+        return
+    store.execute_cypher(
+        "INSERT (n:OntologyEntity {name: $name, type: 'discovered'})",
+        {"name": entity_name},
+    )
+
+
+def _upsert_ontology_relation(store, subj: str, obj: str, rel: str) -> None:
+    """RELATES_TO 边幂等 upsert（写线程内原子）。"""
+    if store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $subj})"
+        "-[:RELATES_TO]->"
+        "(b:OntologyEntity {name: $obj}) RETURN a",
+        {"subj": subj, "obj": obj},
+    ):
+        return
+    store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $subj}), "
+        "(b:OntologyEntity {name: $obj}) "
+        "INSERT (a)-[:RELATES_TO {relation: $rel}]->(b)",
+        {"subj": subj, "obj": obj, "rel": rel},
+    )
 
 
 @router.post("/memories/sensory", summary="写入感觉缓冲区 (Layer1)")
@@ -62,7 +113,8 @@ async def write_sensory(
                 await deps.dream_scheduler.on_node_created()
     else:
         # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
-        deps.graphlite_store.create_episode({
+        # 【v5.23】写串行化：经写队列提交，不阻塞事件循环
+        await qsubmit(deps, deps.graphlite_store.create_episode, {
             "id": record_id,
             "content": record.content,
             "source": record.source,
@@ -70,10 +122,10 @@ async def write_sensory(
             "created_at": start,
             "tau_initial": 1.0,
         })
-        # 命名空间链接
+        # 命名空间链接（同一 task 内三个 submit，FIFO 保证顺序）
         if record.namespace:
-            deps.graphlite_store.ensure_session(record.namespace)
-            deps.graphlite_store.link_to_session(record.namespace, record_id)
+            await qsubmit(deps, deps.graphlite_store.ensure_session, record.namespace)
+            await qsubmit(deps, deps.graphlite_store.link_to_session, record.namespace, record_id)
         if deps.dream_scheduler:
             await deps.dream_scheduler.on_node_created()
 
@@ -257,7 +309,7 @@ async def write_multimodal(
 
             visual_node_id = str(uuid.uuid4())
             if deps.graphlite_store is not None:
-                deps.graphlite_store.create_visual_node({
+                await qsubmit(deps, deps.graphlite_store.create_visual_node, {
                     "id": visual_node_id,
                     "image_path": media_paths[0] if media_paths else "",
                     "caption": merged_text[:1024],
@@ -270,7 +322,7 @@ async def write_multimodal(
 
     # ── 写入 EpisodeNode（文本索引）──
     if merged_text and deps.graphlite_store is not None:
-        deps.graphlite_store.create_episode({
+        await qsubmit(deps, deps.graphlite_store.create_episode, {
             "id": episode_id,
             "content": merged_text,
             "source": req.source,
@@ -279,8 +331,8 @@ async def write_multimodal(
             "tau_initial": 1.0,
         })
         if req.namespace:
-            deps.graphlite_store.ensure_session(req.namespace)
-            deps.graphlite_store.link_to_session(req.namespace, episode_id)
+            await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
+            await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
 
         # 通知梦境调度器
         if deps.dream_scheduler:
@@ -403,17 +455,9 @@ async def create_episode(
                 try:
                     conflict_id = c.get("conflict_id", "")
                     conflict_node_id = f"conflict_{episode_id}_{conflict_id}"
-                    # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
-                    if not deps.graphlite_store.execute_cypher(
-                        "MATCH (c:ConflictNode {id: $id}) RETURN c",
-                        {"id": conflict_node_id},
-                    ):
-                        deps.graphlite_store.execute_cypher(
-                            "INSERT (:ConflictNode {id: $id, episode_a: $a, episode_b: $b, "
-                            "rule_id: $rule, detected_at: $t, resolved: false})",
-                            {"id": conflict_node_id,
-                             "a": episode_id, "b": conflict_id,
-                             "rule": "write_validate", "t": _now()})
+                    # 【v5.23】MATCH 检查 + INSERT 组闭包整体入队（写线程内原子）
+                    await qsubmit(deps, _upsert_conflict_node, deps.graphlite_store,
+                                  conflict_node_id, episode_id, conflict_id)
                 except Exception:
                     logger.warning("Conflict node creation failed for %s / %s", episode_id, conflict_id)
             # P2: 通知梦境调度器有冲突产生
@@ -438,7 +482,7 @@ async def create_episode(
             episode_data["entity_name"] = val_result.entity_name
         if val_result.entity_value:
             episode_data["entity_value"] = val_result.entity_value
-    deps.graphlite_store.create_episode(episode_data)
+    await qsubmit(deps, deps.graphlite_store.create_episode, episode_data)
 
     # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
     # 【P0-1】用 hidden(决策时 SSM 状态)而非 hidden_prev:
@@ -458,8 +502,8 @@ async def create_episode(
 
     # 命名空间链接
     if req.namespace:
-        deps.graphlite_store.ensure_session(req.namespace)
-        deps.graphlite_store.link_to_session(req.namespace, episode_id)
+        await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
+        await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
 
     # [Ontology v2] 写时类型验证
     if deps.ontology_v2 is not None:
@@ -487,28 +531,13 @@ async def create_episode(
                             continue  # 空串守卫：避免写入哨兵节点
                         if entity_name not in seen_entities:
                             seen_entities.add(entity_name)
-                            if not deps.graphlite_store.execute_cypher(
-                                "MATCH (n:OntologyEntity {name: $name}) RETURN n",
-                                {"name": entity_name},
-                            ):
-                                deps.graphlite_store.execute_cypher(
-                                    "INSERT (n:OntologyEntity {name: $name, type: 'discovered'})",
-                                    {"name": entity_name},
-                                )
+                            # 【v5.23】MATCH 检查 + INSERT 组闭包整体入队
+                            await qsubmit(deps, _upsert_ontology_entity,
+                                          deps.graphlite_store, entity_name)
                 # 批量创建关系边（GraphLite 不支持 MERGE：MATCH 边存在性 + INSERT）
                 for t in triples:
-                    if not deps.graphlite_store.execute_cypher(
-                        "MATCH (a:OntologyEntity {name: $subj})"
-                        "-[:RELATES_TO]->"
-                        "(b:OntologyEntity {name: $obj}) RETURN a",
-                        {"subj": t.subject, "obj": t.obj},
-                    ):
-                        deps.graphlite_store.execute_cypher(
-                            "MATCH (a:OntologyEntity {name: $subj}), "
-                            "(b:OntologyEntity {name: $obj}) "
-                            "INSERT (a)-[:RELATES_TO {relation: $rel}]->(b)",
-                            {"subj": t.subject, "obj": t.obj, "rel": t.relation},
-                        )
+                    await qsubmit(deps, _upsert_ontology_relation,
+                                  deps.graphlite_store, t.subject, t.obj, t.relation)
             if triples:
                 logger.info("Relation extraction: %d typed edges", len(triples))
         except Exception:
@@ -568,11 +597,13 @@ async def create_episode(
     try:
         session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
         if session_id and deps.graphlite_store is not None:
-            session_node_id = deps.graphlite_store.get_or_create_session(
-                session_id, metadata=json.dumps({"source": req.source})
+            session_node_id = await qsubmit(
+                deps, deps.graphlite_store.get_or_create_session,
+                session_id, metadata=json.dumps({"source": req.source}),
             )
             if session_node_id:
-                deps.graphlite_store.link_session_member(session_node_id, episode_id)
+                await qsubmit(deps, deps.graphlite_store.link_session_member,
+                              session_node_id, episode_id)
     except Exception:
         logger.exception("Session memory link failed for episode %s", episode_id)
 
@@ -606,7 +637,7 @@ async def create_episodes_batch(
         tau_initial = 1.0
         try:
             if deps.graphlite_store is not None:
-                deps.graphlite_store.create_episode({
+                await qsubmit(deps, deps.graphlite_store.create_episode, {
                     "id": episode_id, "content": req.content, "source": req.source,
                     "visibility": req.visibility, "created_at": created_at,
                     "tau_initial": tau_initial,
@@ -614,8 +645,8 @@ async def create_episodes_batch(
                 })
             # namespace 关联(同单条逻辑)
             if req.namespace and deps.graphlite_store is not None:
-                deps.graphlite_store.ensure_session(req.namespace)
-                deps.graphlite_store.link_to_session(req.namespace, episode_id)
+                await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
+                await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
             # 【P1-1】超边创建改为批量合并 (循环外每 source 2 次查询),
             # 不再逐条触发 (原: 每项 2 次 MATCH 全表扫描)。
             created_entries.append((episode_id, req.source))
@@ -689,7 +720,7 @@ async def promote_to_episode(
     else:
         content = "promoted_record"
 
-    deps.graphlite_store.create_episode({
+    await qsubmit(deps, deps.graphlite_store.create_episode, {
         "id": episode_id,
         "content": content,
         "source": "promoted",
@@ -799,18 +830,15 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         if len(recent_ids) >= 2:
             # 用所有最近的 + 新节点一起创建时态超边
             member_ids = [episode_id] + recent_ids[:4]
-            deps.hyperedge_manager.create_temporal_hyperedge(
-                member_ids=member_ids,
-                start_time=now - 300,
-                end_time=now,
-            )
+            # 【v5.23】超边创建（HyperedgeNode INSERT + 边 INSERT）入写队列
+            await qsubmit(deps, deps.hyperedge_manager.create_temporal_hyperedge,
+                          member_ids=member_ids, start_time=now - 300, end_time=now)
             created += 1
             logger.info("Auto-created TEMPORAL hyperedge: %d members (source=%s)", len(member_ids), source)
         elif len(recent_ids) == 1:
             member_ids = [episode_id, recent_ids[0]]
-            deps.hyperedge_manager.create_temporal_hyperedge(
-                member_ids=member_ids, start_time=now - 300, end_time=now,
-            )
+            await qsubmit(deps, deps.hyperedge_manager.create_temporal_hyperedge,
+                          member_ids=member_ids, start_time=now - 300, end_time=now)
             created += 1
             logger.info("Auto-created TEMPORAL hyperedge (pair): source=%s", source)
 
@@ -830,10 +858,9 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         # 如果同一 source 在 1h 内有 5+ 个节点 → 创建情节超边
         if len(window_ids) >= 4:
             member_ids = [episode_id] + window_ids[:7]
-            deps.hyperedge_manager.create_episode_hyperedge(
-                member_ids=member_ids,
-                topic=f"batch_{source}_{int(now)}",
-            )
+            # 【v5.23】超边创建入写队列
+            await qsubmit(deps, deps.hyperedge_manager.create_episode_hyperedge,
+                          member_ids=member_ids, topic=f"batch_{source}_{int(now)}")
             created += 1
             logger.info("Auto-created EPISODE hyperedge: %d members (source=%s)", len(member_ids), source)
 
@@ -876,9 +903,9 @@ async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Se
             # 合并本批新节点去重 (批内节点已落库, 查询可能已含它们)
             merged = list(dict.fromkeys(recent_ids + new_ids))[:5]
             if len(merged) >= 2:
-                deps.hyperedge_manager.create_temporal_hyperedge(
-                    member_ids=merged, start_time=now - 300, end_time=now,
-                )
+                # 【v5.23】超边创建入写队列
+                await qsubmit(deps, deps.hyperedge_manager.create_temporal_hyperedge,
+                              member_ids=merged, start_time=now - 300, end_time=now)
                 created += 1
                 logger.info("Batch TEMPORAL hyperedge: %d members (source=%s)", len(merged), src)
             # 情节超边: 3600s 窗口 (每 source 1 次)
@@ -896,9 +923,9 @@ async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Se
                     window_ids.append(str(row.get("id", "")))
             merged_w = list(dict.fromkeys(window_ids + new_ids))[:8]
             if len(merged_w) >= 4:
-                deps.hyperedge_manager.create_episode_hyperedge(
-                    member_ids=merged_w, topic=f"batch_{src}_{int(now)}",
-                )
+                # 【v5.23】超边创建入写队列
+                await qsubmit(deps, deps.hyperedge_manager.create_episode_hyperedge,
+                              member_ids=merged_w, topic=f"batch_{src}_{int(now)}")
                 created += 1
                 logger.info("Batch EPISODE hyperedge: %d members (source=%s)", len(merged_w), src)
         return created
