@@ -9,6 +9,7 @@ from api.routes._deps import (
     set_trace_id, record_request,
     Depends, HTTPException, Query,
     uuid, base64, np,
+    qsubmit,
 )
 
 VISUALS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "visuals")
@@ -56,7 +57,8 @@ async def create_visual_memory(
         raise HTTPException(status_code=500, detail="Embedding failed")
     emb_array = emb.reshape(-1).astype(np.float32)
 
-    deps.graphlite_store.create_visual_node({
+    # 【v5.24】写串行化：VisualNode INSERT 经写队列提交，不阻塞事件循环
+    await qsubmit(deps, deps.graphlite_store.create_visual_node, {
         "id": visual_id,
         "image_path": image_path,
         "caption": caption,

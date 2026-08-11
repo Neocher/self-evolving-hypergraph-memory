@@ -22,12 +22,69 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from config.settings import load_settings, get_settings
 from api.routes import router, init_services, Services
+from api.routes._deps import qsubmit
 from observability.metrics import record_request
 from observability.logger import get_logger, configure_logging
 from api.dashboard import dashboard_router
 from graph.graphlite_store import CircuitBreakerOpen
 
 logger = get_logger(__name__)
+
+
+def _upsert_system_node(store, node_id: str, payload: str) -> None:
+    """SystemNode 幂等 upsert：MATCH 存在性检查 + SET/INSERT（写线程内原子）。
+
+    GraphLite 不支持 MERGE；与原 _persist_dream_state 的
+    "MATCH 存在性检查 + INSERT/SET" 语义完全一致。
+    """
+    if store.execute_cypher(
+        "MATCH (s:SystemNode {id: $id}) RETURN s",
+        {"id": node_id},
+    ):
+        store.execute_cypher(
+            "MATCH (s:SystemNode {id: $id}) SET s.payload = $payload",
+            {"id": node_id, "payload": payload},
+        )
+    else:
+        store.execute_cypher(
+            "INSERT (s:SystemNode {id: $id, payload: $payload})",
+            {"id": node_id, "payload": payload},
+        )
+
+
+def _persist_dream_state(svc: Services, state: dict) -> None:
+    """【H4】将调度器状态写入 GraphLite SystemNode（由调度器在触发/完成时回调）。
+
+    【v5.24】调度器回调在 loop 线程同步执行：有写队列时包 async 闭包 +
+    create_task 提交（写线程执行 MATCH+SET/INSERT，事件循环不被阻塞）；
+    队列不存在/无 running loop 时降级同步直调（与原实现一致）。
+    """
+    if svc.graphlite_store is None:
+        return
+    try:
+        import json as _json
+        state_json = _json.dumps(state)
+        if svc.write_queue is not None:
+            async def _submit() -> None:
+                try:
+                    await qsubmit(svc, _upsert_system_node, svc.graphlite_store,
+                                  "dream_scheduler_state", state_json)
+                except HTTPException:
+                    # 队列满/关闭（如 shutdown 竞态）→ 降级记 WARNING，不落 ERROR
+                    logger.warning("Dream scheduler state persist deferred (write queue busy)")
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and loop.is_running():
+                asyncio.create_task(_submit())
+            else:
+                asyncio.run(_submit())
+        else:
+            # 降级：同步直调（与原实现一致）
+            _upsert_system_node(svc.graphlite_store, "dream_scheduler_state", state_json)
+    except Exception:
+        logger.warning("Dream scheduler state persist failed (non-fatal)")
 
 
 def _init_services() -> Services:
@@ -263,35 +320,14 @@ def _init_services() -> Services:
         if svc.dream_pipeline is not None and hasattr(svc.dream_pipeline, "run"):
             pipeline_fn = svc.dream_pipeline.run
 
-        def _persist_dream_state(state: dict) -> None:
-            """【H4】将调度器状态写入 GraphLite SystemNode（由调度器在触发/完成时回调）。"""
-            if svc.graphlite_store is None:
-                return
-            try:
-                import json as _json
-                state_json = _json.dumps(state)
-                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT/SET
-                if svc.graphlite_store.execute_cypher(
-                    "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) RETURN s"
-                ):
-                    svc.graphlite_store.execute_cypher(
-                        "MATCH (s:SystemNode {id: 'dream_scheduler_state'}) "
-                        "SET s.payload = $payload",
-                        {"payload": state_json},
-                    )
-                else:
-                    svc.graphlite_store.execute_cypher(
-                        "INSERT (s:SystemNode {id: 'dream_scheduler_state', "
-                        "payload: $payload})",
-                        {"payload": state_json},
-                    )
-            except Exception:
-                logger.warning("Dream scheduler state persist failed (non-fatal)")
+        def _persist_dream_state_closure(state: dict) -> None:
+            # 【v5.24】委托模块级 _persist_dream_state（可单测；写队列提交在内部）
+            _persist_dream_state(svc, state)
 
         svc.dream_scheduler = DreamScheduler(
             config=dream_cfg,
             pipeline_fn=pipeline_fn,
-            state_persist_fn=_persist_dream_state,
+            state_persist_fn=_persist_dream_state_closure,
         )
         # 【FIX】注入GraphLite引用供梦境调度器拉取数据
         svc.dream_scheduler._graphlite_store = svc.graphlite_store
@@ -549,9 +585,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     # 自动 apply 梦境候选
                     if hasattr(svc, "dream_candidate_store") and svc.dream_candidate_store is not None:
                         try:
-                            applied, communities, deleted = svc.dream_candidate_store.auto_apply_candidates(svc.graphlite_store)
-                            if applied > 0:
-                                logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
+                            # 【v5.24】auto_apply 的 _persist_community_nodes（循环
+                            # execute_cypher 写）整体入队 → 不在 loop 线程同步写；
+                            # 队列积压超阈值时延迟（dream 写量大，避免占满单写者额度）
+                            q = getattr(svc, "write_queue", None)
+                            if q is not None and q.pending_count() > q.max_pending // 2:
+                                logger.warning(
+                                    "Write queue busy (%d pending), dream auto-apply deferred",
+                                    q.pending_count(),
+                                )
+                            else:
+                                applied, communities, deleted = await qsubmit(
+                                    svc, svc.dream_candidate_store.auto_apply_candidates,
+                                    svc.graphlite_store,
+                                )
+                                if applied > 0:
+                                    logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
+                        except HTTPException:
+                            logger.warning("Write queue busy, dream auto-apply deferred")
                         except Exception:
                             logger.exception("Auto-apply error (non-fatal)")
             except asyncio.CancelledError:
@@ -593,7 +644,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             try:
                 # 导入 consumer 函数
                 from api._routes import _process_embed_queue
-                _process_embed_queue(svc)
+                await _process_embed_queue(svc)  # 【v5.24】async：hebbian 写经队列，不阻塞 loop
             except Exception:
                 logger.exception("Embed poll error (non-fatal)")
             await asyncio.sleep(5)

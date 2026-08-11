@@ -13,6 +13,7 @@ from api.routes._deps import (
     RetrieveRequest, RetrieveResponse, EpisodicResult,
     SearchVectorRequest, SearchVectorResult, SearchVectorResponse,
     SessionMemoryCreate, SessionMemoryItem, SessionMemoryListResponse,
+    qsubmit,
 )
 
 from graph.graphlite_store import CircuitBreakerOpen
@@ -187,6 +188,16 @@ async def retrieve(
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
         try:
+            # 【v5.24】首次检索触发的 lazy 同步（sync_entity_types + 关系边写）
+            # 预同步经写队列——不在 loop 线程同步写（一次性，_ontology_synced 置位
+            # 后检索纯读）。读验证本身留 loop。
+            if not deps.ontology_validator._ontology_synced:
+                try:
+                    await qsubmit(deps, deps.ontology_validator.sync_entity_types_to_graphlite)
+                    await qsubmit(deps, deps.ontology_validator._populate_relationships)
+                    deps.ontology_validator._ontology_synced = True
+                except HTTPException:
+                    logger.warning("Write queue busy, ontology sync deferred (validation continues)")
             validated = deps.ontology_validator.read_validate(
                 [{
                     "id": r.get("node_id", ""),

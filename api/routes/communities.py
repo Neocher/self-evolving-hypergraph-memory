@@ -8,6 +8,7 @@ from api.routes._deps import (
     Depends, Query, HTTPException,
     CommunityInfo, CommunityListResponse,
     WriteReconciler, ConflictLogger, Strategy,
+    qsubmit,
 )
 
 
@@ -173,10 +174,12 @@ async def resolve_conflict(
     if deps.graphlite_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    deps.graphlite_store.execute_cypher(
+    # 【v5.24】SET 写经写队列提交（不阻塞事件循环）
+    await qsubmit(
+        deps, deps.graphlite_store.execute_cypher,
         "MATCH (c:ConflictNode) WHERE c.id = $id "
         "SET c.resolved = true",
-        {"id": conflict_id}
+        {"id": conflict_id},
     )
 
     record_request("POST", f"/conflicts/{conflict_id}/resolve", "200", _now() - start)
@@ -193,10 +196,12 @@ async def resolve_all_conflicts(
     if deps.graphlite_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    deps.graphlite_store.execute_cypher(
+    # 【v5.24】SET 写经写队列提交（不阻塞事件循环）
+    await qsubmit(
+        deps, deps.graphlite_store.execute_cypher,
         "MATCH (c:ConflictNode) WHERE c.resolved = false "
         "SET c.resolved = true",
-        {}
+        {},
     )
 
     record_request("POST", "/conflicts/resolve-all", "200", _now() - start)
@@ -285,8 +290,11 @@ async def reconcile_conflict(
             write_data = {k: v for k, v in result["data"].items()
                          if k in ("content", "source", "visibility")}
             write_data["id"] = node_id
-            # 使用 update_with_version 确保写入原子性
-            deps.graphlite_store.update_with_version(
+            # 【v5.24】update_with_version 是"查 version → SET"复合闭包，整体入队
+            # （写线程内读-写原子，版本检查不会被并发写撕裂）；OCC 检测 resolve()
+            # 是纯内存读节点版本，留在事件循环。
+            await qsubmit(
+                deps, deps.graphlite_store.update_with_version,
                 node_id=node_id,
                 updates=write_data,
                 expected_version=result["current_version"] if not force else None,

@@ -85,6 +85,21 @@ def _upsert_ontology_relation(store, subj: str, obj: str, rel: str) -> None:
     )
 
 
+def _run_hebbian_update(deps: Services, active: dict, conns: dict) -> None:
+    """【v5.24】Hebbian update 在写线程内执行（_persist_batch 的 execute_cypher
+    随 update 整体入队，MATCH 边存在 + SET/INSERT 在写线程内原子）。"""
+    if deps.hebbian_updater is None:
+        return
+    deps.hebbian_updater.update(active, conns)
+
+
+def _run_entity_resolver(deps: Services, content: str) -> dict:
+    """【v5.24】实体消歧整体在写线程执行（link_aliases 的 ALIAS_OF 写不再阻塞 loop）。"""
+    from core.entity_resolver import EntityResolver
+    resolver = EntityResolver(graphlite_store=deps.graphlite_store)
+    return resolver.process(content)
+
+
 @router.post("/memories/sensory", summary="写入感觉缓冲区 (Layer1)")
 async def write_sensory(
     record: SensoryRecord,
@@ -558,21 +573,28 @@ async def create_episode(
     # [Step 3] 实体消歧 — 仅对有一定信息量的内容执行
     if deps.graphlite_store is not None and len(req.content) > 80:
         try:
-            from core.entity_resolver import EntityResolver
-            resolver = EntityResolver(graphlite_store=deps.graphlite_store)
-            result = resolver.process(req.content)
+            # 【v5.24】整个同步调用包闭包入队（link_aliases 的 ALIAS_OF 写在写线程）
+            result = await qsubmit(deps, _run_entity_resolver, deps, req.content)
             if result.get("alias_count", 0) > 0:
                 logger.info("Entity resolver: %d alias edges, %d entities",
                             result["alias_count"], len(result.get("entities", [])))
+        except HTTPException:
+            logger.warning("Write queue busy, entity resolver deferred (non-fatal)")
         except Exception:
             logger.exception("Entity resolver error (non-fatal)")
 
     # [Phase3] 写入时提取实体共现 → 建 RELATES_TO 边（保留旧逻辑作为fallback）
     if deps.ontology_validator is not None and triples is None:
         try:
-            rel_count = deps.ontology_validator.extract_and_relate(req.content)
+            # 【v5.24】extract_and_relate 整体入队（sync_entity_types 首次 lazy
+            # 同步 + RELATES_TO 边创建都在写线程，不阻塞事件循环）
+            rel_count = await qsubmit(
+                deps, deps.ontology_validator.extract_and_relate, req.content
+            )
             if rel_count > 0:
                 logger.info("Write-time entity relations: %d edges (fallback)", rel_count)
+        except HTTPException:
+            logger.warning("Write queue busy, entity relations extraction deferred (non-fatal)")
         except Exception:
             logger.exception("Entity relations extraction failed (non-fatal)")
 
@@ -753,8 +775,12 @@ async def promote_to_episode(
 # ─── 【P6】异步 embedding 队列消费 ─────────────────────────
 
 
-def _process_embed_queue(deps: Services) -> int:
-    """消费 embedding 队列：异步编码并加入 FAISS 缓冲。"""
+async def _process_embed_queue(deps: Services) -> int:
+    """消费 embedding 队列：异步编码并加入 FAISS 缓冲。
+
+    【v5.24】改为 async：hebbian 持久化随 update 闭包经写队列执行
+    （_persist_batch 的 execute_cypher 在写线程，poll loop 不再被阻塞）。
+    """
     global _embed_queue
     if not deps.encoder:
         return 0
@@ -783,9 +809,14 @@ def _process_embed_queue(deps: Services) -> int:
                     deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
                 try:
                     if deps.hebbian_updater and deps.graphlite_store:
-                        deps.hebbian_updater.update(
-                            {episode_id: 1.0}, deps.graphlite_store.get_all_connections()
-                        )
+                        # 读留 loop（get_all_connections 是 MATCH 读），写随闭包入队
+                        conns = deps.graphlite_store.get_all_connections()
+                        await qsubmit(deps, _run_hebbian_update,
+                                      deps, {episode_id: 1.0}, conns)
+                except HTTPException:
+                    # 【v5.24】poll loop 内队列满/关闭：503 语义无意义，记 WARNING 降级
+                    logger.warning("Write queue busy, hebbian update deferred for %s",
+                                   episode_id)
                 except Exception:
                     logger.exception("Hebbian update failed for %s", episode_id)
                 count += 1

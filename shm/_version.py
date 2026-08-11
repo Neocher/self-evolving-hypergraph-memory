@@ -1,13 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.23.0"
-__version_info__ = (5, 23, 0)
-__version_name__ = "Write-Serialized"
+__version__ = "5.24.0"
+__version_info__ = (5, 24, 0)
+__version_name__ = "Full-Write-Queue"
 __release_date__ = "2026-08-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 写串行化队列 (2026-08-11):
+核心变更 — 写路径全量收敛 WriteQueue (2026-08-11):
+  • 请求路径写调用全部经 qsubmit 入队: gateway_api (write_sensory /
+    store_episode / store_multimodal) + visual + communities (冲突 resolve /
+    reconcile update_with_version 复合闭包) + ontology batch_relations
+    (6 次 execute_cypher 组闭包) + hyperedges (三分支) — 事件循环不再被同步写阻塞
+  • hebbian 持久化入队: _process_embed_queue 改 async, update 闭包经写队列
+    (_persist_batch 的 SET/INSERT 在写线程), 5s poll loop 不卡 loop
+  • app.py _persist_dream_state 入队: 调度器同步回调 → async 闭包 +
+    create_task 桥接 (写线程执行 MATCH+SET/INSERT); 无队列/无 loop 降级同步直调
+  • 随主写入队: 写路径 entity_resolver.process / extract_and_relate 闭包入队
+    (ALIAS_OF / RELATES_TO 写在写线程); 检索路径首次 lazy 同步预同步入队
+  • dream auto_apply 入队 + 队列深度检查 (积压 > max_pending/2 时延迟,
+    避免梦境大块写占满单写者额度)
+  • 后台/推理路径维持判定: dream 主路径 (asyncio.to_thread) 与
+    /index/rebuild (显式运维) 不入队; 检索读验证留 loop (qsubmit 只收写)
+
+v5.23.0 (2026-08-11) Write-Serialized:
   • 写串行化队列 core/write_queue.py — 所有 GraphLite 写调用收敛到专用写线程
     串行执行（queue.Queue + 单 worker executor 桥接 + concurrent Future），
     事件循环不再被同步写阻塞: 8 并发写 3.2s/条 → 排队 + 写, 读请求不受影响
