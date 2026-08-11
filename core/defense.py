@@ -50,10 +50,6 @@ _LOCK_WAIT_TIMEOUT = 2.0
 # 同 source 连续写入时历史内容 embedding 命中缓存, 省 200ms+/条。
 _R2_EMB_CACHE_MAX = 512
 
-# 【P0-2】R1/R4/R5 短临界区专用小池: threading.Lock 只保护纯内存计数操作
-# (亚毫秒), 高并发写入不再被单把 asyncio.Lock 全局串行化。
-_RULES_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shm-defense-rules")
-
 
 # ─── 枚举 ──────────────────────────────────────────────────
 
@@ -274,22 +270,13 @@ class MemoryDefenseEngine:
         if not r3_pass:
             reasons.append(r3_reason)
 
-        # 【P0-2】R1/R4/R5 检查 + 状态更新 → threading.Lock 短临界区 (专用小池)。
-        # 高并发写入不再排队单把 asyncio.Lock; 锁内只做亚毫秒计数操作。
+        # 【P0-2】R1/R4/R5 检查 + 状态更新 → threading.Lock 短临界区: 纯内存计数
+        # 亚毫秒, 无 I/O 无 await。直接在事件循环内同步执行 —— 不经过线程池:
+        # R1/R4/R5 是纯内存计数操作, 池化只让并发写入排队 worker (Codex 实测
+        # 8 线程 2583ms/条, 新瓶颈是线程池而非锁); 锁内 µs 级不阻塞事件循环。
+        # （R2 的 _R2_EXECUTOR 保留: embedding 是 CPU 重活才需要池。）
         # 【M2-b】锁等待独立短超时: 超时 fail-closed → QUARANTINE (独立 reason)。
-        try:
-            loop = asyncio.get_running_loop()
-            result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _RULES_EXECUTOR, self._run_r1_r4_r5_locked,
-                    source, content, ts, r2_flag, r3_flag,
-                ),
-                timeout=_LOCK_WAIT_TIMEOUT + 0.5,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Defense rules timed out after %.1fs, quarantining write",
-                           _LOCK_WAIT_TIMEOUT)
-            return MemoryDefenseVerdict.QUARANTINE, "defense_lock_timeout"
+        result = self._run_r1_r4_r5_locked(source, content, ts, r2_flag, r3_flag)
         if result is None:
             logger.warning("Defense rules lock wait timed out after %.1fs, quarantining write",
                            _LOCK_WAIT_TIMEOUT)
