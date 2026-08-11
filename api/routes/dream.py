@@ -3,7 +3,7 @@
 """
 
 from api.routes._deps import (
-    router, Services, get_services, _now, logger,
+    router, Services, get_services, _now, logger, qsubmit,
     set_trace_id, record_request,
     Depends, HTTPException,
     DreamTriggerResponse,
@@ -133,7 +133,20 @@ async def apply_dream_candidate(
     if deps.graphlite_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    success = store.apply_candidate(dream_id, deps.graphlite_store)
+    # 【v5.25】apply_candidate（PRUNE DETACH DELETE + MERGE 循环写）整体闭包入队：
+    # 写在线程执行，事件循环不被阻塞；PRUNE → MERGE → _mark_applied 顺序在写线程
+    # 内保持（禁止拆开多次 submit，否则会插入其他写）。队列满 → 503 降级为
+    # deferred 语义：整体未执行（不写库不标记），下次重试重走全部流程，幂等保持。
+    try:
+        success = await qsubmit(
+            deps,
+            store.apply_candidate,
+            dream_id, deps.graphlite_store,
+        )
+    except HTTPException:
+        logger.warning("Write queue busy, dream apply deferred (non-fatal)")
+        return DreamApplyResponse(success=False, dream_id=dream_id,
+                                  message="Apply deferred: write queue busy, retry later")
     if success:
         return DreamApplyResponse(success=True, dream_id=dream_id, message="Dream applied to production")
     else:

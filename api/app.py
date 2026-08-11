@@ -72,6 +72,11 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
                 except HTTPException:
                     # 队列满/关闭（如 shutdown 竞态）→ 降级记 WARNING，不落 ERROR
                     logger.warning("Dream scheduler state persist deferred (write queue busy)")
+                except Exception:
+                    # 【v5.25】SDK 异常兜底（execute_cypher 抛 ConnectionError/QueryError
+                    # 等）：fire-and-forget task 内不重抛 → 消除 "Task exception was
+                    # never retrieved" 噪音；非致命，只记日志
+                    logger.exception("Dream scheduler state persist failed (non-fatal)")
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:

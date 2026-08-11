@@ -315,14 +315,10 @@ class DreamScheduler:
             # P2: 矛盾驱动梦境后重置冲突计数
             if trigger_mode == TriggerMode.CONFLICT_RESOLUTION:
                 self._unresolved_conflict_count = 0
-            # 梦境完成后自动 apply 高质量候选
-            if candidate_store is not None and self._graphlite_store is not None:
-                try:
-                    applied, communities, deleted = candidate_store.auto_apply_candidates(self._graphlite_store)
-                    if applied > 0:
-                        logger.info("Dream auto-apply: %d candidates → %d communities (%d files cleaned)", applied, communities, deleted)
-                except Exception:
-                    logger.exception("Dream auto-apply failed (non-fatal)")
+            # 【v5.25】auto_apply 已移除：v5.24 起由 app.py _dream_poll_loop 承担
+            # （qsubmit 整体闭包入队 + 队列深度守卫）。调度器内不再有 loop 线程
+            # 同步写（auto_apply 的 _persist_community_nodes 是几十次 execute_cypher
+            # 循环）。梦境完成后候选延迟最多一个 poll interval 应用，可接受。
         except Exception:
             self._dream_fail_count += 1
             logger.exception("Dream pipeline failed")

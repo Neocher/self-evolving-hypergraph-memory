@@ -1,13 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.24.0"
-__version_info__ = (5, 24, 0)
-__version_name__ = "Full-Write-Queue"
+__version__ = "5.25.0"
+__version_info__ = (5, 25, 0)
+__version_name__ = "Write-Queue-Complete"
 __release_date__ = "2026-08-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 写路径全量收敛 WriteQueue (2026-08-11):
+核心变更 — 写路径最终收敛 (2026-08-11):
+  • dream API apply_candidate 整体闭包入队: PRUNE (DETACH DELETE) + MERGE 循环写
+    在写线程执行, 事件循环不再被阻塞; 整体闭包保证 PRUNE→MERGE→_mark_applied
+    顺序 (禁止拆开 submit), 队列满(503)时整体未执行 → deferred 语义, 幂等保持
+  • dream_scheduler auto_apply 移除: 调度器 _run_dream 不再有 loop 线程同步写
+    (原 _persist_community_nodes 几十次 execute_cypher 循环), 完全由
+    _dream_poll_loop 经 qsubmit 整体闭包入队承接 (延迟 ≤1 poll interval, 可接受)
+  • _persist_dream_state fire-and-forget task SDK 异常兜底: execute_cypher 抛
+    ConnectionError/QueryError 不再泄漏 "Task exception was never retrieved"
+    噪音, 记 ERROR 日志非致命
+  • 语义确认: search 队列忙降级 → 首次 lazy ontology 同步写留在 loop 线程
+    (一次性 + 超载瞬态, 可接受); hebbian 大 batch 保持逐条 submit
+    (合并会改变 active_nodes 批内共激语义, 不可合并)
+
+v5.24.0 (2026-08-11) Full-Write-Queue:
   • 请求路径写调用全部经 qsubmit 入队: gateway_api (write_sensory /
     store_episode / store_multimodal) + visual + communities (冲突 resolve /
     reconcile update_with_version 复合闭包) + ontology batch_relations
