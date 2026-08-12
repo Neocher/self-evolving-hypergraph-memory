@@ -1,7 +1,7 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.27.2"
-__version_info__ = (5, 27, 1)
+__version__ = "5.27.3"
+__version_info__ = (5, 27, 3)
 __version_name__ = "Hermes-Integration-Check"
 __release_date__ = "2026-08-12"
 

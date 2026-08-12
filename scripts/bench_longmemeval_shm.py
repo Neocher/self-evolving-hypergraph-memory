@@ -66,6 +66,32 @@ class SHMClient:
         r.raise_for_status()
         return r.json().get("results", [])
 
+    def faiss_size(self) -> int:
+        """当前 FAISS 索引大小 (health.stats.faiss_index_size)。"""
+        h = self.client.get(f"{self.base}/health").json()
+        return int(h.get("stats", {}).get("faiss_index_size", 0) or 0)
+
+    def wait_faiss_catchup(self, expected_min: int, timeout: float = 180.0) -> bool:
+        """等待异步 embedding 队列消费追平 (v5.24+ 写路径异步, 检索前必须等 FAISS)。
+
+        v5.24+ 写入走异步 embedding 队列 (poll loop 每 5s 消费一次), POST 返回时
+        向量可能尚未进入 FAISS —— 立即检索会 0 命中 (2026-08-12 benchmark 实测
+        10 hybrid recall=0)。轮询 faiss_index_size >= expected_min 即追平。
+        """
+        deadline = time.time() + timeout
+        cur = 0
+        while time.time() < deadline:
+            try:
+                cur = self.faiss_size()
+                if cur >= expected_min:
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        # 不能静默: 超时未追平必须告警 (2026-08-12 benchmark 实测 0 命中根因之一)
+        print(f"[bench] 警告: faiss 未追平: {cur}/{expected_min}", flush=True)
+        return False
+
     def clear(self) -> None:
         """清空命名空间。"""
         try:
@@ -129,11 +155,17 @@ def run_instance(shm: SHMClient, inst: dict, top_k: int, endpoint: str = "vector
 
     # 串行写入(服务端写路径并发不安全: 并发会触发锁竞争/FAISS-Hebbian 重建风暴
     # 导致事件循环卡死, 2026-08-06 benchmark 实测复现)
+    faiss_before = shm.faiss_size()
+    written_ok = 0  # 实际成功写入数 (shm.write 成功即 raise_for_status 通过后才 +1)
     for content, role, ts in write_tasks:
         try:
             shm.write(content, role, ts)
+            written_ok += 1
         except Exception:
             pass
+
+    # 【v5.24+】等待异步 embedding 队列追平再检索 (否则 0 命中, 2026-08-12 实测)
+    shm.wait_faiss_catchup(faiss_before + written_ok)
 
     # 2. 检索
     results = shm.retrieve(question, top_k=top_k, endpoint=endpoint)
@@ -160,7 +192,7 @@ def run_instance(shm: SHMClient, inst: dict, top_k: int, endpoint: str = "vector
         "qid": qid, "type": qtype, "question": question,
         "answer": answer, "key_tokens": key_tokens,
         "hit": hit, "retrieved_count": len(results),
-        "written": written,
+        "written": written_ok,
     }
 
 

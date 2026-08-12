@@ -1,0 +1,167 @@
+{
+  "config": {
+    "data": "/tmp/LongMemEval/data",
+    "shm": "http://127.0.0.1:8000",
+    "limit": 10,
+    "top_k": 10,
+    "endpoint": "hybrid",
+    "cleanup": true
+  },
+  "elapsed": 129.5271921157837,
+  "overall_recall": 1.0,
+  "hits": 10,
+  "total": 10,
+  "by_type": {
+    "temporal-reasoning": {
+      "hit": 10,
+      "total": 10
+    }
+  },
+  "results": [
+    {
+      "qid": "gpt4_2655b836",
+      "type": "temporal-reasoning",
+      "question": "What was the first issue I had with my new car after its first service?",
+      "answer": "GPS system not functioning correctly",
+      "key_tokens": [
+        "gps",
+        "system",
+        "functioning",
+        "correctly"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 36
+    },
+    {
+      "qid": "gpt4_2487a7cb",
+      "type": "temporal-reasoning",
+      "question": "Which event did I attend first, the 'Effective Time Management' workshop or the 'Data Analysis using Python' webinar?",
+      "answer": "'Data Analysis using Python' webinar",
+      "key_tokens": [
+        "data",
+        "analysis",
+        "using",
+        "python",
+        "webinar"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "gpt4_76048e76",
+      "type": "temporal-reasoning",
+      "question": "Which vehicle did I take care of first in February, the bike or the car?",
+      "answer": "bike",
+      "key_tokens": [
+        "bike"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "gpt4_2312f94c",
+      "type": "temporal-reasoning",
+      "question": "Which device did I got first, the Samsung Galaxy S22 or the Dell XPS 13?",
+      "answer": "Samsung Galaxy S22",
+      "key_tokens": [
+        "samsung",
+        "galaxy",
+        "s22"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "0bb5a684",
+      "type": "temporal-reasoning",
+      "question": "How many days before the team meeting I was preparing for did I attend the workshop on 'Effective Communication in the Workplace'?",
+      "answer": "7 days. 8 days (including the last day) is also acceptable.",
+      "key_tokens": [
+        "days",
+        "days",
+        "including",
+        "last",
+        "day"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "08f4fc43",
+      "type": "temporal-reasoning",
+      "question": "How many days had passed between the Sunday mass at St. Mary's Church and the Ash Wednesday service at the cathedral?",
+      "answer": "30 days. 31 days (including the last day) is also acceptable.",
+      "key_tokens": [
+        "days",
+        "days",
+        "including",
+        "last",
+        "day"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 22
+    },
+    {
+      "qid": "2c63a862",
+      "type": "temporal-reasoning",
+      "question": "How many days did it take for me to find a house I loved after starting to work with Rachel?",
+      "answer": "14 days. 15 days (including the last day) is also acceptable.",
+      "key_tokens": [
+        "days",
+        "days",
+        "including",
+        "last",
+        "day"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "gpt4_385a5000",
+      "type": "temporal-reasoning",
+      "question": "Which seeds were started first, the tomatoes or the marigolds?",
+      "answer": "Tomatoes",
+      "key_tokens": [
+        "tomatoes"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 19
+    },
+    {
+      "qid": "2a1811e2",
+      "type": "temporal-reasoning",
+      "question": "How many days had passed between the Hindu festival of Holi and the Sunday mass at St. Mary's Church?",
+      "answer": "21 days. 22 days (including the last day) is also acceptable.",
+      "key_tokens": [
+        "days",
+        "days",
+        "including",
+        "last",
+        "day"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 24
+    },
+    {
+      "qid": "bbf86515",
+      "type": "temporal-reasoning",
+      "question": "How many days before the 'Rack Fest' did I participate in the 'Turbocharged Tuesdays' event?",
+      "answer": "4 days.",
+      "key_tokens": [
+        "days"
+      ],
+      "hit": true,
+      "retrieved_count": 5,
+      "written": 22
+    }
+  ]
+}

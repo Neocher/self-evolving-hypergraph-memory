@@ -478,11 +478,15 @@ class GatewayAPI:
             if namespace and self._svc.graphlite_store is not None:
                 try:
                     ns_rows = self._svc.graphlite_store.query_cypher(
-                        "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                        "MATCH (s:SessionNode {id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                         "RETURN e.id",
                         {"ns": namespace},
                     )
-                    ns_set = {row[0] for row in ns_rows} if ns_rows else set()
+                    ns_set = {
+                        str(r.get("e.id", "") or r.get("id", "")) if isinstance(r, dict) else str(r[0])
+                        for r in ns_rows
+                        if isinstance(r, dict) or (isinstance(r, (list, tuple)) and r)
+                    } if ns_rows else set()
                 except Exception:
                     pass
             for r in results_raw:

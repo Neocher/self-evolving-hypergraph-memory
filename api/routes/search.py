@@ -152,13 +152,17 @@ async def retrieve(
                 ns_rows = await asyncio.wait_for(
                     asyncio.to_thread(
                         deps.graphlite_store.query_cypher,
-                        "MATCH (s:SessionNode {session_id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                        "MATCH (s:SessionNode {id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                         "RETURN e.id",
                         {"ns": req.namespace},
                     ),
                     timeout=_DEGRADE_TIMEOUT,
                 )
-                ns_set = {row[0] for row in ns_rows} if ns_rows else set()
+                ns_set = {
+                    str(r.get("e.id", "") or r.get("id", "")) if isinstance(r, dict) else str(r[0])
+                    for r in ns_rows
+                    if isinstance(r, dict) or (isinstance(r, (list, tuple)) and r)
+                } if ns_rows else set()
             except asyncio.TimeoutError:
                 logger.warning("Namespace prefetch timed out after %.1fs, skipping filter",
                                _DEGRADE_TIMEOUT)
