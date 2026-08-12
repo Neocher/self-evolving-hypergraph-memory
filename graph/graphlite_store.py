@@ -481,8 +481,51 @@ class GraphLiteStore:
         except Exception:
             return []
 
+    def get_hypergraph_neighbors(self, seed_ids: list[str], limit: int = 20) -> dict[str, list[dict]]:
+        """向量种子 → 共享超边成员扩散（1 跳）。返回 {seed_id: [{id, content, co_occurrence}]}。
+
+        每个种子执行单条 GQL 获取其超边邻居，避免逐邻居查询的 N+1 问题。
+        GraphLite b64 编码的 content 在此解码。
+        空输入 / 全部异常 → 返回 {}。
+        """
+        from base64 import b64decode
+
+        if not seed_ids:
+            return {}
+        result: dict[str, list[dict]] = {}
+        for sid in seed_ids:
+            gql = (
+                "MATCH (e:EpisodeNode {id: $sid})-[:HYPEREDGE_MEMBER]-(h:HyperedgeNode)-[:HYPEREDGE_MEMBER]-(e2:EpisodeNode) "
+                "WHERE e2.id <> $sid "
+                "RETURN DISTINCT e2.id AS id, e2.content AS content, count(h) AS co_occurrence "
+                "ORDER BY co_occurrence DESC LIMIT $limit"
+            )
+            # query_cypher 永不抛异常（GraphLiteStore P0-2 契约），无需 try/except
+            rows = self.query_cypher(gql, {"sid": sid, "limit": limit})
+            if not rows:
+                continue
+            neighbors: list[dict] = []
+            for row in rows:
+                nid = row.get("id", "")
+                content = row.get("content", "")
+                cooc = row.get("co_occurrence", 0)
+                # b64 decode if needed
+                if isinstance(content, str) and content.startswith("{b64}"):
+                    try:
+                        content = b64decode(content[5:]).decode("utf-8")
+                    except Exception:
+                        pass  # decode failure → keep raw
+                try:
+                    cooc = int(cooc)
+                except (TypeError, ValueError):
+                    cooc = 0
+                neighbors.append({"id": str(nid), "content": content, "co_occurrence": cooc})
+            if neighbors:
+                result[sid] = neighbors
+        return result
+
     def get_all_hebbian_connections(self) -> list[dict]:
-        gql = "MATCH (a)-[r:HEBBIAN]->(b) RETURN a.id AS src, b.id AS dst, r.weight AS weight"
+        gql = "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) RETURN a.id AS src, b.id AS dst, r.weight AS weight"
         try:
             result = self._session.query(gql)
             return list(result.rows)

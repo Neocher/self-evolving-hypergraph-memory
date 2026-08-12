@@ -79,6 +79,10 @@ class QueryRouterConfig:
     max_bm25_corpus: int = 50000  # BM25 索引最大语料数
     bm25_build_timeout: float = 30.0  # BM25 索引构建超时（秒），超时静默降级
     bm25_retry_cooldown: float = 30.0  # BM25 构建失败后重试冷却窗口（秒），避免失败后每次检索都全量重建
+    # 图扩散配置（v5.26.0）
+    graph_expansion_hop: int = 1  # 固定 1 跳（防图爆炸）
+    graph_expansion_max: int = 20  # 扩散补充最大条数
+    graph_expansion_alpha: float = 0.8  # 扩散新节点分数 = 归一化共现 × 向量尾分 × α
 
 
 class QueryRouter:
@@ -850,7 +854,63 @@ class QueryRouter:
                 episode["node_id"] = episode.pop("id", "")
                 results.append(episode)
 
+        # Graph expansion (v5.26.0): 从向量种子沿超边扩散
+        if results and self.graphlite_store is not None:
+            try:
+                seeds = [r["node_id"] for r in results[:5] if r.get("node_id")]
+                existing_ids = {r["node_id"] for r in results}
+                tail_score = results[-1]["score"] if results else 0.0
+                expansion = self._graph_expansion(seeds, existing_ids, tail_score)
+                if expansion:
+                    results = results + expansion
+            except Exception:
+                pass  # 扩散失败静默回退，纯向量结果不受影响
+
         return self._deduplicate_and_sort(results)
+
+    def _graph_expansion(
+        self, seeds: list[str], existing_ids: set[str], tail_score: float
+    ) -> list[dict]:
+        """从向量种子沿超边扩散获取邻居节点。整个方法 try/except 包裹，异常返回 []。"""
+        if not seeds:
+            return []
+        try:
+            all_neighbors = self.graphlite_store.get_hypergraph_neighbors(
+                seeds, self.config.graph_expansion_max
+            )
+        except CircuitBreakerOpen:
+            return []
+        except Exception as e:
+            logger.error("Graph expansion failed: %s", e)
+            return []
+
+        results: list[dict] = []
+        alpha = self.config.graph_expansion_alpha
+
+        for sid in seeds:
+            for nb in all_neighbors.get(sid, []):
+                nid = nb.get("id", "")
+                content = nb.get("content", "")
+                if not nid or nid in existing_ids:
+                    continue
+                if not content:
+                    continue
+                cooc = nb.get("co_occurrence", 0)
+                score = round(1.0 / (1.0 + max(cooc, 0)) * tail_score * alpha, 6)
+                results.append({
+                    "node_id": nid,
+                    "content": content,
+                    "score": score,
+                    "level": "graph_expansion",
+                    "_source": "graph",
+                })
+
+        # 跨种子截断：汇总所有种子的邻居后，按 score 降序取 top graph_expansion_max 条
+        if len(results) > self.config.graph_expansion_max:
+            results.sort(key=lambda x: x["score"], reverse=True)
+            results = results[:self.config.graph_expansion_max]
+
+        return results
 
     def _vector_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
