@@ -70,15 +70,17 @@ class TestWritePressureDefer:
         # 写入停止: 清空压力窗口
         sched._recent_write_times.clear()
 
-        triggered = run(sched.check_and_trigger())
-        assert triggered is True, "写入停止后应恢复触发"
-        # 等待后台梦境完成
-        async def _wait():
+        # 【FIX】触发 + 等待后台梦境完成必须在同一事件循环内：
+        # check_and_trigger 内部 asyncio.create_task 创建的 _run_dream 任务，
+        # 在 asyncio.run 返回时会被取消，导致 _dream_run_count 永不递增。
+        async def _trigger_and_wait():
+            triggered = await sched.check_and_trigger()
+            assert triggered is True, "写入停止后应恢复触发"
             for _ in range(100):
                 if not sched.is_running:
                     return
                 await asyncio.sleep(0.01)
-        run(_wait())
+        run(_trigger_and_wait())
         assert sched._dream_run_count == 1
 
     def test_old_writes_no_pressure(self):
@@ -101,12 +103,13 @@ class TestWritePressureDefer:
         sched = _sched()
         for _ in range(20):
             run(sched.on_node_created())
-        accepted = run(sched.trigger_explicit())
-        assert accepted is True, "显式触发不受写压力影响"
-        async def _wait():
+        # 【FIX】同 test_runs_after_writes_settle：触发与等待须同一事件循环
+        async def _trigger_and_wait():
+            accepted = await sched.trigger_explicit()
+            assert accepted is True, "显式触发不受写压力影响"
             for _ in range(100):
                 if not sched.is_running:
                     return
                 await asyncio.sleep(0.01)
-        run(_wait())
+        run(_trigger_and_wait())
         assert sched._dream_run_count == 1
