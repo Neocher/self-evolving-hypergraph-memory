@@ -32,16 +32,23 @@ logger = logging.getLogger("shm-mcp-server")
 # 工作目录
 WORKDIR = Path(__file__).parent
 
+# 仅保留只读检查命令；解释器/执行器 (python/pip/npm/node/git/make/pytest/ruff/mypy)
+# 可被用作 RCE 通道，一律移出白名单
 ALLOWED_COMMANDS = {
     "ls", "cat", "head", "tail", "wc", "find", "grep", "rg",
-    "python", "python3", "pytest", "ruff", "mypy",
-    "git", "make", "tree", "du", "df", "file", "stat",
-    "pip", "pip3", "npm", "node",
+    "tree", "du", "df", "file", "stat",
 }
+
+# read_file 单文件读取上限 (1 MB)，防止整文件读入内存无上限
+MAX_FILE_BYTES = 1_000_000
 
 
 def _minimal_env() -> dict[str, str]:
-    safe_keys = {"PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL"}
+    safe_keys = {
+        "PATH", "HOME", "USER", "TERM", "LANG", "LC_ALL",
+        "VIRTUAL_ENV", "PYTHONPATH", "PIP_INDEX_URL",
+    }
+    # 保留 _API_KEY 过滤作为纵深防御，防止后续扩展 safe_keys 时泄漏密钥
     return {k: v for k, v in os.environ.items()
             if k in safe_keys and not k.endswith("_API_KEY")}
 
@@ -63,9 +70,17 @@ def read_file(path: str) -> str:
     Args:
         path: 相对于项目根目录的文件路径
     """
-    full_path = WORKDIR / path
+    root = WORKDIR.resolve()
+    full_path = (WORKDIR / path).resolve()
+    if not full_path.is_relative_to(root):
+        return json.dumps({"error": "path escapes project root"}, ensure_ascii=False)
     if not full_path.exists() or not full_path.is_file():
         return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
+    if full_path.stat().st_size > MAX_FILE_BYTES:
+        return json.dumps(
+            {"error": f"File too large (>{MAX_FILE_BYTES} bytes): {path}"},
+            ensure_ascii=False,
+        )
     try:
         content = full_path.read_text(encoding="utf-8", errors="replace")
         return json.dumps({"content": content, "path": str(full_path)}, ensure_ascii=False)
@@ -84,7 +99,7 @@ def search_files(pattern: str, target: str = "content") -> str:
     try:
         if target == "content":
             result = subprocess.run(
-                ["grep", "-rn", pattern, "--include=*.py", str(WORKDIR)],
+                ["grep", "-rn", "--include=*.py", "--", pattern, str(WORKDIR)],
                 capture_output=True, text=True, timeout=10,
             )
         else:
