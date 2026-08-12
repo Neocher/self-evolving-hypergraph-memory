@@ -405,8 +405,11 @@ def check_prefetch(provider_instance: object) -> tuple[str, str, str | None]:
         )
 
     # Validate result: handle str, list, dict
+    # 兼容两种标题: 官方 "SHM v5 记忆检索" 与本机旧版 "【SHM 记忆检索结果】"
     if isinstance(result, str):
-        has_content = bool(result.strip()) and "SHM v5 记忆检索" in result
+        has_content = bool(result.strip()) and (
+            "SHM v5 记忆检索" in result or "SHM 记忆检索结果" in result
+        )
         count_hint = None
     elif isinstance(result, (list, tuple)):
         has_content = len(result) > 0
