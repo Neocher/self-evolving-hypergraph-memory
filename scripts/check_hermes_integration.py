@@ -135,17 +135,22 @@ def check_plugin_dir(hermes_home: Path) -> tuple[str, str, str | None]:
     """Check ~/.hermes/plugins/shm_v5/ exists with __init__.py.
 
     Also detect wrong location: ~/.hermes/plugins/memory/shm_v5/
+    and legacy naming: ~/.hermes/plugins/shm/ (pre-v5.26.1).
     """
     correct = hermes_home / "plugins" / "shm_v5"
     wrong = hermes_home / "plugins" / "memory" / "shm_v5"
+    legacy = hermes_home / "plugins" / "shm"
     init_file = correct / "__init__.py"
 
     wrong_exists = wrong.is_dir() and (wrong / "__init__.py").exists()
+    legacy_exists = legacy.is_dir() and (legacy / "__init__.py").exists()
 
     if init_file.exists():
         detail = str(correct)
         if wrong_exists:
             detail += " (⚠ 检测到错误位置副本，可删除)"
+        if legacy_exists:
+            detail += " (⚠ 检测到旧命名目录 plugins/shm/，可删除)"
         return ("PASS", detail, None)
 
     if wrong_exists:
@@ -153,6 +158,13 @@ def check_plugin_dir(hermes_home: Path) -> tuple[str, str, str | None]:
             "FAIL",
             f"插件位于错误位置: {wrong}",
             f"请移动: mv {wrong} {correct}",
+        )
+
+    if legacy_exists:
+        return (
+            "FAIL",
+            f"检测到旧命名插件目录: {legacy}（v5.26.1 起标准为 shm_v5）",
+            f"请迁移: mv {legacy} {correct} 并确认 plugin.yaml 中 name 为 shm_v5",
         )
 
     return (

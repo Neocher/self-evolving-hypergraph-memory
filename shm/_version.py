@@ -1,13 +1,13 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.27.1"
+__version__ = "5.27.2"
 __version_info__ = (5, 27, 1)
 __version_name__ = "Hermes-Integration-Check"
 __release_date__ = "2026-08-12"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v5.27.1 (2026-08-12) Hermes-Integration-Check:
+v5.27.2 (2026-08-12) Hermes-Integration-Check:
   • check_hermes_integration.py prefetch 标题兼容双格式 (官方 "SHM v5 记忆检索"
     + 旧版 "【SHM 记忆检索结果】") — 解决本机 shm 插件迁移 shm_v5 后检测误报
   • release 标题补齐 (v5.26.0/1/27.0 缺描述性标题, 历史风格 vX.Y.Z 特性摘要)
