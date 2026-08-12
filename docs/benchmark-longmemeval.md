@@ -1,16 +1,16 @@
 # SHM × LongMemEval Benchmark (Phase 1)
 
-> 实测结果记录 — 2026-08-10 跑测, 文档更新至 2026-08-12 (SHM v5.27.2)
+> 实测结果记录 — 2026-08-10 首测, 2026-08-12 v5.27.3 修复后复测
 
 ## 环境
 
 | 项 | 值 |
 |---|---|
-| SHM 版本 | v5.27.2 (GraphLite + FAISS + BM25 + 混合检索图扩散) |
+| SHM 版本 | v5.27.3 (GraphLite + FAISS + BM25 + 混合检索图扩散 + ns 过滤修复) |
 | Embedding | BAAI/bge-small-zh-v1.5, 512 维, device=auto (本机 RTX 2060 → cuda) |
-| 服务 | systemd shm-server, 真实库 2579+ 节点 (含真实记忆, 非空库) |
+| 服务 | systemd shm-server, 真实库 (含真实记忆, 非空库) |
 | 数据 | LongMemEval oracle (xiaowu0162/longmemeval-cleaned), 500 实例全集 |
-| 评测实例 | 10 (oracle 前 10) |
+| 评测实例 | 10 (oracle 前 10) + 全量 500 尝试 (见限制) |
 
 ## 方法
 
@@ -21,26 +21,37 @@
 - 判定: 答案关键词命中 → recall@k
 - 清理: 评测后 `DELETE /memories/namespace/bench-longmemeval` (delete_namespace)
 
-## 结果
+## 结果 (v5.27.3 复测, 2026-08-12)
 
-```
-实例数: 10 | 写入记忆: 243 条 | 耗时: 93s (9.31s/实例)
-整体 recall@10: 1.0000 (10/10)
-类型                命中率     样本
-temporal-reasoning  1.0000     10
+```text
+10 实例 hybrid (修复后): recall@10 = 1.0000 (10/10)
+耗时: 130s (12.95s/实例) | 写入 243 条 | 结果文件 longmemeval_shm_results_1786520338.json
 ```
 
-结果文件: `scripts/longmemeval_shm_results_1786359462.json`
+**⚠️ P0 修复 (v5.27.3)**: 首次复测 10 hybrid recall=0.0, 根因是 namespace
+过滤查询属性名错误 (`{session_id: $ns}` → SessionNode 实际属性是 `id`) +
+行解析不兼容扁平 dict 格式。修复后 recall 0.0 → 1.0。详情见 v5.27.3 release。
 
-## 对比 (2026-08-07 基线)
+## 对比 (2026-08-07 基线 + v5.21.12)
 
-| 指标 | 2026-08-07 (bge-m3) | 2026-08-10 (v5.21.12, bge-small) |
-|---|---|---|
-| recall@10 | 0.90 | **1.00** |
-| 耗时 (10 实例) | 1512s (25 分钟) | **93s (16× 提速)** |
+| 指标 | 2026-08-07 (bge-m3) | 2026-08-10 (v5.21.12) | 2026-08-12 (v5.27.3) |
+|---|---|---|---|
+| recall@10 | 0.90 | 1.00 | **1.00** |
+| 耗时 (10 实例) | 1512s | 93s (vector) | 130s (hybrid, 含 ns 过滤) |
 
-提速来源: bge-small-zh-v1.5 CPU/GPU 编码 (8ms/条 vs bge-m3 OOM 降级) +
-批量写 API + 写路径优化 (v5.21.9 hyperedge 批量边)。
+## 全量 500 实测结论 (2026-08-12): 当前架构下不可行
+
+全量 500 (预计 ~12000 条写入) 实际跑了 2 小时仅完成 ~30 实例 (~700 条),
+且服务写队列持续打满 (max_pending=100 → 503 拒绝), 被迫中止。**瓶颈不是
+embedding/FAISS, 而是写队列容量 + 每实例 wait_faiss_catchup 空等**:
+- 写队列 100 上限, 批量灌入 12000 条时消费 (embedding + hebbian) 跟不上
+- 每实例写 24 条后等 FAISS 追平, 队列满时等不到 → 180s 空等超时
+- 高负载下服务 health 超时 (163% CPU), 触发"长任务卡死"模式 (已知坑)
+
+**规模化 benchmark 前需先**: ① 写队列扩容或批量写 API 直落 (绕过 embedding
+队列); ② wait 逻辑改为"成功数达成即查"而非轮询 faiss 总量; ③ 或分片跑
+(每片 50 实例, 片间重启服务)。遗留孤儿数据: 部分写入在队列压力下未建
+SESSION_MEMBER 边 (delete_namespace deleted=0), 需按内容特征直删。
 
 ## 复现
 
