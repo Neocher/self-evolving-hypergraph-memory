@@ -1,5 +1,5 @@
 """GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器（当前图引擎）。"""
-import json, shutil, os, time, threading, uuid, sys, tempfile
+import json, shutil, os, time, threading, uuid, sys, tempfile, logging
 import numpy as np
 from enum import Enum
 from pathlib import Path
@@ -13,6 +13,8 @@ from graphlite_sdk.error import (
     ConnectionError as GraphLiteConnectionError,
     QueryError,
 )
+
+logger = logging.getLogger("shm.graphlite_store")
 
 from core.retry import with_retry
 
@@ -287,6 +289,25 @@ class GraphLiteStore:
                 pass  # graph 可能已存在
             self._session.execute(f"SESSION SET GRAPH {SHM_SCHEMA}")
             self._graph_name = SHM_SCHEMA
+
+        # 【P1-2】EpisodeNode (source, created_at) 复合索引 —— 超边窗口查询
+        # (MATCH e WHERE e.source = $src AND e.created_at >= $cutoff) 从全表
+        # 扫描降为索引扫描, 写入延迟不随节点数增长。GraphLite 支持
+        # CREATE INDEX ... ON <node> (col, ...) 语法 (parser + executor 均有),
+        # 已实测不抛异常且查询结果一致。尽力而为: 失败仅日志, 不影响启动
+        # (性能兜底: P1-1 已把每写 2 次 MATCH 合并为每 source 1 次)。
+        self._ensure_episode_index()
+
+    def _ensure_episode_index(self) -> None:
+        """P1-2: 尽力创建 (source, created_at) 复合索引, 失败仅日志。"""
+        try:
+            self._session.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episode_src_ts "
+                "ON EpisodeNode (source, created_at)"
+            )
+            logger.debug("EpisodeNode (source, created_at) index ensured")
+        except Exception as e:
+            logger.warning("EpisodeNode index creation skipped (non-fatal): %s", e)
 
     # ─── Episode CRUD ───────────────────────────────
 
@@ -577,7 +598,7 @@ class GraphLiteStore:
         try:
             result = self._session.query(
                 f"MATCH (s:SessionNode {{id: '{namespace}'}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
-                f"RETURN e.id"
+                f"RETURN e"
             )
             ep_ids = [self._flatten_row(r, "e").get("id", "") for r in result.rows]
             ep_ids = [i for i in ep_ids if i]

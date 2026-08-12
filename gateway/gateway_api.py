@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from api._routes import Services
+from api.routes._deps import qsubmit
 from api.models import (
     HealthStatus,
     HyperedgeListResponse,
@@ -111,7 +112,8 @@ class GatewayAPI:
                     await self._svc.dream_scheduler.on_node_created()
         else:
             # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
-            self._svc.graphlite_store.create_episode({
+            # 【v5.24】写串行化：经写队列提交，不阻塞事件循环（镜像 write.py）
+            await qsubmit(self._svc, self._svc.graphlite_store.create_episode, {
                 "id": record_id,
                 "content": content,
                 "source": source,
@@ -120,8 +122,9 @@ class GatewayAPI:
                 "tau_initial": 1.0,
             })
             if namespace:
-                self._svc.graphlite_store.ensure_session(namespace)
-                self._svc.graphlite_store.link_to_session(namespace, record_id)
+                # 同一 async 方法内 await 顺序 → 队列 FIFO 保证顺序
+                await qsubmit(self._svc, self._svc.graphlite_store.ensure_session, namespace)
+                await qsubmit(self._svc, self._svc.graphlite_store.link_to_session, namespace, record_id)
             if self._svc.dream_scheduler:
                 await self._svc.dream_scheduler.on_node_created()
 
@@ -193,8 +196,9 @@ class GatewayAPI:
                     content=content, source=source,
                 )
 
-        # 持久化
-        self._svc.graphlite_store.create_episode({
+        # 持久化（【v5.24】经写队列提交，不阻塞事件循环；503 传播到路由层由
+        # FastAPI 转 503 响应——A2A 路由无需额外 catch）
+        await qsubmit(self._svc, self._svc.graphlite_store.create_episode, {
             "id": episode_id,
             "content": content,
             "source": source,
@@ -210,10 +214,10 @@ class GatewayAPI:
             except Exception:
                 pass
 
-        # 命名空间链接
+        # 命名空间链接（【v5.24】经队列；await 顺序 → FIFO 保证 link 在 create 后）
         if namespace:
-            self._svc.graphlite_store.ensure_session(namespace)
-            self._svc.graphlite_store.link_to_session(namespace, episode_id)
+            await qsubmit(self._svc, self._svc.graphlite_store.ensure_session, namespace)
+            await qsubmit(self._svc, self._svc.graphlite_store.link_to_session, namespace, episode_id)
 
         # 通知梦境调度器
         if self._svc.dream_scheduler:
@@ -349,7 +353,8 @@ class GatewayAPI:
 
                 visual_node_id = str(uuid.uuid4())
                 if self._svc.graphlite_store is not None:
-                    self._svc.graphlite_store.create_visual_node({
+                    # 【v5.24】经写队列提交（镜像 write.py 多模态写路径）
+                    await qsubmit(self._svc, self._svc.graphlite_store.create_visual_node, {
                         "id": visual_node_id,
                         "image_path": media_paths[0] if media_paths else "",
                         "caption": merged_text[:1024],
@@ -370,7 +375,8 @@ class GatewayAPI:
                     transcription=transcription, created_at=created_at,
                     error=f"Content rejected: credential-like pattern detected ({len(creds)} matches)",
                 )
-            self._svc.graphlite_store.create_episode({
+            # 【v5.24】经写队列提交（同一 async 方法内 await 顺序 → FIFO）
+            await qsubmit(self._svc, self._svc.graphlite_store.create_episode, {
                 "id": episode_id,
                 "content": merged_text,
                 "source": source,
@@ -379,8 +385,8 @@ class GatewayAPI:
                 "tau_initial": 1.0,
             })
             if namespace:
-                self._svc.graphlite_store.ensure_session(namespace)
-                self._svc.graphlite_store.link_to_session(namespace, episode_id)
+                await qsubmit(self._svc, self._svc.graphlite_store.ensure_session, namespace)
+                await qsubmit(self._svc, self._svc.graphlite_store.link_to_session, namespace, episode_id)
             if self._svc.dream_scheduler:
                 await self._svc.dream_scheduler.on_activity()
                 await self._svc.dream_scheduler.on_node_created()

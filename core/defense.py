@@ -20,8 +20,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -44,6 +45,10 @@ _R2_TIMEOUT = 7.0
 # 【M2-b】锁等待独立短超时（秒）：并发写入下 asyncio.Lock 排队不计入 R2
 # 预算 → 正常慢写入不被误隔离（修复前 10s 预算覆盖 R2 执行 + 锁排队）。
 _LOCK_WAIT_TIMEOUT = 2.0
+
+# 【P0-1】R2 参考 embedding 缓存上限 (content_hash -> np.ndarray), FIFO 淘汰。
+# 同 source 连续写入时历史内容 embedding 命中缓存, 省 200ms+/条。
+_R2_EMB_CACHE_MAX = 512
 
 
 # ─── 枚举 ──────────────────────────────────────────────────
@@ -214,7 +219,12 @@ class MemoryDefenseEngine:
         self._trust_versions: dict[str, int] = defaultdict(int)
         self._exact_contents: dict[str, list[tuple[str, float]]] = defaultdict(list)
         self._recovery_counter: dict[str, int] = defaultdict(int)
-        self._lock = asyncio.Lock()
+        # 【P0-2】R1/R4/R5 短临界区: threading.Lock 取代 asyncio.Lock —— 纯内存
+        # 计数操作亚毫秒完成, 不再全局串行化所有并发写入。
+        self._state_lock = threading.Lock()
+        # 【P0-1】R2 参考 embedding 缓存 (FIFO LRU): content_hash -> np.ndarray
+        self._r2_emb_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._r2_emb_cache_lock = threading.Lock()
 
     async def pre_check(
         self,
@@ -235,7 +245,6 @@ class MemoryDefenseEngine:
         """
         ts = created_at or time.time()
         reasons: list[str] = []
-        verdict = MemoryDefenseVerdict.ALLOW
 
         # R2 编码移出锁范围（避免编码器阻塞锁内其他规则）
         # 【M2-a】R2 走专用小池 _R2_EXECUTOR（max_workers=2）而非默认执行器：
@@ -256,45 +265,67 @@ class MemoryDefenseEngine:
         if not r2_pass:
             reasons.append(r2_reason)
 
-        # 【M2-b】锁等待用独立短超时（不算入 R2 执行预算）：高并发写入下
-        # asyncio.Lock 串行化 R1/R3/R4/R5，正常慢写入不再因排队耗尽外层预算
-        # 而被误隔离；超时同样 fail-closed → QUARANTINE（独立 reason 便于运营区分）。
-        try:
-            await asyncio.wait_for(self._lock.acquire(), timeout=_LOCK_WAIT_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("Defense lock wait timed out after %.1fs, quarantining write",
+        # 【P0-2】R3 纯函数无共享状态, 无锁直接计算
+        r3_pass, r3_reason, r3_flag = self._check_r3(content)
+        if not r3_pass:
+            reasons.append(r3_reason)
+
+        # 【P0-2】R1/R4/R5 检查 + 状态更新 → threading.Lock 短临界区: 纯内存计数
+        # 亚毫秒, 无 I/O 无 await。直接在事件循环内同步执行 —— 不经过线程池:
+        # R1/R4/R5 是纯内存计数操作, 池化只让并发写入排队 worker (Codex 实测
+        # 8 线程 2583ms/条, 新瓶颈是线程池而非锁); 锁内 µs 级不阻塞事件循环。
+        # （R2 的 _R2_EXECUTOR 保留: embedding 是 CPU 重活才需要池。）
+        # 【M2-b】锁等待独立短超时: 超时 fail-closed → QUARANTINE (独立 reason)。
+        result = self._run_r1_r4_r5_locked(source, content, ts, r2_flag, r3_flag)
+        if result is None:
+            logger.warning("Defense rules lock wait timed out after %.1fs, quarantining write",
                            _LOCK_WAIT_TIMEOUT)
             return MemoryDefenseVerdict.QUARANTINE, "defense_lock_timeout"
+        verdict, state_reasons = result
+        reasons.extend(state_reasons)
+
+        # 静默模式: BLOCK 降级为 QUARANTINE
+        if verdict == MemoryDefenseVerdict.BLOCK and self.config.silent:
+            verdict = MemoryDefenseVerdict.QUARANTINE
+            reasons = [f"[silent] {r}" for r in reasons]
+
+        reason_str = "; ".join(reasons) if reasons else "all rules passed"
+        return verdict, reason_str
+
+    # ── R1/R4/R5 短临界区（P0-2）─────────────────────────
+
+    def _run_r1_r4_r5_locked(self, source: str, content: str, ts: float,
+                              r2_flag: EscalationFlag, r3_flag: EscalationFlag,
+                              ) -> Optional[tuple[MemoryDefenseVerdict, list[str]]]:
+        """P0-2: R1/R4/R5 检查 + 状态更新, threading.Lock 短临界区。
+
+        check-then-act 原子 (检查与记录在同一临界区, 不破坏 R1/R4/R5 判定语义)。
+        拿不到锁 → 返回 None (调用方 fail-closed → QUARANTINE), 不执行规则
+        也不更新状态 (与旧 asyncio.Lock 超时行为一致: 超时写入不记账)。
+        """
+        if not self._state_lock.acquire(timeout=_LOCK_WAIT_TIMEOUT):
+            return None
         try:
-            # 锁内只做计数器状态操作（R1/R3/R4/R5）
-            # R1 — 写入频率尖峰（含本次写入的预计算）
+            verdict = MemoryDefenseVerdict.ALLOW
+            reasons: list[str] = []
+            # R1 — 写入频率尖峰 (含本次写入的预计算)
             r1_pass, r1_reason, r1_flag = self._check_r1(source, include_pending=True)
             if not r1_pass:
                 reasons.append(r1_reason)
-
-            # R3 — 实体共现异常
-            r3_pass, r3_reason, r3_flag = self._check_r3(content)
-            if not r3_pass:
-                reasons.append(r3_reason)
-
-            # R4 — 重复洪泛（含本次写入的预计算）
+            # R4 — 重复洪泛 (含本次写入的预计算)
             r4_pass, r4_reason, r4_flag = self._check_r4(source, content, include_pending=True)
             if not r4_pass:
                 reasons.append(r4_reason)
-
             # R5 — 信任衰减
             r5_pass, r5_reason, r5_flag = self._check_r5(source)
             if not r5_pass:
                 reasons.append(r5_reason)
-
-            # 聚合升级
-            for flag in [r1_flag, r2_flag, r3_flag, r4_flag, r5_flag]:
+            # 聚合升级 (R1/R4 恒 NONE, R5 可 BLOCK; r2_flag/r3_flag 由调用方传入)
+            for flag in (r1_flag, r2_flag, r3_flag, r4_flag, r5_flag):
                 if flag != EscalationFlag.NONE:
                     verdict = self._escalate(verdict, flag)
-
-            # 根据判定结果执行操作
+            # 根据判定结果执行操作 (与旧实现完全一致)
             if verdict in (MemoryDefenseVerdict.BLOCK, MemoryDefenseVerdict.QUARANTINE):
-                # silent=True 时不执行真实的信任衰减（仅模拟判定）
                 if not self.config.silent:
                     current_trust = self._trust_scores[source]
                     expected_version = self._trust_versions[source]
@@ -303,11 +334,9 @@ class MemoryDefenseEngine:
                 self._recovery_counter[source] = 0
                 logger.warning(
                     "Defense %s: source=%s, trust=%.2f, reasons=%s",
-                    verdict.value, source,
-                    self._trust_scores[source], reasons,
+                    verdict.value, source, self._trust_scores[source], reasons,
                 )
             else:
-                # ALLOW: 记录本次写入
                 self._history.record(source, content, ts)
                 self._exact_contents[source].append((content, ts))
                 self._trim_exact(source)
@@ -320,16 +349,9 @@ class MemoryDefenseEngine:
                     self.config.initial_trust,
                     current_trust + recovery_rate,
                 )
+            return verdict, reasons
         finally:
-            self._lock.release()
-
-        # 静默模式：BLOCK 降级为 QUARANTINE（在锁外，不影响状态）
-        if verdict == MemoryDefenseVerdict.BLOCK and self.config.silent:
-            verdict = MemoryDefenseVerdict.QUARANTINE
-            reasons = [f"[silent] {r}" for r in reasons]
-
-        reason_str = "; ".join(reasons) if reasons else "all rules passed"
-        return verdict, reason_str
+            self._state_lock.release()
 
     # ── Verdict 升级 ─────────────────────────────────────
 
@@ -365,7 +387,7 @@ class MemoryDefenseEngine:
         if len(recent) < 3:
             return True, "", EscalationFlag.NONE  # 历史不足，无法检测漂移
 
-        content_emb = self._get_embedding(content)
+        content_emb = self._cached_embedding(content)
         if content_emb is None:
             return True, "", EscalationFlag.NONE  # 无编码器可用，跳过 R2
 
@@ -373,7 +395,7 @@ class MemoryDefenseEngine:
         ref_contents = recent[:-1]
         ref_embs: list[np.ndarray] = []
         for prev in ref_contents:
-            emb = self._get_embedding(prev)
+            emb = self._cached_embedding(prev)
             if emb is not None:
                 ref_embs.append(emb)
 
@@ -412,6 +434,26 @@ class MemoryDefenseEngine:
             logger.debug("Cloud embedding fallback failed, R2 will be skipped")
 
         return None
+
+    def _cached_embedding(self, text: str) -> Optional[np.ndarray]:
+        """P0-1: 带 FIFO LRU 缓存的 embedding —— 历史内容命中即复用。
+
+        key 用 hash(text) 省内存; 编码计算在锁外 (编码器可能慢), 只锁
+        dict 读写 (短临界区)。R2 只在 _R2_EXECUTOR 线程跑, 但保留锁防误用。
+        """
+        key = hash(text)
+        with self._r2_emb_cache_lock:
+            if key in self._r2_emb_cache:
+                self._r2_emb_cache.move_to_end(key)
+                return self._r2_emb_cache[key]
+        emb = self._get_embedding(text)
+        if emb is None:
+            return None
+        with self._r2_emb_cache_lock:
+            self._r2_emb_cache[key] = emb
+            if len(self._r2_emb_cache) > _R2_EMB_CACHE_MAX:
+                self._r2_emb_cache.popitem(last=False)
+        return emb
 
     # ── R3: 实体共现异常 ─────────────────────────────────
 

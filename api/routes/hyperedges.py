@@ -9,6 +9,7 @@ from api.routes._deps import (
     json,
     CoreHyperedgeType, APIHyperedgeType,
     HyperedgeCreate, HyperedgeResponse, HyperedgeListResponse,
+    qsubmit,
 )
 
 
@@ -37,16 +38,21 @@ async def create_hyperedge(
 
     core_type = CoreHyperedgeType(req.type.value)
     try:
+        # 【v5.24】超边创建（HyperedgeNode INSERT + 批量边 INSERT）整体经写队列，
+        # 写线程内原子完成；ValueError（成员<2）经 submit 传播 → 现有 400 处理不变
         if core_type == CoreHyperedgeType.EPISODE:
-            edge = deps.hyperedge_manager.create_episode_hyperedge(
-                member_ids=req.member_ids, topic=req.topic
+            edge = await qsubmit(
+                deps, deps.hyperedge_manager.create_episode_hyperedge,
+                member_ids=req.member_ids, topic=req.topic,
             )
         elif core_type == CoreHyperedgeType.SEMANTIC:
-            edge = deps.hyperedge_manager.create_semantic_hyperedge(
-                member_ids=req.member_ids, conclusion=req.conclusion or ""
+            edge = await qsubmit(
+                deps, deps.hyperedge_manager.create_semantic_hyperedge,
+                member_ids=req.member_ids, conclusion=req.conclusion or "",
             )
         else:
-            edge = deps.hyperedge_manager.create_temporal_hyperedge(
+            edge = await qsubmit(
+                deps, deps.hyperedge_manager.create_temporal_hyperedge,
                 member_ids=req.member_ids,
                 start_time=req.start_time or _now(),
                 end_time=req.end_time or _now(),

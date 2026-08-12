@@ -10,8 +10,47 @@ from api.routes._deps import (
     AttributeDefModel, EdgeTypeDefModel,
     EdgeTypeListResponse, OntologyStatsResponse,
     Dict, Any, List, Optional, BaseModel, Field,
+    qsubmit,
 )
 from fastapi import Query, Response
+
+
+def _upsert_batch_relation(store, subj: str, obj: str, rel_type: str, rel: str) -> None:
+    """单个三元组的 6 次 execute_cypher 组闭包（写线程内原子）。
+
+    【v5.24】GraphLite 无 MERGE，原路由内"subj MATCH+INSERT → obj MATCH+INSERT →
+    边 MATCH+INSERT"共 6 次写若拆成 6 个 submit，每个三元组占 6 个队列槽位
+    且存在性检查会读到中间态；包成单个闭包整体入队，顺序天然正确
+    （先建 subj/obj 节点再建边，写线程内同步）。
+    """
+    if not store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $name}) RETURN a",
+        {"name": subj},
+    ):
+        store.execute_cypher(
+            "INSERT (a:OntologyEntity {name: $name})",
+            {"name": subj},
+        )
+    if not store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $name}) RETURN a",
+        {"name": obj},
+    ):
+        store.execute_cypher(
+            "INSERT (a:OntologyEntity {name: $name})",
+            {"name": obj},
+        )
+    if not store.execute_cypher(
+        f"MATCH (a:OntologyEntity {{name: $subj}})"
+        f"-[r:{rel_type}]->"
+        f"(b:OntologyEntity {{name: $obj}}) RETURN a",
+        {"subj": subj, "obj": obj},
+    ):
+        store.execute_cypher(
+            f"MATCH (a:OntologyEntity {{name: $subj}}), "
+            f"(b:OntologyEntity {{name: $obj}}) "
+            f"INSERT (a)-[:{rel_type} {{relation: $rel}}]->(b)",
+            {"subj": subj, "obj": obj, "rel": rel},
+        )
 
 
 class DiscoverResponse(BaseModel):
@@ -309,38 +348,11 @@ async def batch_relations(
             continue
 
         try:
-            # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT（幂等）
-            if not deps.graphlite_store.execute_cypher(
-                "MATCH (a:OntologyEntity {name: $name}) RETURN a",
-                {"name": subj},
-            ):
-                deps.graphlite_store.execute_cypher(
-                    "INSERT (a:OntologyEntity {name: $name})",
-                    {"name": subj},
-                )
-            if not deps.graphlite_store.execute_cypher(
-                "MATCH (a:OntologyEntity {name: $name}) RETURN a",
-                {"name": obj},
-            ):
-                deps.graphlite_store.execute_cypher(
-                    "INSERT (a:OntologyEntity {name: $name})",
-                    {"name": obj},
-                )
-
             rel_type = item.get("edge_type", "RELATES_TO")
-            # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-            if not deps.graphlite_store.execute_cypher(
-                f"MATCH (a:OntologyEntity {{name: $subj}})"
-                f"-[r:{rel_type}]->"
-                f"(b:OntologyEntity {{name: $obj}}) RETURN a",
-                {"subj": subj, "obj": obj},
-            ):
-                deps.graphlite_store.execute_cypher(
-                    f"MATCH (a:OntologyEntity {{name: $subj}}), "
-                    f"(b:OntologyEntity {{name: $obj}}) "
-                    f"INSERT (a)-[:{rel_type} {{relation: $rel}}]->(b)",
-                    {"subj": subj, "obj": obj, "rel": rel},
-                )
+            # 【v5.24】6 次 execute_cypher 组闭包整体经写队列（写线程内原子,
+            # 先建 subj/obj 节点再建边；不阻塞事件循环）
+            await qsubmit(deps, _upsert_batch_relation,
+                          deps.graphlite_store, subj, obj, rel_type, rel)
             results["created"] += 1
         except Exception as e:
             results["errors"] += 1

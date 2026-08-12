@@ -13,7 +13,10 @@ from api.routes._deps import (
     RetrieveRequest, RetrieveResponse, EpisodicResult,
     SearchVectorRequest, SearchVectorResult, SearchVectorResponse,
     SessionMemoryCreate, SessionMemoryItem, SessionMemoryListResponse,
+    qsubmit,
 )
+
+from graph.graphlite_store import CircuitBreakerOpen
 
 # 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
 # 超时返回空结果而非无限挂起 + 线程泄漏（与写路径超时对称）
@@ -185,6 +188,16 @@ async def retrieve(
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
         try:
+            # 【v5.24】首次检索触发的 lazy 同步（sync_entity_types + 关系边写）
+            # 预同步经写队列——不在 loop 线程同步写（一次性，_ontology_synced 置位
+            # 后检索纯读）。读验证本身留 loop。
+            if not deps.ontology_validator._ontology_synced:
+                try:
+                    await qsubmit(deps, deps.ontology_validator.sync_entity_types_to_graphlite)
+                    await qsubmit(deps, deps.ontology_validator._populate_relationships)
+                    deps.ontology_validator._ontology_synced = True
+                except HTTPException:
+                    logger.warning("Write queue busy, ontology sync deferred (validation continues)")
             validated = deps.ontology_validator.read_validate(
                 [{
                     "id": r.get("node_id", ""),
@@ -316,9 +329,12 @@ async def search_vector(
 
         distances, indices = deps.faiss_index.search(emb_array, k)
 
-        # 3. 回查 GraphLite 获取节点详情
+        # 3. 回查 GraphLite 获取节点详情（批量，一次 GraphLite 查询）
         results: list[SearchVectorResult] = []
         faiss_id_map = getattr(deps, "faiss_id_map", {}) or {}
+
+        # 先收集有效的 (faiss_id, episode_id, score) 三元组（保持 FAISS 排名顺序）
+        hits: list[tuple[int, str, float]] = []
         for rank in range(len(indices[0])):
             faiss_id = int(indices[0][rank])
             if faiss_id < 0:
@@ -333,17 +349,30 @@ async def search_vector(
             if not episode_id:
                 continue
 
-            # 从 GraphLite 获取节点详情
-            try:
-                node = deps.graphlite_store.get_episode(episode_id) if deps.graphlite_store else None
-                content = node.get("content", "") if node else ""
-            except Exception:
-                content = ""
+            hits.append((faiss_id, episode_id, round(score, 4)))
 
+        # 批量回查 GraphLite（与 query_router 批量回查同模式，一次 GraphLite 查询）
+        episodes_dict: dict[str, dict] = {}
+        if hits and deps.graphlite_store is not None:
+            try:
+                episodes_dict = {
+                    ep["id"]: ep
+                    for ep in deps.graphlite_store.get_episodes_batch(
+                        [eid for _, eid, _ in hits]
+                    )
+                }
+            except CircuitBreakerOpen:
+                episodes_dict = {}  # 熔断跳闸：静默跳过回查（content 为空）
+            except Exception:
+                logger.exception("search_vector: GraphLite batch lookup failed, results will have empty content")
+
+        for faiss_id, episode_id, score in hits:
+            node = episodes_dict.get(episode_id)
+            content = node.get("content", "") if node else ""
             results.append(SearchVectorResult(
                 node_id=episode_id,
                 content=content,
-                score=round(score, 4),
+                score=score,
                 faiss_id=faiss_id,
             ))
 

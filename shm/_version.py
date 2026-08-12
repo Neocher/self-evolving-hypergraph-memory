@@ -1,13 +1,66 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.21.10"
-__version_info__ = (5, 21, 10)
-__version_name__ = "Dream-Fix"
-__release_date__ = "2026-08-09"
+__version__ = "5.25.0"
+__version_info__ = (5, 25, 0)
+__version_name__ = "Write-Queue-Complete"
+__release_date__ = "2026-08-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-核心变更 — 修正 embedding 声明漂移 (2026-08-09):
+核心变更 — 写路径最终收敛 (2026-08-11):
+  • dream API apply_candidate 整体闭包入队: PRUNE (DETACH DELETE) + MERGE 循环写
+    在写线程执行, 事件循环不再被阻塞; 整体闭包保证 PRUNE→MERGE→_mark_applied
+    顺序 (禁止拆开 submit), 队列满(503)时整体未执行 → deferred 语义, 幂等保持
+  • dream_scheduler auto_apply 移除: 调度器 _run_dream 不再有 loop 线程同步写
+    (原 _persist_community_nodes 几十次 execute_cypher 循环), 完全由
+    _dream_poll_loop 经 qsubmit 整体闭包入队承接 (延迟 ≤1 poll interval, 可接受)
+  • _persist_dream_state fire-and-forget task SDK 异常兜底: execute_cypher 抛
+    ConnectionError/QueryError 不再泄漏 "Task exception was never retrieved"
+    噪音, 记 ERROR 日志非致命
+  • 语义确认: search 队列忙降级 → 首次 lazy ontology 同步写留在 loop 线程
+    (一次性 + 超载瞬态, 可接受); hebbian 大 batch 保持逐条 submit
+    (合并会改变 active_nodes 批内共激语义, 不可合并)
+
+v5.24.0 (2026-08-11) Full-Write-Queue:
+  • 请求路径写调用全部经 qsubmit 入队: gateway_api (write_sensory /
+    store_episode / store_multimodal) + visual + communities (冲突 resolve /
+    reconcile update_with_version 复合闭包) + ontology batch_relations
+    (6 次 execute_cypher 组闭包) + hyperedges (三分支) — 事件循环不再被同步写阻塞
+  • hebbian 持久化入队: _process_embed_queue 改 async, update 闭包经写队列
+    (_persist_batch 的 SET/INSERT 在写线程), 5s poll loop 不卡 loop
+  • app.py _persist_dream_state 入队: 调度器同步回调 → async 闭包 +
+    create_task 桥接 (写线程执行 MATCH+SET/INSERT); 无队列/无 loop 降级同步直调
+  • 随主写入队: 写路径 entity_resolver.process / extract_and_relate 闭包入队
+    (ALIAS_OF / RELATES_TO 写在写线程); 检索路径首次 lazy 同步预同步入队
+  • dream auto_apply 入队 + 队列深度检查 (积压 > max_pending/2 时延迟,
+    避免梦境大块写占满单写者额度)
+  • 后台/推理路径维持判定: dream 主路径 (asyncio.to_thread) 与
+    /index/rebuild (显式运维) 不入队; 检索读验证留 loop (qsubmit 只收写)
+
+v5.23.0 (2026-08-11) Write-Serialized:
+  • 写串行化队列 core/write_queue.py — 所有 GraphLite 写调用收敛到专用写线程
+    串行执行（queue.Queue + 单 worker executor 桥接 + concurrent Future），
+    事件循环不再被同步写阻塞: 8 并发写 3.2s/条 → 排队 + 写, 读请求不受影响
+  • 集成: write.py 全部 GraphLite 写调用 (create_episode / ensure_session /
+    link_to_session / create_visual_node / execute_cypher / 超边创建) 经
+    qsubmit 入队; MATCH 检查+INSERT 幂等对组闭包整体入队 (写线程内原子)
+  • 背压: max_pending=100 满则拒新写 (503); 单写等待 30s 超时; 队列满/超时
+    由 qsubmit 转 HTTPException 503; 迟到完成语义 (超时后任务仍落库, 不重试)
+  • 生命周期: app startup 创建单例, shutdown 先 drain 在途写再关 GraphLite
+  • 测试: FIFO 顺序 / 异常传播 / 超时迟到完成 / 队列满拒绝 / 写线程重入直连 /
+    读不受写影响 / 8 并发写 80 条吞吐基准
+
+v5.22.0 (2026-08-11) Write-Perf:
+  • P0-1: R2 参考 embedding 缓存 (content_hash → embedding, FIFO LRU 512 条)
+    —— 同 source 连续写入省 200ms+/条
+  • P0-2: defense 锁拆细 — asyncio.Lock → threading.Lock 短临界区 + 专用小池,
+    并发写吞吐 0.4 → 数十 req/s; fail-closed 两处 QUARANTINE 原样保留
+  • P1-1: 批量接口真正批量化 — 超边创建按 source 合并, 每 source 2 次 MATCH
+    (原逐条 2n 次), 批量写均摊 ≤100ms/条
+  • P1-2: EpisodeNode (source, created_at) 复合索引 (尽力而为, 失败仅日志)
+  • P2-1: 梦境调度写入压力感知 — 持续写入推迟梦境触发, 消除批量写偶发超时
+
+v5.21.12 (2026-08-10) Dream-Fix:
   • 修正：EmbeddingConfig.model_name 默认值 bge-m3→bge-small-zh-v1.5
     （YAML 早已回退，代码默认未同步）；FAISS 无"动态适配"（dimension 恒 512）
 
