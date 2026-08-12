@@ -198,14 +198,20 @@ class GatewayAPI:
 
         # 持久化（【v5.24】经写队列提交，不阻塞事件循环；503 传播到路由层由
         # FastAPI 转 503 响应——A2A 路由无需额外 catch）
-        await qsubmit(self._svc, self._svc.graphlite_store.create_episode, {
+        episode_data = {
             "id": episode_id,
             "content": content,
             "source": source,
             "visibility": visibility,
             "created_at": created_at,
             "tau_initial": tau_initial,
-        })
+        }
+        # 【v5.27.0】force_promote=true → 打 protected 顶层标记（与 api/routes/write.py
+        # 同构）：梦境 PRUNE 永不剪这类节点；否则 A2A/ACP 经此入口的强制提升
+        # 记忆旁路 protected 标记，与 HTTP 入口语义不一致。
+        if force_promote:
+            episode_data["protected"] = True
+        await qsubmit(self._svc, self._svc.graphlite_store.create_episode, episode_data)
 
         # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
         if self._svc.ssm_gate is not None and self._svc.tau_engine is not None:

@@ -274,3 +274,38 @@ class TestMediaWarmupBudget:
         assert getattr(svc, "_media_warmup_done", False) is True, (
             "带媒体请求实际尝试嵌入后应置位 _media_warmup_done"
         )
+
+
+class TestForcePromoteProtectedFlagRoute:
+    """【v5.27.0】force_promote=true 路由级测试（走生产链路）。
+
+    覆盖 POST /memories/episodes → create_episode → 落库 全链路：
+    断言落库节点的 protected 标记。修复前路由直调层仅写入 τ 值，未在
+    episode dict 打 protected 标记（与 gateway/store_episode 的 A2A/ACP
+    旁路同构缺陷），本测试证明 force_promote=true 时标记真实落库。
+    """
+
+    def test_force_promote_route_persists_protected_flag(self, client, graphlite_store):
+        """POST force_promote=true → 落库节点 protected in (True, "true", 1)。
+
+        真实 GraphLite 存储读回，兼容 _flatten_row 还原的 Python True
+        与 GraphLite 原生 "true"/1 形态。
+        """
+        svc = Services()
+        svc.graphlite_store = graphlite_store
+
+        resp = client(svc).post("/memories/episodes", json={
+            "content": "重要记忆 force promote 路由级测试",
+            "source": "test",
+            "force_promote": True,
+        })
+
+        assert resp.status_code == 200, resp.text
+        episode_id = resp.json()["episode_id"]
+        got = graphlite_store.get_episode(episode_id)
+        assert got is not None
+        assert got["content"] == "重要记忆 force promote 路由级测试"
+        assert got.get("protected") in (True, "true", 1), (
+            "force_promote=true 应经生产链路打 protected 标记并落库，"
+            f"实际读回 protected={got.get('protected')!r}"
+        )

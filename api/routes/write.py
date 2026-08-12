@@ -489,6 +489,11 @@ async def create_episode(
         "created_at": created_at,
         "tau_initial": tau_initial,
     }
+    # 【v5.27.0】force_promote=true → 打 protected 顶层标记，
+    # 梦境 PRUNE 永不剪这类节点（dream_pipeline._prune_step 消费）。
+    # GraphLite 布尔非 b64，读取经 _flatten_row 还原 Python True。
+    if req.force_promote:
+        episode_data["protected"] = True
     # 本体字段: 验证器提取到了就存独立字段, 供矛盾检测等值匹配 (b64 根治)
     if val_result is not None:
         if val_result.ontology_type:

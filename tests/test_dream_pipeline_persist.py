@@ -11,6 +11,7 @@ import time
 import uuid
 
 from core.dream_pipeline import DreamPipeline
+from core.tau_decay import TauDecayEngine
 
 
 def _create_episode(graphlite_store, ep_id: str, content: str = "test content") -> None:
@@ -186,3 +187,132 @@ class TestPipelinePersistSharedMember:
         assert _edge_exists(graphlite_store, c2_id, epZ), (
             f"C2 exclusive member epZ edge missing"
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# v5.27.0 梦境 PRUNE 保护修复（2026-08-12 事故：9 条全孤立旧节点 100% 被剪）
+#  ① force_promote 节点打 protected 标记 → PRUNE 永不剪
+#  ② 单次剪枝比例 > 50% → 中止本次剪枝（全部保留）
+#  ③ protected 节点永不参与合并（防合并击穿）
+# ══════════════════════════════════════════════════════════════════
+
+
+def _make_old_node(eid, protected=False, tau=0.05, created_at=None):
+    """构造命中全部剪枝候选条件的旧节点（除 protected 外）。
+
+    - created_at 默认 7201s 前（≥ 7200s 低龄保护线）
+    - tau 默认 0.05（< decay_threshold 0.1，且 ≤ 0.3 高 τ 保护线）
+    - connections={} → degree=0 ≤ 1
+    注意：_prune_step 直接读 tau_value，因此 tau_initial 与 tau_value 都置为 tau。
+    """
+    if created_at is None:
+        created_at = time.time() - 7201
+    node = {
+        "id": eid,
+        "content": f"content-{eid}",
+        "created_at": created_at,
+        "tau_initial": tau,
+        "tau_value": tau,
+    }
+    if protected:
+        node["protected"] = True  # 仅 protected=true 时携带标记（兼容旧数据无标记）
+    return node
+
+
+class TestPruneProtection:
+    """v5.27.0 PRUNE 保护：protected 标记 + 批量比例护栏 + 合并防护。"""
+
+    def _pipe(self):
+        return DreamPipeline(tau_engine=TauDecayEngine())
+
+    def test_prune_keeps_force_promote_node(self):
+        """方案①：protected 节点 τ 衰减后仍不被剪，普通节点同条件照常被剪。
+
+        且比例 1/2 = 50% 不触发中止 → 验证两方案正交。
+        """
+        pipe = self._pipe()
+        nodes = [
+            _make_old_node("prot", protected=True),
+            _make_old_node("normal"),
+        ]
+        keep, _, pruned, ops = pipe._prune_step(nodes, {})
+        keep_ids = {n["id"] for n in keep}
+        assert "normal" not in keep_ids      # 普通节点照常被剪（方案①不改变普通剪枝）
+        assert "prot" in keep_ids            # protected 保留（方案①）
+        assert pruned == 1
+        assert len(ops) == 1
+
+    def test_prune_aborts_when_ratio_over_50pct(self):
+        """方案②：事故复现——9 条全孤立旧节点，9/9 > 50% → 中止，全部保留。"""
+        pipe = self._pipe()
+        nodes = [_make_old_node(f"n{i}") for i in range(9)]
+        keep, conns, pruned, ops = pipe._prune_step(nodes, {})
+        assert pruned == 0
+        assert {n["id"] for n in keep} == {f"n{i}" for i in range(9)}  # 原 nodes 原样返回
+        assert ops == []
+
+    def test_prune_normal_ratio_unchanged(self):
+        """方案②：正常比例（1/10 = 10% ≤ 50%）剪枝不受影响。"""
+        pipe = self._pipe()
+        now = time.time()
+        nodes = [_make_old_node("old")] + [
+            {"id": f"fresh{i}", "content": f"c{i}",
+             "created_at": now, "tau_initial": 1.0, "tau_value": 1.0}
+            for i in range(9)
+        ]
+        keep, _, pruned, ops = pipe._prune_step(nodes, {})
+        assert pruned == 1
+        assert "old" not in {n["id"] for n in keep}
+        assert len(ops) == 1
+
+    def test_prune_mixed_protected_and_old_nodes(self):
+        """方案①+② 联动：事故场景混合。
+
+        - 8 候选 + 1 protected → 8/9 > 50% → 中止，全保留（含 protected）
+        - 5 候选 + 5 protected → 5/10 = 50% 恰好放行（> 严格大于）→ 正常剪 5 候选
+        """
+        pipe = self._pipe()
+        nodes = [_make_old_node(f"old{i}") for i in range(8)] + \
+                [_make_old_node("prot", protected=True)]
+        keep, _, pruned, ops = pipe._prune_step(nodes, {})
+        assert pruned == 0
+        assert "prot" in {n["id"] for n in keep}
+
+        nodes2 = [_make_old_node(f"old{i}") for i in range(5)] + \
+                 [_make_old_node(f"prot{i}", protected=True) for i in range(5)]
+        keep2, _, pruned2, _ = pipe._prune_step(nodes2, {})
+        assert pruned2 == 5
+        assert {n["id"] for n in keep2} == {f"prot{i}" for i in range(5)}
+
+    def test_protected_node_never_merged_away(self):
+        """方案③：protected 节点永不作为合并方/被合并方（防合并击穿）。
+
+        protected 节点 τ 更低（0.05）、普通节点 τ 更高（1.0）、内容相同
+        （Jaccard=1.0 ≥ 0.8）→ 修复前 protected 作 loser 被 DETACH DELETE；
+        修复后两节点均保留、无合并操作。
+        """
+        pipe = self._pipe()
+        nodes = [
+            {"id": "protected-low-tau", "content": "相同记忆内容",
+             "created_at": time.time() - 7201, "tau_value": 0.05, "protected": True},
+            {"id": "normal-high-tau", "content": "相同记忆内容",
+             "created_at": time.time() - 7201, "tau_value": 1.0},
+        ]
+        remaining, ops = pipe._find_and_merge_conflicts(nodes)
+        assert ops == []                                      # 不合并
+        assert {n["id"] for n in remaining} == \
+            {"protected-low-tau", "normal-high-tau"}          # 两节点都保留
+        assert "protected-low-tau" in {n["id"] for n in remaining}
+
+    def test_normal_nodes_still_merge(self):
+        """方案③：普通节点对不受影响，仍按 τ 高低正常合并（回归）。"""
+        pipe = self._pipe()
+        nodes = [
+            {"id": "loser", "content": "相同记忆内容",
+             "created_at": time.time() - 7201, "tau_value": 0.05},
+            {"id": "winner", "content": "相同记忆内容",
+             "created_at": time.time() - 7201, "tau_value": 1.0},
+        ]
+        remaining, ops = pipe._find_and_merge_conflicts(nodes)
+        assert len(ops) == 1
+        assert {n["id"] for n in remaining} == {"winner"}

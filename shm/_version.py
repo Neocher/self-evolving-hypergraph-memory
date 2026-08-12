@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.26.1"
-__version_info__ = (5, 26, 0)
-__version_name__ = "Hermes-Integration-Guide"
-__release_date__ = "2026-08-11"
+__version__ = "5.27.0"
+__version_info__ = (5, 27, 0)
+__version_name__ = "Dream-Prune-Guard"
+__release_date__ = "2026-08-12"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+核心变更 — 梦境 PRUNE 保护 (2026-08-12):
+  • 方案①: force_promote=true 写入打顶层 protected 标记 → PRUNE 永不剪
+    (2026-08-12 事故: 9 条全孤立旧节点 100% 被剪; 语义保护消除"显式永久保留"被误删)
+  • 方案②: 批量剪枝比例护栏 — 单次剪枝 > 50% 活跃节点 → 中止本次剪枝全部保留
+    (_MAX_PRUNE_RATIO=0.5 硬编码, 兜底任何未来剪枝逻辑缺陷)
+  • 方案③: protected 节点永不参与合并 — 防合并击穿 (普通节点 τ 更高时
+    protected 作 loser 被 DETACH DELETE 的语义漏洞)
+  • 测试: 新增 8 用例 (protected 保留 / 9/9 中止 / 10% 正常剪 / 5/10 边界放行 /
+    合并防护+回归 / 落库布尔闭环 / 无标记默认不保护)
+
+v5.26.1 (2026-08-11) Hermes-Integration-Guide:
 核心变更 — 写路径最终收敛 (2026-08-11):
   • dream API apply_candidate 整体闭包入队: PRUNE (DETACH DELETE) + MERGE 循环写
     在写线程执行, 事件循环不再被阻塞; 整体闭包保证 PRUNE→MERGE→_mark_applied

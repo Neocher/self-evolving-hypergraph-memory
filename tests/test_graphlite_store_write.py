@@ -166,3 +166,27 @@ class TestEpisodeWritePath:
         assert got["ontology_type"] == "person_birth"
         assert got["entity_name"] == "张三"
         assert got["entity_value"] == "1990"
+
+    def test_force_promote_protected_flag_storage_layer_roundtrip(self, gstore):
+        """【存储层闭环】protected 布尔标记写入 → 读回 闭环。
+
+        本测试直调 gstore.create_episode 并手动预置 protected，验证的是
+        存储层本身的读写能力（中文 content 走 b64 + 布尔 protected 非 b64
+        同写不冲突；读取经 _flatten_row 还原为 Python True）。
+        force_promote=true → protected 标记的**生产链路**（路由层加标记）由
+        tests/test_write_routes.py 的 TestForcePromoteProtectedFlagRoute 覆盖。
+        """
+        ep = _make_episode("重要记忆")
+        ep["protected"] = True
+        eid = gstore.create_episode(ep)
+        got = gstore.get_episode(eid)
+        assert got is not None
+        assert got["content"] == "重要记忆"          # b64 中文解码正常
+        assert got.get("protected") in (True, "true", 1)  # 布尔标记还原
+
+    def test_episode_without_protected_flag_defaults_unprotected(self, gstore):
+        """【v5.27.0】未打 protected 标记的节点读回不携带标记（兼容旧数据，默认不保护）。"""
+        ep = _make_episode("普通记忆")
+        eid = gstore.create_episode(ep)
+        got = gstore.get_episode(eid)
+        assert got.get("protected") in (None, False)

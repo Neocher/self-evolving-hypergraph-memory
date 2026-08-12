@@ -42,6 +42,11 @@ _MAX_LLM_NER_TOTAL = 100
 # NER 连续失败阈值：达到后 skip LLM → 正则（跨社区 fail-fast）
 _NER_FAIL_FAST_THRESHOLD = 3
 
+# 【v5.27.0】单次剪枝比例上限：待剪节点 > 50% 的活跃节点时中止本次剪枝（全部保留）。
+# 兜底防"整批记忆被一次梦境清空"（2026-08-12 事故：9/9 全剪）。
+# 分母 = run() 收到的全部活跃节点（含 protected），保证事故场景仍触发护栏。
+_MAX_PRUNE_RATIO = 0.5
+
 
 @dataclass
 class DreamReport:
@@ -1082,7 +1087,11 @@ Text:
             created_at = node.get("created_at", 0)
             age_seconds = time.time() - created_at
             # 保护规则：新节点（< 2h）、高 τ（> 0.3）、或高连接度 不剪枝
-            is_protected = (age_seconds < 7200) or (tau > 0.3) or (degree > 1)
+            # 【v5.27.0】force_promote 节点打 protected 标记 → 永不剪（方案①）
+            is_protected = (
+                node.get("protected") in (True, "true", 1)
+                or (age_seconds < 7200) or (tau > 0.3) or (degree > 1)
+            )
             if not is_protected and self.tau_engine and tau < self.tau_engine.config.decay_threshold:
                 pruned_ids.add(node_id)
                 prune_ops.append(
@@ -1095,6 +1104,17 @@ Text:
                 )
             else:
                 keep_nodes.append(node)
+
+        # 【v5.27.0】批量剪枝上限保护（方案②）：单次剪枝 > 50% 活跃节点 → 中止，全部保留。
+        # 返回原 nodes（而非 keep_nodes，后者已剔除候选且不含保护标记），
+        # 下游 RESOLVE/PERSIST 在完整节点集上照常运行；返回 0, [] → _persist_prune 无操作。
+        total = len(nodes)
+        if total > 0 and len(pruned_ids) > total * _MAX_PRUNE_RATIO:
+            logger.warning(
+                "PRUNE aborted: %d/%d nodes (%d%%) exceed 50%% batch limit — all kept",
+                len(pruned_ids), total, round(len(pruned_ids) / total * 100),
+            )
+            return nodes, connections, 0, []
 
         # 清理被剪枝节点的连接
         clean_connections: dict[str, dict[str, float]] = {}
@@ -1159,8 +1179,15 @@ Text:
         for i in range(len(nodes)):
             if nodes[i]["id"] in merged:
                 continue
+            # 【v5.27.0】方案①防合并击穿：protected 节点永不参与合并（既不作胜者也
+            # 不作被合并方）。否则普通节点 τ 更高时 protected 节点作 loser 被
+            # DETACH DELETE → "永久保留"语义被间接击穿。
+            if nodes[i].get("protected") in (True, "true", 1):
+                continue
             for j in range(i + 1, len(nodes)):
                 if nodes[j]["id"] in merged:
+                    continue
+                if nodes[j].get("protected") in (True, "true", 1):
                     continue
                 sim = self._combined_similarity(
                     nodes[i].get("content", ""), nodes[j].get("content", "")
