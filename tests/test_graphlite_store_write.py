@@ -190,3 +190,275 @@ class TestEpisodeWritePath:
         eid = gstore.create_episode(ep)
         got = gstore.get_episode(eid)
         assert got.get("protected") in (None, False)
+
+
+class TestFlattenBadB64:
+    """L1：_flatten_row 对坏 b64 内容不抛异常、保留原文。
+
+    修复前裸 `except:` 吞掉一切异常（含 KeyboardInterrupt）；
+    修复后限定 `except ValueError:`——b64decode 的 binascii.Error 与
+    decode 的 UnicodeDecodeError 都是 ValueError 子类，语义不变。
+    """
+
+    def test_invalid_b64_keeps_original(self):
+        """坏 b64 块（非 base64 字符）→ 解码失败 → 保留原文不抛。"""
+        from graph.graphlite_store import GraphLiteStore
+        row = {"n": {"Node": {"properties": {"content": "{b64}!!!not-base64!!!"}}}}
+        out = GraphLiteStore._flatten_row(row)
+        assert out["n"]["content"] == "{b64}!!!not-base64!!!"
+
+    def test_b64_invalid_chars_keeps_original(self):
+        """含非法字符的 b64 串 → 不抛、保留原文。"""
+        from graph.graphlite_store import GraphLiteStore
+        row = {"n": {"Node": {"properties": {"content": "{b64}%%%invalid"}}}}
+        out = GraphLiteStore._flatten_row(row)
+        assert out["n"]["content"] == "{b64}%%%invalid"
+
+    def test_valid_b64_decodes(self):
+        """合法 b64 仍正常解码（修复不破坏正常路径）。"""
+        from base64 import b64encode
+        from graph.graphlite_store import GraphLiteStore
+        payload = b64encode("中文内容".encode("utf-8")).decode("ascii")
+        row = {"n": {"Node": {"properties": {"content": f"{{b64}}{payload}"}}}}
+        out = GraphLiteStore._flatten_row(row)
+        assert out["n"]["content"] == "中文内容"
+
+    def test_garbage_utf8_bytes_keeps_original(self):
+        """b64 合法但 decode('utf-8') 失败（非法 UTF-8 字节）→ 不抛、保留原文。"""
+        from graph.graphlite_store import GraphLiteStore
+        # b64encode(b'\xff\xfe\xfd') = /v79，是合法 b64 但非法 UTF-8
+        row = {"n": {"Node": {"properties": {"content": "{b64}/v79"}}}}
+        out = GraphLiteStore._flatten_row(row)
+        assert out["n"]["content"] == "{b64}/v79"
+
+    def test_unicode_decode_error_is_valueerror(self):
+        """判别性：UnicodeDecodeError 确实是 ValueError 子类（防修错类型）。"""
+        assert issubclass(UnicodeDecodeError, ValueError)
+        import binascii
+        assert issubclass(binascii.Error, ValueError)
+
+    def test_keyboard_interrupt_not_swallowed(self):
+        """判别性：修复后裸 except 已消失——源码中 _flatten_row 内不再有裸 except。"""
+        import inspect
+        from graph.graphlite_store import GraphLiteStore
+        src = inspect.getsource(GraphLiteStore._flatten_row)
+        assert "except:" not in src, "L1 修复后 _flatten_row 不应再有裸 except"
+
+
+class TestH1GqlEscaping:
+    """H1：外部可达的 id/session 插值全部经 _gql_value 转义。
+
+    注入面：GET /memories/episodes/{id}（get_episode）、X-Session-Id 头
+    （ensure_session/get_or_create_session/link_session_member）、
+    batch ids、hyperedge/visual/namespace 家族。含 ' 或 \ 的 id 不应以
+    裸引号形式出现在发给引擎的 GQL 中（修复前被 except 吞，仅表现为 404）。
+    """
+
+    def _escaped_id(self, store, method: str, *args):
+        """记录发给 session 的 GQL，断言其中无裸引号 id（对每个参数都检查）。"""
+        from graph.graphlite_store import _gql_value
+        sent: list[str] = []
+        real_query = store._locked_query
+        real_execute = store._locked_execute
+        store._locked_query = lambda gql: (sent.append(gql), real_query(gql))[1]
+        store._locked_execute = lambda gql: (sent.append(gql), real_execute(gql))[1]
+        try:
+            getattr(store, method)(*args)
+        finally:
+            store._locked_query = real_query
+            store._locked_execute = real_execute
+        assert sent, f"{method} 应至少发出一条 GQL"
+        for evil in args:
+            expected = _gql_value(str(evil))
+            # 每条 GQL 必须包含转义后的字面量，且不含裸 evil 串
+            for gql in sent:
+                assert expected in gql, f"GQL 未含转义字面量 {expected!r}: {gql!r}"
+                assert f"'{evil}'" not in gql, f"GQL 含裸 id 插值: {gql!r}"
+
+    def test_get_episode_escapes_quote(self, gstore):
+        """id 含单引号 → GQL 无裸引号（修复前: MATCH ... {id: 'a'b'} 语法错/注入）。"""
+        self._escaped_id(gstore, "get_episode", "a'b")
+
+    def test_get_episode_escapes_backslash(self, gstore):
+        """id 含反斜杠 → GQL 无裸反斜杠。"""
+        self._escaped_id(gstore, "get_episode", "a\\b")
+
+    def test_get_episode_escapes_combined(self, gstore):
+        """id 含 ' 与 \\ 组合 → GQL 无裸引号。"""
+        self._escaped_id(gstore, "get_episode", "x'y\\z")
+
+    def test_ensure_session_escapes(self, gstore):
+        """X-Session-Id 头（ensure_session）→ GQL 无裸引号。"""
+        self._escaped_id(gstore, "ensure_session", "sess'one")
+
+    def test_get_or_create_session_escapes(self, gstore):
+        """get_or_create_session（外部可达，X-Session-Id）→ GQL 无裸引号。"""
+        self._escaped_id(gstore, "get_or_create_session", "sess\\two")
+
+    def test_link_session_member_escapes(self, gstore):
+        """link_session_member（X-Session-Id）→ GQL 无裸引号。"""
+        # 两个参数都是注入面：session_node_id + episode_id
+        self._escaped_id(gstore, "link_session_member", "sess'x", "ep'y")
+
+    def test_link_to_session_escapes(self, gstore):
+        """link_to_session（namespace 路径）→ GQL 无裸引号。"""
+        self._escaped_id(gstore, "link_to_session", "ns'a", "ep\\b")
+
+    def test_get_session_memories_escapes(self, gstore):
+        """get_session_memories（namespace 路径）→ GQL 无裸引号。"""
+        self._escaped_id(gstore, "get_session_memories", "ns'q")
+
+    def test_hyperedge_family_escapes(self, gstore):
+        """hyperedge id / member / visual / namespace 家族 → GQL 无裸引号。"""
+        self._escaped_id(gstore, "get_hyperedge_members", "he'1")
+        self._escaped_id(gstore, "get_hyperedges_by_node", "ep'1")
+        self._escaped_id(gstore, "get_visual_node", "vis\\1")
+
+    def test_delete_namespace_escapes(self, gstore):
+        """delete_namespace（外部可达 DELETE /namespaces/{ns}）→ GQL 无裸引号。"""
+        self._escaped_id(gstore, "delete_namespace", "ns'z")
+
+    def test_create_episode_with_evil_id(self, gstore):
+        """create_episode 带含 ' 的 id → 写入后能按原 id 读回（转义不破坏功能）。"""
+        evil = "evil'id"
+        eid = gstore.create_episode({"id": evil, "content": "x", "created_at": 1.0})
+        assert eid == evil
+        got = gstore.get_episode(evil)
+        assert got is not None, "转义后的 id 应可正常读回"
+        assert got.get("content") == "x"
+
+    def test_create_episode_evil_id_roundtrip_ascii_content(self, gstore):
+        """含反斜杠 id 写入 → 读回（功能不破坏）。"""
+        evil = "evil\\id"
+        gstore.create_episode({"id": evil, "content": "y", "created_at": 1.0})
+        got = gstore.get_episode(evil)
+        assert got is not None and got.get("content") == "y"
+
+
+class TestM2AtomicUpdateWithVersion:
+    """M2：update_with_version 读 version + SET 包进同一个 _session_lock。
+
+    修复前：Step1 读 version 与 Step2 SET 是两次独立的 _locked_query/_locked_execute，
+    中间存在"读后、SET 前"窗口——另一写线程抢先更新会让本次乐观锁漏检
+    （读了旧 version，SET 却落在新状态上）。修复后单次持锁完成读+写
+    （直接调 self._session.query/execute，不再分两次 _locked_*）。
+    """
+
+    def test_single_lock_span_read_and_set(self):
+        """读+SET 在同一持锁周期：query 与 execute 均在锁内执行（无解锁窗口）。"""
+        import threading
+        from graph.graphlite_store import GraphLiteStore
+
+        class TrackLock:
+            """委托包装 _session_lock：记录 acquire/release，暴露 _held。"""
+            def __init__(self):
+                self._inner = threading.Lock()
+                self._held = False
+            def acquire(self, *a, **k):
+                r = self._inner.acquire(*a, **k)
+                if r:
+                    self._held = True
+                return r
+            def release(self):
+                self._held = False
+                self._inner.release()
+            def __enter__(self):
+                self.acquire()
+                return self
+            def __exit__(self, *exc):
+                self.release()
+                return False
+
+        lock = TrackLock()
+        held_at_call: list[bool] = []
+
+        class FakeSession:
+            def query(self, gql):
+                held_at_call.append(lock._held)
+                return type("R", (), {"rows": [{"v": 1}]})()
+            def execute(self, gql):
+                held_at_call.append(lock._held)
+                return type("R", (), {"rows": []})()
+
+        store = GraphLiteStore.__new__(GraphLiteStore)
+        store._session = FakeSession()
+        store._session_lock = lock
+        store._db = None
+        store.config = type("cfg", (), {"database_path": ""})()
+
+        ok = store.update_with_version("n1", {"content": "x"}, expected_version=1)
+        assert ok is True
+        assert held_at_call == [True, True], \
+            f"query/execute 均应在持锁状态下执行: {held_at_call}"
+
+    def test_double_update_exactly_one_wins(self):
+        """并发双写同 expected_version → 恰好一个 True（原子化后无漏检）。"""
+        import threading
+        from graph.graphlite_store import GraphLiteStore
+
+        class FakeSession:
+            """同一 session 上双线程并发 update_with_version。
+
+            store._session_lock 是 RLock——修复后整个 读+SET 在锁内，两线程
+            严格串行：线程 A 读 v=1 → SET v=2 → True；线程 B 读 v=2 → 不匹配
+            → False。修复前（两次 _locked_* 分锁）可能出现 A 读 v=1、B 读 v=1、
+            A SET v=2、B SET v=2 → 两个 True（漏检）。
+            """
+            def __init__(self):
+                self.version = 1
+            def query(self, gql):
+                return type("R", (), {"rows": [{"v": self.version}]})()
+            def execute(self, gql):
+                # 模拟真实引擎：SET e.version = {next} 递增
+                self.version += 1
+                return type("R", (), {"rows": []})()
+
+        session = FakeSession()
+        store = GraphLiteStore.__new__(GraphLiteStore)
+        store._session = session
+        store._session_lock = threading.RLock()
+        store._db = None
+        store.config = type("cfg", (), {"database_path": ""})()
+
+        results = []
+        barrier = threading.Barrier(2)
+        def worker():
+            barrier.wait()
+            results.append(store.update_with_version("n1", {"content": "w"}, expected_version=1))
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sum(1 for r in results if r) == 1, \
+            f"双写同 expected_version 应恰好一个成功: {results}"
+
+    def test_version_mismatch_false(self):
+        """version 不匹配 → False（原子化不破坏原有语义）。"""
+        from graph.graphlite_store import GraphLiteStore
+        class FakeSession:
+            def query(self, gql):
+                return type("R", (), {"rows": [{"v": 5}]})()
+            def execute(self, gql):
+                raise AssertionError("version 不匹配不应执行 SET")
+        store = GraphLiteStore.__new__(GraphLiteStore)
+        store._session = FakeSession()
+        store._session_lock = __import__("threading").RLock()
+        store._db = None
+        store.config = type("cfg", (), {"database_path": ""})()
+        assert store.update_with_version("n1", {"content": "x"}, expected_version=1) is False
+
+    def test_missing_node_false(self):
+        """节点不存在 → False（无 rows）。"""
+        from graph.graphlite_store import GraphLiteStore
+        class FakeSession:
+            def query(self, gql):
+                return type("R", (), {"rows": []})()
+            def execute(self, gql):
+                raise AssertionError("节点不存在不应执行 SET")
+        store = GraphLiteStore.__new__(GraphLiteStore)
+        store._session = FakeSession()
+        store._session_lock = __import__("threading").RLock()
+        store._db = None
+        store.config = type("cfg", (), {"database_path": ""})()
+        assert store.update_with_version("n1", {"content": "x"}, expected_version=1) is False

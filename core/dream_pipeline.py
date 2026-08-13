@@ -47,6 +47,11 @@ _NER_FAIL_FAST_THRESHOLD = 3
 # 分母 = run() 收到的全部活跃节点（含 protected），保证事故场景仍触发护栏。
 _MAX_PRUNE_RATIO = 0.5
 
+# 【P3】RESOLVE Jaccard 预筛阈值：jac < 0.15 时跳过余弦编码。
+# 数学保证：sim = 0.4·jac + 0.6·cos ≤ 0.4·0.15 + 0.6 = 0.66 < 0.8（合并阈值）
+# → 预筛跳过的文本对合并决策与全量计算完全一致，纯省 encoder.embed 调用。
+_JACCARD_PRESCREEN_THRESHOLD = 0.15
+
 
 @dataclass
 class DreamReport:
@@ -292,7 +297,11 @@ class DreamPipeline:
         logger.info("Dream %s: PRUNE — %d nodes pruned", dream_id, prune_count)
 
         # Step 6: RESOLVE — 冲突检测
-        merge_ops, conflict_count = self._resolve_step(communities, gathered)
+        # 【P3】整块包 asyncio.to_thread：encoder.embed（嵌入）+ 余弦计算均 CPU 密集，
+        # 移出事件循环（max_dream_duration 可抢占）。
+        merge_ops, conflict_count = await asyncio.to_thread(
+            self._resolve_step, communities, gathered
+        )
         audit_ops.extend(merge_ops)
         stats["updated"] += conflict_count
         logger.info("Dream %s: RESOLVE — %d conflicts resolved", dream_id, conflict_count)
@@ -335,21 +344,24 @@ class DreamPipeline:
             # 【H5】GraphLite 无跨语句事务（TransactionManager 的 rollback 仅做
             # tx_tag 清理，无法撤销裸 GQL 的 CREATE/DELETE），故不做伪事务包装；
             # 改为：任一步骤抛异常 → 打 degraded 标记，下次梦境通过 upsert 修复
+            # 【H2】写队列深度守卫（镜像 app.py auto_apply 的错峰逻辑）：PERSIST
+            # 会在单写线程上排队多步写，若队列已过半满（积压 > max_pending//2）
+            # 说明写压力大，梦境写回会加剧积压 → 本次跳过 PERSIST（degraded），
+            # 下次梦境按 H5 upsert 语义自愈。只减少写、不新增写路径。
             persist_degraded = False
-            try:
-                persist_deleted, pruned_ids = await self._persist_async(
-                    self._persist_prune, graphlite_store, prune_ops)
-                all_removed_ids.extend(pruned_ids)
-                persist_created = await self._persist_async(
-                    self._persist_communities, graphlite_store, communities, dream_id)
-                all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-                await self._persist_async(self._persist_merge, graphlite_store, merge_ops)
-                await self._persist_async(
-                    self._persist_hyperedges, graphlite_store, communities, dream_id)
-            except Exception as persist_exc:
+            q = self._write_queue
+            if q is not None and q.pending_count() > q.max_pending // 2:
                 persist_degraded = True
-                logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
-                             dream_id, persist_exc)
+                logger.warning(
+                    "Dream %s: PERSIST skipped — write queue busy "
+                    "(%d/%d pending, degraded, next dream repairs)",
+                    dream_id, q.pending_count(), q.max_pending,
+                )
+            else:
+                (persist_created, persist_deleted, all_removed_ids,
+                 persist_degraded) = await self._persist_direct(
+                    graphlite_store, communities, prune_ops, merge_ops, dream_id,
+                )
             logger.info("Dream %s: PERSIST — %d created, %d deleted, %d for FAISS cleanup%s",
                         dream_id, persist_created, persist_deleted, len(all_removed_ids),
                         " [DEGRADED]" if persist_degraded else "")
@@ -540,21 +552,21 @@ class DreamPipeline:
             if len(node_items) > MAX_ONT_NODES:
                 node_items = node_items[:MAX_ONT_NODES]
             ont_edge_count = 0
+            # 【P9】types 缓存：先遍历 node_items 一次算出 {nid: type_set}（含去空过滤），
+            # 内循环只取集合求交——N=2000 时 4M 次正则 → 2000 次，纯等价重构。
+            type_sets: dict[str, set] = {}
+            for nid, node in node_items:
+                content = node.get("content", "")
+                types = self.ontology_validator._extract_types(content)
+                type_sets[nid] = {t.get("type", "") for t in types if t.get("type")}
             for i, (nid_a, node_a) in enumerate(node_items):
-                content_a = node_a.get("content", "")
                 for nid_b, node_b in node_items[i + 1 :]:
                     if G.has_edge(nid_a, nid_b):
                         continue  # 已有连接，不覆盖
-                    content_b = node_b.get("content", "")
-                    types_a = self.ontology_validator._extract_types(content_a)
-                    types_b = self.ontology_validator._extract_types(content_b)
-                    if types_a and types_b:
-                        type_set_a = {t.get("type", "") for t in types_a if t.get("type")}
-                        type_set_b = {t.get("type", "") for t in types_b if t.get("type")}
-                        shared_types = type_set_a & type_set_b
-                        if shared_types:
-                            G.add_edge(nid_a, nid_b, weight=0.15)
-                            ont_edge_count += 1
+                    shared_types = type_sets[nid_a] & type_sets[nid_b]
+                    if shared_types:
+                        G.add_edge(nid_a, nid_b, weight=0.15)
+                        ont_edge_count += 1
             if ont_edge_count > 0:
                 logger.info("P1 ontology edges added: %d", ont_edge_count)
         return G
@@ -1178,6 +1190,9 @@ Text:
 
         ops: list = []
         merged: set[str] = set()
+        # 【P3】嵌入记忆化：encoder.embed 结果按文本缓存（dict），重复文本跳过编码。
+        # 社区内最坏 O(N²) 对比较 → 每唯一文本只编码 1 次。
+        emb_cache: dict[str, np.ndarray] = {}
 
         for i in range(len(nodes)):
             if nodes[i]["id"] in merged:
@@ -1193,7 +1208,8 @@ Text:
                 if nodes[j].get("protected") in (True, "true", 1):
                     continue
                 sim = self._combined_similarity(
-                    nodes[i].get("content", ""), nodes[j].get("content", "")
+                    nodes[i].get("content", ""), nodes[j].get("content", ""),
+                    emb_cache=emb_cache,
                 )
                 if sim >= 0.8:
                     # 合并：保留 τ 值更高的节点
@@ -1217,6 +1233,43 @@ Text:
 
         remaining = [n for n in nodes if n["id"] not in merged]
         return remaining, ops
+
+    # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
+
+    async def _persist_direct(
+        self,
+        graphlite_store,
+        communities: list[dict],
+        prune_ops: list,
+        merge_ops: list,
+        dream_id: str,
+    ) -> tuple[int, int, list[str], bool]:
+        """直接模式 PERSIST 五步（PRUNE → COMMUNITIES → MERGE → HYPEREDGES）。
+
+        【H2】从 run() 内联块提取为方法：写队列深度守卫（队列过半满）时跳过
+        整个 PERSIST，不逐步骤判断；本方法保留原 try/except 语义——任一步
+        抛异常 → degraded 标记（返回），下次梦境 upsert 自愈。
+        返回 (created, deleted, all_removed_ids, degraded)。
+        """
+        persist_created = 0
+        persist_deleted = 0
+        all_removed_ids: list[str] = []
+        persist_degraded = False
+        try:
+            persist_deleted, pruned_ids = await self._persist_async(
+                self._persist_prune, graphlite_store, prune_ops)
+            all_removed_ids.extend(pruned_ids)
+            persist_created = await self._persist_async(
+                self._persist_communities, graphlite_store, communities, dream_id)
+            all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
+            await self._persist_async(self._persist_merge, graphlite_store, merge_ops)
+            await self._persist_async(
+                self._persist_hyperedges, graphlite_store, communities, dream_id)
+        except Exception as persist_exc:
+            persist_degraded = True
+            logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
+                         dream_id, persist_exc)
+        return persist_created, persist_deleted, all_removed_ids, persist_degraded
 
     # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
 
@@ -1366,15 +1419,35 @@ Text:
         return deleted, pruned_ids
 
     def _persist_merge(self, graphlite_store, merge_ops: list) -> None:
-        """将RESOLVE合并结果写回GraphLite（打标记 + DETACH DELETE被合并节点）。"""
+        """将RESOLVE合并结果写回GraphLite（打标记 + DETACH DELETE被合并节点）。
+
+        【P8】merge 截断：先读现有 content，Python 侧拼
+        `(old + ' | merged: ' + old_value)[:2000]` 再 SET——防止无界追加
+        （连续合并下 content 无限增长）。每 merge 多 1 次读（合并本就低频）。
+        """
         for op in merge_ops:
             if op.op_type == "update" and op.new_value:
                 try:
-                    # 把被合并节点的内容保存到目标节点
+                    # 先读目标节点现有 content，Python 侧拼接并截断
+                    rows = graphlite_store.query_cypher(
+                        "MATCH (target:EpisodeNode {id: $target}) "
+                        "RETURN target.content AS content",
+                        {"target": op.new_value},
+                    )
+                    old_content = ""
+                    if rows:
+                        row = rows[0]
+                        if isinstance(row, dict):
+                            old_content = row.get("content", "") or ""
+                        elif isinstance(row, (list, tuple)) and len(row) >= 1:
+                            old_content = row[0] or ""
+                    merged_content = (
+                        str(old_content) + " | merged: " + (op.old_value or "")
+                    )[:2000]
                     graphlite_store.query_cypher(
                         "MATCH (target:EpisodeNode {id: $target}) "
-                        "SET target.content = target.content + ' | merged: ' + $content",
-                        {"target": op.new_value, "content": op.old_value or ""}
+                        "SET target.content = $content",
+                        {"target": op.new_value, "content": merged_content}
                     )
                     # 删除被合并节点（DETACH先删边）
                     graphlite_store.query_cypher(
@@ -1436,13 +1509,25 @@ Text:
         union = len(words_a | words_b)
         return intersection / union if union > 0 else 0.0
 
-    def _combined_similarity(self, text_a: str, text_b: str) -> float:
-        """加权合并：Jaccard 词集 + 向量余弦相似度。"""
+    def _combined_similarity(
+        self,
+        text_a: str,
+        text_b: str,
+        emb_cache: Optional[dict] = None,
+    ) -> float:
+        """加权合并：Jaccard 词集 + 向量余弦相似度。
+
+        【P3】Jaccard 预筛：jac < _JACCARD_PRESCREEN_THRESHOLD 时跳过余弦编码
+        （sim ≤ 0.4·jac + 0.6 < 0.8，合并决策不变）；emb_cache 按文本缓存
+        encoder.embed 结果，重复文本跳过编码。
+        """
         jac = self._jaccard_similarity(text_a, text_b)
+        if jac < _JACCARD_PRESCREEN_THRESHOLD:
+            return jac
         if self.encoder is not None:
             try:
-                emb_a = self.encoder.embed(text_a)
-                emb_b = self.encoder.embed(text_b)
+                emb_a = self._embed_with_cache(text_a, emb_cache)
+                emb_b = self._embed_with_cache(text_b, emb_cache)
                 if emb_a is not None and emb_b is not None:
                     norm_a = np.linalg.norm(emb_a)
                     norm_b = np.linalg.norm(emb_b)
@@ -1452,3 +1537,15 @@ Text:
             except Exception:
                 pass
         return jac
+
+    def _embed_with_cache(
+        self,
+        text: str,
+        emb_cache: Optional[dict] = None,
+    ):
+        """encoder.embed 记忆化：emb_cache 命中直接返回，未命中编码并缓存。"""
+        if emb_cache is None:
+            return self.encoder.embed(text)
+        if text not in emb_cache:
+            emb_cache[text] = self.encoder.embed(text)
+        return emb_cache[text]

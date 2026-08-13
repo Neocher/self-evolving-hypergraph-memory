@@ -65,6 +65,7 @@ from graph.hyperedge import HyperedgeManager, HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker, HealthCheckResult
 from observability.logger import get_logger, set_trace_id
 from core.defense import MemoryDefenseEngine, DefenseConfig, MemoryDefenseVerdict
+from graph.graphlite_store import EpisodeCache
 from core.quarantine_store import QuarantineStore
 from core.write_reconciler import WriteReconciler, ConflictLogger, Strategy
 from core.write_queue import WriteQueueClosedError, WriteQueueFullError
@@ -129,6 +130,9 @@ class Services:
     quarantine_store: Any = None
     # v5.23: 写串行化队列（由 app.py 注入；None 时写路径回退同步直调）
     write_queue: Any = None
+    # 【M5】检索侧 episode 内容缓存（EpisodeCache: OrderedDict LRU + TTL）。
+    # 由 app.py 注入 query_router 共享引用；flush_faiss_buffer 是本缓存唯一写入方。
+    _episode_cache: Any = None
 
 
 _services: Optional[Services] = None
@@ -139,6 +143,9 @@ def init_services(svc: Services) -> None:
     global _services
     svc._faiss_buffer_lock = threading.Lock()
     svc._session_memory_lock = threading.Lock()
+    # 【M5】episode 内容缓存（LRU + TTL）与 query_router 共享引用
+    if svc._episode_cache is None:
+        svc._episode_cache = EpisodeCache()
     # 初始化记忆投毒防御引擎 + 隔离存储
     try:
         svc.defense_engine = MemoryDefenseEngine(config=DefenseConfig(), encoder=svc.encoder)
@@ -225,6 +232,19 @@ def flush_faiss_buffer(deps: Services) -> int:
         if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
             for faiss_id, _emb, ep_id in batch:
                 deps.faiss_id_map[int(faiss_id)] = ep_id
+        # 【M5】episode 内容缓存填充：faiss_id_map 与 _episode_cache 均为
+        # query_router 共享引用，本批写入的节点内容在此预填，检索零回查。
+        # 用最小 dict 记录（命中时经 get_episodes_batch 补全），仅新增写入方。
+        cache = getattr(deps, "_episode_cache", None)
+        if cache is None:
+            # 未显式初始化（测试/降级路径）→ 惰性创建，保证 flush 恒写入
+            cache = EpisodeCache()
+            deps._episode_cache = cache
+        for _faiss_id, _emb, ep_id in batch:
+            try:
+                cache[ep_id] = {"id": ep_id}
+            except Exception:
+                break
         logger.debug("FAISS batch flush: %d vectors added", len(batch))
         return len(batch)
     except Exception:

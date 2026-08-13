@@ -6,10 +6,13 @@ P2-1 梦境写压力感知测试
   · 推迟不丢候选 (累积计数保留)
   · 写入停止后梦境正常触发
   · 显式触发不受写压力影响
+  · 【H2】写队列深度守卫: PERSIST 在队列过半满时跳过 (degraded, 零写)
 运行: python -m pytest tests/test_dream_pressure.py -v
 """
 import asyncio
+import logging
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 from core.dream_scheduler import DreamScheduler, DreamSchedulerConfig
 
@@ -113,3 +116,58 @@ class TestWritePressureDefer:
                 await asyncio.sleep(0.01)
         run(_trigger_and_wait())
         assert sched._dream_run_count == 1
+
+
+class TestH2PersistDepthGuard:
+    """H2：PERSIST 写队列深度守卫——队列过半满时跳过 PERSIST（degraded），零写。
+
+    修复前：梦境直接模式在队列深度无关条件下无条件写回，加重写队列积压；
+    修复后：pending_count > max_pending//2 → 跳过 4 步 PERSIST + warning，
+    下次梦境按 H5 upsert 语义自愈。只减少写、不新增写路径。
+    """
+
+    def _pipe(self):
+        from core.dream_pipeline import DreamPipeline
+        pipe = DreamPipeline()
+        pipe._write_queue = MagicMock()
+        return pipe
+
+    def test_busy_queue_skips_persist(self, caplog):
+        """队列过半满 → PERSIST 零调用 + degraded=True + warning。"""
+        pipe = self._pipe()
+        pipe._write_queue.pending_count.return_value = 60
+        pipe._write_queue.max_pending = 100
+        # 统计真实 PERSIST 调用（经 _persist_async 的 submit）
+        pipe._persist_async = AsyncMock()
+
+        store = MagicMock()
+        store.execute_cypher.return_value = []
+        store.query_cypher.return_value = []
+
+        with caplog.at_level(logging.WARNING, logger="core.dream_pipeline"):
+            report = run(pipe.run(
+                nodes=[{"id": "n1", "content": "alpha", "created_at": time.time()},
+                       {"id": "n2", "content": "beta", "created_at": time.time()}],
+                connections={},
+                trigger_mode="explicit",
+                graphlite_store=store,
+                candidate_store=None,
+            ))
+
+        assert report.degraded is True, "队列过半满应 degraded=True"
+        pipe._persist_async.assert_not_called(), \
+            "PERSIST 应被整体跳过（4 步零调用）"
+        assert any("PERSIST skipped" in r.getMessage()
+                   for r in caplog.records), "应打 warning 说明跳过原因"
+
+    def test_idle_queue_guard_decision(self):
+        """H2 守卫条件单元测试: 空闲队列 (1/100) → 不触发跳过。"""
+        q = MagicMock()
+        q.pending_count.return_value = 1
+        q.max_pending = 100
+        assert not (q is not None and q.pending_count() > q.max_pending // 2)
+
+    def test_no_queue_guard_inert(self):
+        """H2 守卫条件: 无 write_queue (None) → 守卫不生效。"""
+        q = None
+        assert not (q is not None and q.pending_count() > q.max_pending // 2)

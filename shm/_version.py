@@ -1,13 +1,13 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.30.0"
+__version__ = "5.31.0"
 __version_info__ = (5, 30, 0)
 __version_name__ = "Interpolate-Prefix-Fix"
 __release_date__ = "2026-08-13"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v5.30.0 (2026-08-13) Interpolate-Prefix-Fix:
+v5.31.0 (2026-08-13) Interpolate-Prefix-Fix:
   • _interpolate 前缀碰撞修复 (P0 静默数据丢失) — 旧实现按 dict 序逐键
     str.replace，$t1 会误替换 $t10 内的前缀（'$t1' in '$t10'）→
     query_router 实体匹配对 ≥10 候选（t0..t12）生成多段 CONTAINS 时
