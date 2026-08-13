@@ -23,7 +23,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from config.settings import load_settings, get_settings
 from api.routes import router, init_services, Services
 from api.routes._deps import qsubmit
+import api.routes._deps as _deps
+from observability.health import HealthChecker
 from observability.metrics import record_request
+from shm._version import __version__, __version_name__
 from observability.logger import get_logger, configure_logging
 from api.dashboard import dashboard_router
 from graph.graphlite_store import CircuitBreakerOpen, EpisodeCache
@@ -736,8 +739,35 @@ def create_app() -> FastAPI:
     # 认证 + 速率限制（在 observe_request 之前）
     from gateway.auth import create_auth_middleware, is_dev_mode
     dev_mode = is_dev_mode()
-    skip_paths = ["/health", "/metrics"]
+    skip_paths = ["/health", "/metrics", "/api/health", "/api/version"]
     app.middleware("http")(create_auth_middleware(dev_mode=dev_mode, skip_paths=skip_paths))
+
+    # ── 只读探活/版本端点（免认证，供负载均衡/监控直接调用） ──
+    @app.get("/api/health", summary="轻量探活（免认证）")
+    async def api_health() -> dict:
+        """只读探活：status 恒为 "ok"；graph/faiss 状态经 HealthChecker 动态检测。
+
+        _services 未初始化（应用尚未完成 startup）时回退 False 并仍返回 200，
+        不做 503 失败语义——探活端点必须始终可被调用。
+        """
+        # 模块属性引用：读取 _deps._services 的实时值（init_services 启动时赋值）
+        svc = _deps._services
+        if svc is None:
+            return {"status": "ok", "graph_connected": False, "faiss_loaded": False}
+        result = HealthChecker(
+            graph_store=svc.graphlite_store,
+            faiss_index=svc.faiss_index,
+        ).check()
+        return {
+            "status": "ok",
+            "graph_connected": result.graph_connected,
+            "faiss_loaded": result.faiss_loaded,
+        }
+
+    @app.get("/api/version", summary="版本信息（免认证）")
+    async def api_version() -> dict:
+        """只读版本：从 shm._version 导入，禁止硬编码。"""
+        return {"version": __version__, "version_name": __version_name__}
 
     # 请求级中间件：trace_id + 性能监控
     @app.middleware("http")
