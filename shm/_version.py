@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.29.0"
-__version_info__ = (5, 29, 0)
-__version_name__ = "Dream-Write-Lock"
+__version__ = "5.30.0"
+__version_info__ = (5, 30, 0)
+__version_name__ = "Interpolate-Prefix-Fix"
 __release_date__ = "2026-08-13"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.30.0 (2026-08-13) Interpolate-Prefix-Fix:
+  • _interpolate 前缀碰撞修复 (P0 静默数据丢失) — 旧实现按 dict 序逐键
+    str.replace，$t1 会误替换 $t10 内的前缀（'$t1' in '$t10'）→
+    query_router 实体匹配对 ≥10 候选（t0..t12）生成多段 CONTAINS 时
+    $t10..$t12 被污染，检索静默漏检
+  • 改单次 re.sub(r"\\$([A-Za-z_]\\w*)", callback)：按捕获完整键名查
+    params，键序无关、无前缀碰撞；未知键返回原 match（未命中不替换语义
+    保持不变）；str/ascii/b64/int-float/numpy/None/空串哨兵类型分支全保留
+  • 测试: 新增 11 用例（前缀碰撞 / 键序无关 / ≥10 段 CONTAINS / 类型分支
+    保真 / 未知占位符 / 空参数）
+
 v5.29.0 (2026-08-13) Dream-Write-Lock:
   • 梦境与写库并发卡死修复 (2026-08-12 生产 8/12 两次 SIGKILL) —
     梦境拉取 (F1) 与 hyperedge_sweep (F3) 改 to_thread, 事件循环不再被

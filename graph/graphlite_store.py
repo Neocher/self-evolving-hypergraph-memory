@@ -794,35 +794,48 @@ class GraphLiteStore:
 
     @staticmethod
     def _interpolate(query: str, params: Optional[dict] = None) -> str:
-        """Basic $param interpolation to GQL literals (security: simple only)."""
+        """Basic $param interpolation to GQL literals (security: simple only).
+
+        v5.30.0 改单次 re.sub 带回调替换 $name —— 按捕获的完整键名查 params：
+        - 键序无关（旧实现按 dict 序逐键 str.replace）
+        - 无前缀碰撞（旧实现 $t1 会误替换 $t10 → P0 静默数据丢失）
+        - 无需 re.escape（占位符是 $word，匹配不到普通文本）
+        未知键返回原 match 文本（保持"未命中不替换"语义）。
+        """
+        import re
         from base64 import b64encode
         if not params:
             return query
-        result = query
-        for k, v in params.items():
+
+        def _repl(match: re.Match) -> str:
+            key = match.group(1)
+            if key not in params:
+                return match.group(0)
+            v = params[key]
             if isinstance(v, str):
                 if not v:
                     # 空串：GraphLite 中 CONTAINS '' 恒真 → NOT CONTAINS '' 恒假，
                     # read_validate 的 $new_value 为空会导致矛盾漏检。
                     # 用哨兵值使 NOT CONTAINS 恒真（语义 = 不排除已有事实）。
-                    result = result.replace(f"${k}", "'__SHM_NO_VALUE__'")
-                else:
-                    try:
-                        v.encode('ascii')
-                        result = result.replace(f"${k}", f"'{v}'")
-                    except UnicodeEncodeError:
-                        # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
-                        b64 = b64encode(v.encode('utf-8')).decode('ascii')
-                        result = result.replace(f"${k}", f"'{{b64}}{b64}'")
+                    return "'__SHM_NO_VALUE__'"
+                try:
+                    v.encode('ascii')
+                    return f"'{v}'"
+                except UnicodeEncodeError:
+                    # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
+                    b64 = b64encode(v.encode('utf-8')).decode('ascii')
+                    return f"'{{b64}}{b64}'"
             elif isinstance(v, (int, float)):
-                result = result.replace(f"${k}", str(v))
+                return str(v)
             elif isinstance(v, (np.integer, np.floating)):
                 # numpy 标量（如 FAISS 搜索返回的 np.float32）不是 int/float 实例，
                 # 直接 str() 会带类型前缀；统一转 Python 标量
-                result = result.replace(f"${k}", str(v.item()))
+                return str(v.item())
             elif v is None:
-                result = result.replace(f"${k}", "NULL")
-        return result
+                return "NULL"
+            return match.group(0)
+
+        return re.sub(r"\$([A-Za-z_]\w*)", _repl, query)
 
     # ─── Lifecycle ──────────────────────────────────
 
