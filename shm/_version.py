@@ -1,12 +1,18 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.27.3"
-__version_info__ = (5, 27, 3)
-__version_name__ = "Hermes-Integration-Check"
-__release_date__ = "2026-08-12"
+__version__ = "5.28.0"
+__version_info__ = (5, 28, 0)
+__version_name__ = "Write-Queue-Watchdog"
+__release_date__ = "2026-08-13"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.28.0 (2026-08-13) Write-Queue-Watchdog:
+  • 写队列永久卡死修复 — submit() 改用 asyncio.shield(wrap_future) 不占 executor
+    线程（旧 run_in_executor 单 worker 被占死 → 全 503 永不恢复）
+  • 看门狗仅线程死亡时重启（alive+慢写不重启避免双写并发；空闲不误判）
+  • shutdown 满队列 put_nowait 跳过 sentinel（uvicorn 关闭不挂起）
+
 v5.27.2 (2026-08-12) Hermes-Integration-Check:
   • check_hermes_integration.py prefetch 标题兼容双格式 (官方 "SHM v5 记忆检索"
     + 旧版 "【SHM 记忆检索结果】") — 解决本机 shm 插件迁移 shm_v5 后检测误报

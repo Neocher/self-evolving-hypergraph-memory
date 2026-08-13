@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.27.3** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.28.0** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -219,7 +219,7 @@ SHM_EMBEDDING__DEVICE=cpu bash install.sh --user   # no-GPU machine
 
 ```bash
 python -m pytest tests/ -q
-# 502/502 passed (0 skipped) — v5.27 含 PRUNE 保护 9 用例；无 DEEPSEEK_API_KEY 环境为 501/502 (1 skipped)
+# 526/526 passed (1 skipped) — v5.28 含写队列卡死修复 8 用例；无 DEEPSEEK_API_KEY 环境为 525/526 (1 skipped)
 ```
 
 ---
