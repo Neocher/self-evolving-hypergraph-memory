@@ -1,5 +1,6 @@
 """v5.26.0 图扩散检索测试 — 超边共现 + Hebbian P0 修复"""
 import sys
+import threading
 from unittest.mock import MagicMock, patch
 
 
@@ -193,6 +194,8 @@ class TestHebbianConnectionFix:
         from graph.graphlite_store import GraphLiteStore
 
         store = GraphLiteStore.__new__(GraphLiteStore)
+        # 【v5.29.0 F5】__new__ 绕过 __init__，需手动初始化 session 锁
+        store._session_lock = threading.RLock()
 
         mock_row = MagicMock()
         mock_row.get.side_effect = lambda key, default=None: {

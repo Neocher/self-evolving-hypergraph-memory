@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "5.28.0"
+version = "5.29.0"
 description = "SHM — 自演化超图记忆系统 (Self-evolving Hypergraph Memory)"
 readme = "README.md"
 license = {text = "MIT"}

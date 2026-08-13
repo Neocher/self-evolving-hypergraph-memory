@@ -243,12 +243,24 @@ class GraphLiteStore:
         self._db_path: str = ""
         self.config = config or type("cfg", (), {"database_path": "", "max_threads": 4})()
         self.circuit_breaker = CircuitBreaker(cb_config)
+        # 【F5】session 访问锁：GraphLite session 无并发防护（跨线程并发访问会引擎级
+        # 挂起），所有 _session.query/execute 统一经 _locked_query/_locked_execute 串行化。
+        # RLock 可重入——写线程内嵌套调用不死锁。
+        self._session_lock = threading.RLock()
 
     @property
     def conn(self):
         if self._session is None:
             raise RuntimeError("GraphLiteStore not connected")
         return self._session
+
+    def _locked_query(self, gql: str):
+        with self._session_lock:
+            return self._session.query(gql)
+
+    def _locked_execute(self, gql: str):
+        with self._session_lock:
+            return self._session.execute(gql)
 
     def connect(self) -> None:
         """Open/create GraphLite DB and setup schema."""
@@ -269,8 +281,8 @@ class GraphLiteStore:
         # 该前提成立；非 /shm schema 的 legacy 库会新建空 /shm graph。
         for candidate in (SHM_GRAPH, SHM_SCHEMA):
             try:
-                self._session.execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
-                self._session.execute(f"SESSION SET GRAPH {candidate}")
+                self._locked_execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
+                self._locked_execute(f"SESSION SET GRAPH {candidate}")
                 self._graph_name = candidate
                 break
             except Exception:
@@ -279,15 +291,15 @@ class GraphLiteStore:
             # 全新库：按序创建 schema → set schema → create graph → set graph
             # （CREATE GRAPH 前必须先 SESSION SET SCHEMA，顺序颠倒会失败）
             try:
-                self._session.execute(f"CREATE SCHEMA {SHM_SCHEMA}")
+                self._locked_execute(f"CREATE SCHEMA {SHM_SCHEMA}")
             except Exception:
                 pass  # schema 可能已存在
-            self._session.execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
+            self._locked_execute(f"SESSION SET SCHEMA {SHM_SCHEMA}")
             try:
-                self._session.execute(f"CREATE GRAPH {SHM_SCHEMA}")
+                self._locked_execute(f"CREATE GRAPH {SHM_SCHEMA}")
             except Exception:
                 pass  # graph 可能已存在
-            self._session.execute(f"SESSION SET GRAPH {SHM_SCHEMA}")
+            self._locked_execute(f"SESSION SET GRAPH {SHM_SCHEMA}")
             self._graph_name = SHM_SCHEMA
 
         # 【P1-2】EpisodeNode (source, created_at) 复合索引 —— 超边窗口查询
@@ -301,7 +313,7 @@ class GraphLiteStore:
     def _ensure_episode_index(self) -> None:
         """P1-2: 尽力创建 (source, created_at) 复合索引, 失败仅日志。"""
         try:
-            self._session.execute(
+            self._locked_execute(
                 "CREATE INDEX IF NOT EXISTS idx_episode_src_ts "
                 "ON EpisodeNode (source, created_at)"
             )
@@ -320,10 +332,10 @@ class GraphLiteStore:
         eid = episode.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(episode, skip_keys={"id", "version"})
         gql = f"INSERT (e:EpisodeNode {{id: '{eid}', {vals}}})"
-        self._session.execute(gql)
+        self._locked_execute(gql)
         # 乐观锁基线: 无 version 时置 1 (INSERT 带 version 会 QUERY_ERROR, 故后置 SET)
         ver = episode.get("version", 1)
-        self._session.execute(
+        self._locked_execute(
             f"MATCH (e:EpisodeNode {{id: '{eid}'}}) SET e.version = {int(ver)}"
         )
         return eid
@@ -332,7 +344,7 @@ class GraphLiteStore:
         """MATCH EpisodeNode by id."""
         gql = f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) RETURN e"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             if result.rows:
                 row = result.rows[0]
                 return self._flatten_row(row, "e")
@@ -358,7 +370,7 @@ class GraphLiteStore:
         ids = ", ".join(f"'{i}'" for i in node_ids)
         gql = f"MATCH (e:EpisodeNode) WHERE e.id IN [{ids}] RETURN e"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
         except _INFRA_EXCEPTIONS:
             raise  # 交给 with_retry 重试；失败计数由 get_episodes_batch 重试耗尽后统一记录
         except Exception:
@@ -393,7 +405,7 @@ class GraphLiteStore:
         cutoff = _now() - time_window_seconds
         gql = f"MATCH (e:EpisodeNode) WHERE e.created_at >= {cutoff} RETURN e"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
         except Exception:
             return []
@@ -402,7 +414,7 @@ class GraphLiteStore:
         """Filter by tau range."""
         gql = f"MATCH (e:EpisodeNode) WHERE e.tau_initial >= {min_tau} AND e.tau_initial <= {max_tau} RETURN e LIMIT {limit}"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
         except Exception:
             return []
@@ -419,7 +431,7 @@ class GraphLiteStore:
             return True
         # Step 1: 读当前 version
         try:
-            result = self._session.query(
+            result = self._locked_query(
                 f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) RETURN e.version AS v"
             )
         except Exception:
@@ -441,7 +453,7 @@ class GraphLiteStore:
         if next_version is not None:
             set_clause = f"{set_clause}, e.version = {next_version}"
         try:
-            self._session.execute(
+            self._locked_execute(
                 f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET {set_clause}"
             )
             return True
@@ -454,7 +466,7 @@ class GraphLiteStore:
         hid = hyperedge.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values({k: v for k, v in hyperedge.items() if k != "id"})
         gql = f"INSERT (h:HyperedgeNode {{id: '{hid}', {vals}}})"
-        self._session.execute(gql)
+        self._locked_execute(gql)
         return hid
 
     def link_hyperedge_member(self, hyperedge_id: str, episode_id: str) -> None:
@@ -463,12 +475,12 @@ class GraphLiteStore:
             f"(e:EpisodeNode {{id: '{episode_id}'}}) "
             f"INSERT (h)-[:HYPEREDGE_MEMBER]->(e)"
         )
-        self._session.execute(gql)
+        self._locked_execute(gql)
 
     def get_hyperedge_members(self, hyperedge_id: str) -> list[dict]:
         gql = f"MATCH (h:HyperedgeNode {{id: '{hyperedge_id}'}})-[:HYPEREDGE_MEMBER]->(e) RETURN e"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
         except Exception:
             return []
@@ -476,7 +488,7 @@ class GraphLiteStore:
     def get_hyperedges_by_node(self, node_id: str) -> list[dict]:
         gql = f"MATCH (h:HyperedgeNode)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode {{id: '{node_id}'}}) RETURN h"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "h") for r in result.rows]
         except Exception:
             return []
@@ -527,7 +539,7 @@ class GraphLiteStore:
     def get_all_hebbian_connections(self) -> list[dict]:
         gql = "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) RETURN a.id AS src, b.id AS dst, r.weight AS weight"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return list(result.rows)
         except Exception:
             return []
@@ -555,14 +567,14 @@ class GraphLiteStore:
         重复 INSERT 会创建重复节点 —— 必须用 查询-插入 两段式保证幂等。
         """
         try:
-            result = self._session.query(
+            result = self._locked_query(
                 f"MATCH (s:SessionNode {{id: '{session_id}'}}) RETURN s.id"
             )
             if result.rows:
                 return  # 已存在
         except Exception:
             pass  # 查询失败（如表不存在）时走创建路径
-        self._session.execute(
+        self._locked_execute(
             f"INSERT (s:SessionNode {{id: '{session_id}', "
             f"created_at: {int(time.time())}, last_seen: {int(time.time())}}})"
         )
@@ -574,12 +586,12 @@ class GraphLiteStore:
             f"(e:EpisodeNode {{id: '{episode_id}'}}) "
             f"INSERT (s)-[:SESSION_MEMBER]->(e)"
         )
-        self._session.execute(gql)
+        self._locked_execute(gql)
 
     def get_session_memories(self, session_id: str, limit: int = 100) -> list[dict]:
         gql = f"MATCH (s:SessionNode {{id: '{session_id}'}})-[:SESSION_MEMBER]->(e) RETURN e LIMIT {limit}"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
         except Exception:
             return []
@@ -590,7 +602,7 @@ class GraphLiteStore:
         """获取或创建 SessionNode，返回 session_id（两段式幂等，参照 ensure_session）。"""
         self.ensure_session(session_id)
         if metadata:
-            self._session.execute(
+            self._locked_execute(
                 f"MATCH (s:SessionNode {{id: '{session_id}'}}) "
                 f"SET s.metadata = '{metadata}'"
             )
@@ -603,20 +615,20 @@ class GraphLiteStore:
             f"(e:EpisodeNode {{id: '{episode_id}'}}) "
             f"INSERT (s)-[:SESSION_MEMBER]->(e)"
         )
-        self._session.execute(gql)
+        self._locked_execute(gql)
 
     def create_visual_node(self, node: dict) -> str:
         """INSERT VisualNode。id 为必填；embedding 是 list，_gql_value 自动 b64 序列化。"""
         vid = node.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(node, skip_keys={"id"})
-        self._session.execute(f"INSERT (v:VisualNode {{id: '{vid}', {vals}}})")
+        self._locked_execute(f"INSERT (v:VisualNode {{id: '{vid}', {vals}}})")
         return vid
 
     def get_visual_node(self, visual_id: str) -> Optional[dict]:
         """MATCH VisualNode by id（参照 get_episode）。"""
         gql = f"MATCH (v:VisualNode {{id: '{visual_id}'}}) RETURN v"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             if result.rows:
                 return self._flatten_row(result.rows[0], "v")
         except Exception:
@@ -627,7 +639,7 @@ class GraphLiteStore:
         """列出 VisualNode（flatten 后含 b64 解码的 caption）。"""
         gql = f"MATCH (v:VisualNode) RETURN v LIMIT {limit}"
         try:
-            result = self._session.query(gql)
+            result = self._locked_query(gql)
             return [self._flatten_row(r, "v") for r in result.rows]
         except Exception:
             return []
@@ -639,7 +651,7 @@ class GraphLiteStore:
         """
         # 1. 找到该 namespace(SessionNode)下的所有 EpisodeNode
         try:
-            result = self._session.query(
+            result = self._locked_query(
                 f"MATCH (s:SessionNode {{id: '{namespace}'}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                 f"RETURN e"
             )
@@ -652,7 +664,7 @@ class GraphLiteStore:
         deleted = 0
         for eid in ep_ids:
             try:
-                self._session.execute(
+                self._locked_execute(
                     f"MATCH (e:EpisodeNode {{id: '{eid}'}}) DETACH DELETE e"
                 )
                 deleted += 1
@@ -661,7 +673,7 @@ class GraphLiteStore:
 
         # 3. 删除 SessionNode 本身(及其残留关系)
         try:
-            self._session.execute(
+            self._locked_execute(
                 f"MATCH (s:SessionNode {{id: '{namespace}'}}) DETACH DELETE s"
             )
         except Exception:
@@ -686,7 +698,7 @@ class GraphLiteStore:
             raise CircuitBreakerOpen("circuit breaker open, query rejected")
         q = self._interpolate(query, params)
         try:
-            result = self._session.query(q)
+            result = self._locked_query(q)
         except Exception:
             raise
         return list(result.rows)
@@ -711,7 +723,7 @@ class GraphLiteStore:
             return []
         q = self._interpolate(query, params)
         try:
-            result = self._session.query(q)
+            result = self._locked_query(q)
             self.circuit_breaker.record_success()
             return list(result.rows)
         except _INFRA_EXCEPTIONS:

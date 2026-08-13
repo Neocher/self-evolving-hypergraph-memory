@@ -219,7 +219,8 @@ class DreamScheduler:
                 if graphlite_store is not None:
                     try:
                         # 单次获取节点（6844节点，一次查询即可）
-                        rows = graphlite_store.query_cypher(
+                        rows = await asyncio.to_thread(
+                            graphlite_store.query_cypher,
                             "MATCH (e:EpisodeNode) RETURN e.* "
                             "ORDER BY e.created_at DESC LIMIT 10000"
                         )
@@ -249,7 +250,8 @@ class DreamScheduler:
                                         "tau_initial": float(row[4]) if len(row) > 4 else 1.0,
                                     })
                         # 获取Hebbian连接
-                        edge_rows = graphlite_store.query_cypher(
+                        edge_rows = await asyncio.to_thread(
+                            graphlite_store.query_cypher,
                             "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) "
                             "RETURN a.id AS src, b.id AS dst, r.weight AS w LIMIT 5000"
                         )

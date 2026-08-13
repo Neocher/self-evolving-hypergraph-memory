@@ -305,6 +305,7 @@ def _init_services() -> Services:
             audit_chain=svc.audit_chain,  # ← 现在有值了
             llm_client=llm_client,
             ontology_validator=svc.ontology_validator if hasattr(svc, 'ontology_validator') else None,
+            write_queue=svc.write_queue,
         )
         # 【P0-2】梦境候选存储（非破坏性模式）
         try:
@@ -627,10 +628,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)
                 if svc.hyperedge_manager is not None and svc.graphlite_store is not None:
                     # 扫描长时间窗口内的同源节点
-                    rows = svc.graphlite_store.query_cypher(
+                    cutoff = time.time() - 7200
+                    rows = await asyncio.to_thread(
+                        svc.graphlite_store.query_cypher,
                         "MATCH (e:EpisodeNode) WHERE e.created_at >= $cutoff "
                         "RETURN e.id, e.source, e.content ORDER BY e.created_at DESC LIMIT 100",
-                        {"cutoff": time.time() - 7200},
+                        {"cutoff": cutoff},
                     )
                     if rows and len(rows) >= 2:
                         logger.debug("Hyperedge sweep: %d recent episodes found, idle check", len(rows))

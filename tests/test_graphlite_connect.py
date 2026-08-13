@@ -4,6 +4,7 @@
 修复后 connect() 依次尝试 default → /shm，都不行则按序创建 schema/graph。
 本文件用 __new__ 构造 + 状态机 FakeSession 模拟 session，验证三条路径与格式转换。
 """
+import threading
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -41,6 +42,8 @@ def _make_store(tmp_path: pytest.TempPathFactory, session) -> "GraphLiteStore":
     from graph.graphlite_store import GraphLiteStore
 
     store = GraphLiteStore.__new__(GraphLiteStore)
+    # 【v5.29.0 F5】__new__ 绕过 __init__，需手动初始化 session 锁
+    store._session_lock = threading.RLock()
     store.config = type("cfg", (), {"database_path": str(tmp_path / "test_graphlite_db")})()
     db = MagicMock()
     db.session.return_value = session

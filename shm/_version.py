@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.28.0"
-__version_info__ = (5, 28, 0)
-__version_name__ = "Write-Queue-Watchdog"
+__version__ = "5.29.0"
+__version_info__ = (5, 29, 0)
+__version_name__ = "Dream-Write-Lock"
 __release_date__ = "2026-08-13"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.29.0 (2026-08-13) Dream-Write-Lock:
+  • 梦境与写库并发卡死修复 (2026-08-12 生产 8/12 两次 SIGKILL) —
+    梦境拉取 (F1) 与 hyperedge_sweep (F3) 改 to_thread, 事件循环不再被
+    大查询阻塞; 梦境 PERSIST (F2) 收敛到 write_queue 单写线程串行
+    (不再裸 to_thread 绕开单写线程约束 → 引擎级挂起根因消除)
+  • GraphLiteStore session 访问锁 (F5): _locked_query/_locked_execute 包装
+    全部 34 处 _session.query/execute, RLock 可重入兜底跨线程并发访问
+  • write_queue 看门狗增强 (F6): 连续 3 次超时 + 疑似卡死 → logger.critical
+    告警建议人工重启 (不自动重启, 由 systemd/人工决策)
+  • 测试: 新增 6 用例 (F1 拉取不阻塞 loop / F2 persist 经 write_queue 串行 /
+    F5 并发读写 session 有锁保护)
+
 v5.28.0 (2026-08-13) Write-Queue-Watchdog:
   • 写队列永久卡死修复 — submit() 改用 asyncio.shield(wrap_future) 不占 executor
     线程（旧 run_in_executor 单 worker 被占死 → 全 503 永不恢复）

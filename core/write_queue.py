@@ -30,6 +30,15 @@ handler 恢复
 - 看门狗（F3）：写线程记录心跳 `_last_activity`；**仅线程死亡时** `_restart_worker()`
   重建（alive+慢写不重启——避免双消费者并发写 GraphLite；空闲队列不误判卡死）。
   能救回"线程意外死亡"，救不回 GraphLite 引擎级死锁（后者需进程重启）。
+  【F6】引擎级死锁仅告警不自动重启：连续 3 次超时 + stuck 状态**持续超过观察窗**
+  （2×stuck_timeout）才 critical（观察窗过滤单步长写的心跳短暂过期）；成功路径归零。
+  【F6-M2.1】告警去抖：critical 后 60s 内不重复告警（`_last_critical_at` 时间戳去抖，
+  比计数归零可靠——并发 >=3 的超时同批对齐时，计数归零后剩余并发又凑满 3 次会
+  单批多次告警；时间去抖与并发顺序无关，同一批必然只告警一次）。
+  【F6-M1.3/M1.4】检测依赖**持续写流量**：只有 submit 超时事件才累计计数，单条长写
+  无并发流量不告警。⚠️ 残留误报边界：长写超过观察窗 + 持续写流量时仍会告警——
+  心跳无法区分"超窗长写"与真死锁，属已知边界（成功路径清理计数 + stuck 起算时刻，
+  恢复后不复发）。告警文案 worker unresponsive (alive or dead) 同时覆盖线程死亡场景。
 - 重入：写线程内再 submit → 直接同步执行（防死锁）。
 - 优雅关闭：sentinel 退出 + join(timeout) 兜底；shutdown 先 drain 在途写。
 
@@ -88,6 +97,22 @@ class WriteQueue:
         self._last_activity: float = time.monotonic()
         self._stuck_timeout: float = max(wait_timeout * 2, 60.0)
         self._stuck_lock = threading.Lock()
+        # 【F6】死锁疑似计数：连续 N 次 submit 超时且写线程疑似卡死（worker 存活
+        # 但心跳超时）时告警建议人工重启。不自动重启——引擎级死锁需进程重启，
+        # 由 systemd/人工决策。M2：计数操作全部受 _stuck_lock 保护，成功路径归零。
+        self._deadlock_suspect_count = 0
+        # 【F6-M2.1】告警去抖：critical 后记录时刻，_critical_debounce（60s）内即使
+        # 计数再次达到阈值也不重复告警（防刷屏）。比"计数归零"可靠——并发 >=3 的
+        # 超时在同一批内对齐时，计数归零后剩余并发超时又凑满 3 次 → 单批多次告警；
+        # 时间去抖与并发到达顺序无关，同一批必然只告警一次。
+        self._last_critical_at: Optional[float] = None
+        self._critical_debounce: float = 60.0
+        # 【F6-M1】持续观察窗：stuck 状态（心跳过期+积压）须**持续**超过该时长才
+        # 认定疑似死锁。单步长写（如梦境 PERSIST 单步 > stuck_timeout）会让心跳
+        # 短暂过期但随写完成恢复——若按瞬时 _is_stuck() 计数，3 次超时即 critical
+        # 会误导运营重启打断合法长写。真死锁的 stuck 状态必然持续存在。
+        self._stuck_observe_window: float = self._stuck_timeout * 2
+        self._stuck_since: Optional[float] = None  # 首次检测到 stuck 的时刻
 
     # ─── 事件循环侧：唯一入口 ───────────────────────────
 
@@ -125,10 +150,43 @@ class WriteQueue:
         # shield 保护：wait_for 超时只取消 shield 外层，**不会取消底层 concurrent
         # future**（否则写线程迟到 set_result 抛 InvalidStateError，迟到完成语义
         # 被破坏）。超时只影响本请求，其他请求不受影响。
-        return await asyncio.wait_for(
-            asyncio.shield(asyncio.wrap_future(fut)),
-            timeout=self._wait_timeout,
-        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(fut)),
+                timeout=self._wait_timeout,
+            )
+        except asyncio.TimeoutError:
+            # 【F6】看门狗增强：连续 3 次超时且**持续**疑似卡死（worker 无响应——
+            # 心跳超时 + 队列积压，线程存活或已死亡均覆盖）→ critical 告警建议
+            # 人工重启。不自动重启。M1 观察窗：须 stuck 状态持续超过
+            # _stuck_observe_window（2×stuck_timeout）才计数——单步长写会短暂心跳
+            # 过期但会恢复，不满足"持续" → 不误报。
+            if self._is_stuck_sustained():
+                with self._stuck_lock:
+                    self._deadlock_suspect_count += 1
+                    if self._deadlock_suspect_count >= 3:
+                        now = time.monotonic()
+                        if (self._last_critical_at is None
+                                or now - self._last_critical_at >= self._critical_debounce):
+                            # M2.1 时间去抖：同一批并发超时对齐时只告警一次（计数
+                            # 归零后剩余并发又凑满 3 次 → 旧逻辑单批多次告警）。
+                            # 文案 M1.4：worker unresponsive (alive or dead) 同时
+                            # 覆盖线程死亡场景（_is_stuck 对死亡线程恒真）。
+                            logger.critical(
+                                "write queue worker unresponsive (alive or dead); "
+                                "manual restart required"
+                            )
+                            self._last_critical_at = now
+                        self._deadlock_suspect_count = 0  # 门控"连续 ≥3 次超时"
+            raise
+        # 【F6-M2】成功路径清理：本次请求在 wait_timeout 内真实完成 → 写线程在推进，
+        # 此前累积的死锁疑似不成立（"连续 N 次超时" = 相邻超时之间无成功）。同锁内
+        # 一并清掉 _stuck_since（M1.3）——上次 stuck 起算时刻不得残留到下一次卡死
+        # 判定，否则新卡死会沿用旧起算时刻被误判为"已持续超过观察窗"。
+        with self._stuck_lock:
+            self._deadlock_suspect_count = 0
+            self._stuck_since = None
+        return result
 
     # ─── 写线程侧：串行消费 ────────────────────────────
 
@@ -167,6 +225,25 @@ class WriteQueue:
         with self._stuck_lock:
             return time.monotonic() - self._last_activity > self._stuck_timeout
 
+    def _is_stuck_sustained(self) -> bool:
+        """【F6-M1】疑似引擎级卡死：stuck 状态**持续**超过观察窗。
+
+        与 _is_stuck() 的区别：_is_stuck() 只看"此刻"心跳是否过期——单步长写
+        （> _stuck_timeout，如梦境 PERSIST 单步）会让心跳短暂过期，随后随写完成
+        恢复，属慢写而非死锁。真死锁的 stuck 状态不会自行恢复，故要求其持续
+        超过 _stuck_observe_window（2× stuck_timeout）才认定疑似卡死，过滤慢写、
+        避免 critical 误导运营重启打断合法长写。
+        """
+        now = time.monotonic()
+        if not self._is_stuck():
+            with self._stuck_lock:
+                self._stuck_since = None
+            return False
+        with self._stuck_lock:
+            if self._stuck_since is None:
+                self._stuck_since = now
+            return now - self._stuck_since >= self._stuck_observe_window
+
     def _restart_worker(self) -> None:
         """**仅在线程死亡时**重建写线程接管队列。
 
@@ -184,6 +261,10 @@ class WriteQueue:
             self._worker.start()
             self._worker_ident = self._worker.ident
             self._last_activity = time.monotonic()
+            # 【F6-M1/M2】新线程 = 新纪元：清掉旧 worker 时期的 stuck 起算时刻与
+            # 疑似计数（它们针对已死亡的旧线程，不得带入新线程）。
+            self._stuck_since = None
+            self._deadlock_suspect_count = 0
 
     # ─── 背压 / 探测（P2-1 梦境错峰探测点）──────────────
 

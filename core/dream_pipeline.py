@@ -168,6 +168,7 @@ class DreamPipeline:
         confidence_calibrator=None,
         ssm_engine=None,
         encoder=None,
+        write_queue=None,
     ) -> None:
         """
         Args:
@@ -179,6 +180,7 @@ class DreamPipeline:
             confidence_calibrator: ConfidenceCalibrator 实例（可选，P1 过度巩固防护）
             ssm_engine: SSMEngine 实例（可选，P2 SSM 梦境深度巩固）
             encoder: 编码器实例（可选，用于向量余弦相似度合并 Jaccard）
+            write_queue: WriteQueue 实例（可选，存在时 PERSIST 经单写线程 submit 串行执行）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
@@ -190,6 +192,7 @@ class DreamPipeline:
         self.encoder = encoder
         self._ssm_wrapper: Optional[SSMDreamWrapper] = None
         self._ssm_initialized = False
+        self._write_queue = write_queue
 
     async def run(
         self,
@@ -334,14 +337,14 @@ class DreamPipeline:
             # 改为：任一步骤抛异常 → 打 degraded 标记，下次梦境通过 upsert 修复
             persist_degraded = False
             try:
-                persist_deleted, pruned_ids = await asyncio.to_thread(
+                persist_deleted, pruned_ids = await self._persist_async(
                     self._persist_prune, graphlite_store, prune_ops)
                 all_removed_ids.extend(pruned_ids)
-                persist_created = await asyncio.to_thread(
+                persist_created = await self._persist_async(
                     self._persist_communities, graphlite_store, communities, dream_id)
                 all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
-                await asyncio.to_thread(self._persist_merge, graphlite_store, merge_ops)
-                await asyncio.to_thread(
+                await self._persist_async(self._persist_merge, graphlite_store, merge_ops)
+                await self._persist_async(
                     self._persist_hyperedges, graphlite_store, communities, dream_id)
             except Exception as persist_exc:
                 persist_degraded = True
@@ -1216,6 +1219,12 @@ Text:
         return remaining, ops
 
     # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
+
+    async def _persist_async(self, fn, *args, **kwargs):
+        """PERSIST 写入串行化：有 write_queue 时经单写线程 submit，否则回退 to_thread。"""
+        if self._write_queue is not None:
+            return await self._write_queue.submit(fn, *args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _persist_communities(self, graphlite_store, communities: list[dict], dream_id: str) -> int:
         """将CLUSTER结果写回GraphLite CommunityNode。
