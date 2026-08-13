@@ -1,13 +1,35 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
 __version__ = "5.31.0"
-__version_info__ = (5, 30, 0)
-__version_name__ = "Interpolate-Prefix-Fix"
+__version_info__ = (5, 31, 0)
+__version_name__ = "Starlink-Audit-Fix"
 __release_date__ = "2026-08-13"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v5.31.0 (2026-08-13) Interpolate-Prefix-Fix:
+v5.31.0 (2026-08-13) Starlink-Audit-Fix:
+  • 星链批量审计修复 19 项（H1/H2/M1/M2 + P2-P9 + M3-M5 + L1-L4）— 599 passed
+  • H1 GQL 注入面转义 21 处：id/metadata/session_id 等外部可达字段全部经
+    _gql_value 转义（' / \ 不再裸插注入 GQL）
+  • H2 梦境深度守卫：PERSIST 写队列过半满 → 跳过本次写回（degraded，下次
+    梦境 upsert 自愈）；M1 引擎死锁探测：独立只读 ping 探针 + diagnose()
+    快照（心跳/在途任务/线程栈），自动重建仍由 systemd/人工决策
+  • M2 乐观锁原子化：update_with_version 读 version + SET 并入同一 session
+    锁临界区（消除"读后、SET 前"另一写线程抢先更新的漏检窗口）
+  • P2-P9 性能主线：P2 embed 批扫 conns 提出批循环 / P3 RESOLVE 嵌入记忆化 +
+    Jaccard 预筛（sim ≤ 0.66 < 0.8 决策等价）/ P4 BM25 构建异步化（锁只护
+    swap 短临界区，zombie 构建不钉死锁）/ P6 fusion 三通道 ThreadPoolExecutor
+    并行 / P8 merge content 截断 2000 / P9 ontology types 预筛缓存（N=2000
+    时 4M 次正则 → 2000 次）
+  • M3 shutdown 哨兵重放 + 积压任务 set_exception 立即失败（uvicorn 关闭
+    不再挂起）；M4 CJK 查询跳过 entity/L4 通道（GraphLite CONTAINS 不支持
+    UTF-8，通道恒空，省全表扫描）；M5 EpisodeCache（OrderedDict LRU+TTL
+    4096/600s，flush 预填检索零回查）
+  • P7 时态+情节窗口查询合并单条（3600s 窗 LIMIT 20，to_thread 不冻 loop）；
+    L1-L4 机械修复：裸 except→ValueError / home 路径降级回退 / 慢写非死锁
+    计数归零 / create+ensure+link 合成单闭包（失败短路消除半写）
+
+v5.30.0 (2026-08-13) Interpolate-Prefix-Fix:
   • _interpolate 前缀碰撞修复 (P0 静默数据丢失) — 旧实现按 dict 序逐键
     str.replace，$t1 会误替换 $t10 内的前缀（'$t1' in '$t10'）→
     query_router 实体匹配对 ≥10 候选（t0..t12）生成多段 CONTAINS 时
