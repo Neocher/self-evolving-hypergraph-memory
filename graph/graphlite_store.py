@@ -1,18 +1,34 @@
 """GraphLiteStore — 基于 GraphLite (GQL) 的图存储适配器（当前图引擎）。"""
 import json, shutil, os, time, threading, uuid, sys, tempfile, logging
+from collections import OrderedDict
 import numpy as np
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Any
 
-sys.path.insert(0, os.environ.get("GRAPHLITE_BINDINGS", os.path.expanduser("~/GraphLite/bindings/python")))
-sys.path.insert(0, os.environ.get("GRAPHLITE_SDK", os.path.expanduser("~/GraphLite/sdk-python/src")))
-
-from graphlite_sdk import GraphLite, Session
-from graphlite_sdk.error import (
-    ConnectionError as GraphLiteConnectionError,
-    QueryError,
-)
+# 【L2】硬编码 home 路径降级为回退：优先直接 import（SDK 已在标准路径/已装包）；
+# 仅 ImportError 时才把 GRAPHLITE_BINDINGS / GRAPHLITE_SDK（含默认 ~/GraphLite 回退）
+# 插入 sys.path——本机 SDK 只经这两个路径可见，默认路径必须保留为回退，不能删；
+# 且 os.path.isdir 存在才插（避免污染 sys.path）。
+try:
+    from graphlite_sdk import GraphLite, Session
+    from graphlite_sdk.error import (
+        ConnectionError as GraphLiteConnectionError,
+        QueryError,
+    )
+except ImportError:
+    for env_key, default in (
+        ("GRAPHLITE_BINDINGS", "~/GraphLite/bindings/python"),
+        ("GRAPHLITE_SDK", "~/GraphLite/sdk-python/src"),
+    ):
+        p = os.path.expanduser(os.environ.get(env_key, default))
+        if os.path.isdir(p):
+            sys.path.insert(0, p)
+    from graphlite_sdk import GraphLite, Session
+    from graphlite_sdk.error import (
+        ConnectionError as GraphLiteConnectionError,
+        QueryError,
+    )
 
 logger = logging.getLogger("shm.graphlite_store")
 
@@ -97,6 +113,49 @@ def _dict_to_gql_set_values(d: dict, skip_keys: set = None) -> str:
 class CircuitBreakerOpen(Exception):
     """断路器跳闸异常，供上层捕获降级（兼容 RyuStore 接口）。"""
     pass
+
+
+class EpisodeCache:
+    """检索侧 episode 内容缓存（OrderedDict LRU + TTL）。
+
+    【M5】原 Services._episode_cache 是裸 dict 且无任何写入方（死缓存）。
+    加界壳：maxsize 封顶（默认 4096，超限逐出最旧未访问项）、ttl 过期
+    （默认 600s，过期项读取时惰性剔除）。读写均 O(1)，无锁——调用侧
+    已通过 FAISS 批量 flush 单线程写入、检索线程只读，与 faiss_id_map
+    相同的共享引用语义。
+    """
+
+    def __init__(self, maxsize: int = 4096, ttl: float = 600.0) -> None:
+        self.maxsize = int(maxsize)
+        self.ttl = float(ttl)
+        self._data: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+
+    def _expired(self, entry: tuple[float, dict], now: float) -> bool:
+        ts, _val = entry
+        return now - ts > self.ttl
+
+    def __getitem__(self, key: str) -> dict:
+        entry = self._data[key]
+        if self._expired(entry, time.time()):
+            del self._data[key]
+            raise KeyError(key)
+        self._data.move_to_end(key)
+        return entry[1]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data and not self._expired(self._data[key], time.time())
+
+    def get(self, key: str, default: Optional[dict] = None) -> Optional[dict]:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __setitem__(self, key: str, value: dict) -> None:
+        self._data[key] = (time.time(), value)
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
 
 
 class CircuitBreakerState(str, Enum):
@@ -331,18 +390,21 @@ class GraphLiteStore:
         """
         eid = episode.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(episode, skip_keys={"id", "version"})
-        gql = f"INSERT (e:EpisodeNode {{id: '{eid}', {vals}}})"
+        # 【H1】id 经 _gql_value 转义（含 ' / \ 的 id 不再裸插注入 GQL）
+        id_lit = _gql_value(str(eid))
+        gql = f"INSERT (e:EpisodeNode {{id: {id_lit}, {vals}}})"
         self._locked_execute(gql)
         # 乐观锁基线: 无 version 时置 1 (INSERT 带 version 会 QUERY_ERROR, 故后置 SET)
         ver = episode.get("version", 1)
         self._locked_execute(
-            f"MATCH (e:EpisodeNode {{id: '{eid}'}}) SET e.version = {int(ver)}"
+            f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET e.version = {int(ver)}"
         )
         return eid
 
     def get_episode(self, node_id: str) -> Optional[dict]:
         """MATCH EpisodeNode by id."""
-        gql = f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) RETURN e"
+        # 【H1】id 经 _gql_value 转义（外部可达：GET /memories/episodes/{id}）
+        gql = f"MATCH (e:EpisodeNode {{id: {_gql_value(str(node_id))}}}) RETURN e"
         try:
             result = self._locked_query(gql)
             if result.rows:
@@ -367,7 +429,8 @@ class GraphLiteStore:
         """
         if not self.circuit_breaker.allow_request():
             raise CircuitBreakerOpen("circuit breaker open, batch lookup rejected")
-        ids = ", ".join(f"'{i}'" for i in node_ids)
+        # 【H1】批量 id 逐个 _gql_value 转义（含 ' / \ 的 id 不再裸插注入 GQL）
+        ids = ", ".join(_gql_value(str(i)) for i in node_ids)
         gql = f"MATCH (e:EpisodeNode) WHERE e.id IN [{ids}] RETURN e"
         try:
             result = self._locked_query(gql)
@@ -425,60 +488,73 @@ class GraphLiteStore:
         expected_version=None 时跳过版本检查 (force 写入, 不递增 version —
         语义选择: force 后旧 expected_version 仍可通过校验, 调用方需自行保证时序)。
         节点不存在 / version 不匹配 / 旧数据无 version → False。
+
+        【M2】读 version + SET 包进同一个 `with self._session_lock:`（直接调
+        self._session.query/execute，不再分两次 _locked_query/_locked_execute）。
+        RLock 可重入，写线程内安全；锁本来就是全局唯一串行点，无新并发结构——
+        消除"读后、SET 前"另一写线程抢先更新导致的乐观锁漏检窗口。
         """
+        # 【H1】node_id 经 _gql_value 转义
+        id_lit = _gql_value(str(node_id))
         set_clause = _dict_to_gql_set_values(updates, skip_keys={"id", "version"})
         if not set_clause:
             return True
-        # Step 1: 读当前 version
-        try:
-            result = self._locked_query(
-                f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) RETURN e.version AS v"
-            )
-        except Exception:
-            return False
-        if not result.rows:
-            return False  # 节点不存在
-        v = result.rows[0].get("v") if isinstance(result.rows[0], dict) else None
-        next_version = None
-        if expected_version is not None:
-            if v is None:
-                return False  # 旧数据无 version 字段
+        with self._session_lock:
+            # Step 1: 读当前 version
             try:
-                if int(v) != int(expected_version):
-                    return False
-                next_version = int(expected_version) + 1
-            except (TypeError, ValueError):
+                result = self._session.query(
+                    f"MATCH (e:EpisodeNode {{id: {id_lit}}}) RETURN e.version AS v"
+                )
+            except Exception:
                 return False
-        # Step 2: 版本匹配 (或跳过检查) → SET 更新 + version 递增
-        if next_version is not None:
-            set_clause = f"{set_clause}, e.version = {next_version}"
-        try:
-            self._locked_execute(
-                f"MATCH (e:EpisodeNode {{id: '{node_id}'}}) SET {set_clause}"
-            )
-            return True
-        except Exception:
-            return False
+            if not result.rows:
+                return False  # 节点不存在
+            v = result.rows[0].get("v") if isinstance(result.rows[0], dict) else None
+            next_version = None
+            if expected_version is not None:
+                if v is None:
+                    return False  # 旧数据无 version 字段
+                try:
+                    if int(v) != int(expected_version):
+                        return False
+                    next_version = int(expected_version) + 1
+                except (TypeError, ValueError):
+                    return False
+            # Step 2: 版本匹配 (或跳过检查) → SET 更新 + version 递增
+            if next_version is not None:
+                set_clause = f"{set_clause}, e.version = {next_version}"
+            try:
+                self._session.execute(
+                    f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET {set_clause}"
+                )
+                return True
+            except Exception:
+                return False
 
     # ─── Hyperedge CRUD ─────────────────────────────
 
     def create_hyperedge_node(self, hyperedge: dict) -> str:
         hid = hyperedge.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values({k: v for k, v in hyperedge.items() if k != "id"})
-        gql = f"INSERT (h:HyperedgeNode {{id: '{hid}', {vals}}})"
+        # 【H1】id 经 _gql_value 转义
+        id_lit = _gql_value(str(hid))
+        gql = f"INSERT (h:HyperedgeNode {{id: {id_lit}, {vals}}})"
         self._locked_execute(gql)
         return hid
 
     def link_hyperedge_member(self, hyperedge_id: str, episode_id: str) -> None:
+        # 【H1】id 经 _gql_value 转义
+        hid_lit = _gql_value(str(hyperedge_id))
+        eid_lit = _gql_value(str(episode_id))
         gql = (
-            f"MATCH (h:HyperedgeNode {{id: '{hyperedge_id}'}}), "
-            f"(e:EpisodeNode {{id: '{episode_id}'}}) "
+            f"MATCH (h:HyperedgeNode {{id: {hid_lit}}}), "
+            f"(e:EpisodeNode {{id: {eid_lit}}}) "
             f"INSERT (h)-[:HYPEREDGE_MEMBER]->(e)"
         )
         self._locked_execute(gql)
 
     def get_hyperedge_members(self, hyperedge_id: str) -> list[dict]:
-        gql = f"MATCH (h:HyperedgeNode {{id: '{hyperedge_id}'}})-[:HYPEREDGE_MEMBER]->(e) RETURN e"
+        gql = f"MATCH (h:HyperedgeNode {{id: {_gql_value(str(hyperedge_id))}}})-[:HYPEREDGE_MEMBER]->(e) RETURN e"
         try:
             result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
@@ -486,7 +562,7 @@ class GraphLiteStore:
             return []
 
     def get_hyperedges_by_node(self, node_id: str) -> list[dict]:
-        gql = f"MATCH (h:HyperedgeNode)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode {{id: '{node_id}'}}) RETURN h"
+        gql = f"MATCH (h:HyperedgeNode)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode {{id: {_gql_value(str(node_id))}}}) RETURN h"
         try:
             result = self._locked_query(gql)
             return [self._flatten_row(r, "h") for r in result.rows]
@@ -566,30 +642,35 @@ class GraphLiteStore:
         注意: GraphLite 是 schemaless 图库，无 MERGE（Kuzu 语法）也无主键冲突，
         重复 INSERT 会创建重复节点 —— 必须用 查询-插入 两段式保证幂等。
         """
+        # 【H1】session_id 外部可达（X-Session-Id 头），经 _gql_value 转义
+        id_lit = _gql_value(str(session_id))
         try:
             result = self._locked_query(
-                f"MATCH (s:SessionNode {{id: '{session_id}'}}) RETURN s.id"
+                f"MATCH (s:SessionNode {{id: {id_lit}}}) RETURN s.id"
             )
             if result.rows:
                 return  # 已存在
         except Exception:
             pass  # 查询失败（如表不存在）时走创建路径
         self._locked_execute(
-            f"INSERT (s:SessionNode {{id: '{session_id}', "
+            f"INSERT (s:SessionNode {{id: {id_lit}, "
             f"created_at: {int(time.time())}, last_seen: {int(time.time())}}})"
         )
 
     def link_to_session(self, session_id: str, episode_id: str) -> None:
         """Link episode to session node."""
+        # 【H1】session_id/episode_id 经 _gql_value 转义（外部可达：X-Session-Id 头）
+        sid_lit = _gql_value(str(session_id))
+        eid_lit = _gql_value(str(episode_id))
         gql = (
-            f"MATCH (s:SessionNode {{id: '{session_id}'}}), "
-            f"(e:EpisodeNode {{id: '{episode_id}'}}) "
+            f"MATCH (s:SessionNode {{id: {sid_lit}}}), "
+            f"(e:EpisodeNode {{id: {eid_lit}}}) "
             f"INSERT (s)-[:SESSION_MEMBER]->(e)"
         )
         self._locked_execute(gql)
 
     def get_session_memories(self, session_id: str, limit: int = 100) -> list[dict]:
-        gql = f"MATCH (s:SessionNode {{id: '{session_id}'}})-[:SESSION_MEMBER]->(e) RETURN e LIMIT {limit}"
+        gql = f"MATCH (s:SessionNode {{id: {_gql_value(str(session_id))}}})-[:SESSION_MEMBER]->(e) RETURN e LIMIT {limit}"
         try:
             result = self._locked_query(gql)
             return [self._flatten_row(r, "e") for r in result.rows]
@@ -602,17 +683,21 @@ class GraphLiteStore:
         """获取或创建 SessionNode，返回 session_id（两段式幂等，参照 ensure_session）。"""
         self.ensure_session(session_id)
         if metadata:
+            # 【H1】session_id/metadata 经 _gql_value 转义（metadata 为外部可达 JSON 串）
             self._locked_execute(
-                f"MATCH (s:SessionNode {{id: '{session_id}'}}) "
-                f"SET s.metadata = '{metadata}'"
+                f"MATCH (s:SessionNode {{id: {_gql_value(str(session_id))}}}) "
+                f"SET s.metadata = {_gql_value(str(metadata))}"
             )
         return session_id
 
     def link_session_member(self, session_node_id: str, episode_id: str) -> None:
         """Link episode to session node（参照 link_to_session 的 MATCH + INSERT）。"""
+        # 【H1】session_node_id/episode_id 经 _gql_value 转义
+        sid_lit = _gql_value(str(session_node_id))
+        eid_lit = _gql_value(str(episode_id))
         gql = (
-            f"MATCH (s:SessionNode {{id: '{session_node_id}'}}), "
-            f"(e:EpisodeNode {{id: '{episode_id}'}}) "
+            f"MATCH (s:SessionNode {{id: {sid_lit}}}), "
+            f"(e:EpisodeNode {{id: {eid_lit}}}) "
             f"INSERT (s)-[:SESSION_MEMBER]->(e)"
         )
         self._locked_execute(gql)
@@ -621,12 +706,14 @@ class GraphLiteStore:
         """INSERT VisualNode。id 为必填；embedding 是 list，_gql_value 自动 b64 序列化。"""
         vid = node.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(node, skip_keys={"id"})
-        self._locked_execute(f"INSERT (v:VisualNode {{id: '{vid}', {vals}}})")
+        # 【H1】id 经 _gql_value 转义
+        id_lit = _gql_value(str(vid))
+        self._locked_execute(f"INSERT (v:VisualNode {{id: {id_lit}, {vals}}})")
         return vid
 
     def get_visual_node(self, visual_id: str) -> Optional[dict]:
         """MATCH VisualNode by id（参照 get_episode）。"""
-        gql = f"MATCH (v:VisualNode {{id: '{visual_id}'}}) RETURN v"
+        gql = f"MATCH (v:VisualNode {{id: {_gql_value(str(visual_id))}}}) RETURN v"
         try:
             result = self._locked_query(gql)
             if result.rows:
@@ -649,10 +736,12 @@ class GraphLiteStore:
 
         返回删除的 EpisodeNode 数。节点有关联关系必须 DETACH DELETE(skill 记过的坑)。
         """
+        # 【H1】namespace/eid 经 _gql_value 转义（外部可达：DELETE /namespaces/{ns}）
+        ns_lit = _gql_value(str(namespace))
         # 1. 找到该 namespace(SessionNode)下的所有 EpisodeNode
         try:
             result = self._locked_query(
-                f"MATCH (s:SessionNode {{id: '{namespace}'}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                f"MATCH (s:SessionNode {{id: {ns_lit}}})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                 f"RETURN e"
             )
             ep_ids = [self._flatten_row(r, "e").get("id", "") for r in result.rows]
@@ -665,7 +754,7 @@ class GraphLiteStore:
         for eid in ep_ids:
             try:
                 self._locked_execute(
-                    f"MATCH (e:EpisodeNode {{id: '{eid}'}}) DETACH DELETE e"
+                    f"MATCH (e:EpisodeNode {{id: {_gql_value(str(eid))}}}) DETACH DELETE e"
                 )
                 deleted += 1
             except Exception:
@@ -674,7 +763,7 @@ class GraphLiteStore:
         # 3. 删除 SessionNode 本身(及其残留关系)
         try:
             self._locked_execute(
-                f"MATCH (s:SessionNode {{id: '{namespace}'}}) DETACH DELETE s"
+                f"MATCH (s:SessionNode {{id: {ns_lit}}}) DETACH DELETE s"
             )
         except Exception:
             pass
@@ -771,9 +860,11 @@ class GraphLiteStore:
                 # Decode b64 content
                 for pk in flat:
                     if isinstance(flat[pk], str) and flat[pk].startswith('{b64}'):
+                        # 【L1】裸 except → ValueError：b64decode 抛 binascii.Error⊂ValueError，
+                        # decode 抛 UnicodeDecodeError⊂ValueError；语义不变，不再吞 KeyboardInterrupt。
                         try:
                             flat[pk] = b64decode(flat[pk][5:]).decode('utf-8')
-                        except:
+                        except ValueError:
                             pass
                 if label and k == label:
                     return flat

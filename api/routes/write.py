@@ -4,7 +4,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Any, Optional
 
 from core.defense import MemoryDefenseVerdict
 
@@ -38,6 +38,22 @@ _MEDIA_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shm-medi
 # GraphLite 无 MERGE。原"MATCH + INSERT"两段式若拆成两个 submit，读入队会
 # 消耗单写者额度且可能读到不一致快照；包成单个闭包整体入队，在写线程内
 # 同步完成"检查→写入"，顺序天然正确且不阻塞事件循环（对齐 .trio-plan §3.4）。
+
+
+def _write_episode_with_session(
+    store, episode_data: dict, namespace: Optional[str] = None
+) -> Any:
+    """【L4】create_episode + ensure_session + link_to_session 合成单次写队列提交。
+
+    原三步各自 qsubmit：create 成功但 ensure/link 失败（或队列满/超时卡在三步
+    中间）会留下无 session 链接的半写节点。合成单闭包后：create 一步失败即跳过
+    后两步（失败短路）。注意 GraphLite 无事务——这是"单槽 + 失败短路"而非原子。
+    """
+    eid = store.create_episode(episode_data)
+    if namespace:
+        store.ensure_session(namespace)
+        store.link_to_session(namespace, eid or episode_data.get("id"))
+    return eid
 
 
 def _upsert_conflict_node(store, conflict_node_id: str, episode_id: str, conflict_id: str) -> None:
@@ -129,18 +145,15 @@ async def write_sensory(
     else:
         # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
         # 【v5.23】写串行化：经写队列提交，不阻塞事件循环
-        await qsubmit(deps, deps.graphlite_store.create_episode, {
+        # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
+        await qsubmit(deps, _write_episode_with_session, deps.graphlite_store, {
             "id": record_id,
             "content": record.content,
             "source": record.source,
             "visibility": record.visibility,
             "created_at": start,
             "tau_initial": 1.0,
-        })
-        # 命名空间链接（同一 task 内三个 submit，FIFO 保证顺序）
-        if record.namespace:
-            await qsubmit(deps, deps.graphlite_store.ensure_session, record.namespace)
-            await qsubmit(deps, deps.graphlite_store.link_to_session, record.namespace, record_id)
+        }, record.namespace or None)
         if deps.dream_scheduler:
             await deps.dream_scheduler.on_node_created()
 
@@ -337,17 +350,15 @@ async def write_multimodal(
 
     # ── 写入 EpisodeNode（文本索引）──
     if merged_text and deps.graphlite_store is not None:
-        await qsubmit(deps, deps.graphlite_store.create_episode, {
+        # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
+        await qsubmit(deps, _write_episode_with_session, deps.graphlite_store, {
             "id": episode_id,
             "content": merged_text,
             "source": req.source,
             "visibility": req.visibility,
             "created_at": created_at,
             "tau_initial": 1.0,
-        })
-        if req.namespace:
-            await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
-            await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
+        }, req.namespace or None)
 
         # 通知梦境调度器
         if deps.dream_scheduler:
@@ -502,7 +513,9 @@ async def create_episode(
             episode_data["entity_name"] = val_result.entity_name
         if val_result.entity_value:
             episode_data["entity_value"] = val_result.entity_value
-    await qsubmit(deps, deps.graphlite_store.create_episode, episode_data)
+    # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
+    await qsubmit(deps, _write_episode_with_session, deps.graphlite_store,
+                  episode_data, req.namespace or None)
 
     # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
     # 【P0-1】用 hidden(决策时 SSM 状态)而非 hidden_prev:
@@ -520,10 +533,7 @@ async def create_episode(
             deps.quarantine_store.quarantine(episode_id, defense_reason, req.source)
             logger.info("Node %s quarantined after write: %s", episode_id[:12], defense_reason[:80])
 
-    # 命名空间链接
-    if req.namespace:
-        await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
-        await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
+    # 命名空间链接已并入 _write_episode_with_session 单闭包（L4，失败短路）
 
     # [Ontology v2] 写时类型验证
     if deps.ontology_v2 is not None:
@@ -800,6 +810,18 @@ async def _process_embed_queue(deps: Services) -> int:
     if deps.quarantine_store is not None:
         quarantined_set = deps.quarantine_store.get_quarantined_ids()
 
+    # 【P2】embed 批扫：get_all_connections 提到批循环外——每次 embed flush 只做
+    # 1 次全表 MATCH 读（to_thread 不阻塞 loop），循环内复用。update 是原地
+    # mutate，逐条语义不变。不给 get_all_hebbian_connections 加 LIMIT——会静默
+    # 截断连接图破坏 hebbian top-K 正确性。
+    conns: dict = {}
+    if deps.hebbian_updater and deps.graphlite_store:
+        try:
+            conns = await asyncio.to_thread(deps.graphlite_store.get_all_connections)
+        except Exception:
+            logger.exception("get_all_connections failed for embed batch")
+            conns = {}
+
     for episode_id, content, created_at in batch:
         # 隔离节点不加入 FAISS
         if episode_id in quarantined_set:
@@ -814,8 +836,7 @@ async def _process_embed_queue(deps: Services) -> int:
                     deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
                 try:
                     if deps.hebbian_updater and deps.graphlite_store:
-                        # 读留 loop（get_all_connections 是 MATCH 读），写随闭包入队
-                        conns = deps.graphlite_store.get_all_connections()
+                        # 【P2】conns 已提到批循环外（本批内复用），写随闭包入队
                         await qsubmit(deps, _run_hebbian_update,
                                       deps, {episode_id: 1.0}, conns)
                 except HTTPException:
@@ -850,19 +871,35 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         created = 0
         now = _now()
 
-        # 时态超边：最近 300s 内的同源节点
-        recent_rows = deps.graphlite_store.query_cypher(
+        # 【P7】时态 + 情节两条窗口查询合并为一条（3600s 窗 LIMIT 20）：
+        # 原单条路径 2 次全表 MATCH（300s LIMIT5 + 3600s LIMIT20），合并后
+        # Python 侧按 created_at >= now-300 过滤出 recent（行序保持 DESC）。
+        # 包 asyncio.to_thread——原实现 loop 上持锁同步读，不再冻结事件循环。
+        # 批量路径（_auto_create_hyperedges_batch）已各自合并，不动。
+        rows = await asyncio.to_thread(
+            deps.graphlite_store.query_cypher,
             "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
             "AND e.created_at >= $cutoff "
-            "RETURN e.id ORDER BY e.created_at DESC LIMIT 5",
-            {"id": episode_id, "src": source, "cutoff": now - 300},
+            "RETURN e.id, e.created_at ORDER BY e.created_at DESC LIMIT 20",
+            {"id": episode_id, "src": source, "cutoff": now - 3600},
         )
-        recent_ids = []
-        for row in recent_rows:
+        window_ids: list[str] = []
+        recent_ids: list[str] = []
+        for row in rows:
             if isinstance(row, (list, tuple)):
-                recent_ids.append(str(row[0]))
+                eid = str(row[0]) if row[0] is not None else ""
+                created_ts = row[1] if len(row) > 1 else None
             elif isinstance(row, dict):
-                recent_ids.append(str(row.get("id", "")))
+                eid = str(row.get("id", ""))
+                created_ts = row.get("created_at")
+            else:
+                continue
+            if not eid:
+                continue
+            window_ids.append(eid)
+            # 时态窗口（300s）：Python 侧过滤（行已按 created_at DESC 排序）
+            if created_ts is not None and float(created_ts) >= now - 300:
+                recent_ids.append(eid)
         if len(recent_ids) >= 2:
             # 用所有最近的 + 新节点一起创建时态超边
             member_ids = [episode_id] + recent_ids[:4]
@@ -878,20 +915,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
             created += 1
             logger.info("Auto-created TEMPORAL hyperedge (pair): source=%s", source)
 
-        # 情节超边：同一 source 在 3600s 内的节点池
-        window_rows = deps.graphlite_store.query_cypher(
-            "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
-            "AND e.created_at >= $cutoff_window "
-            "RETURN e.id ORDER BY e.created_at DESC LIMIT 20",
-            {"id": episode_id, "src": source, "cutoff_window": now - 3600},
-        )
-        window_ids = []
-        for row in window_rows:
-            if isinstance(row, (list, tuple)):
-                window_ids.append(str(row[0]))
-            elif isinstance(row, dict):
-                window_ids.append(str(row.get("id", "")))
-        # 如果同一 source 在 1h 内有 5+ 个节点 → 创建情节超边
+        # 情节超边：同一 source 在 3600s 内的节点池（来自合并查询）
         if len(window_ids) >= 4:
             member_ids = [episode_id] + window_ids[:7]
             # 【v5.23】超边创建入写队列

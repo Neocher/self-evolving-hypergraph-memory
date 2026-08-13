@@ -23,6 +23,7 @@ import math
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -127,7 +128,12 @@ class QueryRouter:
         self.tfidf_index = tfidf_index
         self.encoder = encoder
         self.faiss_id_map = faiss_id_map if faiss_id_map is not None else {}
-        self._episode_cache = episode_cache or {}  # 【Perf】共享 Services._episode_cache
+        # 【M5】共享 Services._episode_cache（EpisodeCache: OrderedDict LRU + TTL）。
+        # flush_faiss_buffer 是唯一写入方；传入 None（测试/降级）时退化为裸 dict，
+        # 行为与改造前一致（恒空）。
+        self._episode_cache = episode_cache if episode_cache is not None else {}
+        # 【M4】CJK 通道跳过一次性标志（进程内首次 warning，不刷屏）
+        self._cjk_warned = False
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
             "最近",
@@ -203,6 +209,9 @@ class QueryRouter:
         self._bm25_built: bool = False  # 标记构建是否成功（仅成功路径置位）
         self._bm25_last_attempt: float = 0.0  # 上次构建尝试时间（失败后冷却重试）
         self._bm25_build_lock = threading.Lock()  # 【P1-2】BM25 构建锁（防并发构建竞态）
+        # 【P4】BM25 构建进行中标志：构建期间 _bm25_search 返回旧索引/None，
+        # 不阻塞事件循环等待构建完成；锁只保护最终 swap（短临界区）。
+        self._bm25_building: bool = False
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -232,46 +241,65 @@ class QueryRouter:
     # ──────────────────────────────
 
     def _build_bm25_index(self) -> None:
-        """构建 BM25 检索索引（防并发构建竞态 + 空语料冷却重试）。
+        """构建 BM25 检索索引（同步入口，供测试/兼容直接调用）。
 
-        【M1-a】改进（对比 P1-2 的阻塞锁）：
-          - 先无锁快速检查 _bm25_built/_bm25_ready：已构建/已就绪则直接返回
-          - try-acquire（非阻塞）：拿不到锁说明已有构建进行中（可能被 prewarm
-            超时遗留的 zombie 线程持有）→ 直接返回，不阻塞查询线程
-          - 持锁后二次检查：等锁期间另一线程可能已完成构建 → 杜绝并发双重构建
+        【P4】重构（对比 M1-a 的整构建持锁）：
+          - _bm25_building 标志防并发构建（构建中后续调用直接跳过，返回旧索引/None）
+          - 锁只保护最终 swap（_swap_bm25_index 短临界区），GQL 拉取 + fit 在锁外
+            以本地变量计算 → prewarm 超时遗留的 zombie 构建不会永久钉死锁
+          - 失败/空语料不置位 _bm25_built（保留冷却窗口重试机会）
         """
-        if getattr(self, "_bm25_built", False) or getattr(self, "_bm25_ready", False):
+        if (getattr(self, "_bm25_built", False)
+                or getattr(self, "_bm25_ready", False)
+                or getattr(self, "_bm25_building", False)):
             return
-        lock = getattr(self, "_bm25_build_lock", None)
-        if lock is None:
-            self._bm25_last_attempt = time.time()
-            self._build_bm25_index_core()
-            return
-        # 非阻塞 try-acquire：zombie 持锁时跳过本次构建，不卡住查询线程
-        if not lock.acquire(blocking=False):
-            logger.debug("BM25: build already in progress (or lock held), skipping")
-            return
+        self._bm25_building = True
+        self._bm25_last_attempt = time.time()
         try:
-            # 持锁后二次检查：等待期间另一线程可能已完成构建
-            if getattr(self, "_bm25_built", False) or getattr(self, "_bm25_ready", False):
-                return
-            self._bm25_last_attempt = time.time()
-            self._build_bm25_index_core()
+            state = self._build_bm25_index_core()
+            if state is not None:
+                self._swap_bm25_index(state)
         finally:
-            lock.release()
+            self._bm25_building = False
 
-    def _build_bm25_index_core(self) -> None:
-        """BM25 索引构建核心逻辑（调用方需持有 _bm25_build_lock）。
+    async def _build_bm25_index_async(self) -> None:
+        """异步构建 BM25：fit_transform 经 asyncio.to_thread 在线程执行。
+
+        供 prewarm_bm25 使用（不阻塞事件循环）；构建期间查询线程见
+        _bm25_building 标志即返回旧索引/None。
+        """
+        if (getattr(self, "_bm25_built", False)
+                or getattr(self, "_bm25_ready", False)
+                or getattr(self, "_bm25_building", False)):
+            return
+        self._bm25_building = True
+        self._bm25_last_attempt = time.time()
+        try:
+            state = await asyncio.to_thread(self._build_bm25_index_core)
+            if state is not None:
+                self._swap_bm25_index(state)
+        finally:
+            self._bm25_building = False
+
+    def _build_bm25_index_core(self):
+        """BM25 索引构建核心（纯计算：不持锁、不改实例属性）。
 
         从 GraphLite Store 拉取 EpisodeNode 内容（LIMIT 下推到数据库侧），
         使用 sklearn TfidfVectorizer 计算 IDF，并预计算文档长度用于 BM25 评分。
 
-        【M1】_bm25_built 仅在成功路径置位：query_cypher 异常/空语料/
-        TfidfVectorizer 异常时保留重试机会，避免"失败一次即永久降级"。
+        【P4】全程本地变量计算 → 返回 state 元组，由调用方在短临界区内一次性
+        swap（_swap_bm25_index）。锁不再横跨 GQL 拉取 + fit。
+
+        【M1】_bm25_built 仅由 _swap_bm25_index 在成功路径置位：query_cypher
+        异常/空语料/TfidfVectorizer 异常时返回 None，保留重试机会。
+
+        Returns:
+            state = (vectorizer, doc_ids, doc_contents, doc_tau,
+                     term_matrix, idf, doc_lens, avgdl)，失败返回 None。
         """
         if self.graphlite_store is None:
             logger.warning("BM25: graphlite_store unavailable, skipping index build")
-            return
+            return None
 
         try:
             rows = self.graphlite_store.query_cypher(
@@ -284,7 +312,7 @@ class QueryRouter:
             )
         except Exception:
             logger.exception("BM25: failed to fetch corpus from GraphLite")
-            return
+            return None
 
         if not rows:
             # 【B-复审】空语料非终态：不置位 _bm25_built/_bm25_ready，
@@ -296,11 +324,11 @@ class QueryRouter:
                 logger.warning("BM25: empty corpus from GraphLite")
             else:
                 logger.debug("BM25: empty corpus from GraphLite (will retry after cooldown)")
-            return
+            return None
 
-        self._bm25_doc_ids.clear()
-        self._bm25_doc_contents.clear()
-        self._bm25_doc_tau.clear()
+        doc_ids: list[str] = []
+        doc_contents: list[str] = []
+        doc_tau: list[float] = []
         corpus: list[str] = []
 
         for row in rows:
@@ -317,9 +345,9 @@ class QueryRouter:
 
             if not nid or not content.strip():
                 continue
-            self._bm25_doc_ids.append(nid)
-            self._bm25_doc_contents.append(content)
-            self._bm25_doc_tau.append(tau)
+            doc_ids.append(nid)
+            doc_contents.append(content)
+            doc_tau.append(tau)
             corpus.append(content)
 
         if not corpus:
@@ -330,7 +358,7 @@ class QueryRouter:
                 logger.warning("BM25: no valid documents in corpus")
             else:
                 logger.debug("BM25: no valid documents in corpus (will retry after cooldown)")
-            return
+            return None
 
         # 限制语料大小，防 OOM
         max_corpus = self.config.max_bm25_corpus
@@ -338,9 +366,9 @@ class QueryRouter:
             logger.warning("BM25: corpus too large (%d), truncating to %d",
                            len(corpus), max_corpus)
             corpus = corpus[:max_corpus]
-            self._bm25_doc_ids = self._bm25_doc_ids[:max_corpus]
-            self._bm25_doc_contents = self._bm25_doc_contents[:max_corpus]
-            self._bm25_doc_tau = self._bm25_doc_tau[:max_corpus]
+            doc_ids = doc_ids[:max_corpus]
+            doc_contents = doc_contents[:max_corpus]
+            doc_tau = doc_tau[:max_corpus]
 
         try:
             # 中文检索：使用字符级 bigram/trigram/4-gram（与 TfidfEncoder 一致），
@@ -358,33 +386,58 @@ class QueryRouter:
             doc_lens = tf_matrix.sum(axis=1).A1  # (n_docs,)
             avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
 
-            self._bm25_vectorizer = vectorizer
-            self._bm25_doc_term_matrix = tf_matrix
-            self._bm25_idf = idf
-            self._bm25_doc_lens = doc_lens
-            self._bm25_avgdl = avgdl
-            # 【M1】成功路径末尾置位：失败（上方各 return/except）不置位，保留重试机会
-            self._bm25_ready = True
-            self._bm25_built = True
             logger.info(
                 "BM25 index built",
                 num_docs=len(corpus),
                 features=len(idf),
                 avgdl=round(avgdl, 2),
             )
+            return (vectorizer, doc_ids, doc_contents, doc_tau,
+                    tf_matrix, idf, doc_lens, avgdl)
         except Exception:
             logger.exception("BM25: TfidfVectorizer failed")
+            return None
+
+    def _swap_bm25_index(self, state) -> None:
+        """短临界区：持 _bm25_build_lock 一次性 swap BM25 索引状态。
+
+        state 由 _build_bm25_index_core 本地计算返回，此处只做赋值，
+        锁不横跨 GQL 拉取 + fit（prewarm 超时 zombie 不会永久钉死锁）。
+        """
+        (vectorizer, doc_ids, doc_contents, doc_tau,
+         term_matrix, idf, doc_lens, avgdl) = state
+
+        def _assign() -> None:
+            self._bm25_vectorizer = vectorizer
+            self._bm25_doc_ids = doc_ids
+            self._bm25_doc_contents = doc_contents
+            self._bm25_doc_tau = doc_tau
+            self._bm25_doc_term_matrix = term_matrix
+            self._bm25_idf = idf
+            self._bm25_doc_lens = doc_lens
+            self._bm25_avgdl = avgdl
+            # 【M1】成功路径末尾置位：失败/空语料（core 返回 None）不置位，保留重试机会
+            self._bm25_ready = True
+            self._bm25_built = True
+
+        lock = getattr(self, "_bm25_build_lock", None)
+        if lock is not None:
+            with lock:
+                _assign()
+        else:
+            _assign()
 
     async def prewarm_bm25(self) -> None:
         """异步预热 BM25 索引（启动时调用，不阻塞事件循环）。
 
-        - 构建放到线程池执行（asyncio.to_thread），避免阻塞事件循环
+        - 构建经 _build_bm25_index_async：fit_transform 放线程池（asyncio.to_thread）
         - 受 bm25_build_timeout 超时保护；超时/失败静默降级（_bm25_ready=False），
           首个查询走延迟构建或直接返回空，不影响启动
+        - 超时取消后 _bm25_building 在 finally 复位，zombie 构建不持锁（_swap 短临界区）
         """
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(self._build_bm25_index),
+                self._build_bm25_index_async(),
                 timeout=self.config.bm25_build_timeout,
             )
         except asyncio.TimeoutError:
@@ -408,11 +461,18 @@ class QueryRouter:
         """
         # 【M1】懒构建：失败不置位 _bm25_built → 保留重试机会；
         # 以 bm25_retry_cooldown 为冷却窗口，避免失败后每次检索都触发全量重建
+        # 【P4】构建进行中（_bm25_building）→ 不阻塞等待，返回旧索引/None；
+        # 旧索引可用（_bm25_ready）时直接使用，否则返回空。
         if not self._bm25_built:
-            last_attempt = getattr(self, "_bm25_last_attempt", 0.0)
-            if (last_attempt == 0.0
-                    or time.time() - last_attempt >= self.config.bm25_retry_cooldown):
-                self._build_bm25_index()
+            if getattr(self, "_bm25_building", False):
+                if not self._bm25_ready:
+                    logger.debug("BM25: index building in progress, returning empty")
+                    return []
+            else:
+                last_attempt = getattr(self, "_bm25_last_attempt", 0.0)
+                if (last_attempt == 0.0
+                        or time.time() - last_attempt >= self.config.bm25_retry_cooldown):
+                    self._build_bm25_index()
         if not self._bm25_ready or self._bm25_vectorizer is None:
             # 【日志降噪】索引未就绪（空库/构建中）是正常状态，debug 即可
             logger.debug("BM25: index not ready")
@@ -749,6 +809,11 @@ class QueryRouter:
 
         同时运行向量、BM25、实体匹配三条通道，输出加权融合结果。
 
+        【P6】vector/bm25/entity 三路经 ThreadPoolExecutor(max_workers=3) 并行
+        执行（docstring 的"并行"变真）；逐通道收结果保持现有 try/except 降级，
+        结果合并逻辑（_fuse_results）不变。【M4】CJK 跳过实体通道逻辑不破坏：
+        CJK 查询不提交 entity 任务（省一次全表扫描），一次性 warning 标志保留。
+
         Args:
             query: 归一化后的查询文本
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
@@ -759,29 +824,54 @@ class QueryRouter:
         """
         cfg = self.config
 
-        # 1. 向量通道
+        # 【M4】CJK 查询跳过实体通道：GraphLite lexer 不支持 UTF-8，CONTAINS 对
+        # 中文无子串保持性（b64 块编码），通道恒空——纯省一次全表扫描。
+        # 在提交任务前判断：CJK 时根本不提交 entity 任务。
+        skip_entity = any("一" <= ch <= "鿿" for ch in query)
+        if skip_entity and not self._cjk_warned:
+            self._cjk_warned = True
+            logger.warning("Fusion: CJK query detected, skipping entity channel (CONTAINS not UTF-8 safe)")
+
         vector_results: list[dict] = []
-        try:
-            vector_results = self._vector_retrieve(query, query_embedding)
-        except FAISSUnavailable:
-            logger.warning("Fusion: vector channel unavailable, skipping")
-        except Exception:
-            logger.exception("Fusion: vector channel failed")
-
-        # 2. BM25 通道（用未归一化的原始查询：语料为原始中文，归一化后无交集）
         bm25_results: list[dict] = []
-        try:
-            bm25_query = raw_query if raw_query is not None else query
-            bm25_results = self._bm25_search(bm25_query, cfg.top_k_vector)
-        except Exception:
-            logger.exception("Fusion: BM25 channel failed")
-
-        # 3. 实体匹配通道
         entity_results: list[dict] = []
-        try:
-            entity_results = self._entity_match(query, cfg.top_k_keyword)
-        except Exception:
-            logger.exception("Fusion: entity match channel failed")
+
+        def _run_vector():
+            return self._vector_retrieve(query, query_embedding)
+
+        def _run_bm25():
+            # BM25 通道用未归一化的原始查询：语料为原始中文，归一化后无交集
+            bm25_query = raw_query if raw_query is not None else query
+            return self._bm25_search(bm25_query, cfg.top_k_vector)
+
+        def _run_entity():
+            return self._entity_match(query, cfg.top_k_keyword)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures: dict = {}
+            futures["vector"] = pool.submit(_run_vector)
+            futures["bm25"] = pool.submit(_run_bm25)
+            if not skip_entity:
+                futures["entity"] = pool.submit(_run_entity)
+
+            for channel in ("vector", "bm25", "entity"):
+                fut = futures.get(channel)
+                if fut is None:
+                    continue
+                try:
+                    result = fut.result()
+                except FAISSUnavailable:
+                    logger.warning("Fusion: %s channel unavailable, skipping", channel)
+                    continue
+                except Exception:
+                    logger.exception("Fusion: %s channel failed", channel)
+                    continue
+                if channel == "vector":
+                    vector_results = result
+                elif channel == "bm25":
+                    bm25_results = result
+                else:
+                    entity_results = result
 
         logger.info(
             "Fusion retrieval results",
@@ -825,11 +915,12 @@ class QueryRouter:
         # GraphLite 批量回查获取节点详情
         node_uuids = list(uuid_map.values())
         episodes_dict: dict[str, dict] = {}
-        if node_uuids and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
+        missing = [u for u in node_uuids if u not in self._episode_cache]
+        if missing and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in self.graphlite_store.get_episodes_batch(node_uuids)
+                    for ep in self.graphlite_store.get_episodes_batch(missing)
                 }
             except CircuitBreakerOpen:
                 raise  # 熔断跳闸：向上传播，由 retrieve() L613 级联到 L2
@@ -1025,6 +1116,14 @@ class QueryRouter:
             logger.warning("L4 fallback: graphlite_store unavailable")
             return []
 
+        # 【M4】CJK 查询直接返回 []：GraphLite CONTAINS 对中文无子串保持性
+        # （b64 块编码），L4 兜底通道对中文恒空——纯省一次全表扫描。
+        if any("一" <= ch <= "鿿" for ch in query):
+            if not self._cjk_warned:
+                self._cjk_warned = True
+                logger.warning("L4 fallback: CJK query skipped (CONTAINS not UTF-8 safe)")
+            return []
+
         logger.info("L4 fallback: querying GraphLite directly", query=query[:80])
         try:
             # 提取关键词（取前5个有意义的词）
@@ -1168,7 +1267,7 @@ class QueryRouter:
         unique: list[dict] = []
         for r in sorted(results, key=lambda x: x["score"], reverse=True):
             content = r.get("content", "")
-            key = content[:100]
+            key = (content or r.get("node_id") or "")[:100]
             if key and key not in seen:
                 seen.add(key)
                 unique.append(r)

@@ -61,6 +61,10 @@ async def _fast_pipeline(*args, **kwargs):
 
 
 class _RecordingQueue:
+    max_pending = 100
+
+    def pending_count(self) -> int:
+        return 0
     """记录 submit 的 fn 名并按同步方式执行（模拟单写线程）。"""
 
     def __init__(self):

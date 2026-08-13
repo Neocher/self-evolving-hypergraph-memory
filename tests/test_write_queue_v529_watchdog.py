@@ -232,11 +232,11 @@ class TestResidualFpBoundary:
     def test_over_window_long_write_with_sustained_traffic(self, caplog):
         """① 无持续流量：超窗长写单条（无并发 submit 超时）不告警——检测依赖持续
         写流量（只有 submit 超时事件才累计计数）。
-        ② 超窗长写 + 持续流量：心跳无法区分"超窗长写"与真死锁 → 已文档化残留误报，
-        恰 1 条 critical（M1.4 文案 worker unresponsive (alive or dead)）。
+        ② 超窗长写 + 持续流量：注入 ping_fn=True（M1 探针通过）→ L3③ 降级为
+        warning 不 critical（修复前为已文档化残留误报 1 条 critical）。
         ③ 长写完成 → 队列恢复，成功路径清理计数与 _stuck_since → 不复发。
         """
-        q = WriteQueue(max_pending=50, wait_timeout=0.05)
+        q = WriteQueue(max_pending=50, wait_timeout=0.05, ping_fn=lambda: True)
         try:
             q._stuck_timeout = 0.2
             q._stuck_observe_window = 0.4
@@ -260,7 +260,7 @@ class TestResidualFpBoundary:
                 await asyncio.sleep(0.15)
                 crits = [r for r in caplog.records if r.levelname == "CRITICAL"]
                 assert not crits, "无持续流量时不应告警（检测依赖持续写流量）"
-                # ② 持续流量：并发 6 个超时 submit → 单批仅一条（残留误报，已文档化）
+                # ② 持续流量：并发 6 个超时 submit → 触发疑似；ping 通过 → 降级 warning
                 tasks = [asyncio.create_task(q.submit(lambda: 1)) for _ in range(6)]
                 for t in tasks:
                     with pytest.raises(asyncio.TimeoutError):
@@ -275,14 +275,154 @@ class TestResidualFpBoundary:
                 assert q._deadlock_suspect_count == 0, "恢复后计数应归零"
                 assert q._stuck_since is None, "恢复后 stuck 起算时刻应清理（M1.3）"
 
+            with caplog.at_level(logging.WARNING, logger="core.write_queue"):
+                asyncio.run(run())
+            crits = [r for r in caplog.records if r.levelname == "CRITICAL"]
+            assert not crits, (
+                f"L3③：ping 通过（引擎存活）→ 慢写降级 warning 不 critical，"
+                f"实际 {len(crits)}: {[r.getMessage() for r in crits]}"
+            )
+            warns = [r for r in caplog.records if r.levelname == "WARNING"
+                     and "ping ok" in r.getMessage()]
+            assert warns, "ping 通过应输出降级 warning"
+        finally:
+            release.set()
+            q.shutdown()
+
+    def test_completed_between_timeouts_resets_suspect(self, caplog):
+        """L3①：两次超时之间有任务完成 → 慢写非死锁，疑似计数归零不累计。
+
+        每个 cycle：在途慢写卡过观察窗（计数 1）→ 放行完成（_completed_tasks+1）
+        → 下一 cycle 计数前见完成 → 归零。反复多次也不到 3 → 无 critical。
+        """
+        q = WriteQueue(max_pending=10, wait_timeout=0.05)
+        try:
+            q._stuck_timeout = 0.2
+            q._stuck_observe_window = 0.4
+            entered = threading.Event()
+            release = threading.Event()
+
+            def gated():
+                entered.set()
+                release.wait(5)
+
+            async def run():
+                for _ in range(4):
+                    t = asyncio.create_task(q.submit(gated))
+                    await asyncio.to_thread(entered.wait, 2)
+                    entered.clear()
+                    # 模拟超窗慢写：心跳过期 + stuck 起算时刻在观察窗外
+                    q._last_activity = time.monotonic() - q._stuck_timeout - 1
+                    q._stuck_since = time.monotonic() - q._stuck_observe_window - 1
+                    # 1 次超时 submit → 计数 +1（或见完成后被归零再 +1）
+                    with pytest.raises(asyncio.TimeoutError):
+                        await q.submit(lambda: 1)
+                    # 放行：写线程完成 gated + lambda → _completed_tasks +2
+                    release.set()
+                    for _ in range(100):
+                        if q.pending_count() == 0:
+                            break
+                        await asyncio.sleep(0.01)
+                    release.clear()
+
             with caplog.at_level(logging.CRITICAL, logger="core.write_queue"):
                 asyncio.run(run())
             crits = [r for r in caplog.records if r.levelname == "CRITICAL"]
-            assert len(crits) == 1, (
-                f"超窗长写+持续流量为已文档化残留误报：应恰好 1 条 critical，"
+            assert not crits, (
+                f"L3①：两次超时之间有完成 → 不 critical，"
                 f"实际 {len(crits)}: {[r.getMessage() for r in crits]}"
             )
-            assert "unresponsive" in crits[0].getMessage(), "M1.4 文案应覆盖 alive or dead"
+            assert q._deadlock_suspect_count < 3, "计数不应残留到可再次触发告警"
         finally:
             release.set()
+            q.shutdown()
+
+    def test_true_deadlock_with_failed_ping_still_alerts(self, caplog):
+        """L3③ 判别性：ping 失败（引擎不可达）→ 仍 critical（只有 ping 通过才降级）。"""
+        q = WriteQueue(max_pending=10, wait_timeout=0.05, ping_fn=lambda: False)
+        try:
+            q._stuck_timeout = 0.2
+            q._stuck_observe_window = 0.4
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked():
+                entered.set()
+                release.wait(30)  # 引擎级死锁：永不返回
+
+            async def run():
+                t1 = asyncio.create_task(q.submit(blocked))
+                await asyncio.to_thread(entered.wait, 2)
+                q._last_activity = time.monotonic() - q._stuck_timeout - 1
+                q._stuck_since = time.monotonic() - q._stuck_observe_window - 1
+                for _ in range(3):
+                    with pytest.raises(asyncio.TimeoutError):
+                        await q.submit(lambda: 1)
+                with pytest.raises(asyncio.TimeoutError):
+                    await t1
+
+            with caplog.at_level(logging.CRITICAL, logger="core.write_queue"):
+                asyncio.run(run())
+            crits = [r for r in caplog.records if r.levelname == "CRITICAL"]
+            assert any(
+                "manual restart required" in r.getMessage() for r in crits
+            ), "ping 失败（引擎不可达）→ 真死锁仍应 critical"
+            # L3② 文案：critical 附在途任务 repr + 心跳时长
+            crit = [r for r in crits if "manual restart required" in r.getMessage()][0]
+            msg = crit.getMessage()
+            assert "heartbeat_age=" in msg, "critical 文案应附心跳时长（L3②）"
+            assert "in-flight=" in msg, "critical 文案应附在途任务 repr（L3②）"
+        finally:
+            release.set()
+            q.shutdown()
+
+
+class TestM1Diagnose:
+    """M1：diagnose() 引擎级死锁探测——只读快照，不触发写/重启。"""
+
+    def test_diagnose_idle(self):
+        """空闲队列 → 快照字段齐全、worker_alive=True。"""
+        q = WriteQueue(max_pending=5, wait_timeout=0.05)
+        try:
+            d = q.diagnose()
+            assert d["worker_alive"] is True
+            assert isinstance(d["heartbeat_age"], float)
+            assert d["depth"] == 0
+            assert d["current_task"] == "none"
+            assert isinstance(d["stack"], str)
+        finally:
+            q.shutdown()
+
+    def test_diagnose_inflight_task(self):
+        """在途任务 → current_task 含 repr（写线程设置 _current_task 快照）。"""
+        import threading
+        q = WriteQueue(max_pending=5, wait_timeout=0.05)
+        entered = threading.Event()
+        release = threading.Event()
+        try:
+            def gated():
+                entered.set()
+                release.wait(5)
+            import asyncio
+            async def run():
+                task = asyncio.create_task(q.submit(gated))
+                await asyncio.to_thread(entered.wait, 2)
+                d = q.diagnose()
+                assert d["worker_alive"] is True
+                assert d["current_task"] != "none", "在途任务应有快照 repr"
+                assert "gated" in d["current_task"], f"repr 应含函数名: {d['current_task']}"
+                release.set()
+                await task
+            asyncio.run(run())
+        finally:
+            release.set()
+            q.shutdown()
+
+    def test_diagnose_does_not_restart_or_write(self):
+        """判别性：diagnose 只读——不触发 _restart_worker、不调用 ping_fn。"""
+        q = WriteQueue(max_pending=5, wait_timeout=0.05, ping_fn=lambda: (_ for _ in ()).throw(AssertionError("ping 不应被 diagnose 调用")))
+        try:
+            d = q.diagnose()
+            assert d["worker_alive"] is True
+        finally:
             q.shutdown()

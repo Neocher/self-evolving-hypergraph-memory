@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -85,7 +86,20 @@ class WriteQueue:
         wait_timeout: 调用方等待单次写完成的最长时间（秒）。
     """
 
-    def __init__(self, max_pending: int = 100, wait_timeout: float = 30.0):
+    def __init__(
+        self,
+        max_pending: int = 100,
+        wait_timeout: float = 30.0,
+        ping_fn: Optional[Callable[[], bool]] = None,
+    ):
+        """
+        Args:
+            max_pending: 入队积压上限，满则 submit 抛 WriteQueueFullError（背压）。
+            wait_timeout: 调用方等待单次写完成的最长时间（秒）。
+            ping_fn: 【L3/M1】可选引擎存活探针（True=引擎存活，慢写而非死锁）。
+                由 app 注入：独立 daemon 连接 + 1 条 trivial 查询，join(timeout) 兜底。
+                探针通过 → critical 降级为 warning；失败/挂 → 仍 critical。
+        """
         self._q: queue.Queue = queue.Queue(maxsize=max_pending)
         self._wait_timeout = wait_timeout
         self._closed = False
@@ -113,6 +127,14 @@ class WriteQueue:
         # 会误导运营重启打断合法长写。真死锁的 stuck 状态必然持续存在。
         self._stuck_observe_window: float = self._stuck_timeout * 2
         self._stuck_since: Optional[float] = None  # 首次检测到 stuck 的时刻
+        # 【L3】完成计数：写线程每完成一个任务 +1（_stuck_lock 保护）。两次超时之间
+        # 有完成 → 慢写非死锁，疑似计数归零不累计（"连续 N 次超时" = 相邻超时
+        # 之间无成功，完成即证明队列在推进）。
+        self._completed_tasks = 0
+        self._completed_at_last_suspect = 0
+        # 【L3】当前在途任务快照（写线程侧设置；critical 文案附 repr）
+        self._current_task: Optional[_WriteTask] = None
+        self._ping_fn = ping_fn
 
     # ─── 事件循环侧：唯一入口 ───────────────────────────
 
@@ -161,23 +183,52 @@ class WriteQueue:
             # 人工重启。不自动重启。M1 观察窗：须 stuck 状态持续超过
             # _stuck_observe_window（2×stuck_timeout）才计数——单步长写会短暂心跳
             # 过期但会恢复，不满足"持续" → 不误报。
+            # 【L3】慢写非死锁：两次超时之间有任务完成（_completed_tasks 增加）
+            # → 队列在推进，疑似计数归零不累计。
             if self._is_stuck_sustained():
+                should_alert = False
                 with self._stuck_lock:
+                    if self._completed_tasks > self._completed_at_last_suspect:
+                        self._deadlock_suspect_count = 0
+                    self._completed_at_last_suspect = self._completed_tasks
                     self._deadlock_suspect_count += 1
                     if self._deadlock_suspect_count >= 3:
                         now = time.monotonic()
-                        if (self._last_critical_at is None
-                                or now - self._last_critical_at >= self._critical_debounce):
-                            # M2.1 时间去抖：同一批并发超时对齐时只告警一次（计数
-                            # 归零后剩余并发又凑满 3 次 → 旧逻辑单批多次告警）。
-                            # 文案 M1.4：worker unresponsive (alive or dead) 同时
-                            # 覆盖线程死亡场景（_is_stuck 对死亡线程恒真）。
-                            logger.critical(
-                                "write queue worker unresponsive (alive or dead); "
-                                "manual restart required"
-                            )
-                            self._last_critical_at = now
+                        # M2.1 时间去抖：同一批并发超时对齐时只告警一次（计数
+                        # 归零后剩余并发又凑满 3 次 → 旧逻辑单批多次告警）。
+                        should_alert = (
+                            self._last_critical_at is None
+                            or now - self._last_critical_at >= self._critical_debounce
+                        )
                         self._deadlock_suspect_count = 0  # 门控"连续 ≥3 次超时"
+                if should_alert:
+                    # 【L3③】M1 ping 联动：锁外 ping（有界调用）。引擎存活
+                    # （ping 通过）→ 慢写而非死锁，降级 warning 不 critical。
+                    ping_ok = False
+                    if self._ping_fn is not None:
+                        try:
+                            ping_ok = bool(self._ping_fn())
+                        except Exception:
+                            ping_ok = False
+                    if ping_ok:
+                        logger.warning(
+                            "write queue worker slow (ping ok, alive); "
+                            "degraded, no restart"
+                        )
+                    else:
+                        # 文案 L3②：附当前在途任务 repr + 心跳时长；M1.4 文案
+                        # worker unresponsive (alive or dead) 同时覆盖线程死亡场景。
+                        heartbeat_age = time.monotonic() - self._last_activity
+                        current = self._current_task
+                        task_repr = repr(current) if current is not None else "none"
+                        logger.critical(
+                            "write queue worker unresponsive (alive or dead); "
+                            "manual restart required; "
+                            "heartbeat_age=%.1fs in-flight=%s",
+                            heartbeat_age, task_repr,
+                        )
+                        with self._stuck_lock:
+                            self._last_critical_at = time.monotonic()
             raise
         # 【F6-M2】成功路径清理：本次请求在 wait_timeout 内真实完成 → 写线程在推进，
         # 此前累积的死锁疑似不成立（"连续 N 次超时" = 相邻超时之间无成功）。同锁内
@@ -200,13 +251,20 @@ class WriteQueue:
             try:
                 # 【F3】心跳：任务开始前打点（即便任务卡死也能检测）
                 self._touch_activity()
+                # 【L3】在途任务快照（看门狗 critical 文案附 repr）
+                self._current_task = task
                 result = task.fn(*task.args, **task.kwargs)
                 task.fut.set_result(result)
             except BaseException as exc:  # 含 GraphLite 异常 / CircuitBreakerOpen
                 task.fut.set_exception(exc)
             finally:
+                self._current_task = None
                 self._touch_activity()
                 self._q.task_done()
+                # 【L3】完成计数（_stuck_lock 保护）：submit 超时分支用它判定
+                # "两次超时之间队列有完成 → 慢写非死锁"。
+                with self._stuck_lock:
+                    self._completed_tasks += 1
 
     def _touch_activity(self) -> None:
         with self._stuck_lock:
@@ -276,6 +334,39 @@ class WriteQueue:
     def max_pending(self) -> int:
         return self._q.maxsize
 
+    # ─── M1 引擎级死锁探测（只读诊断，供 health 端点）──────────
+
+    def diagnose(self) -> dict:
+        """返回写队列/写线程诊断快照（只读，不触发任何写/重启）。
+
+        【M1】只做探测、不做自动重建——自动重建 = 从另一线程关/重建 GraphLite，
+        属 8/12 事故区禁止。重建仍由 systemd/人工决策。
+        返回: {worker_alive, heartbeat_age, depth, current_task, stack}。
+        """
+        with self._stuck_lock:
+            heartbeat_age = time.monotonic() - self._last_activity
+            current = self._current_task
+            task_repr = repr(current) if current is not None else "none"
+        stack = ""
+        if self._worker.is_alive():
+            try:
+                frames = sys._current_frames()
+                fid = self._worker.ident
+                if fid in frames:
+                    import traceback
+                    stack = "".join(
+                        traceback.format_stack(frames[fid])
+                    ).strip()
+            except Exception:
+                stack = "<unavailable>"
+        return {
+            "worker_alive": bool(self._worker.is_alive()),
+            "heartbeat_age": round(heartbeat_age, 3),
+            "depth": self._q.qsize(),
+            "current_task": task_repr,
+            "stack": stack,
+        }
+
     # ─── 优雅关闭 ──────────────────────────────────────
 
     def shutdown(self, drain: bool = True, drain_timeout: float = 10.0) -> None:
@@ -306,11 +397,35 @@ class WriteQueue:
         try:
             self._q.put_nowait(_SENTINEL)
         except queue.Full:
-            # MED-4：worker 卡死 + 积压达 maxsize 时阻塞 put 会永久等空位，
-            # join 兜底永远执行不到 → uvicorn 关闭挂起。worker 卡死时 join
-            # 本就会超时，daemon 线程随进程退出清理，跳过 sentinel 无害。
+            # 【M3】worker 卡死 + 队列真满时阻塞 put 会永久等空位，join 兜底永远
+            # 执行不到 → uvicorn 关闭挂起。改为 get_nowait 循环清空积压：对每个
+            # 未完成的 _WriteTask 先 fut.set_exception(WriteQueueClosedError) 再
+            # task_done()——等待方立即失败而非各自挂到 wait_for 超时；然后重放
+            # sentinel（worker 若恢复则正常退出）。不新增消费者（仍是单写线程）。
+            failed = 0
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if isinstance(item, _WriteTask) and not item.fut.done():
+                        item.fut.set_exception(
+                            WriteQueueClosedError(
+                                "write queue closed during shutdown with pending task"
+                            )
+                        )
+                        failed += 1
+                finally:
+                    self._q.task_done()
             logger.warning(
-                "WriteQueue shutdown: queue full, skipping sentinel "
-                "(worker stuck; daemon thread cleaned by process exit)"
+                "WriteQueue shutdown: queue full, failed %d pending task(s) "
+                "(worker stuck; daemon thread cleaned by process exit)",
+                failed,
             )
+            # 重放 sentinel：积压已清空，队列必有空位
+            try:
+                self._q.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
         self._worker.join(timeout=5.0)

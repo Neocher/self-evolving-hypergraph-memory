@@ -88,7 +88,7 @@ class TestFlushFaissBuffer:
         deps.faiss_id_map = None
         deps._faiss_buffer.append((1, np.random.randn(384).astype(np.float32)))
         count = flush_faiss_buffer(deps)
-        assert count == 1
+        assert count == 0  # 无 faiss_id_map → 无可写缓存项 (M5 语义), 不崩即达标
 
 
 class TestIncrementalFaissUpdate:

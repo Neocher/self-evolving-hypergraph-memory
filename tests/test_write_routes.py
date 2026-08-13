@@ -309,3 +309,171 @@ class TestForcePromoteProtectedFlagRoute:
             "force_promote=true 应经生产链路打 protected 标记并落库，"
             f"实际读回 protected={got.get('protected')!r}"
         )
+
+
+class TestP2EmbedBatchSingleConnScan:
+    """P2：embed 批扫 get_all_connections 提到批循环外（每批恰 1 次全表 MATCH 读）。
+
+    修复前：_process_embed_queue 循环内每个 episode 都调一次 get_all_connections
+    （N 条批 → N 次全表扫描）；修复后提到批循环外（to_thread 不阻塞 loop），
+    循环内复用。update 原地 mutate，逐条语义不变。
+    """
+
+    def _svc(self):
+        svc = Services()
+        svc.encoder = MagicMock()
+        svc.encoder.embed.return_value = np.zeros(384, dtype=np.float32)
+        svc.faiss_index = MagicMock()
+        svc._faiss_buffer_lock = __import__("threading").Lock()
+        svc._faiss_buffer = []
+        svc.hebbian_updater = MagicMock()
+        svc.graphlite_store = MagicMock()
+        svc.graphlite_store.get_all_connections = MagicMock(return_value={"a": {"b": 0.5}})
+        svc.quarantine_store = MagicMock()
+        svc.quarantine_store.get_quarantined_ids.return_value = set()
+        return svc
+
+    @patch("api.routes.write._embed_queue", [("e1", "c1", 1.0), ("e2", "c2", 1.0)])
+    def test_get_all_connections_called_once_per_batch(self):
+        """N 条批 → get_all_connections 恰 1 次（修复前 N 次）。"""
+        import asyncio
+        from api.routes.write import _process_embed_queue
+        svc = self._svc()
+
+        async def run():
+            count = await _process_embed_queue(svc)
+            return count
+        count = asyncio.run(run())
+
+        assert count == 2, f"2 条批应都处理: {count}"
+        assert svc.graphlite_store.get_all_connections.call_count == 1, (
+            "P2: get_all_connections 应提到批循环外（每批 1 次），"
+            f"实际 {svc.graphlite_store.get_all_connections.call_count} 次"
+        )
+
+    @patch("api.routes.write._embed_queue", [("e1", "c1", 1.0), ("e2", "c2", 1.0)])
+    def test_conns_reused_across_batch_items(self):
+        """循环内复用同一 conns dict（update 原地 mutate，逐条语义不变）。"""
+        import asyncio
+        from unittest.mock import MagicMock
+        from api.routes.write import _process_embed_queue
+        svc = self._svc()
+        hebbian_calls: list = []
+        svc.hebbian_updater.update = MagicMock(side_effect=lambda *a, **k: hebbian_calls.append(a))
+
+        async def run():
+            await _process_embed_queue(svc)
+        asyncio.run(run())
+
+        assert len(hebbian_calls) == 2, f"2 条批应触发 2 次 hebbian update: {len(hebbian_calls)}"
+        # 每次 update 收到的是同一 conns 对象（引用复用，而非每批重取）
+        assert all(call[1] is svc.graphlite_store.get_all_connections.return_value
+                   for call in hebbian_calls), "循环内应复用同一 conns dict"
+
+
+class TestP7SingleWriteSingleWindowScan:
+    """P7：单条写超边检测 2 条窗口 GQL 合并为 1 条（3600s 窗 LIMIT 20）。
+
+    修复前：_auto_create_hyperedges 对单条写入发 2 次全表 MATCH
+    （300s LIMIT5 + 3600s LIMIT20），且 loop 上持锁同步读。
+    修复后：合并为 1 条（RETURN e.id, e.created_at ... LIMIT 20），
+    Python 侧按 created_at >= now-300 过滤出 recent；包 asyncio.to_thread。
+    批量路径（_auto_create_hyperedges_batch）已各自合并，不动。
+    """
+
+    def _svc(self, rows: list[list]) -> Services:
+        from api.routes.write import _auto_create_hyperedges
+
+        svc = Services()
+        gstore = MagicMock()
+        gstore.query_cypher = MagicMock(return_value=rows)
+        svc.graphlite_store = gstore
+        svc.hyperedge_manager = MagicMock()
+        return svc
+
+    def test_single_write_single_cypher_query(self):
+        """单条写：query_cypher 恰 1 次（修复前 2 次）。"""
+        from api.routes.write import _auto_create_hyperedges
+
+        svc = self._svc([])
+        asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
+        assert svc.graphlite_store.query_cypher.call_count == 1, (
+            "P7: 单条写两条窗口查询应合并为 1 条 GQL，"
+            f"实际 {svc.graphlite_store.query_cypher.call_count} 次"
+        )
+
+    def test_merged_query_uses_3600s_window_limit20(self):
+        """合并后查询使用 3600s 窗 + LIMIT 20，且返回 id + created_at。"""
+        from api.routes.write import _auto_create_hyperedges
+
+        svc = self._svc([])
+        asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
+        gql = svc.graphlite_store.query_cypher.call_args[0][0]
+        assert "created_at >= $cutoff" in gql
+        assert "LIMIT 20" in gql
+        assert "e.created_at" in gql, "合并查询应 RETURN e.created_at 供 Python 侧过滤"
+        params = svc.graphlite_store.query_cypher.call_args[0][1]
+        assert params["cutoff"] <= time.time(), "cutoff 应为 3600s 窗（now-3600）"
+
+    def test_recent_filtered_in_python(self):
+        """Python 侧 300s 过滤：300s 内节点触发时态超边，更旧节点只进情节窗。"""
+        from api.routes.write import _auto_create_hyperedges
+
+        now = time.time()
+        # 行序按 created_at DESC：fresh(50s 前) → old(2000s 前)
+        rows = [
+            ["e2", now - 50],
+            ["e3", now - 2000],
+        ]
+        svc = self._svc(rows)
+        created = asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
+
+        # recent_ids = [e2]（len==1 → 时态 pair 超边）+ window_ids = [e2, e3]
+        # （len==2 < 4 → 不创建情节超边）
+        assert created == 1, f"应创建 1 条时态 pair 超边: {created}"
+        temporal_calls = [
+            c for c in svc.hyperedge_manager.create_temporal_hyperedge.call_args_list
+        ]
+        assert len(temporal_calls) == 1
+        member_ids = temporal_calls[0].kwargs["member_ids"]
+        assert member_ids == ["e1", "e2"], (
+            f"时态超边成员应为 [e1, e2]（300s 内过滤），实际 {member_ids}"
+        )
+        svc.hyperedge_manager.create_episode_hyperedge.assert_not_called()
+
+    def test_episode_window_uses_full_pool(self):
+        """情节窗使用全部 3600s 内节点（≥4 → 创建情节超边）。"""
+        from api.routes.write import _auto_create_hyperedges
+
+        now = time.time()
+        rows = [
+            ["e2", now - 100],
+            ["e3", now - 1000],
+            ["e4", now - 2000],
+            ["e5", now - 3000],
+        ]
+        svc = self._svc(rows)
+        created = asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
+        assert created == 2, f"应创建时态超边 + 情节超边: {created}"
+        episode_calls = [
+            c for c in svc.hyperedge_manager.create_episode_hyperedge.call_args_list
+        ]
+        assert len(episode_calls) == 1
+        member_ids = episode_calls[0].kwargs["member_ids"]
+        assert member_ids == ["e1"] + [f"e{i}" for i in range(2, 6)], (
+            f"情节超边成员应为 [e1, e2..e5]，实际 {member_ids}"
+        )
+
+    def test_handles_dict_rows(self):
+        """兼容 dict 行（扁平 dict 解析）：e.id / e.created_at。"""
+        from api.routes.write import _auto_create_hyperedges
+
+        now = time.time()
+        rows = [
+            {"id": "e2", "created_at": now - 50},
+        ]
+        svc = self._svc(rows)
+        created = asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
+        assert created == 1
+        member_ids = svc.hyperedge_manager.create_temporal_hyperedge.call_args.kwargs["member_ids"]
+        assert member_ids == ["e1", "e2"]

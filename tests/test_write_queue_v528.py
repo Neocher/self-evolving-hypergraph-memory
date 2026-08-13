@@ -223,3 +223,54 @@ class TestShutdown:
         elapsed = time.monotonic() - t0
         assert elapsed < 7.0, f"shutdown hung {elapsed:.1f}s"
         release.set()
+
+    def test_shutdown_full_queue_fails_pending_immediately(self):
+        """M3：worker 卡死 + 队列真满 → shutdown 清空积压，pending future 立即收到
+        WriteQueueClosedError（而非各自挂到 wait_timeout 超时）；shutdown 按时返回。
+
+        修复前积压任务的等待方在 shutdown 后仍挂 wait_for(wait_timeout) 直到超时；
+        修复后 get_nowait 清空 + fut.set_exception + task_done() + 重放 sentinel。
+        """
+        from core.write_queue import WriteQueueClosedError
+
+        q = WriteQueue(max_pending=2, wait_timeout=10.0)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocker():
+            entered.set()
+            release.wait(30)
+
+        async def scenario():
+            t1 = asyncio.create_task(q.submit(blocker))  # 在途（占写线程）
+            await asyncio.sleep(0.1)
+            assert entered.is_set(), "blocker 应已进入写线程"
+            t2 = asyncio.create_task(q.submit(blocker))  # pending
+            t3 = asyncio.create_task(q.submit(blocker))  # pending → 队列满
+            await asyncio.sleep(0.1)
+            assert q.pending_count() == 2, "应有 2 条 pending 占满队列"
+
+            t0 = time.monotonic()
+            q.shutdown(drain=True, drain_timeout=0.2)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 7.0, f"shutdown hung {elapsed:.1f}s"
+
+            # 积压任务立即失败（WriteQueueClosedError）：wait_timeout=10s 远大于
+            # shutdown 耗时（~5.2s），证明是 M3 set_exception 而非各自自然超时。
+            results = await asyncio.wait_for(
+                asyncio.gather(t2, t3, return_exceptions=True),
+                timeout=1.0,
+            )
+            for r in results:
+                assert isinstance(r, WriteQueueClosedError), f"pending 应收到关闭异常: {r!r}"
+            # 在途任务仍由写线程持有：放行后迟到完成（迟到完成语义不破坏）
+            release.set()
+            r1 = await asyncio.wait_for(
+                asyncio.gather(t1, return_exceptions=True), timeout=2.0
+            )
+            assert r1[0] is None, f"在途任务应迟到完成（blocker 返回 None）: {r1[0]!r}"
+            return elapsed
+
+        elapsed = asyncio.run(scenario())
+        release.set()
+        assert elapsed < 7.0, f"shutdown hung {elapsed:.1f}s"

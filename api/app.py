@@ -26,7 +26,7 @@ from api.routes._deps import qsubmit
 from observability.metrics import record_request
 from observability.logger import get_logger, configure_logging
 from api.dashboard import dashboard_router
-from graph.graphlite_store import CircuitBreakerOpen
+from graph.graphlite_store import CircuitBreakerOpen, EpisodeCache
 
 logger = get_logger(__name__)
 
@@ -124,8 +124,33 @@ def _init_services() -> Services:
     # 事件循环不再被同步写阻塞；队列不可用时写路径回退同步直调）
     try:
         from core.write_queue import WriteQueue
-        svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0)
-        logger.info("WriteQueue initialized", max_pending=100, wait_timeout=30.0)
+        # 【M1】引擎级死锁探测：注入 ping 探针（独立 daemon 只读连接 + 1 条 trivial
+        # 查询，join(timeout) 兜底）。探针通过 → 看门狗 critical 降级 warning（慢写
+        # 而非死锁）；失败/挂 → 仍 critical。ping 为独立只读连接，不触碰写线程。
+        ping_fn = None
+        if svc.graphlite_store is not None:
+            try:
+                from graph.graphlite_store import GraphLite as _GL
+                ping_path = str(cfg.graphlite.database_path)
+
+                def _ping_graphlite(path: str = ping_path) -> bool:
+                    try:
+                        db = _GL.open(path)
+                        try:
+                            s = db.session("shm")
+                            rows = s.query("RETURN 1 AS ok")
+                            return bool(rows and rows.rows)
+                        finally:
+                            db.close()
+                    except Exception:
+                        return False
+
+                ping_fn = _ping_graphlite
+            except Exception as e:
+                logger.warning("WriteQueue ping probe disabled: %s", e)
+        svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0, ping_fn=ping_fn)
+        logger.info("WriteQueue initialized", max_pending=100, wait_timeout=30.0,
+                    ping_probe=ping_fn is not None)
     except Exception as e:
         errors.append(f"WriteQueue: {e}")
         logger.warning("WriteQueue init failed (fallback: sync direct writes)", error=str(e))
@@ -313,7 +338,8 @@ def _init_services() -> Services:
             svc.dream_candidate_store = DreamCandidateStore()
             logger.info("DreamCandidateStore initialized")
         except Exception as e:
-            logger.warning("DreamCandidateStore init skipped: %s", e)
+            # 【H2】init 失败从 warning 升为 error：保留回落直接模式，但必须可观测
+            logger.error("DreamCandidateStore init skipped: %s", e)
         from core.dream_scheduler import DreamScheduler, DreamSchedulerConfig
         dcfg = cfg.dream
         dream_cfg = DreamSchedulerConfig(
@@ -391,7 +417,7 @@ def _init_services() -> Services:
             "encoder": svc.encoder,
             # 【修复】query_router 和 _routes 共享同一个 faiss_id_map 对象
             "faiss_id_map": svc.faiss_id_map,  # 引用传递
-            "episode_cache": getattr(svc, "_episode_cache", {}),  # 【Perf】共享缓存，flush_faiss_buffer 的修改对 query_router 可见
+            "episode_cache": getattr(svc, "_episode_cache", {}) or EpisodeCache(),  # 【Perf】共享缓存，flush_faiss_buffer 的修改对 query_router 可见
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(
