@@ -1,13 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.2"
-__version_info__ = (5, 31, 2)
-__version_name__ = "Ontology-Sync-Shortcircuit"
+__version__ = "5.31.3"
+__version_info__ = (5, 31, 3)
+__version_name__ = "Write-Path-Breaker-Neutral"
 __release_date__ = "2026-08-14"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v5.31.2 (2026-08-14) Ontology-Sync-Shortcircuit:
+v5.31.3 (2026-08-14) Write-Path-Breaker-Neutral:
+  • 写路径熔断中立补漏 (瑕疵1) — _flush_hebbian_batch 改用 execute_cypher
+    (写路径, P2-2: 不 record_success/failure)，不再走 query_cypher 读路径
+    (带重试 + 熔断计数)。v5.31.1 的 Hebbian 分号修复只是降低概率，未根除：
+    若 GraphLite 对某批 20 对 MATCH+INSERT 报 QueryError，读路径会重试 2 次
+    + record_failure → 写失败仍污染读熔断窗口。execute_cypher 不吞异常契约
+    → rebuild_index 两处调用点补 try/except 兜底 (失败记日志不中断重建)。
+  • ontology 幂等短路精确化 (瑕疵2) — sync_entity_types_to_graphlite 短路
+    条件从 count>0 改为「ENTITY_TYPE_MAP 全部类型已存在 + 实体数齐全」：
+    v5.31.2 的短路在同步中途中断 (库里只有部分类型) 时，剩余类型/实体/
+    IS_A 边永不补齐；写入路径只提取实体共现不建 OntologyType，无法自愈。
+    仍保留短路目的 (避免 180 实体 × 5-6 次 execute_cypher 全量重跑)。
+  • H1 风格 id 转义 (瑕疵3) — _flush_hebbian_batch 内 f-string 直接插值
+    src/dst 重蹈 H1 教训，改为经 _gql_value 转义 (含 ' / \\ 的 id 不再
+    裸插注入 GQL，与 graphlite_store 的 21 处 H1 修复保持一致)。
+  • 测试: 新增 10 用例 (写路径熔断中立 3 / 特殊字符 id 建边 4 / 短路
+    精确化 3) — 全量 614 passed
   • 写队列永久卡死修复（生产 8/14 全线写超时根因）— sync_entity_types_
     to_graphlite 全量 180 实体 × 5-6 次 execute_cypher 在写线程执行，
     生产库 INSERT 新 OntologyType 触发 GraphLite 引擎挂起 → 写线程卡死
