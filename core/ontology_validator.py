@@ -617,6 +617,21 @@ class OntologyValidator:
         if self.graphlite is None:
             return 0
         self._ensure_ontology_schema()
+        # 【幂等短路 v5.31.2】已同步过（OntologyType 有数据）→ 直接标记完成并返回，
+        # 避免全量 180 实体 × 5-6 次 execute_cypher 在写线程执行（生产库实测：
+        # INSERT 新 OntologyType 触发 GraphLite 引擎挂起 → 写线程永久卡死）。
+        # 增量新增的实体由 _learn_candidate_entities/写入路径覆盖，无需全量重跑。
+        try:
+            rows = self.graphlite.execute_cypher(
+                "MATCH (t:OntologyType) RETURN count(*) AS cnt"
+            )
+            if rows:
+                cnt = rows[0].get("cnt") if isinstance(rows[0], dict) else rows[0][0]
+                if int(cnt) > 0:
+                    self._ontology_synced = True
+                    return 0
+        except Exception as e:
+            logger.warning("Ontology sync pre-check failed (non-fatal): %s", e)
         count = 0
         for entity, etype in self.ENTITY_TYPE_MAP.items():
             category = self.ENTITY_TYPE_CATEGORIES.get(etype, "unknown")
