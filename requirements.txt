@@ -2,10 +2,15 @@
 #
 # ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) 不在 PyPI：
 #   需要源码构建（Rust）后通过环境变量注入 sys.path：
-#     git clone https://github.com/GraphLite-AI/GraphLite ~/GraphLite
+#     git clone https://github.com/Neocher/GraphLite ~/GraphLite   # ⚠️ 必须用修复版 fork（含 UTF-8 lexer 修复 4452a96+）
 #     cd ~/GraphLite && source ~/.cargo/env && cargo build --release -p graphlite-ffi
 #     export GRAPHLITE_BINDINGS=~/GraphLite/bindings/python
 #     export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
+#   ⚠️⚠️ 勿用上游 https://github.com/GraphLite-AI/GraphLite（main 停滞 2026-01）：
+#   其 lexer 在多字节 UTF-8 字符处 panic（end byte index not a char boundary），
+#   SHM v5.31.4+ 已去除 b64 透明编码（原生中文直写），必须搭配修复版引擎，
+#   否则中文 INSERT/CONTAINS/LIKE 全部 PANIC。fork 修复内容见
+#   https://github.com/Neocher/GraphLite/commit/4452a96
 #   详见 README 「Installation」章节。
 #
 # 以下均为 PyPI 依赖：

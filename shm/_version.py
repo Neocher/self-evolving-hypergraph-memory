@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.3"
-__version_info__ = (5, 31, 3)
-__version_name__ = "Write-Path-Breaker-Neutral"
+__version__ = "5.31.4"
+__version_info__ = (5, 31, 4)
+__version_name__ = "Native-UTF8-NoB64"
 __release_date__ = "2026-08-14"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.31.4 (2026-08-14) Native-UTF8-NoB64:
+  • 引擎级 UTF-8 修复落地 — GraphLite fork (Neocher/GraphLite 4452a96)
+    lexer 字节边界 panic 根治（145 处关键字切片 + is_keyword_match +
+    _timewindow_literal），中文 INSERT/CONTAINS/LIKE 原生支持 7/7 验证
+  • 去 b64 透明编码 — _gql_value/_interpolate 原生直写（读端 _decode_b64
+    保留兼容旧数据）；生产迁移 3144 节点（content 416 + summary 2612 +
+    entity_name 101 + name 15；OntologyType 内部 id node_xxx 用 name
+    等值匹配修复 SET 静默失败）
+  • ⚠️ 依赖更新 — requirements.txt/README 注明必须使用修复版 fork
+    （Neocher/GraphLite），勿用上游（lexer UTF-8 bug 未修）
+  • 测试: 全量 631 passed（interpolate 断言更新为新语义）
+
 v5.31.3 (2026-08-14) Write-Path-Breaker-Neutral:
   • 写路径熔断中立补漏 (瑕疵1) — _flush_hebbian_batch 改用 execute_cypher
     (写路径, P2-2: 不 record_success/failure)，不再走 query_cypher 读路径

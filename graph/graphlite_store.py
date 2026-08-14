@@ -59,25 +59,19 @@ def _now() -> float:
 
 def _gql_value(v: Any) -> Optional[str]:
     """Encode a single Python value to GQL literal (UTF-8-safe). None if unsupported."""
-    from base64 import b64encode
     if isinstance(v, str):
-        # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
-        try:
-            v.encode('ascii')
-            v = v.replace("\\", "\\\\").replace("'", "\\'")
-            return f"'{v}'"
-        except UnicodeEncodeError:
-            # Non-ASCII: store as b64 with prefix
-            b64 = b64encode(v.encode('utf-8')).decode('ascii')
-            return f"'{{b64}}{b64}'"
+        # GraphLite lexer UTF-8 bug 已修复（fork Neocher/GraphLite 4452a96）——原生中文直写
+        v = v.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{v}'"
     if isinstance(v, bool):
         return str(v).lower()
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
-        # JSON 序列化后统一 b64 (GraphLite lexer UTF-8 bug: 中文 list 直插 PANIC)
-        b64 = b64encode(json.dumps(v, ensure_ascii=False).encode('utf-8')).decode('ascii')
-        return f"'{chr(123)}b64{chr(125)}{b64}'"
+        # JSON 序列化直写（引擎支持 UTF-8）；先转义反斜杠再转义单引号
+        json_str = json.dumps(v, ensure_ascii=False)
+        json_str = json_str.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{json_str}'"
     return None
 
 
@@ -894,7 +888,6 @@ class GraphLiteStore:
         未知键返回原 match 文本（保持"未命中不替换"语义）。
         """
         import re
-        from base64 import b64encode
         if not params:
             return query
 
@@ -909,13 +902,9 @@ class GraphLiteStore:
                     # read_validate 的 $new_value 为空会导致矛盾漏检。
                     # 用哨兵值使 NOT CONTAINS 恒真（语义 = 不排除已有事实）。
                     return "'__SHM_NO_VALUE__'"
-                try:
-                    v.encode('ascii')
-                    return f"'{v}'"
-                except UnicodeEncodeError:
-                    # GraphLite Rust lexer has UTF-8 bug; b64-encode non-ASCII
-                    b64 = b64encode(v.encode('utf-8')).decode('ascii')
-                    return f"'{{b64}}{b64}'"
+                # GraphLite lexer UTF-8 bug 已修复（fork 4452a96）——原生中文直插
+                escaped = v.replace("\\", "\\\\").replace("'", "\\'")
+                return f"'{escaped}'"
             elif isinstance(v, (int, float)):
                 return str(v)
             elif isinstance(v, (np.integer, np.floating)):

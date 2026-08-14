@@ -74,7 +74,7 @@ class TestManyParams:
 class TestTypeBranchesPreserved:
 
     def test_all_types_mixed(self):
-        """类型分支保真：str/float/None/空串/非ASCII(b64)/numpy 标量"""
+        """类型分支保真：str/float/None/空串/中文原生直写/numpy 标量"""
         params = {
             "s": "hello",
             "f": 3.14,
@@ -93,9 +93,8 @@ class TestTypeBranchesPreserved:
         assert "'__SHM_NO_VALUE__'" in q
         assert "1.5" in q
         assert "$" not in q
-        zh_b64 = b64encode("中文内容".encode("utf-8")).decode("ascii")
-        assert f"'{{b64}}{zh_b64}'" in q, "中文应 b64 编码（{b64}前缀）"
-        assert "中文内容" not in q, "中文原样不得出现在 GQL 字面量中"
+        # GraphLite lexer UTF-8 bug 已修复（fork 4452a96）——中文原生直写
+        assert "'中文内容'" in q, "中文应原生直写（lexer UTF-8 已修复，不再 b64）"
 
     def test_empty_string_sentinel(self):
         """空串 → '__SHM_NO_VALUE__' 哨兵（NOT CONTAINS 恒真语义）"""

@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.31.3** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.31.4** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -165,8 +165,13 @@ SHM's storage engine is [GraphLite](https://github.com/GraphLite-AI/GraphLite)
 (Apache-2.0), an embedded graph database written in Rust. Its Python SDK is **not
 published on PyPI** — clone and build it first:
 
+> ⚠️ **v5.31.4+ 必须使用修复版 fork**（`Neocher/GraphLite`，含 UTF-8 lexer 修复
+> `4452a96`）。上游 main 自 2026-01 停滞，其 lexer 在多字节 UTF-8 字符处 panic
+> （`end byte index not a char boundary`）。SHM v5.31.4 起已去除 b64 透明编码
+> （中文原生直写），若搭配旧引擎，中文 INSERT/CONTAINS/LIKE 将全部 PANIC。
+
 ```bash
-git clone https://github.com/GraphLite-AI/GraphLite ~/GraphLite
+git clone https://github.com/Neocher/GraphLite ~/GraphLite   # 修复版 fork（4452a96+）
 cd ~/GraphLite && source ~/.cargo/env && cargo build --release -p graphlite-ffi
 ```
 
