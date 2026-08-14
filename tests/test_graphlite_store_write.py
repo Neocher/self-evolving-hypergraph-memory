@@ -378,7 +378,7 @@ class TestM2AtomicUpdateWithVersion:
                 return type("R", (), {"rows": [{"v": 1}]})()
             def execute(self, gql):
                 held_at_call.append(lock._held)
-                return type("R", (), {"rows": []})()
+                return 1  # v5.31.4+: execute 返回 rows_affected
 
         store = GraphLiteStore.__new__(GraphLiteStore)
         store._session = FakeSession()
@@ -388,8 +388,8 @@ class TestM2AtomicUpdateWithVersion:
 
         ok = store.update_with_version("n1", {"content": "x"}, expected_version=1)
         assert ok is True
-        assert held_at_call == [True, True], \
-            f"query/execute 均应在持锁状态下执行: {held_at_call}"
+        assert held_at_call == [True], \
+            f"execute 应在持锁状态下执行（CAS 单条无 query）: {held_at_call}"
 
     def test_double_update_exactly_one_wins(self):
         """并发双写同 expected_version → 恰好一个 True（原子化后无漏检）。"""
@@ -399,19 +399,22 @@ class TestM2AtomicUpdateWithVersion:
         class FakeSession:
             """同一 session 上双线程并发 update_with_version。
 
-            store._session_lock 是 RLock——修复后整个 读+SET 在锁内，两线程
-            严格串行：线程 A 读 v=1 → SET v=2 → True；线程 B 读 v=2 → 不匹配
-            → False。修复前（两次 _locked_* 分锁）可能出现 A 读 v=1、B 读 v=1、
-            A SET v=2、B SET v=2 → 两个 True（漏检）。
+            store._session_lock 是 RLock——整个 CAS 在锁内，两线程严格串行：
+            线程 A WHERE version=1 匹配 → SET version=2 → 返回 1 → True；
+            线程 B WHERE version=1 不匹配（version 已 2）→ 返回 0 → False。
             """
             def __init__(self):
                 self.version = 1
             def query(self, gql):
                 return type("R", (), {"rows": [{"v": self.version}]})()
             def execute(self, gql):
-                # 模拟真实引擎：SET e.version = {next} 递增
-                self.version += 1
-                return type("R", (), {"rows": []})()
+                # v5.31.4+: 模拟真实引擎 CAS——WHERE version 匹配则递增并返回 1
+                import re
+                m = re.search(r"WHERE e\.version = (\d+)", gql)
+                if m and int(m.group(1)) == self.version:
+                    self.version += 1
+                    return 1
+                return 0
 
         session = FakeSession()
         store = GraphLiteStore.__new__(GraphLiteStore)

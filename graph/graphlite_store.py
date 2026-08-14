@@ -494,34 +494,30 @@ class GraphLiteStore:
         if not set_clause:
             return True
         with self._session_lock:
-            # Step 1: 读当前 version
-            try:
-                result = self._session.query(
-                    f"MATCH (e:EpisodeNode {{id: {id_lit}}}) RETURN e.version AS v"
-                )
-            except Exception:
-                return False
-            if not result.rows:
-                return False  # 节点不存在
-            v = result.rows[0].get("v") if isinstance(result.rows[0], dict) else None
-            next_version = None
-            if expected_version is not None:
-                if v is None:
-                    return False  # 旧数据无 version 字段
+            assert self._session is not None  # connect() 后必有
+            if expected_version is None:
+                # force 写入（跳过版本检查、不递增 version——保持 v5.31.0 语义）
                 try:
-                    if int(v) != int(expected_version):
-                        return False
-                    next_version = int(expected_version) + 1
-                except (TypeError, ValueError):
+                    self._session.execute(
+                        f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET {set_clause}"
+                    )
+                    return True
+                except Exception:
                     return False
-            # Step 2: 版本匹配 (或跳过检查) → SET 更新 + version 递增
-            if next_version is not None:
-                set_clause = f"{set_clause}, e.version = {next_version}"
+            # CAS 单条 GQL（v5.31.4+ 引擎 rows_affected 检测）：
+            # MATCH WHERE version 条件 + SET 单查询原子执行（SHM 单写线程 +
+            # Sled 单写锁保证串行）——无需 BEGIN/COMMIT 包裹（多语句返回
+            # 最后一条 COMMIT 的 rows_affected=0 会误判失败）。
+            # rows_affected > 0 = 更新成功; 0 = 节点不存在/版本不匹配/旧数据无 version
+            nxt = int(expected_version) + 1
+            gql = (
+                f"MATCH (e:EpisodeNode {{id: {id_lit}}}) "
+                f"WHERE e.version = {int(expected_version)} "
+                f"SET e.version = {nxt}, {set_clause}"
+            )
             try:
-                self._session.execute(
-                    f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET {set_clause}"
-                )
-                return True
+                result = self._session.execute(gql)
+                return result is not None and result > 0
             except Exception:
                 return False
 

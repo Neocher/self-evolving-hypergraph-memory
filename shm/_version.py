@@ -1,12 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.4"
-__version_info__ = (5, 31, 4)
-__version_name__ = "Native-UTF8-NoB64"
+__version__ = "5.31.5"
+__version_info__ = (5, 31, 5)
+__version_name__ = "CAS-Optimistic-Lock"
 __release_date__ = "2026-08-14"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.31.5 (2026-08-14) CAS-Optimistic-Lock:
+  • 乐观锁 CAS 化 — update_with_version 改单条 GQL（MATCH WHERE version
+    = X SET version = X+1, ...），rows_affected 检测版本冲突（>0 成功 /
+    0 冲突）——消除两步法读后写前竞态窗口 + 免一次读查询
+  • 依赖引擎 rows_affected（fork e53e3df）——多语句返回最后一条 COMMIT
+    的 rows_affected=0，故 CAS 不用 BEGIN/COMMIT 包裹（单查询本身原子：
+    SHM 单写线程 + Sled 单写锁串行）
+  • 测试: 乐观锁用例适配新接口（execute 返回 rows_affected）+ 全量
+    631 passed
+
 v5.31.4 (2026-08-14) Native-UTF8-NoB64:
   • 引擎级 UTF-8 修复落地 — GraphLite fork (Neocher/GraphLite 4452a96)
     lexer 字节边界 panic 根治（145 处关键字切片 + is_keyword_match +
