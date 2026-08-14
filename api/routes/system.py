@@ -15,6 +15,7 @@ from api.routes._deps import (
     __version__, __version_name__,
     Dict, Any,
 )
+from graph.graphlite_store import _gql_value
 
 # TTL 缓存：graph_store 相关统计（node_count/hyperedge_count），避免每次 /health 全扫描
 _HEALTH_STATS_CACHE: Dict[str, int] = {"node_count": 0, "hyperedge_count": 0}
@@ -35,18 +36,20 @@ def _flush_hebbian_batch(store, pairs: list) -> bool:
         store: GraphLiteStore 实例
         pairs: [(src_id, dst_id, weight), ...]，长度 ≤ HEBBIAN_BATCH
     Returns:
-        bool: query_cypher 有返回行视为成功（永不抛契约下静默失败返回 []）
+        bool: execute_cypher 有返回行视为成功（不吞异常契约——失败 raise，
+            由调用方 try/except 处理；写路径熔断中立，不 record_success/failure）
     """
     if not pairs:
         return True
     match_parts: list[str] = []
     insert_parts: list[str] = []
     for i, (src, dst, w) in enumerate(pairs):
-        match_parts.append(f"(a{i}:EpisodeNode {{id: '{src}'}})")
-        match_parts.append(f"(b{i}:EpisodeNode {{id: '{dst}'}})")
+        # 【H1】id 经 _gql_value 转义（含 ' / \ 的 id 不再裸插注入 GQL）
+        match_parts.append(f"(a{i}:EpisodeNode {{id: {_gql_value(str(src))}}})")
+        match_parts.append(f"(b{i}:EpisodeNode {{id: {_gql_value(str(dst))}}})")
         insert_parts.append(f"(a{i})-[:HEBBIAN_CONNECTION {{weight: {w}}}]->(b{i})")
     gql = f"MATCH {', '.join(match_parts)} INSERT {', '.join(insert_parts)}"
-    rows = store.query_cypher(gql)
+    rows = store.execute_cypher(gql)
     return bool(rows)
 
 
@@ -404,14 +407,27 @@ async def rebuild_index(
                 pending.append((node_ids[i], nb_node_id, round(similarity, 4)))
                 hebbian_count += 1
                 if len(pending) >= HEBBIAN_BATCH:
-                    if not _flush_hebbian_batch(deps.graphlite_store, pending):
-                        logger.warning("Hebbian batch creation failed silently (%d pairs)", len(pending))
+                    try:
+                        ok = _flush_hebbian_batch(deps.graphlite_store, pending)
+                    except Exception as e:
+                        # execute_cypher 不吞异常：写路径失败 raise（熔断中立），此处兜底
+                        logger.warning("Hebbian batch creation failed (%d pairs): %s",
+                                       len(pending), e)
+                        ok = False
+                    if not ok:
+                        logger.warning("Hebbian batch creation failed (%d pairs)", len(pending))
                     pending = []
         except Exception:
             logger.exception("FAISS search failed for Hebbian rebuild at index %d", i)
     if pending:
-        if not _flush_hebbian_batch(deps.graphlite_store, pending):
-            logger.warning("Hebbian batch creation failed silently (%d pairs)", len(pending))
+        try:
+            ok = _flush_hebbian_batch(deps.graphlite_store, pending)
+        except Exception as e:
+            # execute_cypher 不吞异常：写路径失败 raise（不污染读熔断窗口），此处兜底
+            logger.warning("Hebbian batch creation failed (%d pairs): %s", len(pending), e)
+            ok = False
+        if not ok:
+            logger.warning("Hebbian batch creation failed (%d pairs)", len(pending))
 
     record_request("POST", "/index/rebuild", "200", _now() - start)
     logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",

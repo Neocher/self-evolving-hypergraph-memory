@@ -617,19 +617,36 @@ class OntologyValidator:
         if self.graphlite is None:
             return 0
         self._ensure_ontology_schema()
-        # 【幂等短路 v5.31.2】已同步过（OntologyType 有数据）→ 直接标记完成并返回，
-        # 避免全量 180 实体 × 5-6 次 execute_cypher 在写线程执行（生产库实测：
-        # INSERT 新 OntologyType 触发 GraphLite 引擎挂起 → 写线程永久卡死）。
-        # 增量新增的实体由 _learn_candidate_entities/写入路径覆盖，无需全量重跑。
+        # 【幂等短路 v5.31.3】仅当 ENTITY_TYPE_MAP 的全部类型都已存在于 OntologyType
+        # 表且实体数齐全时才跳过全量同步（v5.31.2 的 count>0 过宽：上次同步中途中断
+        # 时库里只有部分类型/实体，剩余类型与 IS_A 边永不补齐；写入路径只提取实体
+        # 共现，不建 OntologyType，无法自愈）。仍保留短路目的（避免 180 实体 × 5-6
+        # 次 execute_cypher 全量重跑），只是条件更精确。
         try:
-            rows = self.graphlite.execute_cypher(
-                "MATCH (t:OntologyType) RETURN count(*) AS cnt"
+            type_rows = self.graphlite.execute_cypher(
+                "MATCH (t:OntologyType) RETURN t.name"
             )
-            if rows:
-                cnt = rows[0].get("cnt") if isinstance(rows[0], dict) else rows[0][0]
-                if int(cnt) > 0:
-                    self._ontology_synced = True
-                    return 0
+            existing_types = set()
+            for row in type_rows or []:
+                if isinstance(row, dict):
+                    name = row.get("t.name") or row.get("name")
+                elif isinstance(row, (list, tuple)) and row:
+                    name = row[0]
+                else:
+                    continue
+                if name:
+                    existing_types.add(str(name))
+            cnt_rows = self.graphlite.execute_cypher(
+                "MATCH (e:OntologyEntity) RETURN count(*) AS cnt"
+            )
+            entity_cnt = 0
+            if cnt_rows:
+                cnt_row = cnt_rows[0]
+                entity_cnt = int(cnt_row.get("cnt") if isinstance(cnt_row, dict) else cnt_row[0])
+            required_types = set(self.ENTITY_TYPE_MAP.values())
+            if required_types.issubset(existing_types) and entity_cnt >= len(self.ENTITY_TYPE_MAP):
+                self._ontology_synced = True
+                return 0
         except Exception as e:
             logger.warning("Ontology sync pre-check failed (non-fatal): %s", e)
         count = 0
