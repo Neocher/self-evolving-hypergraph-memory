@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.5"
-__version_info__ = (5, 31, 5)
-__version_name__ = "CAS-Optimistic-Lock"
+__version__ = "5.31.6"
+__version_info__ = (5, 31, 6)
+__version_name__ = "Graceful-Shutdown"
 __release_date__ = "2026-08-14"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.31.6 (2026-08-14) Graceful-Shutdown:
+  • SIGTERM/SIGINT 优雅退出（三体协奏 Phase1 CC 设计 → Phase2 OpenCode
+    实施 → Phase3 Codex 审核）— lifespan 注册信号处理器转发 uvicorn
+    handle_exit → should_exit → Server.shutdown → drain 写队列 → close
+    → Sled 落盘释放锁（堵住 kill -9 之外的隐性终止路径；实测纠正：
+    loop.stop() 会跳过 lifespan shutdown 段）
+  • open 失败自动备份损坏库 — connect 包 try/except：GraphLite.open
+    失败 → copytree 到 .corrupt.<ts> 保留崩溃现场 → 裸 re-raise
+  • Codex 审核 ✅（uvicorn 0.51 源码链实测）+ 修 2 🟡（信号处理器内
+    日志→置标志位防死锁；备份时间戳加 %f 防同秒碰撞）
+  • 测试: 新增 test_signal_shutdown + connect 备份用例，全量 631+ passed
+
 v5.31.5 (2026-08-14) CAS-Optimistic-Lock:
   • 乐观锁 CAS 化 — update_with_version 改单条 GQL（MATCH WHERE version
     = X SET version = X+1, ...），rows_affected 检测版本冲突（>0 成功 /

@@ -57,6 +57,20 @@ _INFRA_EXCEPTIONS = (
 def _now() -> float:
     return time.time()
 
+
+def _backup_corrupt_db(db_path: str) -> None:
+    """open 失败时自动备份损坏库，保留崩溃现场供恢复；备份失败仅日志，不吞原始异常。"""
+    try:
+        if not os.path.isdir(db_path):
+            logger.error("GraphLite open failed; DB path absent, nothing to back up: %s", db_path)
+            return
+        backup_path = f"{db_path}.corrupt.{time.strftime('%Y%m%d_%H%M%S_%f')}"
+        shutil.copytree(db_path, backup_path)
+        logger.error("GraphLite open failed; corrupted DB backed up: %s", backup_path)
+    except Exception:
+        logger.exception("Corrupt DB backup failed (original error preserved)")
+
+
 def _gql_value(v: Any) -> Optional[str]:
     """Encode a single Python value to GQL literal (UTF-8-safe). None if unsupported."""
     if isinstance(v, str):
@@ -322,7 +336,12 @@ class GraphLiteStore:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db_path = db_path
 
-        self._db = GraphLite.open(db_path)
+        try:
+            self._db = GraphLite.open(db_path)
+        except Exception:
+            # open 失败（DATABASE_OPEN_ERROR——kill -9/OOM 使 Sled 库损坏）时先备份损坏库再 re-raise
+            _backup_corrupt_db(db_path)
+            raise
         self._session = self._db.session("shm")
         # Setup schema if first time, otherwise just set context
         # GraphLite 本版要求 graph 名称带 / 前缀（如 /shm），但旧库用 default（无斜杠）

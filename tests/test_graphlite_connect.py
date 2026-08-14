@@ -105,6 +105,29 @@ def test_connect_schema_exists_no_graph(tmp_path):
     assert session.calls[-1].startswith("CREATE INDEX IF NOT EXISTS")
 
 
+def test_connect_open_failure_backs_up_and_reraises(tmp_path):
+    """open 失败（DATABASE_OPEN_ERROR）→ 自动备份损坏库 + re-raise 原始异常。
+
+    走真实备份逻辑（仅 mock GraphLite.open 抛异常），验证崩溃现场被保留。
+    """
+    from graph.graphlite_store import GraphLiteStore
+
+    db_path = tmp_path / "corrupt_db"
+    db_path.mkdir()
+    (db_path / "data.sled").write_bytes(b"corrupt-sled-bytes")
+
+    store = GraphLiteStore(config=type("cfg", (), {"database_path": str(db_path)})())
+
+    with patch("graph.graphlite_store.GraphLite") as mock_gl:
+        mock_gl.open.side_effect = RuntimeError("DATABASE_OPEN_ERROR")
+        with pytest.raises(RuntimeError, match="DATABASE_OPEN_ERROR"):
+            store.connect()
+
+    backups = [p for p in tmp_path.iterdir() if ".corrupt." in p.name]
+    assert len(backups) == 1
+    assert (backups[0] / "data.sled").read_bytes() == b"corrupt-sled-bytes"
+
+
 def test_get_all_connections_format():
     """get_all_connections 应把 list[dict] 转为 {src: {dst: weight}}（含嵌套键兜底）。"""
     from graph.graphlite_store import GraphLiteStore

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -32,6 +33,42 @@ from api.dashboard import dashboard_router
 from graph.graphlite_store import CircuitBreakerOpen, EpisodeCache
 
 logger = get_logger(__name__)
+
+
+def _install_signal_handler(loop, sig: int) -> None:
+    """注册单个信号处理器：转发前驱 handler（uvicorn 的 handle_exit）→ 优雅 shutdown。
+
+    uvicorn 在 lifespan startup 前已安装 signal.signal(sig, handle_exit)，
+    故此处 signal.signal 返回的前驱即 handle_exit；信号到达时由 handle_exit 置
+    should_exit=True → main_loop 退出 → Server.shutdown() → 本 lifespan yield
+    后的 shutdown 段执行（drain 写队列 → close → Sled 落盘释放锁），而非进程
+    被默认终止。非 uvicorn 环境（前驱非 callable，如 SIG_DFL/SIG_IGN）降级为
+    loop.stop() 兜底。
+    """
+    previous = None
+    _sig_received = False
+
+    def _handle(signum, frame) -> None:
+        # ⚠️ 信号处理器运行在主线程任意字节码间隙：此处不能 logger.info
+        # （若恰在主线程持有 logging 内部锁时到达 → 处理器等锁 → 优雅退出死锁）。
+        # 只置标志位（异步信号安全），shutdown 段补记日志。
+        _sig_received = True
+        if callable(previous):
+            previous(signum, frame)  # uvicorn handle_exit → should_exit=True → 优雅 shutdown
+        else:
+            loop.call_soon_threadsafe(loop.stop)  # 非 uvicorn 兜底
+
+    try:
+        previous = signal.signal(sig, _handle)
+    except (ValueError, OSError):
+        # 非主线程无法 signal.signal（如 gunicorn worker）；uvicorn 主线程正常注册
+        logger.warning("Unable to register signal handler for %s (non-main thread?)", sig)
+
+
+def _register_signal_handlers(loop) -> None:
+    """注册 SIGTERM/SIGINT 处理器，让外部 kill 触发既有优雅 shutdown 路径。"""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        _install_signal_handler(loop, sig)
 
 
 def _upsert_system_node(store, node_id: str, payload: str) -> None:
@@ -509,6 +546,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     app.state.config = load_settings()
     app.state.logger = logger
     logger.info("SHM v4.0 starting up", config_path=str(get_settings().graphlite.database_path))
+
+    # 注册 SIGTERM/SIGINT 处理器（最早注册，避免启动期信号被默认终止）
+    _register_signal_handlers(asyncio.get_running_loop())
 
     # 初始化所有服务并注入
     svc = _init_services()
