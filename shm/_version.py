@@ -1,12 +1,37 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.0"
-__version_info__ = (5, 31, 0)
-__version_name__ = "Starlink-Audit-Fix"
-__release_date__ = "2026-08-13"
+__version__ = "5.31.2"
+__version_info__ = (5, 31, 2)
+__version_name__ = "Ontology-Sync-Shortcircuit"
+__release_date__ = "2026-08-14"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.31.2 (2026-08-14) Ontology-Sync-Shortcircuit:
+  • 写队列永久卡死修复（生产 8/14 全线写超时根因）— sync_entity_types_
+    to_graphlite 全量 180 实体 × 5-6 次 execute_cypher 在写线程执行，
+    生产库 INSERT 新 OntologyType 触发 GraphLite 引擎挂起 → 写线程卡死
+    → 所有写请求 30s 超时。熔断 closed（v5.31.1 Hebbian 修复后）首次
+    暴露：此前熔断 open 时 sync 全部快速失败，掩盖了此路径。
+  • 修复: sync 加幂等短路 — OntologyType 已有数据（count>0）直接标记
+    _ontology_synced 返回，不再全量重跑；增量实体由写入路径覆盖。
+  • 附带: 清库重建流程（备份在线复制不完整= DATABASE_OPEN_ERROR，
+    损坏库 INSERT 全报 QUERY_ERROR → mv 保留 + 重启自动建新库，
+    数据由 Hermes 同步管道重建）
+  • 验证: 新库首次写入 2.32s（全量 sync）→ 二次写入 0.02s（短路）；
+    OntologyType 23 / OntologyEntity 180 / 检索 0.02s hits=1
+
+v5.31.1 (2026-08-14) Hebbian-Batch-Fix:
+  • Hebbian 批量建边分号拼接修复 — 启动熔断风暴根因：system.py 用
+    "; ".join(pending) 拼接多条 MATCH+INSERT，GraphLite 对分号多语句
+    静默截断只执行第一条 / QUERY_ERROR；episode 少时失败数不达熔断阈值
+    (1/10=10%<50%) 未暴露，episode 多时 (374 连接=8 批) 8 次失败打满
+    窗口 (80%≥50%) → 熔断 open → BM25 prewarm/ontology 同步全被拒 →
+    启动后 1-2 分钟假死 (health nodes=0, 检索空)
+  • 修复: _flush_hebbian_batch 单条多模式 MATCH + 多边 INSERT（逗号分隔），
+    HEBBIAN_BATCH 50→20（GraphLite 单查询上限实测 20 对 OK / 25 对静默丢弃）
+  • 验证: 临时库 20 对全建 / 25 对正确检测失败 / 全量测试通过
+
 v5.31.0 (2026-08-13) Starlink-Audit-Fix:
   • 星链批量审计修复 19 项（H1/H2/M1/M2 + P2-P9 + M3-M5 + L1-L4）— 599 passed
   • H1 GQL 注入面转义 21 处：id/metadata/session_id 等外部可达字段全部经

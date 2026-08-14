@@ -22,6 +22,33 @@ _HEALTH_STATS_CACHE_TIME: float = 0.0
 _HEALTH_STATS_CACHE_LOCK = threading.Lock()
 _HEALTH_STATS_TTL: float = 5.0
 
+# Hebbian 批量建边：GraphLite 单查询上限（实测 20 对 OK，25 对静默丢弃）。
+# 分号拼接（"; ".join）在 GraphLite 会静默截断只执行第一条 / QUERY_ERROR，
+# 启动时多批失败会打满熔断窗口 → 全库假死（v5.31.1 修复）。
+HEBBIAN_BATCH = 20
+
+
+def _flush_hebbian_batch(store, pairs: list) -> bool:
+    """GraphLite 批量建边：单条多模式 MATCH + 多边 INSERT（逗号分隔）。
+
+    Args:
+        store: GraphLiteStore 实例
+        pairs: [(src_id, dst_id, weight), ...]，长度 ≤ HEBBIAN_BATCH
+    Returns:
+        bool: query_cypher 有返回行视为成功（永不抛契约下静默失败返回 []）
+    """
+    if not pairs:
+        return True
+    match_parts: list[str] = []
+    insert_parts: list[str] = []
+    for i, (src, dst, w) in enumerate(pairs):
+        match_parts.append(f"(a{i}:EpisodeNode {{id: '{src}'}})")
+        match_parts.append(f"(b{i}:EpisodeNode {{id: '{dst}'}})")
+        insert_parts.append(f"(a{i})-[:HEBBIAN_CONNECTION {{weight: {w}}}]->(b{i})")
+    gql = f"MATCH {', '.join(match_parts)} INSERT {', '.join(insert_parts)}"
+    rows = store.query_cypher(gql)
+    return bool(rows)
+
 
 def _recompute_status(result: HealthCheckResult) -> str:
     if not result.graph_connected:
@@ -357,10 +384,9 @@ async def rebuild_index(
     # 原实现 np.where(faiss_ids == nb_idx) 在循环内 O(n²), 1174 节点下即 130 万+ 次比较,
     # 加上逐条 GraphLite 事务 → Hebbian 重建 20+ 分钟, 服务启动卡死。
     faiss_to_node = {int(fid): node_ids[i] for i, fid in enumerate(faiss_ids.tolist())}
-    # 【PERF 2026-08-07】批量 INSERT(GraphLite 分号分隔多语句, 实测上限 ~50 条带 MATCH)
-    # 逐条事务 73ms/条 → 批量 50 条 ~0.002s, 695 节点重建 13.5min → 预计 <1min
-    HEBBIAN_BATCH = 50
-    pending: list[str] = []
+    # 【PERF 2026-08-07】批量建边：GraphLite 单查询上限 20 对（25 对静默丢弃），
+    # 用 _flush_hebbian_batch 单条多模式 MATCH + 多边 INSERT（分号拼接会截断/报错）
+    pending: list[tuple[str, str, float]] = []  # (src_id, dst_id, weight)
     for i in range(len(node_ids)):
         query_vec = embeddings[i:i+1].astype(np.float32)
         try:
@@ -375,25 +401,17 @@ async def rebuild_index(
                 nb_node_id = faiss_to_node.get(nb_idx)
                 if nb_node_id is None:
                     continue
-                pending.append(
-                    f"MATCH (a:EpisodeNode {{id: '{node_ids[i]}'}}), "
-                    f"(b:EpisodeNode {{id: '{nb_node_id}'}}) "
-                    f"INSERT (a)-[:HEBBIAN_CONNECTION {{weight: {round(similarity, 4)}}}]->(b)"
-                )
+                pending.append((node_ids[i], nb_node_id, round(similarity, 4)))
                 hebbian_count += 1
                 if len(pending) >= HEBBIAN_BATCH:
-                    try:
-                        deps.graphlite_store.query_cypher("; ".join(pending))
-                    except Exception:
-                        logger.exception("Hebbian batch creation failed (%d stmts)", len(pending))
+                    if not _flush_hebbian_batch(deps.graphlite_store, pending):
+                        logger.warning("Hebbian batch creation failed silently (%d pairs)", len(pending))
                     pending = []
         except Exception:
             logger.exception("FAISS search failed for Hebbian rebuild at index %d", i)
     if pending:
-        try:
-            deps.graphlite_store.query_cypher("; ".join(pending))
-        except Exception:
-            logger.exception("Hebbian batch creation failed (%d stmts)", len(pending))
+        if not _flush_hebbian_batch(deps.graphlite_store, pending):
+            logger.warning("Hebbian batch creation failed silently (%d pairs)", len(pending))
 
     record_request("POST", "/index/rebuild", "200", _now() - start)
     logger.info("FAISS index rebuilt: %d vectors, %d Hebbian connections",
