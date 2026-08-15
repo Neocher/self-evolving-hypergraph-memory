@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.38.0** | *7 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.39.0** | *8 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-ready-orange)](https://modelcontextprotocol.io)
 [![A2A](https://img.shields.io/badge/A2A-ready-blueviolet)](https://github.com/google/A2A)
-[![Tests](https://img.shields.io/badge/tests-502%2F502-green)]()
+[![Tests](https://img.shields.io/badge/tests-730%2F731-green)]()
 
 ---
 
@@ -64,7 +64,7 @@ Layer 1: Sensory       — Ring buffer (raw input)
 
 ---
 
-## ✨ 7 Unique Capabilities
+## ✨ 8 Unique Capabilities
 
 | # | Capability | Paper | SHM Only? |
 |:-:|:-----------|:------|:----------|
@@ -75,8 +75,9 @@ Layer 1: Sensory       — Ring buffer (raw input)
 | 5 | **Learnable Forgetting** | AdaMem | ✅ |
 | 6 | **Multi-Agent Governance** | MemClaw | ✅ |
 | 7 | **SSM Dream Consolidation** | Language Models Need Sleep (2605.26099) | ✅ |
+| 8 | **User-Profile** | Profile-Graph Memory (2606.06036) | ✅ |
 
-**Benchmark: 0/7 shared with Mem0, Letta, Engram, or Zep.**
+**Benchmark: 0/8 shared with Mem0, Letta, Engram, or Zep.**
 
 ---
 

@@ -102,6 +102,77 @@ class TestRetrieveEndpoint:
         body = response.json()
         assert body["results"] == []
 
+    def test_retrieve_profile_context_injected(self, client, mock_services):
+        """search_profile 命中 → profile_context 注入响应（User-Profile 旁路接线回归）。"""
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = []
+        mock_qr._qr = mock_qr  # SelfEvolvingRetrieval 解包路径：内层即本 mock
+        mock_qr.search_profile.return_value = {
+            "matched": True,
+            "context": "【用户画像】\n- preferences: 咖啡 (weight 1.0)",
+        }
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.return_value = []
+        response = client.post("/memories/retrieve", json={
+            "query": "咖啡",
+            "top_k": 5,
+        })
+        assert response.status_code == 200
+        body = response.json()
+        assert body["profile_context"] == "【用户画像】\n- preferences: 咖啡 (weight 1.0)"
+
+    def test_retrieve_profile_context_no_hit_is_none(self, client, mock_services):
+        """search_profile 未命中 → profile_context 为 None（字段向后兼容）。"""
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = []
+        mock_qr._qr = mock_qr
+        mock_qr.search_profile.return_value = {"matched": False, "context": ""}
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.return_value = []
+        response = client.post("/memories/retrieve", json={
+            "query": "随便问问",
+            "top_k": 5,
+        })
+        assert response.status_code == 200
+        assert response.json()["profile_context"] is None
+
+    def test_retrieve_profile_boost_score_clamped(self, client, mock_services):
+        """P1 回归（v5.39.0）：score=1.0 画像命中 → boost 后钳制 ≤1.0 → 200 不 500。
+
+        走 /memories/retrieve 公共入口：真实 QueryRouter.retrieve →
+        _deduplicate_and_sort（画像 ×1.2 → min(1.0) 钳制）→ EpisodicResult 构造。
+        修复前 score=1.0×1.2=1.2 触发 le=1.0 ValidationError → 500。
+        """
+        from retrieval.query_router import QueryRouter, QueryRouterConfig, set_user_profile
+
+        set_user_profile({"preferences": {"咖啡": {"weight": 1.0, "sources": 1}}})
+        try:
+            router = QueryRouter.__new__(QueryRouter)
+            router.config = QueryRouterConfig()
+            router._zh_en_tech_map = {}
+            router._time_keywords = set()
+            # 注入 score=1.0 且命中画像的原始检索结果（模拟画像命中加分前置状态）
+            router._hypergraph_retrieve = MagicMock(return_value=[{
+                "node_id": "n_profile", "content": "今天喝咖啡", "score": 1.0,
+                "fact_track": "active", "level": "hypergraph",
+                "tau_value": 1.0, "created_at": time.time(),
+            }])
+            mock_services.query_router = router
+            mock_services.graphlite_store.query_cypher.return_value = []
+            response = client.post("/memories/retrieve", json={
+                "query": "今天喝咖啡",
+                "top_k": 5,
+            })
+            assert response.status_code == 200, response.text
+            results = response.json()["results"]
+            assert results, "画像命中结果应出现在响应中"
+            # 契约断言：score ∈ [0, 1]（越界即 EpisodicResult 构造失败 → 500）
+            assert all(0.0 <= r["score"] <= 1.0 for r in results)
+            assert results[0]["score"] == 1.0  # 1.0×1.2 → 钳制 1.0
+            assert results[0]["node_id"] == "n_profile"
+        finally:
+            set_user_profile({})
+
 
 class TestSearchVectorEndpoint:
     """向量检索端点测试"""

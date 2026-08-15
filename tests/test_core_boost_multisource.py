@@ -152,16 +152,16 @@ class TestBM25FactTrackCompat:
 
 class TestDeduplicateCoreBoost:
     def test_core_boost_reorders(self):
-        """core 轨 ×1.1 后反超 active，排序结果 core 在前。"""
+        """core 轨 ×1.1 后反超 active，排序结果 core 在前（输入低于 1.0 避免钳制掩盖排序）。"""
         results = [
-            {"node_id": "a", "content": "active", "score": 1.0, "fact_track": "active"},
-            {"node_id": "b", "content": "core", "score": 0.95, "fact_track": "core"},
+            {"node_id": "a", "content": "active", "score": 0.8, "fact_track": "active"},
+            {"node_id": "b", "content": "core", "score": 0.75, "fact_track": "core"},
         ]
         out = QueryRouter._deduplicate_and_sort(results)
         assert out[0]["node_id"] == "b"
-        assert out[0]["score"] == pytest.approx(0.95 * 1.1)
+        assert out[0]["score"] == pytest.approx(0.75 * 1.1)
         assert out[1]["node_id"] == "a"
-        assert out[1]["score"] == 1.0
+        assert out[1]["score"] == 0.8
 
     def test_non_core_no_boost(self):
         """active / 缺 fact_track 键 → 不 boost。"""
@@ -178,34 +178,41 @@ class TestDeduplicateCoreBoost:
 
 class TestVectorPathCoreBoost:
     def test_l2_vector_path_applies_core_boost(self):
-        """缺陷 1：L2 向量通道经 retrieve() _finish 统一出口获 core ×1.1 boost。"""
+        """缺陷 1：L2 向量通道经 retrieve() _finish 统一出口获 core ×1.1 boost。
+
+        输入 FAISS distance=1/9 → score=0.9，×1.1=0.99 < 1.0（越界断言改由
+        test_user_profile 钳制用例覆盖，此处验证 boost 数学而非钳制边界）。
+        """
         router = _make_router([{
             "id": "uuid-1", "content": "我是北京人", "tau_initial": 1.0,
             "archived": False, "fact_track": "core",
         }])
-        router.faiss_index = _FakeFaiss(np.array([[0.0]]), np.array([[0]]))
+        router.faiss_index = _FakeFaiss(np.array([[1.0 / 9.0]]), np.array([[0]]))
         router.faiss_id_map = {0: "uuid-1"}
         results = router.retrieve(
             "我是北京人", query_embedding=np.zeros((1, 512)),
             level=RetrievalLevel.VECTOR,
         )
         assert results and results[0]["fact_track"] == "core"
-        assert results[0]["score"] == pytest.approx(1.0 * 1.1)
+        assert results[0]["score"] == pytest.approx(0.9 * 1.1)
 
 
 # ─── 缺陷 1b：L3 KEYWORD 路径经 retrieve() 统一出口获 core boost ──────
 
 class TestKeywordPathCoreBoost:
     def test_l3_keyword_path_applies_core_boost(self):
-        """缺陷 1b：L3 关键词通道经 retrieve() _finish 统一出口获 core ×1.1 boost。"""
+        """缺陷 1b：L3 关键词通道经 retrieve() _finish 统一出口获 core ×1.1 boost。
+
+        输入 TF-IDF score=0.9 → ×1.1=0.99 < 1.0（钳制边界用例见 test_user_profile）。
+        """
         router = _make_router([{
             "id": "uuid-1", "content": "deep learning framework", "tau_initial": 1.0,
             "archived": False, "fact_track": "core",
         }])
-        router.tfidf_index = _FakeTfidf([("uuid-1", 1.0, "deep learning framework")])
+        router.tfidf_index = _FakeTfidf([("uuid-1", 0.9, "deep learning framework")])
         results = router.retrieve("deep learning", level=RetrievalLevel.KEYWORD)
         assert results and results[0]["fact_track"] == "core"
-        assert results[0]["score"] == pytest.approx(1.0 * 1.1)
+        assert results[0]["score"] == pytest.approx(0.9 * 1.1)
 
 
 # ─── 缺陷 1c：L4 GraphLite fallback 路径经 retrieve() 获 core boost ───

@@ -607,6 +607,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             except Exception as e:
                 logger.warning("Startup BM25 prewarm skipped (non-fatal): %s", e)
 
+        # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
+        # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；
+        #  仅非空重建结果才覆盖写，失败静默降级，不阻塞启动）
+        # 【P2-单租户语义】全库扫描 + 模块级 _USER_PROFILE 全局，不按 namespace
+        # 隔离——当前产品单租户部署，跨 namespace 画像共享为已知接受语义；
+        # 多租户需按 {namespace: profile} 键控 + 此处按 ns 过滤扫描。
+        try:
+            from core import user_profile as _up
+            from retrieval.query_router import set_user_profile
+            profile = _up.load_profile(_up._DEFAULT_PROFILE_PATH)
+            if svc.graphlite_store is not None:
+                # 【P3】同步 query_cypher 移入线程池，避免阻塞事件循环；
+                # 排除 archived/quarantine 节点（同检索侧过滤语义）
+                rows = await asyncio.to_thread(
+                    svc.graphlite_store.query_cypher,
+                    "MATCH (e:EpisodeNode) "
+                    "WHERE (e.archived IS NULL OR e.archived = false) "
+                    "AND (e.quarantine IS NULL OR e.quarantine = false) "
+                    "RETURN e LIMIT 10000",
+                )
+                profile = _up.rebuild_or_keep(profile, _up.scan_rows(rows))
+            if profile:
+                _up.save_profile(profile, _up._DEFAULT_PROFILE_PATH)
+            set_user_profile(profile)
+            total = sum(len(g) for g in profile.values())
+            logger.info("Startup: user profile ready",
+                        entries=total, groups=list(profile.keys()))
+        except Exception as e:
+            logger.warning("Startup user-profile build skipped (non-fatal): %s", e)
+
     async def _cleanup_dream_candidates() -> None:
         """启动时清理过期的梦境候选文件（保留最近50个）。"""
         try:

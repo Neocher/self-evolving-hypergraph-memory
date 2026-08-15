@@ -250,6 +250,21 @@ async def retrieve(
                 retrieval_level=getattr(r, "source", "hypergraph"),
             ))
 
+    # 【User-Profile】旁路上下文：画像命中 → profile_context 注入响应
+    # （消费方 prepend 到 prompt；SelfEvolvingRetrieval 包装时取内层 QueryRouter）
+    profile_context = None
+    qr = deps.query_router
+    if qr is not None:
+        try:
+            inner_qr = getattr(qr, "_qr", qr)
+            search_profile = getattr(inner_qr, "search_profile", None)
+            if callable(search_profile):
+                sp = search_profile(req.query)
+                if isinstance(sp, dict) and sp.get("matched"):
+                    profile_context = sp.get("context") or None
+        except Exception:
+            profile_context = None
+
     latency = (_now() - start) * 1000
     response = RetrieveResponse(
         query=req.query,
@@ -258,6 +273,7 @@ async def retrieve(
         total_found=len(results),
         latency_ms=round(latency, 2),
         degraded=degraded,
+        profile_context=profile_context,
     )
     # 【Perf】存入结果缓存
     with _result_cache_lock:

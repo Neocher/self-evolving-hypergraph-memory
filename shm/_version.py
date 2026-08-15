@@ -1,12 +1,33 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.38.0"
-__version_info__ = (5, 38, 0)
-__version_name__ = "Ontology-Evolution"
+__version__ = "5.39.0"
+__version_info__ = (5, 39, 0)
+__version_name__ = "User-Profile"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.39.0 (2026-08-15) User-Profile:
+  • 显式用户画像层 — 对标 Profile-Graph Memory（2606.06036）：从用户直述
+    （source_type=direct）节点提取稳定偏好/身份/工作，检索画像值命中
+    score ×1.2 加分 + search_profile 旁路上下文，不做重排
+  • 新建 core/user_profile.py — scan_preference_candidates（复用
+    fact_track.CORE_KEYWORDS 值提取子集 + 补「工作/工作于」+ 英文低误报词
+    I live in/I work at/my favorite；source_type==direct 硬门控 + 句首
+    第一人称 ^(我|我的|i\\b) 防误识别）、aggregate（按值去重归一 +
+    source_type 权重累积 direct 1.0/tool 0.7/inferred 0.5 + 多源计数加分）、
+    build_profile（preferences/identity/work 分组，空候选 → 空 dict）、
+    load_profile/save_profile（JSON 原子读写 temp+rename，缺失/损坏降级）
+  • 检索加分 — query_router _deduplicate_and_sort 画像命中 ×1.2（复用
+    core-boost 模式，乘正因子单调）；set_user_profile 模块级注入内存常驻；
+    search_profile 旁路返回画像上下文（prepend 到 prompt 不参与主排序）
+  • app.py 接线 — _startup_rebuild 后台扫描 EpisodeNode → 构建画像 →
+    落盘 data/user_profile.json + 注入内存常驻（全量重扫覆盖写，幂等）
+  • 存储 — JSON + 内存常驻，不用 GraphLite Hyperedge（≥2 成员硬约束 +
+    检索不可见 + N+1 反查）；data/ 整体 gitignore
+  • 测试: 新增 test_user_profile 10 用例（scan 3 含误识别用例 / aggregate 2 /
+    build_profile 2 / search_profile 2 / 检索加分 1），core_boost 无回归
+
 v5.38.0 (2026-08-15) Ontology-Evolution:
   • Schema 自演化 — 对标 MindMemOS：ontology 随数据生长。梦境 SYNTHESIZE 后
     聚合全部社区 topics/report 做 1 次 LLM 调用（复用 llm_client.chat，

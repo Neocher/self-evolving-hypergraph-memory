@@ -31,11 +31,25 @@ from typing import Optional
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from core.user_profile import profile_hit, profile_values
 from graph.graphlite_store import CircuitBreakerOpen
 
 from observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 【User-Profile】内存常驻用户画像（app.py 启动时全量重建后经 set_user_profile
+# 注入；单实例服务模块级共享，_deduplicate_and_sort 静态方法可直接读取）。
+# 【P2-单租户语义】画像为模块级全局，检索加分/旁路 context 均不感知
+# req.namespace——当前产品为单租户/单 Agent 部署，跨 namespace 画像泄露为
+# 已知接受语义；多租户需将 _USER_PROFILE 改为 {namespace: profile} 键控。
+_USER_PROFILE: dict = {}
+
+
+def set_user_profile(profile: dict) -> None:
+    """注入/更新用户画像（v5.39.0；启动全量重建后调用，内存常驻）。"""
+    global _USER_PROFILE
+    _USER_PROFILE = profile or {}
 
 
 class RetrievalLevel(Enum):
@@ -1321,11 +1335,22 @@ class QueryRouter:
 
     @staticmethod
     def _deduplicate_and_sort(results: list[dict]) -> list[dict]:
-        """按 content[:100] 去重并按 score 降序排列（core 轨温和 boost ×1.1）。"""
-        # 【Core-Boost】core 事实温和加分：score 非 [0,1] 但乘正因子单调，不破坏排序语义
+        """按 content[:100] 去重并按 score 降序排列（core 轨 ×1.1 / 画像命中 ×1.2）。
+
+        【P1】分数契约：boost 后钳制 score ∈ [0, 1]——EpisodicResult.score 约束
+        le=1.0（api/models.py），越界会让 /memories/retrieve 构造响应抛
+        ValidationError → 500（如 1.0×1.2=1.2）。钳制不破坏排序语义（单调）。
+        """
+        # 【Core-Boost】core 事实温和加分 + 【Profile-Boost】画像值命中加分
+        profile_vals = profile_values(_USER_PROFILE)
         for r in results:
             if r.get("fact_track") == "core":
                 r["score"] *= 1.1
+            if profile_hit(r.get("content", ""), profile_vals):
+                r["score"] *= 1.2
+            # 【P1】钳制上界 1.0：core ×1.1 / 画像 ×1.2 可能突破 1.0，
+            # 契约越界 → EpisodicResult ValidationError → 生产检索 500
+            r["score"] = min(1.0, r["score"])
         seen: set[str] = set()
         unique: list[dict] = []
         for r in sorted(results, key=lambda x: x["score"], reverse=True):
@@ -1335,6 +1360,27 @@ class QueryRouter:
                 seen.add(key)
                 unique.append(r)
         return unique
+
+    def search_profile(self, query: str) -> dict:
+        """旁路：返回与 query 相关的画像上下文块（prepend 到 prompt，不参与主排序）。
+
+        消费点：api/routes/search.py /memories/retrieve 注入响应
+        RetrieveResponse.profile_context（SelfEvolvingRetrieval 包装时经 _qr 解包调用）。
+        """
+        if not _USER_PROFILE:
+            return {"matched": False, "context": ""}
+        hits = []
+        for group, entries in _USER_PROFILE.items():
+            if not isinstance(entries, dict):
+                continue
+            for value, info in entries.items():
+                if value and str(value) in query:
+                    weight = info.get("weight", 0.0) if isinstance(info, dict) else 0.0
+                    hits.append({"group": group, "value": value, "weight": weight})
+        if not hits:
+            return {"matched": False, "context": ""}
+        lines = "\n".join(f"- {h['group']}: {h['value']} (weight {h['weight']:.1f})" for h in hits)
+        return {"matched": True, "context": f"【用户画像】\n{lines}", "hits": hits}
 
     @staticmethod
     def _filter_archived(results: list[dict]) -> list[dict]:

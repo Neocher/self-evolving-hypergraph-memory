@@ -203,6 +203,10 @@ class RetrieveResponse(BaseModel):
     total_found: int = Field(default=0, ge=0, description="检索到的结果总数")
     latency_ms: float = Field(default=0.0, description="检索耗时（毫秒）")
     degraded: bool = Field(default=False, description="是否触发了检索降级")
+    profile_context: Optional[str] = Field(
+        default=None,
+        description="用户画像旁路上下文块（search_profile 命中时注入，消费方 prepend 到 prompt，不参与主排序）",
+    )
 
 
 # ─── 梦境 ──────────────────────────────────────────────────
