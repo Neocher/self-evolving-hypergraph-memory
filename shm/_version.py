@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.31.6"
-__version_info__ = (5, 31, 6)
-__version_name__ = "Graceful-Shutdown"
-__release_date__ = "2026-08-14"
+__version__ = "5.32.0"
+__version_info__ = (5, 32, 0)
+__version_name__ = "Archive-Supersedes"
+__release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.32.0 (2026-08-15) Archive-Supersedes:
+  • 结构化归档 + supersedes 血统链 — 梦境「遗忘」从物理删除改为归档
+    （archived=true）+ 建 (old)-[:SUPERSEDES]->(new) 血统边，对标 MindMemOS
+  • PRUNE 改归档: _persist_prune DETACH DELETE → graphlite_store.archive_node
+    （τ 衰减节点归档而非删除；pruned_ids 仍供 FAISS remove_ids）
+  • RESOLVE 改归档: _persist_merge loser DETACH DELETE → archive_node(loser,
+    winner)，winner 拼接摘要后建 SUPERSEDES 边，历史可追溯
+  • 检索层默认排除 archived: retrieve() 加 include_archived 参数 + _filter_archived
+    后置过滤；Cypher 兜底追加 (archived IS NULL OR archived = false)；向量路由
+    Python 侧过滤；写时基线 create_episode 默认 archived=false
+  • 旧数据兼容: 过滤写 IS NULL OR = false（不误排除无 archived 字段旧节点）
+
 v5.31.6 (2026-08-14) Graceful-Shutdown:
   • SIGTERM/SIGINT 优雅退出（三体协奏 Phase1 CC 设计 → Phase2 OpenCode
     实施 → Phase3 Codex 审核）— lifespan 注册信号处理器转发 uvicorn

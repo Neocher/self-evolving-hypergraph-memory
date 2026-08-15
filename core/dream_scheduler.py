@@ -221,7 +221,9 @@ class DreamScheduler:
                         # 单次获取节点（6844节点，一次查询即可）
                         rows = await asyncio.to_thread(
                             graphlite_store.query_cypher,
-                            "MATCH (e:EpisodeNode) RETURN e.* "
+                            "MATCH (e:EpisodeNode) "
+                            "WHERE (e.archived IS NULL OR e.archived = false) "
+                            "RETURN e.* "
                             "ORDER BY e.created_at DESC LIMIT 10000"
                         )
                         if rows:

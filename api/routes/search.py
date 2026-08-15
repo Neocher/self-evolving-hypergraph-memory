@@ -38,8 +38,8 @@ async def retrieve(
     set_trace_id()
     degraded = False
 
-    # 【Perf】结果缓存命中
-    cache_key = f"{req.query}:{req.top_k}"
+    # 【Perf】结果缓存命中（键含 include_archived，避免 True/False 互相污染缓存）
+    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}"
     with _result_cache_lock:
         if cache_key in _result_cache:
             latency = (_now() - start) * 1000
@@ -55,7 +55,10 @@ async def retrieve(
         # 【P1-3】全同步检索链路（FAISS/sklearn/GraphLite）移到线程池，避免阻塞事件循环
         # 【H2】外层 wait_for：GraphLite/FAISS 挂起时超时返回空结果（降级），不无限挂起
         results_raw = await asyncio.wait_for(
-            asyncio.to_thread(deps.query_router.retrieve, req.query),
+            asyncio.to_thread(
+                deps.query_router.retrieve, req.query,
+                include_archived=req.include_archived,
+            ),
             timeout=_RETRIEVE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -84,6 +87,7 @@ async def retrieve(
                 conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words[:5])))
                 cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                           "AND (e.quarantine IS NULL OR e.quarantine = false) "
+                          "AND (e.archived IS NULL OR e.archived = false) "
                           f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
                 # 【H2】【H2-a】Cypher 兜底移入线程池 + 套 wait_for：
                 # GraphLite 卡死时超时即跳过兜底，不再无限挂起
@@ -372,6 +376,8 @@ async def search_vector(
 
         for faiss_id, episode_id, score in hits:
             node = episodes_dict.get(episode_id)
+            if node and node.get("archived") in (True, "true", 1):
+                continue  # 排除已归档节点
             content = node.get("content", "") if node else ""
             results.append(SearchVectorResult(
                 node_id=episode_id,

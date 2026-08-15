@@ -304,6 +304,7 @@ class QueryRouter:
         try:
             rows = self.graphlite_store.query_cypher(
                 "MATCH (e:EpisodeNode) "
+                "WHERE (e.archived IS NULL OR e.archived = false) "
                 "RETURN e.id AS node_id, e.content AS content, "
                 "e.tau_initial AS tau_value "
                 "ORDER BY e.created_at DESC "
@@ -574,7 +575,8 @@ class QueryRouter:
                 conditions.append(f"e.content CONTAINS ${pkey}")
             where_clause = " OR ".join(conditions)
             cypher = (
-                f"MATCH (e:EpisodeNode) WHERE {where_clause} "
+                f"MATCH (e:EpisodeNode) WHERE ({where_clause}) "
+                f"AND (e.archived IS NULL OR e.archived = false) "
                 f"RETURN e.id AS node_id, e.content AS content, "
                 f"e.tau_initial AS tau_value "
                 f"LIMIT $limit"
@@ -728,6 +730,7 @@ class QueryRouter:
         query: str,
         query_embedding: Optional[np.ndarray] = None,
         level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
+        include_archived: bool = False,
     ) -> list[dict]:
         """多信号检索融合入口。
 
@@ -739,6 +742,7 @@ class QueryRouter:
             query: 查询文本
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
             level: 检索级别（默认从 L1 开始，传入 FUSION 使用并行融合）
+            include_archived: 是否包含已归档节点（默认 False，排除 archived=true）
 
         Returns:
             检索结果列表 [...]
@@ -747,12 +751,15 @@ class QueryRouter:
         raw_query = query  # 保留原始查询（BM25 通道需要未归一化的中文原文）
         query = self._normalize_query(query)
 
+        def _finish(results: list[dict]) -> list[dict]:
+            return results if include_archived else self._filter_archived(results)
+
         strategy = self.detect_strategy(query)
         logger.info("Retrieval started", query=query[:80], level=level.value, strategy=strategy)
 
         # F — 三路并行融合（向量 + BM25 + 实体匹配）
         if level == RetrievalLevel.FUSION:
-            return self._fusion_retrieve(query, query_embedding, raw_query)
+            return _finish(self._fusion_retrieve(query, query_embedding, raw_query))
 
         # 从指定级别开始，逐级尝试（空结果自动级联）
         results: list[dict] = []
@@ -761,31 +768,31 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
                 self._tag_degraded(r, level="l1_circuit_breaker")
                 return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
                 self._tag_degraded(r, level="l1_faiss_unavailable")
                 return r
             if results:
-                return results
+                return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR)
+            return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
 
         if level == RetrievalLevel.VECTOR:
             try:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
             if results:
-                return results
+                return _finish(results)
             logger.info("L2 empty, cascading to L3")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived)
             self._tag_degraded(r, level="l2_empty")
             return r
 
@@ -793,11 +800,11 @@ class QueryRouter:
         try:
             results = self._keyword_retrieve(query)
         except Exception as e:
-            return self._graphlite_text_fallback(query, str(e))
+            return _finish(self._graphlite_text_fallback(query, str(e)))
         if results:
-            return results
+            return _finish(results)
         logger.info("L3 empty, trying L4 GraphLite fallback")
-        return self._graphlite_text_fallback(query, "L3 empty")
+        return _finish(self._graphlite_text_fallback(query, "L3 empty"))
 
     def _fusion_retrieve(
         self,
@@ -978,6 +985,16 @@ class QueryRouter:
         results: list[dict] = []
         alpha = self.config.graph_expansion_alpha
 
+        # 邻居 dict 无 archived 字段（get_hypergraph_neighbors 只回 id/content/co_occurrence）
+        # 且 HYPEREDGE_MEMBER 边在归档后仍保留——回查补 archived 交 _filter_archived 过滤。
+        neighbor_ids: list[str] = []
+        for sid in seeds:
+            for nb in all_neighbors.get(sid, []):
+                nid = nb.get("id", "")
+                if nid:
+                    neighbor_ids.append(nid)
+        archived_ids = self._lookup_archived_ids(neighbor_ids)
+
         for sid in seeds:
             for nb in all_neighbors.get(sid, []):
                 nid = nb.get("id", "")
@@ -992,6 +1009,7 @@ class QueryRouter:
                     "node_id": nid,
                     "content": content,
                     "score": score,
+                    "archived": nid in archived_ids,
                     "level": "graph_expansion",
                     "_source": "graph",
                 })
@@ -1060,6 +1078,7 @@ class QueryRouter:
                 "content": episode.get("content", ""),
                 "score": round(1.0 / (1.0 + float(score)), 4),
                 "tau_value": episode.get("tau_initial", 0.0),
+                "archived": episode.get("archived", False),
                 "level": RetrievalLevel.VECTOR.value,
             })
 
@@ -1079,7 +1098,8 @@ class QueryRouter:
         except Exception as e:
             raise RuntimeError(f"TF-IDF keyword search failed: {e}") from e
 
-        results: list[dict] = []
+        items: list[tuple[str, str, float]] = []
+        node_ids: list[str] = []
         for item in keyword_results:
             if isinstance(item, tuple) and len(item) >= 2:
                 doc_id, score = item[0], item[1]
@@ -1087,16 +1107,22 @@ class QueryRouter:
             else:
                 doc_id, score = str(item), 0.0
                 content = ""
-            results.append(
-                {
-                    "node_id": str(doc_id),
-                    "content": str(content),
-                    "score": float(score),
-                    "tau_value": 0.0,
-                    "level": RetrievalLevel.KEYWORD.value,
-                }
-            )
-        return results
+            nid = str(doc_id)
+            items.append((nid, str(content), float(score)))
+            node_ids.append(nid)
+        # TF-IDF 快照语料在 app.py/system.py fit，无法在此构建期过滤——回查补 archived
+        archived_ids = self._lookup_archived_ids(node_ids)
+        return [
+            {
+                "node_id": doc_id,
+                "content": content,
+                "score": score,
+                "tau_value": 0.0,
+                "archived": doc_id in archived_ids,
+                "level": RetrievalLevel.KEYWORD.value,
+            }
+            for doc_id, content, score in items
+        ]
 
     def _graphlite_text_fallback(self, query: str, error_context: str = "") -> list[dict]:
         """
@@ -1139,7 +1165,8 @@ class QueryRouter:
                 f"e.content CONTAINS $w{i}" for i in range(len(search_terms))
             )
             cypher = (
-                f"MATCH (e:EpisodeNode) WHERE {conditions} "
+                f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
+                f"AND (e.archived IS NULL OR e.archived = false) "
                 f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value "
                 "LIMIT $limit"
             )
@@ -1272,3 +1299,27 @@ class QueryRouter:
                 seen.add(key)
                 unique.append(r)
         return unique
+
+    @staticmethod
+    def _filter_archived(results: list[dict]) -> list[dict]:
+        """排除已归档节点（archived=true）。旧节点无 archived 字段视为未归档，不排除。"""
+        return [r for r in results
+                if r.get("archived") not in (True, "true", 1)]
+
+    def _lookup_archived_ids(self, node_ids: list[str]) -> set[str]:
+        """批量回查节点归档状态，返回已归档 id 集合（回查失败返回空集，不误过滤）。"""
+        if not node_ids or self.graphlite_store is None:
+            return set()
+        try:
+            if not hasattr(self.graphlite_store, "get_episodes_batch"):
+                return set()
+            eps = self.graphlite_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
+            if not isinstance(eps, (list, tuple)):
+                return set()
+            return {
+                str(ep.get("id", ""))
+                for ep in eps
+                if isinstance(ep, dict) and ep.get("archived") in (True, "true", 1)
+            }
+        except Exception:
+            return set()

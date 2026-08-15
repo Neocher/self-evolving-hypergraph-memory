@@ -485,7 +485,7 @@ class SelfEvolvingRetrieval:
 
         # 无锁执行检索（读操作，可并发执行，不再串行化）
         try:
-            raw = self._qr.retrieve(query)
+            raw = self._qr.retrieve(query, include_archived=False)
         except Exception as e:
             logger.error("检索失败: %s", e)
             return []

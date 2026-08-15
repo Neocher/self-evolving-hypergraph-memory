@@ -371,6 +371,7 @@ class RecordingStore:
         self.existing_content = existing_content
         self.calls: list[tuple[str, dict]] = []
         self.deleted: list[str] = []
+        self.archived: list[tuple[str, str]] = []
 
     def query_cypher(self, cypher: str, params: dict):
         self.calls.append((cypher, params))
@@ -381,6 +382,10 @@ class RecordingStore:
             return []
         # 读现有 content
         return [{"content": self.existing_content}]
+
+    def archive_node(self, node_id: str, replacement_id: str = None) -> bool:
+        self.archived.append((node_id, replacement_id))
+        return True
 
     def last_set_params(self):
         for cypher, params in reversed(self.calls):
@@ -428,7 +433,7 @@ class TestP8MergeTruncation:
         assert "target.content + ' | merged: '" not in " ".join(c for c, _ in store.calls), (
             "不应再使用 GQL 内联拼接（无界追加路径已移除）"
         )
-        assert store.deleted == ["loser"], "被合并节点仍应 DETACH DELETE"
+        assert store.archived == [("loser", "winner")], "被合并节点应归档并建 SUPERSEDES 血统边"
 
     def test_merge_no_existing_content(self):
         """目标节点不存在/无 content → 空 base 正常拼接。"""

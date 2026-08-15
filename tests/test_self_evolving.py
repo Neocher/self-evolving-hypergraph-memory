@@ -142,7 +142,7 @@ class MockRouter:
         bm25_b = 0.75
     config = Config()
 
-    def retrieve(self, q):
+    def retrieve(self, q, include_archived=False):
         return [{"content": f"result_{q}", "score": 0.7}]
 
     def state(self):
@@ -161,7 +161,7 @@ class TestSelfEvolvingRetrieval:
     def test_evolve_cycle(self):
         """低质量检索多次后触发演化的完整循环"""
         class BadRouter(MockRouter):
-            def retrieve(self, q):
+            def retrieve(self, q, include_archived=False):
                 return []  # 总是返回空
 
         se = SelfEvolvingRetrieval(BadRouter(), evolve_interval=3, quality_threshold=0.5)
@@ -177,7 +177,7 @@ class TestSelfEvolvingRetrieval:
         不能返回 dict —— 下游 search.py/gateway_api.py 按 list 遍历，
         dict 会触发 AttributeError → 500（曾导致线上故障）。"""
         class RaisingRouter(MockRouter):
-            def retrieve(self, q):
+            def retrieve(self, q, include_archived=False):
                 raise RuntimeError("simulated retrieval failure")
 
         se = SelfEvolvingRetrieval(RaisingRouter())
@@ -207,7 +207,7 @@ class TestSelfEvolvingRetrievalConcurrency:
         import threading
 
         class SlowRouter(MockRouter):
-            def retrieve(self, q):
+            def retrieve(self, q, include_archived=False):
                 time.sleep(0.002)  # 拉大并发交错窗口
                 return [{"content": f"result_{q}", "score": 0.7}]
 
@@ -239,7 +239,7 @@ class TestSelfEvolvingRetrievalConcurrency:
         import threading
 
         class BadRouter(MockRouter):
-            def retrieve(self, q):
+            def retrieve(self, q, include_archived=False):
                 time.sleep(0.001)
                 return []  # 空结果 → 低质量 → 触发诊断/演化
 
@@ -273,7 +273,7 @@ class TestSelfEvolvingRetrievalConcurrency:
         import time as _time
 
         class SlowRouter(MockRouter):
-            def retrieve(self, q):
+            def retrieve(self, q, include_archived=False):
                 _time.sleep(0.1)  # 模拟 100ms 检索
                 return [{"content": f"result_{q}", "score": 0.7}]
 

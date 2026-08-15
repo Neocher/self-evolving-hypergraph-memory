@@ -1397,29 +1397,26 @@ Text:
         return created
 
     def _persist_prune(self, graphlite_store, prune_ops: list) -> tuple[int, list[str]]:
-        """将PRUNE剪枝结果执行真实的GraphLite DELETE。
+        """将 PRUNE 剪枝结果归档（archived=true，替代物理删除）。
 
-        先删边再删节点，避免GraphLite外键约束错误。
-        返回 (删除数量, 被删节点ID列表)
+        保留 (deleted_count, pruned_ids) 签名不变——deleted_count 语义改为
+        「归档数」；pruned_ids 仍返回给下游 FAISS incremental_faiss_update 做
+        remove_ids（节点归档后须从向量索引剔除）。
         """
         deleted = 0
         pruned_ids: list[str] = []
         for op in prune_ops:
             if op.op_type == "delete":
                 try:
-                    # 先用 DETACH 删掉所有指向该节点的边
-                    graphlite_store.query_cypher(
-                        "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
-                        {"id": op.node_id}
-                    )
-                    deleted += 1
-                    pruned_ids.append(op.node_id)
+                    if graphlite_store.archive_node(op.node_id):
+                        deleted += 1
+                        pruned_ids.append(op.node_id)
                 except Exception:
-                    logger.warning("Failed to DETACH DELETE pruned node from GraphLite", exc_info=True)
+                    logger.warning("Failed to archive pruned node in GraphLite", exc_info=True)
         return deleted, pruned_ids
 
     def _persist_merge(self, graphlite_store, merge_ops: list) -> None:
-        """将RESOLVE合并结果写回GraphLite（打标记 + DETACH DELETE被合并节点）。
+        """将 RESOLVE 合并结果写回 GraphLite（winner 拼接摘要 + 归档 loser + SUPERSEDES 边）。
 
         【P8】merge 截断：先读现有 content，Python 侧拼
         `(old + ' | merged: ' + old_value)[:2000]` 再 SET——防止无界追加
@@ -1449,11 +1446,8 @@ Text:
                         "SET target.content = $content",
                         {"target": op.new_value, "content": merged_content}
                     )
-                    # 删除被合并节点（DETACH先删边）
-                    graphlite_store.query_cypher(
-                        "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
-                        {"id": op.node_id}
-                    )
+                    # 归档被合并节点（loser）+ 建 SUPERSEDES 血统边（替代 DETACH DELETE）
+                    graphlite_store.archive_node(op.node_id, op.new_value)
                 except Exception:
                     logger.warning("Failed to persist merge resolution in GraphLite", exc_info=True)
 

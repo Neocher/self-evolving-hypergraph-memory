@@ -465,3 +465,51 @@ class TestM2AtomicUpdateWithVersion:
         store._db = None
         store.config = type("cfg", (), {"database_path": ""})()
         assert store.update_with_version("n1", {"content": "x"}, expected_version=1) is False
+
+
+class TestArchiveNode:
+    """Archive-Supersedes：archive_node 归档节点 + 建 SUPERSEDES 血统边。"""
+
+    @staticmethod
+    def _store_with_session(rows_affected):
+        from graph.graphlite_store import GraphLiteStore
+
+        class RecordingSession:
+            def __init__(self, affected):
+                self.affected = affected
+                self.executed: list[str] = []
+
+            def execute(self, gql):
+                self.executed.append(gql)
+                return self.affected
+
+        session = RecordingSession(rows_affected)
+        store = GraphLiteStore.__new__(GraphLiteStore)
+        store._session = session
+        store._session_lock = __import__("threading").RLock()
+        store._db = None
+        store.config = type("cfg", (), {"database_path": ""})()
+        return store, session
+
+    def test_archive_sets_archived_true(self):
+        """归档存在节点 → SET archived=true 并返回 True。"""
+        store, session = self._store_with_session(rows_affected=1)
+        assert store.archive_node("n1") is True
+        assert len(session.executed) == 1
+        assert "SET e.archived = true" in session.executed[0]
+        assert "id: 'n1'" in session.executed[0]
+
+    def test_archive_missing_returns_false(self):
+        """节点不存在（rows_affected=0）→ False，不建边。"""
+        store, session = self._store_with_session(rows_affected=0)
+        assert store.archive_node("n1") is False
+        assert len(session.executed) == 1
+
+    def test_archive_with_replacement_builds_supersedes(self):
+        """replacement 非空 → 建 SUPERSEDES 边（第二条 execute）。"""
+        store, session = self._store_with_session(rows_affected=1)
+        assert store.archive_node("n1", "n2") is True
+        assert len(session.executed) == 2
+        assert "SUPERSEDES" in session.executed[1]
+        assert "id: 'n1'" in session.executed[1]
+        assert "id: 'n2'" in session.executed[1]

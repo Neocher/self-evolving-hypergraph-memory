@@ -401,6 +401,10 @@ class GraphLiteStore:
         注意: GraphLite INSERT 不能直接带 version 字段 (会 QUERY_ERROR)，
         必须先 INSERT 再 SET version。
         """
+        # 【Archive-Supersedes】写时基线：新节点默认 archived=false，保证检索过滤一致性
+        # （一处覆盖 4 个写入点：write.py create_episode / write_sensory 兜底 /
+        # write_multimodal / promote_to_episode）。
+        episode.setdefault("archived", False)
         eid = episode.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(episode, skip_keys={"id", "version"})
         # 【H1】id 经 _gql_value 转义（含 ' / \ 的 id 不再裸插注入 GQL）
@@ -539,6 +543,38 @@ class GraphLiteStore:
                 return result is not None and result > 0
             except Exception:
                 return False
+
+    def archive_node(self, node_id: str, replacement_id: Optional[str] = None) -> bool:
+        """标记 EpisodeNode 为归档（archived=true）；replacement_id 非空时建 SUPERSEDES 血统边。
+
+        GraphLite 无 MERGE：supersedes 边用双 MATCH + INSERT（参考
+        link_hyperedge_member 的逗号分隔 MATCH 模式）。节点存在性用
+        session.execute 的 rows_affected 判定（MATCH 无匹配时 execute 返回 0，
+        与 update_with_version 的 CAS 检测一致；query_cypher 对 SET 恒返回
+        status 行，无法区分存在性）。
+        """
+        id_lit = _gql_value(str(node_id))
+        try:
+            affected = self._locked_execute(
+                f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET e.archived = true"
+            )
+        except Exception:
+            logger.warning("archive_node failed for %s", str(node_id)[:12], exc_info=True)
+            return False
+        if affected is None or affected <= 0:
+            return False
+        if replacement_id:
+            new_lit = _gql_value(str(replacement_id))
+            try:
+                self._locked_execute(
+                    f"MATCH (a:EpisodeNode {{id: {id_lit}}}), "
+                    f"(b:EpisodeNode {{id: {new_lit}}}) "
+                    f"INSERT (a)-[:SUPERSEDES]->(b)"
+                )
+            except Exception:
+                logger.warning("archive_node: SUPERSEDES edge insert failed for %s -> %s",
+                               str(node_id)[:12], str(replacement_id)[:12], exc_info=True)
+        return True
 
     # ─── Hyperedge CRUD ─────────────────────────────
 
