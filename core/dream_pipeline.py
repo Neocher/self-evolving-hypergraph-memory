@@ -420,7 +420,10 @@ class DreamPipeline:
             node_copy = dict(node)
             if self.tau_engine:
                 created_at = node.get("created_at", time.time())
-                tau = self.tau_engine.compute_strength(created_at, node_id=node.get("id"))
+                tau = self.tau_engine.compute_strength(
+                    created_at, node_id=node.get("id"),
+                    fact_track=node.get("fact_track", "active"),
+                )
                 node_copy["tau_value"] = tau
             else:
                 node_copy["tau_value"] = node.get("tau_value", 1.0)

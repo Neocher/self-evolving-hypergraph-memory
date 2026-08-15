@@ -92,9 +92,9 @@ class TauDecayConfig:
     tau_decay_min: float = 300.0    # 最短衰减常数（5分钟，高重要性节点）
     tau_decay_max: float = 7200.0   # 最长衰减常数（2小时，低重要性节点）
     importance_decay_modulator: float = 0.5  # 重要性对衰减的调制强度
-    # τ_decay_effective = τ_decay_base · (1 - I · m)
-    # 其中 I ∈ [0,1] 是归一化重要性，m 是调制强度
-    # I=1.0 → τ_decay = τ_decay_base · (1 - 0.5) = 0.5·τ_decay_base (记忆更持久)
+    # τ_decay_effective = τ_decay_base · (1 + I · m · IMP_BOOST_FACTOR)
+    # 其中 I ∈ [0,1] 是归一化重要性，m 是调制强度，IMP_BOOST_FACTOR = 2.0
+    # I=1.0 → τ_decay = τ_decay_base · 2.0 (衰减更慢，记忆更持久)
     # I=0.0 → τ_decay = τ_decay_base (原始行为)
     
     refresh_boost: float = 0.3  # 每次再巩固的时间提升比例
@@ -212,24 +212,31 @@ class TauDecayEngine:
                 self.config.tau_decay_min, min(self.config.tau_decay_max, tau_decay)
             )
 
-    def _get_effective_tau_decay(self, node_id: str) -> float:
+    def _get_effective_tau_decay(self, node_id: str, fact_track: str = "active") -> float:
         """计算有效衰减常数（v2.0 自适应）
         
-        考虑三个因素：
+        考虑四个因素：
         1. 自定义 τ_decay（如有，优先级最高）
         2. 基础 τ_decay × 重要性调制
-        3. 访问次数增强
+        3. 双轨事实：core 轨稳定事实 ×2.0 boost（等效 importance=1.0）
+        4. 访问次数增强
         """
         info = self._node_info.get(node_id)
         if not info:
-            return self.config.tau_decay_seconds
+            base = self.config.tau_decay_seconds
+            if fact_track == "core":
+                base *= IMP_BOOST_FACTOR
+            return max(self.config.tau_decay_min, min(base, self.config.tau_decay_max))
         
         # 自定义衰减
         if info.tau_decay_custom is not None:
             return info.tau_decay_custom
         
         if not self.config.enable_adaptive:
-            return self.config.tau_decay_seconds
+            base = self.config.tau_decay_seconds
+            if fact_track == "core":
+                base *= IMP_BOOST_FACTOR
+            return max(self.config.tau_decay_min, min(base, self.config.tau_decay_max))
         
         # 重要性调制：高重要性 → 衰减更慢（τ_decay 更大）
         I = info.importance  # [0, 1]
@@ -237,6 +244,10 @@ class TauDecayEngine:
         base = self.config.tau_decay_seconds
         # 高重要性 → 增加 τ_decay（衰减更慢，记忆更持久）
         boost = 1.0 + I * m * IMP_BOOST_FACTOR  # I=1.0 → 2x, I=0.5 → 1.5x, I=0 → 1x
+        # 双轨事实：core 轨稳定事实 ×2.0 boost（等效 importance=1.0 的调制），
+        # 避免稳定事实随 τ 衰减被误归档（DUM）
+        if fact_track == "core":
+            boost *= IMP_BOOST_FACTOR
         effective = base * boost
         
         # 访问次数增强：经常访问的节点衰减更慢
@@ -248,7 +259,8 @@ class TauDecayEngine:
                    min(self.config.tau_decay_max, effective))
 
     def compute_tau(self, node_id: str, created_at: Optional[float] = None,
-                    force_now: Optional[float] = None) -> float:
+                    force_now: Optional[float] = None,
+                    fact_track: str = "active") -> float:
         """计算当前 τ 值（v2.0 自适应版本）
         
         使用节点级别的自适应衰减常数。
@@ -257,18 +269,20 @@ class TauDecayEngine:
             node_id: 节点ID（用于查找自定义衰减）
             created_at: 节点创建时间戳
             force_now: 强制时间（用于测试）
+            fact_track: 事实轨（"core" 稳定事实衰减更慢 / "active" 默认）
         """
         info = self._node_info.get(node_id)
         created = created_at or (info.created_at if info else time.time())
         now = force_now or time.time()
         dt = max(0, now - created)
-        tau_decay = self._get_effective_tau_decay(node_id)
+        tau_decay = self._get_effective_tau_decay(node_id, fact_track=fact_track)
         exponent = -dt / tau_decay
         if exponent < -700:
             return 0.0
         return self.config.tau_initial * math.exp(exponent)
 
-    def compute_strength(self, created_at: float, node_id: Optional[str] = None) -> float:
+    def compute_strength(self, created_at: float, node_id: Optional[str] = None,
+                         fact_track: str = "active") -> float:
         """Compute RoMem temporal phase strength.
 
         结合 τ 衰减与傅里叶相位相似度，产生周期性记忆强度。
@@ -282,9 +296,10 @@ class TauDecayEngine:
         Args:
             created_at: 节点创建时间戳
             node_id: 节点ID（用于节点级别的自适应衰减，默认None使用全局τ_decay）
+            fact_track: 事实轨（"core" 稳定事实衰减更慢 / "active" 默认）
         """
         age = max(0.0, time.time() - created_at)
-        tau_val = self.compute_tau(node_id=node_id, created_at=created_at)
+        tau_val = self.compute_tau(node_id=node_id, created_at=created_at, fact_track=fact_track)
         phase_sim = _phase_similarity(age, ROEM_PERIODS)
         return ROEM_ALPHA * tau_val + (1.0 - ROEM_ALPHA) * (phase_sim + 1.0) / 2.0
 

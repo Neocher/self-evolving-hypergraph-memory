@@ -408,6 +408,8 @@ class GraphLiteStore:
         # 【Source-Trust】写时基线：默认 direct 向后兼容；防洗白降级（agent 直述
         # direct→inferred）由调用方 resolve_source_type 完成，此处仅兜底默认。
         episode.setdefault("source_type", "direct")
+        # 【Dual-Track】写时基线：默认 active（保守）；core 由调用方分类后显式写入
+        episode.setdefault("fact_track", "active")
         eid = episode.get("id", str(uuid.uuid4()))
         vals = _dict_to_gql_values(episode, skip_keys={"id", "version"})
         # 【H1】id 经 _gql_value 转义（含 ' / \ 的 id 不再裸插注入 GQL）

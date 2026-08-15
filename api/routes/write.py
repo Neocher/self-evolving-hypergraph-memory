@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from core.defense import MemoryDefenseVerdict
+from core.fact_track import classify_fact_track
 
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
@@ -504,6 +505,10 @@ async def create_episode(
         "created_at": created_at,
         "tau_initial": tau_initial,
     }
+    # 【Dual-Track】写时分类：稳定事实 → core，事件/临时 → active（默认）
+    episode_data["fact_track"] = classify_fact_track(
+        req.content, ontology_type=(val_result.ontology_type if val_result else None)
+    )
     # 【v5.27.0】force_promote=true → 打 protected 顶层标记，
     # 梦境 PRUNE 永不剪这类节点（dream_pipeline._prune_step 消费）。
     # GraphLite 布尔非 b64，读取经 _flatten_row 还原 Python True。

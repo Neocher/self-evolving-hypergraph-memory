@@ -1,12 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.33.0"
-__version_info__ = (5, 33, 0)
-__version_name__ = "Source-Trust"
+__version__ = "5.34.0"
+__version_info__ = (5, 34, 0)
+__version_name__ = "Dual-Track-Facts"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.34.0 (2026-08-15) Dual-Track-Facts:
+  • 双轨事实记忆 (Dual-Track Facts) — MemSIF 双轨启发：稳定事实 (core)
+    不应因 τ 衰减被误归档 (DUM)，事件/临时内容 (active) 随 τ 正常衰减
+  • 新建 core/fact_track.py — classify_fact_track 按 (本体类型 → 关键词 →
+    默认 active) 判定：core 本体类型 (person_birth/person_death/
+    organization_founded/relationship/location_fact/scientific_claim)
+    直判 core；内容含中文持久化关键词 (喜欢/我是/我住/一直/偏好/经常/
+    住在 等) 判 core；其余默认 active (保守)
+  • 写时分类 — create_episode 落库 fact_track 字段 (write.py 经
+    write_validate 的 ontology_type + 内容分类)；graphlite_store 一处
+    setdefault("fact_track", "active") 覆盖全部写入点
+  • τ 衰减差异化 — compute_tau/compute_strength 加 fact_track 参数，
+    _get_effective_tau_decay 对 core 轨 ×2.0 boost (等效 importance=1.0)
+    再走 min/max 钳制；dream_pipeline 用 created_at 重算 τ 时透传 fact_track
+  • 顺手修 tau_decay docstring 过期残留 (1 - I·m → 1 + I·m·IMP_BOOST_FACTOR)
+  • 检索 core 优先 + 多源提升：缓做 (v5.35 候选)
+
 v5.33.0 (2026-08-15) Source-Trust:
   • 来源信任分级接通 — 写时 source_type 分级落库（direct/tool/inferred，
     默认 direct 向后兼容，一处 setdefault 覆盖全部写入点）
