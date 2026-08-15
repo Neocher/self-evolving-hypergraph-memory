@@ -255,8 +255,26 @@ python -m pytest tests/ -q
 - [x] **P2**: Learnable Forgetting + Multi-Agent Governance + SSM Dream
 - [x] **GW1**: MCP + CLI + GatewayAPI
 - [x] **GW2**: A2A + ACP
+- [x] **P3**: LongMemEval-S benchmark (v5.41)
 - [ ] **OSS**: Public release + MCP Registry + blog post
 - [ ] **Prod**: Docker one-liner, pip install
+
+---
+
+## 📊 LongMemEval-S Benchmark (v5.41)
+
+[LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025) 500 问长记忆基准。SHM 检索架构（BM25+向量双通道，英文 embedding 适配）96 问样本结果：
+
+| 指标 | 结果 | 说明 |
+|:--|:--|:--|
+| Recall@5 | 0.846 | Top-5 内召回答案 session |
+| Recall@10 | 0.928 | Top-10 内召回答案 session |
+| NDCG@10 | 0.837 | 位置加权排名质量 |
+| multi-session R@10 | 0.859 | 多会话推理（v5.41 社区扩召回增强目标） |
+
+**分类型 Recall@10**：信息抽取 1.000 / 知识更新 1.000 / 时间推理 0.958 / 用户偏好 0.875 / 助手信息 0.875 / 多会话推理 0.859
+
+**方法论文本**：测的是检索架构（BM25+FAISS 双通道复刻，不写生产库）；英文数据用英文模型（生产 bge-small-zh 中文模型对英文失效——语种不匹配）；社区扩召回用真实 GraphLite 验证（构造社区边 ON=3/3 vs OFF=0/3），LongMemEval-S 干扰 session 独立结构测不出社区桥接（基准适配边界）。
 
 ---
 
