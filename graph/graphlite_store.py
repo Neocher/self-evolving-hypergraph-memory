@@ -662,6 +662,74 @@ class GraphLiteStore:
                 result[sid] = neighbors
         return result
 
+    def get_communities_by_seeds(self, seed_ids: list[str]) -> list[dict]:
+        """【v5.41 社区扩召回】种子节点 → 所属社区反查。
+
+        边方向：(c:CommunityNode)-[:COMMUNITY_MEMBER]->(e:EpisodeNode)（社区→成员，
+        CC 修正：任务书 v1 写反）。一条批量查询返回
+        [{community_id, summary, member_ids}]；member_ids 为该社区命中种子的成员 id。
+
+        复用 query_cypher 永不抛契约：空输入 / 查询失败 / 无命中 → []（静默降级，
+        主检索零回归）。【H1】批量 id 逐个 _gql_value 转义（含 ' / \\ 的 id 不裸插）。
+        """
+        if not seed_ids:
+            return []
+        ids = ", ".join(_gql_value(str(i)) for i in seed_ids)
+        gql = (
+            "MATCH (c:CommunityNode)-[:COMMUNITY_MEMBER]->(e:EpisodeNode) "
+            f"WHERE e.id IN [{ids}] "
+            "RETURN c.id AS community_id, c.summary AS summary, e.id AS member_id"
+        )
+        rows = self.query_cypher(gql)  # 永不抛（P0-2 契约），失败返回 []
+        if not rows:
+            return []
+        communities: dict[str, dict] = {}
+        for row in rows:
+            cid = row.get("community_id", "") or ""
+            if not cid:
+                continue
+            entry = communities.setdefault(cid, {
+                "community_id": cid,
+                "summary": row.get("summary", "") or "",
+                "member_ids": [],
+            })
+            mid = row.get("member_id", "") or ""
+            if mid and mid not in entry["member_ids"]:
+                entry["member_ids"].append(mid)
+        return list(communities.values())
+
+    def get_community_members(self, community_id: str, limit: int = 10) -> list[dict]:
+        """【v5.41 社区扩召回】按社区批量取成员。
+
+        返回 [{member_id, content, archived, fact_track, tau_value}]（content/归档/
+        fact_track 一次取回，供 _finish 去重/归档过滤/core·画像 boost 复用，免 N+1 回查）。
+        复用 query_cypher 永不抛契约：空输入 / 查询失败 → []（静默降级）。
+        """
+        if not community_id:
+            return []
+        gql = (
+            "MATCH (c:CommunityNode {id: $cid})-[:COMMUNITY_MEMBER]->(e:EpisodeNode) "
+            "RETURN e.id AS member_id, e.content AS content, "
+            "e.archived AS archived, e.fact_track AS fact_track, "
+            "e.tau_initial AS tau_value "
+            "ORDER BY e.tau_initial DESC "
+            "LIMIT $limit"
+        )
+        rows = self.query_cypher(gql, {"cid": community_id, "limit": int(limit)})
+        members: list[dict] = []
+        for row in rows:
+            mid = row.get("member_id", "") or ""
+            if not mid:
+                continue
+            members.append({
+                "member_id": mid,
+                "content": row.get("content", "") or "",
+                "archived": row.get("archived", False),
+                "fact_track": row.get("fact_track", "active") or "active",
+                "tau_value": row.get("tau_value", 0.0) or 0.0,
+            })
+        return members
+
     def get_all_hebbian_connections(self) -> list[dict]:
         gql = "MATCH (a)-[r:HEBBIAN_CONNECTION]->(b) RETURN a.id AS src, b.id AS dst, r.weight AS weight"
         try:

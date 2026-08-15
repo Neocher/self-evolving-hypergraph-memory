@@ -32,6 +32,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from core.user_profile import profile_hit, profile_values
+from config.settings import get_settings
 from graph.graphlite_store import CircuitBreakerOpen
 
 from observability.logger import get_logger
@@ -513,7 +514,9 @@ class QueryRouter:
         for qf_idx in query_indices:
             idf = self._bm25_idf[qf_idx]
             col = self._bm25_doc_term_matrix[:, qf_idx]
-            rows = col.indices
+            # 【CSR 行索引修复】列切片 .indices 是列号（恒 0），须用 nonzero()[0] 取行号；
+            # 修复前多文档共享 term 时 BM25 分全部累加到 docs[0]，其余文档恒 0 被跳过
+            rows = col.nonzero()[0]
             if rows.size == 0:
                 continue
             vals = col.data
@@ -784,6 +787,10 @@ class QueryRouter:
             # 经 _deduplicate_and_sort，降级链 L2/L3/L4 直接返回原始列表无 boost）。
             # 【P2】非 include_archived 时先过滤归档再去重：避免同一 content[:100]
             # 的 archived 高分项在去重时挤掉 active 低分项，再过滤后结果为空。
+            # 【v5.41 社区扩召回】补充非替代：统一去重/排序/boost 前 append 社区成员
+            # （闭包可捕获 query/query_embedding/raw_query；候选经
+            # _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大）
+            results = self._community_expansion(results, query, query_embedding, raw_query)
             if not include_archived:
                 results = self._filter_archived(results)
             return self._deduplicate_and_sort(results)
@@ -1060,6 +1067,131 @@ class QueryRouter:
             results = results[:self.config.graph_expansion_max]
 
         return results
+
+    def _community_expansion(
+        self,
+        results: list[dict],
+        query: str,
+        query_embedding: Optional[np.ndarray],
+        raw_query: str,
+    ) -> list[dict]:
+        """【v5.41 社区扩召回】补充非替代：种子 → 社区（BM25-on-summary）→ 成员 append。
+
+        链路（对齐超边扩召回）：
+          1. seeds = 前 5 个检索结果的 node_id
+          2. get_communities_by_seeds(seeds) → 所属社区；relevance = BM25(query, summary)
+          3. relevance < threshold(0.5) 丢弃；相关社区 → get_community_members → 成员（排除种子）
+          4. 扩展分 = relevance × min(种子分) × boost(0.6)（相对尾分缩放，严格低于种子）
+
+        插入点在 retrieve() _finish 去重/排序前——候选经 _deduplicate_and_sort 统一
+        去重、core/画像 boost、score 钳制（不双重放大）。GraphLite 失败/开关关闭 →
+        静默返回原 results（主检索零回归，永不抛异常）。
+        """
+        try:
+            cfg = get_settings().retrieval.community_expansion
+            if not getattr(cfg, "enabled", True) or not results:
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_communities_by_seeds"):
+                return results
+            seeds = [r.get("node_id") for r in results[:5] if r.get("node_id")]
+            if not seeds:
+                return results
+            communities = store.get_communities_by_seeds(seeds)
+            if not isinstance(communities, list) or not communities:
+                return results
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            boost = float(getattr(cfg, "boost", 0.6))
+            threshold = float(getattr(cfg, "threshold", 0.5))
+            max_members = int(getattr(cfg, "max_members", 10))
+            relevance = self._community_relevance(
+                raw_query or query,
+                [c.get("summary", "") or "" for c in communities],
+            )
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for comm, rel_score in zip(communities, relevance):
+                if rel_score < threshold:
+                    continue
+                members = store.get_community_members(
+                    comm.get("community_id", ""), limit=max_members
+                )
+                if not isinstance(members, list):
+                    continue
+                for m in members:
+                    mid = m.get("member_id", "") or ""
+                    content = m.get("content", "") or ""
+                    if not mid or mid in existing_ids or not content:
+                        continue
+                    score = round(rel_score * min_seed_score * boost, 6)
+                    if score <= 0.0:
+                        continue
+                    extra.append({
+                        "node_id": mid,
+                        "content": content,
+                        "score": score,
+                        "tau_value": float(m.get("tau_value") or 0.0),
+                        "archived": m.get("archived", False),
+                        "fact_track": m.get("fact_track") or "active",
+                        "level": "community_expansion",
+                        "_source": "community",
+                    })
+            if extra:
+                logger.info(
+                    "Community expansion appended",
+                    candidates=len(extra),
+                    boost=boost,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Community expansion degraded, returning original results", exc_info=True
+            )
+            return results
+
+    def _community_relevance(self, query: str, summaries: list[str]) -> list[float]:
+        """BM25-on-summary 相关度（[0,1]）：社区 summary 语料上的 BM25 + 单调归一。
+
+        CC 修正 #1：keywords 未落库（GraphLite 只写 id/name/summary/leiden_score/
+        created_at 5 字段）→ 相关度用 summary 词法（≤800 字散文含 Keywords 行）。
+        与主 BM25 同特征空间（char_wb 2-4gram + IDF，k1=1.5/b=0.75）；归一化
+        rel = bm25/(1+bm25)：无词法重叠 → 0（阈值闸口生效），强匹配 → 趋近 1。
+        """
+        if not summaries or not query:
+            return [0.0] * len(summaries)
+        try:
+            vectorizer = TfidfVectorizer(
+                analyzer="char_wb", ngram_range=(2, 4), lowercase=True,
+                max_features=50000,
+            )
+            tf = vectorizer.fit_transform(summaries)
+            idf = np.array(vectorizer.idf_)
+            doc_lens = tf.sum(axis=1).A1
+            avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
+            q_vec = vectorizer.transform([query])
+            k1, b = 1.5, 0.75
+            scores = np.zeros(len(summaries), dtype=np.float64)
+            for qf_idx in q_vec.indices:
+                idf_w = idf[qf_idx]
+                col = tf[:, qf_idx]
+                # 【CSR 行索引修复】列切片 .indices 是列号（恒 0），须用 nonzero()[0] 取行号；
+                # 修复前多社区时所有 BM25 分累加到 summaries[0]，其余社区恒 0
+                vals = col.data
+                rows = col.nonzero()[0]
+                if rows.size == 0:
+                    continue
+                numerator = vals * (k1 + 1.0)
+                denominator = vals + k1 * (1.0 - b + b * doc_lens[rows] / avgdl)
+                scores[rows] += idf_w * numerator / denominator
+            return (scores / (scores + 1.0)).tolist()
+        except Exception:
+            return [0.0] * len(summaries)
 
     def _vector_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None

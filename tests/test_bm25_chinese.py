@@ -130,6 +130,22 @@ def test_retrieve_chinese_mapped_word_recalls() -> None:
     assert all(r["score"] > 0 for r in results)
 
 
+def test_bm25_multi_doc_term_scores_land_on_own_rows() -> None:
+    """P1 回归：多文档共享 term 时 BM25 分须落在各自行（CSR 列切片行索引修复）。
+
+    修复前 col.indices 是列号（恒 0）→ 多文档贡献全部累加到 docs[0]，
+    其余文档 score=0 被跳过 → 只召回第 0 篇。修复后各文档独立召回。
+    """
+    corpus = ["K8s 集群网络 flannel", "K8s 集群网络 calico", "买菜清单"]
+    router = _make_router(corpus)
+    results = router._bm25_search("K8s 网络")
+    docs = [r["content"] for r in results]
+    assert any("flannel" in c for c in docs), "含 flannel 的文档应被召回"
+    assert any("calico" in c for c in docs), "含 calico 的文档应被召回"
+    assert len(results) >= 2, f"多文档共享 term 应各自召回: {docs}"
+    assert all(r["score"] > 0 for r in results)
+
+
 class FailingThenWorkingStore(FakeGraphLiteStore):
     """query_cypher 先抛异常、后恢复正常（模拟 GraphLite 短暂故障恢复）。"""
 

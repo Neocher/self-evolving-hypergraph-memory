@@ -59,6 +59,11 @@ retrieval:
   use_tau_rerank: true           # 是否使用 τ 值重排序
   tau_weight: 0.4                # τ 值权重（混合模式）
   vector_weight: 0.6             # 向量相似度权重（混合模式）
+  community_expansion:           # v5.41.0 社区扩召回（补充非替代，关闭=现状）
+    enabled: true                # 开关
+    boost: 0.6                   # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
+    threshold: 0.5               # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
+    max_members: 10              # 每社区最大成员召回数
 
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5"  # 中文 embedding 模型（512维，中文专用，CPU 0.05s/条）

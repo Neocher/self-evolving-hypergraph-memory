@@ -1,12 +1,35 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.40.0"
-__version_info__ = (5, 40, 0)
-__version_name__ = "Write-Priority"
+__version__ = "5.41.0"
+__version_info__ = (5, 41, 0)
+__version_name__ = "Community-Expansion"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.41.0 (2026-08-15) Community-Expansion:
+  • 社区扩召回 — 检索利用 CommunityNode（生产 2849 个）修复 LongMemEval-S
+    多会话 Recall@10=0.859 短板：种子（前 5 结果）→ 社区（BM25-on-summary
+    相关度，CC 修正：keywords 未落库，summary ≤800 字散文含 Keywords 行
+    词法足够）→ 成员 append，补充非替代
+  • 边方向 — (c:CommunityNode)-[:COMMUNITY_MEMBER]->(e:EpisodeNode)
+    （社区→成员，CC 修正：v1 写反）；get_communities_by_seeds +
+    get_community_members 批量查询原语（复用 query_cypher 永不抛契约，
+    失败返回 [] 静默降级）
+  • 相对尾分缩放 — 扩展分 = relevance × min(种子分) × boost(0.6)，严格低于
+    种子；relevance < threshold(0.5) 丢弃（CC 修正：非绝对 0.6）
+  • 插入点 — retrieve() _finish 去重/排序前 append（闭包捕获 query/
+    query_embedding/raw_query；候选经 _deduplicate_and_sort 单点去重 +
+    core/画像 boost + score 钳制，不双重放大）
+  • 配置 — defaults.yaml + settings.py RetrievalConfig.community_expansion
+    {{enabled, boost, threshold, max_members}}，关闭时行为 = 现状（bit 级一致）
+  • 评测 — 真实 GraphLite 写 2-3 个多会话问题 + _persist_one_community 造
+    真实社区边，扩召回开/关 multi-session Recall@10 对比
+  • 测试: 新增 test_community_expansion 10 用例（配置 YAML 接线 / 边方向真实
+    GraphLite / 不相关不加分 / 成员排除种子 / 假阳性护栏 / GraphLite 失败
+    静默降级 / 开关关闭 bit 级一致 / 画像不双重放大 / 3s 超时预算），
+    test_retrieve_routes 回归无破坏
+
 v5.40.0 (2026-08-15) Write-Priority:
   • 写队列优先级 — 单 queue.Queue → queue.PriorityQueue（天然规避双队列 notify
     死睡 bug）：入队元组 (0 if high else 1, seq, task)，seq 用 itertools.count

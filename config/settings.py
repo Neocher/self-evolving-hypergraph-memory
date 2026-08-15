@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+from typing import get_type_hints
 
 
 def _get_defaults_path() -> Path:
@@ -84,6 +85,15 @@ class FAISSConfig:
 
 
 @dataclass
+class CommunityExpansionConfig:
+    """社区扩召回配置（v5.41.0 Community-Expansion）"""
+    enabled: bool = True        # 开关：关闭时行为 = 现状（bit 级一致）
+    boost: float = 0.6          # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
+    threshold: float = 0.5      # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
+    max_members: int = 10       # 每社区最大成员召回数
+
+
+@dataclass
 class RetrievalConfig:
     top_k_l1: int = 5              # L1 FAISS 检索 top-K
     top_k_vector: int = 20         # L2 向量检索 top-K
@@ -94,6 +104,7 @@ class RetrievalConfig:
     use_tau_rerank: bool = True    # 是否使用 τ 值重排序
     tau_weight: float = 0.4        # τ 值权重（混合模式）
     vector_weight: float = 0.6     # 向量相似度权重（混合模式）
+    community_expansion: CommunityExpansionConfig = field(default_factory=CommunityExpansionConfig)
 
 
 @dataclass
@@ -300,8 +311,18 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
     kwargs: dict[str, Any] = {}
     for section, cls in section_map.items():
         section_data = raw.get(section, {})
-        kwargs[section] = cls(**{k: v for k, v in section_data.items()
-                                if k in cls.__dataclass_fields__})
+        flds = {k: v for k, v in section_data.items()
+                if k in cls.__dataclass_fields__}
+        # 嵌套 dataclass 字段（如 retrieval.community_expansion）：YAML dict → 实例。
+        # 用 get_type_hints 解析真实类型（settings.py 有 from __future__ import
+        # annotations，field.type 是字符串，不能直接 hasattr）。
+        hints = get_type_hints(cls)
+        for fname, fval in flds.items():
+            ftype = hints.get(fname)
+            if isinstance(fval, dict) and hasattr(ftype, "__dataclass_fields__"):
+                flds[fname] = ftype(**{k: v for k, v in fval.items()
+                                       if k in ftype.__dataclass_fields__})
+        kwargs[section] = cls(**flds)
     return Settings(**kwargs)
 
 
