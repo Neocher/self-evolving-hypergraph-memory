@@ -431,7 +431,7 @@ class DreamCandidateStore:
         )
         return created
 
-    def auto_apply_candidates(self, graphlite_store) -> tuple[int, int, int]:
+    def auto_apply_candidates(self, graphlite_store) -> tuple[int, int, int, list]:
         """自动审查并应用高质量的梦境候选。
 
         触发条件：
@@ -449,28 +449,29 @@ class DreamCandidateStore:
         - 社区摘要长度 > 30 字符
 
         Returns:
-            (applied_count, community_created_count, file_deleted_count)
+            (applied_count, community_created_count, file_deleted_count,
+             community_summaries)  # 【v5.37】apply 前从内存收集，供 Skill-Bridge 固化
         """
         if graphlite_store is None:
-            return (0, 0, 0)
+            return (0, 0, 0, [])
 
         # 统计候选 JSON 文件数
         if not os.path.isdir(self.storage_dir):
-            return (0, 0, 0)
+            return (0, 0, 0, [])
         all_files = [f for f in os.listdir(self.storage_dir) if f.endswith(".json")]
         if len(all_files) < 20:
             logger.debug(
                 "Auto-apply skipped: %d candidates < 20 threshold",
                 len(all_files),
             )
-            return (0, 0, 0)
+            return (0, 0, 0, [])
 
         # 加载所有候选，按 created_at 升序（最旧在前）
         all_candidates = self._load_all_candidates()
         # 过滤掉已处理/已废弃的
         pending = [c for c in all_candidates if not c.applied and not c.discarded]
         if not pending:
-            return (0, 0, 0)
+            return (0, 0, 0, [])
 
         # 只处理最旧的一个
         candidate = pending[0]
@@ -494,7 +495,10 @@ class DreamCandidateStore:
                 self.discard_candidate(candidate.dream_id)
             except Exception:
                 pass
-            return (0, 0, 0)
+            return (0, 0, 0, [])
+
+        # 【v5.37】apply 前从内存收集社区摘要（文件随后删除，不能依赖删后读取）
+        community_summaries = list(candidate.community_summaries)
 
         try:
             # 1. 执行 PRUNE（删除已废弃节点）
@@ -524,11 +528,11 @@ class DreamCandidateStore:
                 "Auto-applied dream %s: %d communities, %d prunes",
                 candidate.dream_id[:12], comm_created, deleted_count,
             )
-            return (1, comm_created, 1)
+            return (1, comm_created, 1, community_summaries)
 
         except Exception as e:
             logger.exception("Auto-apply failed for %s: %s", candidate.dream_id[:12], e)
-            return (0, 0, 0)
+            return (0, 0, 0, [])
 
     def clean_old_candidates(self, max_age_hours: int = 72) -> int:
         """清理过期的已处理候选。"""

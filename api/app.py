@@ -672,12 +672,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                                     q.pending_count(),
                                 )
                             else:
-                                applied, communities, deleted = await qsubmit(
+                                applied, communities, deleted, summaries = await qsubmit(
                                     svc, svc.dream_candidate_store.auto_apply_candidates,
                                     svc.graphlite_store,
                                 )
                                 if applied > 0:
                                     logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
+                                    # 【v5.37】Skill-Bridge：auto_apply 返回的社区摘要 → 固化为
+                                    # Hermes skill（纯文件 IO，无 LLM 调用，poll loop 不卡）
+                                    try:
+                                        from core.skill_bridge import sync_from_dream
+                                        # 【v5.37】同步文件 IO（大 skills 目录扫描）→ 线程池，
+                                        # 不阻塞事件循环
+                                        created = await asyncio.to_thread(sync_from_dream, summaries)
+                                        if created:
+                                            logger.info(
+                                                "Skill-Bridge: %d skills from dream: %s",
+                                                len(created), created,
+                                            )
+                                    except Exception:
+                                        logger.exception("Skill-Bridge sync error (non-fatal)")
                         except HTTPException:
                             logger.warning("Write queue busy, dream auto-apply deferred")
                         except Exception:

@@ -1,13 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.36.0"
-__version_info__ = (5, 36, 0)
-__version_name__ = "Cluster-Fix"
+__version__ = "5.37.0"
+__version_info__ = (5, 37, 0)
+__version_name__ = "Skill-Bridge"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v5.36.0 (2026-08-15) Cluster-Fix:
+v5.37.0 (2026-08-15) Skill-Bridge:
+  • 记忆→Skill 一体化 — 梦境巩固产出自动固化为 Hermes skill
+    （Memory-Skill-Bridge），SHM 自演化闭环从「记忆内演化」扩展到
+    「记忆→行为」：检索到的新模式沉淀为可执行 skill
+  • 新建 core/skill_bridge.py — extract_reusable_patterns 质量门三合一
+    （patterns 非空 + report 非 raw JSON + 非元话术）→ generate_skill_name
+    动作短语 kebab-case 命名（不用 hash 主名，宁缺毋滥）→ should_create_skill
+    同名/描述关键词重叠判重 → generate_skill_md（frontmatter + 场景/步骤/来源）
+    → sync_from_dream 主入口（每轮最多 3 个，不覆盖已有 skill）
+  • 时序修复: auto_apply_candidates 返回 community_summaries（apply 前从
+    内存收集，候选文件删除后不再依赖读回）；api/app.py _dream_poll_loop
+    auto_apply 后用返回摘要调 sync_from_dream（纯文件 IO，无 LLM 调用，
+    poll loop 60s 不卡）
+  • 消费端: Hermes skills_dir.rglob("SKILL.md") 递归扫描，直接写
+    ~/.hermes/skills/<name>/SKILL.md 即被加载
+  • 测试: 新增 test_skill_bridge 6 用例（质量门 4 坏例 + 命名/判重/
+    frontmatter/集成 7 社区 4 坏 3 好 → 3 skill）
   • 梦境聚类分区合并 bug 修复 — _cluster_step 合并连通分量分区时丢弃
     _detect_communities 返回的 cid，逐节点分配独立社区 ID（生产 896
     节点 = 896 社区）→ Leiden/Louvain 24 社区结果全废 → SYNTHESIZE
