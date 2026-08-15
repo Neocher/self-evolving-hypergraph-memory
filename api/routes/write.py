@@ -19,6 +19,7 @@ from api.routes._deps import (
     EpisodeCreate, EpisodeResponse,
     PromoteRequest, PromoteResponse,
 )
+from api.models import resolve_source_type
 
 # 【P1-3】外部调用超时（秒）：防御预检 / CLIP 图像嵌入 / Whisper 转录
 _EXTERNAL_CALL_TIMEOUT = 10.0
@@ -150,6 +151,7 @@ async def write_sensory(
             "id": record_id,
             "content": record.content,
             "source": record.source,
+            "source_type": resolve_source_type(record.source, record.source_type),
             "visibility": record.visibility,
             "created_at": start,
             "tau_initial": 1.0,
@@ -355,6 +357,7 @@ async def write_multimodal(
             "id": episode_id,
             "content": merged_text,
             "source": req.source,
+            "source_type": resolve_source_type(req.source, req.source_type),
             "visibility": req.visibility,
             "created_at": created_at,
             "tau_initial": 1.0,
@@ -496,6 +499,7 @@ async def create_episode(
         "id": episode_id,
         "content": req.content,
         "source": req.source,
+        "source_type": resolve_source_type(req.source, req.source_type),
         "visibility": req.visibility,
         "created_at": created_at,
         "tau_initial": tau_initial,
@@ -676,6 +680,7 @@ async def create_episodes_batch(
             if deps.graphlite_store is not None:
                 await qsubmit(deps, deps.graphlite_store.create_episode, {
                     "id": episode_id, "content": req.content, "source": req.source,
+                    "source_type": resolve_source_type(req.source, req.source_type),
                     "visibility": req.visibility, "created_at": created_at,
                     "tau_initial": tau_initial,
                     "metadata": req.metadata,
@@ -761,6 +766,7 @@ async def promote_to_episode(
         "id": episode_id,
         "content": content,
         "source": "promoted",
+        "source_type": "inferred",  # promoted 是系统提升，非用户直述
         "created_at": created_at,
         "tau_initial": tau,
     })

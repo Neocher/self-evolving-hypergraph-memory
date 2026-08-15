@@ -35,6 +35,7 @@ from api.models import (
     CommunityListResponse,
     CommunityInfo,
     HyperedgeType as APIHyperedgeType,
+    resolve_source_type,
 )
 from graph.hyperedge import HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker
@@ -117,6 +118,7 @@ class GatewayAPI:
                 "id": record_id,
                 "content": content,
                 "source": source,
+                "source_type": resolve_source_type(source, "direct"),
                 "visibility": visibility,
                 "created_at": created_at,
                 "tau_initial": 1.0,
@@ -202,6 +204,7 @@ class GatewayAPI:
             "id": episode_id,
             "content": content,
             "source": source,
+            "source_type": resolve_source_type(source, "direct"),
             "visibility": visibility,
             "created_at": created_at,
             "tau_initial": tau_initial,
@@ -386,6 +389,7 @@ class GatewayAPI:
                 "id": episode_id,
                 "content": merged_text,
                 "source": source,
+                "source_type": resolve_source_type(source, "direct"),
                 "visibility": visibility,
                 "created_at": created_at,
                 "tau_initial": 1.0,

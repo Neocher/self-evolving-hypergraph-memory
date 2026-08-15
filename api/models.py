@@ -30,6 +30,31 @@ class TriggerMode(str, Enum):
     EXPLICIT = "explicit"
 
 
+class SourceType(str, Enum):
+    """来源信任分级（写时来源类型，P3）。
+
+    direct   — 用户直接观察/直述（仅 source == "user" 允许）
+    tool     — 工具/系统桥接写入（MCP/CLI 等显式工具调用）
+    inferred — agent 推理/系统提升内容（LLM 生成、梦境提升）
+    """
+    DIRECT = "direct"
+    TOOL = "tool"
+    INFERRED = "inferred"
+
+
+def resolve_source_type(source: str, declared_source_type: str) -> str:
+    """防洗白：agent 来源（非 "user"）不得声明 direct。
+
+    规则：只有 source == "user" 才能落 direct；agent（hermes/codex/claude/
+    opencode 等）写入的 LLM 内容若声明 direct → 强制降级 inferred。
+    tool / inferred 声明及 source == "user" 的 direct 原样放行。
+    """
+    st = getattr(declared_source_type, "value", declared_source_type)
+    if st == "direct" and source != "user":
+        return "inferred"
+    return st
+
+
 # ─── Episode 请求/响应 ─────────────────────────────────────
 
 class EpisodeCreate(BaseModel):
@@ -37,6 +62,7 @@ class EpisodeCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=100_000,
                          description="情节内容文本")
     source: str = Field(default="user", description="来源标识（agent名称，如 hermes/codex/claude）")
+    source_type: SourceType = Field(default=SourceType.DIRECT, description="来源信任分级: direct(用户直述) / tool(工具桥接) / inferred(agent推理/系统提升)")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
     force_promote: bool = Field(default=False, description="是否绕过 τ 阈值强制提升")
     namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离，如 mirofish_xxx）")
@@ -107,6 +133,7 @@ class SensoryRecord(BaseModel):
     content: str = Field(..., min_length=1, max_length=100_000,
                          description="原始文本内容")
     source: str = Field(default="user", description="来源标识（agent名称，如 hermes/codex/claude）")
+    source_type: SourceType = Field(default=SourceType.DIRECT, description="来源信任分级: direct(用户直述) / tool(工具桥接) / inferred(agent推理/系统提升)")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="可选元数据")
     namespace: Optional[str] = Field(default=None, description="命名空间（用于图隔离）")
     visibility: str = Field(default="private", description="可见性: private(仅当前namespace) / shared(所有Agent可检索)")
@@ -448,6 +475,7 @@ class MultimodalRecord(BaseModel):
     audio: List[str] = Field(default_factory=list, description="Base64 编码的音频字节列表")
     video: List[str] = Field(default_factory=list, description="Base64 编码的视频字节列表")
     source: str = Field(default="user", description="来源标识")
+    source_type: SourceType = Field(default=SourceType.DIRECT, description="来源信任分级: direct(用户直述) / tool(工具桥接) / inferred(agent推理/系统提升)")
     namespace: Optional[str] = Field(default=None, description="命名空间")
     visibility: str = Field(default="private", description="可见性")
 

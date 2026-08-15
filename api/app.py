@@ -354,6 +354,7 @@ def _init_services() -> Services:
     # 7. 梦境管道 & 调度器（【FIX】移到audit_chain之后）
     try:
         from core.dream_pipeline import DreamPipeline
+        from core.confidence_calibrator import ConfidenceCalibrator
         # 【P0-1】LLM 客户端注入
         llm_client = None
         try:
@@ -370,6 +371,7 @@ def _init_services() -> Services:
             audit_chain=svc.audit_chain,  # ← 现在有值了
             llm_client=llm_client,
             ontology_validator=svc.ontology_validator if hasattr(svc, 'ontology_validator') else None,
+            confidence_calibrator=ConfidenceCalibrator(),
             write_queue=svc.write_queue,
         )
         # 【P0-2】梦境候选存储（非破坏性模式）

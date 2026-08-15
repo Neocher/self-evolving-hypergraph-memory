@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.32.1"
-__version_info__ = (5, 32, 1)
-__version_name__ = "Gateway-Archive-Align"
+__version__ = "5.33.0"
+__version_info__ = (5, 33, 0)
+__version_name__ = "Source-Trust"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.33.0 (2026-08-15) Source-Trust:
+  • 来源信任分级接通 — 写时 source_type 分级落库（direct/tool/inferred，
+    默认 direct 向后兼容，一处 setdefault 覆盖全部写入点）
+  • 防洗白校验 — agent 来源（hermes/codex/claude/opencode 等非 user）
+    声明 direct 强制降级 inferred；只有 source=="user" 才允许 direct；
+    gateway_api 3 处直调 create_episode 同步 source_type（堵 A2A 洗白漏洞）
+  • promote_to_episode 写死 source_type="inferred"（系统提升非用户直述）
+  • ConfidenceCalibrator 注入 DreamPipeline（app.py 构造点接通，梦境
+    CALIBRATE 步骤非空转，Manufactured Confidence 落生产链路）
+  • 检索排序加权缓做（v5.34，需改 4 处 SELECT 收益有限）
+
 v5.32.1 (2026-08-15) Gateway-Archive-Align:
   • GatewayAPI.retrieve 加 include_archived: bool = False 参数并透传给
     query_router（SelfEvolvingRetrieval / 裸 QueryRouter 均已支持）
