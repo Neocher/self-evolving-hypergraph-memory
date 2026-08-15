@@ -108,7 +108,7 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
             async def _submit() -> None:
                 try:
                     await qsubmit(svc, _upsert_system_node, svc.graphlite_store,
-                                  "dream_scheduler_state", state_json)
+                                  "dream_scheduler_state", state_json, priority="normal")
                 except HTTPException:
                     # 队列满/关闭（如 shutdown 竞态）→ 降级记 WARNING，不落 ERROR
                     logger.warning("Dream scheduler state persist deferred (write queue busy)")
@@ -729,7 +729,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                             else:
                                 applied, communities, deleted, summaries = await qsubmit(
                                     svc, svc.dream_candidate_store.auto_apply_candidates,
-                                    svc.graphlite_store,
+                                    svc.graphlite_store, priority="normal",
                                 )
                                 if applied > 0:
                                     logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)

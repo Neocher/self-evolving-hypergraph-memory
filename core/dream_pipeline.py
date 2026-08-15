@@ -1289,10 +1289,25 @@ Text:
             persist_deleted, pruned_ids = await self._persist_async(
                 self._persist_prune, graphlite_store, prune_ops)
             all_removed_ids.extend(pruned_ids)
-            persist_created = await self._persist_async(
-                self._persist_communities, graphlite_store, communities, dream_id)
+            # 【v5.40】社区 PERSIST 切块：每社区单独提交一个 low 任务（~3s/块），
+            # 块间写线程排空 high 优先级外部写——不切块则 30-60s 单体任务占死
+            # 单写线程，优先级只重排 pending 不重排 in-flight → 外部写 503。
+            # MERGE ON id 语义保留；阶段 3 同源湮灭（每成员只保留最大社区边）
+            # 依赖全局成员集，作为最后一块 low 任务提交（短任务，不影响切块）。
+            member_sets: dict[str, set[str]] = {}
+            for idx, comm in enumerate(communities):
+                created, member_set = await self._persist_async(
+                    self._persist_one_community, graphlite_store, comm,
+                    dream_id, idx, priority="low")
+                persist_created += created
+                if member_set:
+                    member_sets[comm["id"]] = member_set
             all_removed_ids.extend(self._persist_merge_get_removed(merge_ops))
             await self._persist_async(self._persist_merge, graphlite_store, merge_ops)
+            if member_sets:
+                await self._persist_async(
+                    self._persist_communities_prune_edges,
+                    graphlite_store, member_sets)
             await self._persist_async(
                 self._persist_hyperedges, graphlite_store, communities, dream_id)
         except Exception as persist_exc:
@@ -1303,14 +1318,20 @@ Text:
 
     # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
 
-    async def _persist_async(self, fn, *args, **kwargs):
-        """PERSIST 写入串行化：有 write_queue 时经单写线程 submit，否则回退 to_thread。"""
+    async def _persist_async(self, fn, *args, priority: str = "normal", **kwargs):
+        """PERSIST 写入串行化：有 write_queue 时经单写线程 submit（priority 透传），
+        否则回退 to_thread（priority 不参与 to_thread 调用）。"""
         if self._write_queue is not None:
-            return await self._write_queue.submit(fn, *args, **kwargs)
+            return await self._write_queue.submit(fn, *args, priority=priority, **kwargs)
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _persist_communities(self, graphlite_store, communities: list[dict], dream_id: str) -> int:
-        """将CLUSTER结果写回GraphLite CommunityNode。
+        """将CLUSTER结果写回GraphLite CommunityNode（完整语义，供直接调用/测试）。
+
+        【v5.40】内部复用切块原语：逐社区 _persist_one_community（阶段1 清旧边 +
+        阶段2 MERGE 幂等 upsert）+ 阶段 3 同源湮灭 _persist_communities_prune_edges。
+        生产直接模式 _persist_direct 走逐社区 low 任务提交（块间排空 high），
+        本方法保持与 v5.39 一致的原子整体语义。
 
         使用 MERGE ON id 增量 upsert，避免先 DETACH DELETE 全部再重建
         （若中途崩溃则所有社区数据永久丢失）。
@@ -1319,80 +1340,104 @@ Text:
         先清理旧 COMMUNITY_MEMBER 边再 upsert，避免竞赛条件导致
         一个 EpisodeNode 关联到 2 个 CommunityNode。
         """
-        import json
         created = 0
-        new_member_sets: dict[str, set[str]] = {}
-        # 收集所有成员 ID（用于后续阶段）
-        all_member_ids: set[str] = set()
-        for comm in communities:
-            for member_id in comm.get("members", []):
-                all_member_ids.add(member_id)
+        member_sets: dict[str, set[str]] = {}
+        for idx, comm in enumerate(communities):
+            c, member_set = self._persist_one_community(
+                graphlite_store, comm, dream_id, idx)
+            created += c
+            if member_set:
+                member_sets[comm["id"]] = member_set
+        if member_sets:
+            self._persist_communities_prune_edges(graphlite_store, member_sets)
+        return created
 
-        # 先清理自己社区的旧 COMMUNITY_MEMBER 边（不碰外部社区）
+    def _persist_one_community(
+        self, graphlite_store, comm: dict, dream_id: str, idx: int = 0,
+    ) -> tuple[int, set[str]]:
+        """【v5.40】单社区持久化块（切块原语）：清理该社区旧 COMMUNITY_MEMBER 边
+        （限定 {id: $cid} 不碰外部社区）+ MERGE 幂等 upsert 社区节点与成员边。
+
+        返回 (created, member_set)：created∈{0,1}（upsert 成功数）；
+        member_set 供阶段 3 同源湮灭（每成员只保留最大社区边）。
+        生产 _persist_direct 每社区单独经写队列提交一个 low 任务（~3s/块），
+        块间写线程排空 high 优先级外部写。
+        """
+        created = 0
+        member_set: set[str] = set()
+        # 阶段 1：清理该社区旧边（限定 cid，不碰外部社区）
         # 【FIX 2026-08-09】原实现 MATCH (c:CommunityNode) 无社区过滤 →
         # 对每个 dream 成员删除所有社区（含外部）指向它的边（实证 EXT→epX 被删）。
         # 修复：限定 {id: $cid}，与 dream_candidate_store.py L368-376 一致。
         try:
-            for comm in communities:
-                for member_id in comm.get("members", []):
-                    graphlite_store.query_cypher(
-                        "MATCH (c:CommunityNode {id: $cid})"
-                        "-[r:COMMUNITY_MEMBER]->"
-                        "(e:EpisodeNode {id: $eid}) DELETE r",
-                        {"cid": comm["id"], "eid": member_id},
-                    )
+            for member_id in comm.get("members", []):
+                graphlite_store.query_cypher(
+                    "MATCH (c:CommunityNode {id: $cid})"
+                    "-[r:COMMUNITY_MEMBER]->"
+                    "(e:EpisodeNode {id: $eid}) DELETE r",
+                    {"cid": comm["id"], "eid": member_id},
+                )
         except Exception:
             logger.warning("Failed to clean before community upsert", exc_info=True)
-        for comm in communities:
-            try:
-                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 / SET 更新属性
-                comm_vals = {
-                    "id": comm["id"],
-                    "name": f"dream_{dream_id[:8]}_comm_{created}",
-                    "summary": comm.get("report", "")[:800],
-                    "score": 0.0,
-                    "created_at": time.time(),
-                }
-                if graphlite_store.execute_cypher(
-                    "MATCH (c:CommunityNode {id: $id}) RETURN c",
-                    {"id": comm["id"]},
-                ):
-                    graphlite_store.execute_cypher(
-                        "MATCH (c:CommunityNode {id: $id}) "
-                        "SET c.name = $name, c.summary = $summary, "
-                        "c.leiden_score = $score, c.created_at = $created_at",
-                        comm_vals,
-                    )
-                else:
-                    graphlite_store.execute_cypher(
-                        "INSERT (c:CommunityNode {id: $id, name: $name, "
-                        "summary: $summary, leiden_score: $score, "
-                        "created_at: $created_at})",
-                        comm_vals,
-                    )
-                member_set: set[str] = set()
-                for member_id in comm.get("members", []):
-                    member_set.add(member_id)
-                    try:
-                        # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-                        if not graphlite_store.execute_cypher(
-                            "MATCH (c:CommunityNode {id: $cid})"
-                            "-[:COMMUNITY_MEMBER]->"
-                            "(e:EpisodeNode {id: $eid}) RETURN c",
+        # 阶段 2：GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 / SET 更新属性
+        try:
+            comm_vals = {
+                "id": comm["id"],
+                "name": f"dream_{dream_id[:8]}_comm_{idx}",
+                "summary": comm.get("report", "")[:800],
+                "score": 0.0,
+                "created_at": time.time(),
+            }
+            if graphlite_store.execute_cypher(
+                "MATCH (c:CommunityNode {id: $id}) RETURN c",
+                {"id": comm["id"]},
+            ):
+                graphlite_store.execute_cypher(
+                    "MATCH (c:CommunityNode {id: $id}) "
+                    "SET c.name = $name, c.summary = $summary, "
+                    "c.leiden_score = $score, c.created_at = $created_at",
+                    comm_vals,
+                )
+            else:
+                graphlite_store.execute_cypher(
+                    "INSERT (c:CommunityNode {id: $id, name: $name, "
+                    "summary: $summary, leiden_score: $score, "
+                    "created_at: $created_at})",
+                    comm_vals,
+                )
+            for member_id in comm.get("members", []):
+                member_set.add(member_id)
+                try:
+                    # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
+                    if not graphlite_store.execute_cypher(
+                        "MATCH (c:CommunityNode {id: $cid})"
+                        "-[:COMMUNITY_MEMBER]->"
+                        "(e:EpisodeNode {id: $eid}) RETURN c",
+                        {"cid": comm["id"], "eid": member_id},
+                    ):
+                        graphlite_store.execute_cypher(
+                            "MATCH (c:CommunityNode {id: $cid}), "
+                            "(e:EpisodeNode {id: $eid}) "
+                            "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
                             {"cid": comm["id"], "eid": member_id},
-                        ):
-                            graphlite_store.execute_cypher(
-                                "MATCH (c:CommunityNode {id: $cid}), "
-                                "(e:EpisodeNode {id: $eid}) "
-                                "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
-                                {"cid": comm["id"], "eid": member_id},
-                            )
-                    except Exception:
-                        logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
-                new_member_sets[comm["id"]] = member_set
-                created += 1
-            except Exception as e:
-                logger.warning("Community persist failed: %s", e)
+                        )
+                except Exception:
+                    logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
+            created = 1
+        except Exception as e:
+            logger.warning("Community persist failed: %s", e)
+        return created, member_set
+
+    def _persist_communities_prune_edges(
+        self, graphlite_store, new_member_sets: dict[str, set[str]],
+    ) -> None:
+        """【v5.40】阶段 3 同源湮灭（切块最后一块）：每成员只保留最大社区的边。
+
+        输入为全部社区切块返回的 member_set 汇总；按 member_count 倒序建
+        max_community_by_member，每成员只保留最大社区的边，只删自己社区的边，
+        不动外部社区。原 _persist_communities 阶段 3 提取（2026-08-09 同源湮灭
+        bug 修复语义保持）。
+        """
         # 【FIX 2026-08-09】同源湮灭 bug：原实现用 WHERE c.id <> $cid DELETE r
         # 对每个 (cid, member) 删其他所有社区的边（含外部社区）→ 共享成员被互删
         # → 孤儿（属零个社区）。新实现：按 member_count 倒序，每成员只保留最大
@@ -1424,7 +1469,6 @@ Text:
                         )
         except Exception:
             logger.warning("Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True)
-        return created
 
     def _persist_prune(self, graphlite_store, prune_ops: list) -> tuple[int, list[str]]:
         """将 PRUNE 剪枝结果归档（archived=true，替代物理删除）。

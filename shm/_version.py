@@ -1,12 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.39.0"
-__version_info__ = (5, 39, 0)
-__version_name__ = "User-Profile"
+__version__ = "5.40.0"
+__version_info__ = (5, 40, 0)
+__version_name__ = "Write-Priority"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.40.0 (2026-08-15) Write-Priority:
+  • 写队列优先级 — 单 queue.Queue → queue.PriorityQueue（天然规避双队列 notify
+    死睡 bug）：入队元组 (0 if high else 1, seq, task)，seq 用 itertools.count
+    （同优先级 FIFO + 元组永不比较 _WriteTask）；SENTINEL 包装为最低优先元组
+  • 外部写优先 — qsubmit 默认 priority="high"（kwargs 提取不污染 fn 参数）；
+    低准入闸 low_max（默认 max_pending - 10%，为 high 预留）：low/normal 入队
+    qsize()>=low_max 即拒，high 仅在队列真满时 503（与现状一致）
+  • 梦境 PERSIST 切块（决定性）— _persist_communities 30-60s 单体长任务拆为
+    逐社区 low 任务（_persist_one_community，~3s/块）+ 阶段 3 同源湮灭最后
+    一块（_persist_communities_prune_edges，全局成员集，湮灭语义保持）；
+    块间写线程排空 high → 外部写不再被梦境长任务饿到 30s 超时 503
+  • auto-apply/_persist_dream_state 显式 priority="normal"（梦境低价值写走闸）
+  • 测试: 新增 test_write_queue_priority 7 用例（高优先插队/低不饿死/背压+
+    high 预留/重入/切块端到端），test_write_queue + v524/v525/v528/v529 回归全绿
+
 v5.39.0 (2026-08-15) User-Profile:
   • 显式用户画像层 — 对标 Profile-Graph Memory（2606.06036）：从用户直述
     （source_type=direct）节点提取稳定偏好/身份/工作，检索画像值命中

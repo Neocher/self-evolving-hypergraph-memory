@@ -10,11 +10,11 @@ v5.29.0 梦境与写库并发卡死修复测试
         · test_dream_fetch_loop_responsive: 慢查询期间事件循环心跳正常（无 ≈5s 卡顿）
 
 · F2 — core/dream_pipeline.py: 新增可选构造参数 write_queue + 助手 _persist_async；
-        直接模式（candidate_store=None）PERSIST 的 4 个持久化步骤
-        （_persist_prune/_persist_communities/_persist_merge/_persist_hyperedges）
-        经 write_queue 串行提交，纯函数 _persist_merge_get_removed 不入队；
-        无 write_queue 时回退 asyncio.to_thread。
-        · test_persist_routed_through_write_queue: 4 步按序入队 + 纯函数不入队
+        直接模式（candidate_store=None）PERSIST 步骤（_persist_prune + 社区
+        切块 _persist_one_community/阶段3 _persist_communities_prune_edges +
+        _persist_merge/_persist_hyperedges）经 write_queue 串行提交，纯函数
+        _persist_merge_get_removed 不入队；无 write_queue 时回退 asyncio.to_thread。
+        · test_persist_routed_through_write_queue: 步骤按序入队 + 纯函数不入队
         · test_persist_fallback_to_thread_without_queue: 无队列时回退 to_thread
 
 · F5 — graph/graphlite_store.py: _session_lock = threading.RLock() + 全部
@@ -71,6 +71,8 @@ class _RecordingQueue:
         self.calls: list[str] = []
 
     async def submit(self, fn, *args, **kwargs):
+        # 【v5.40】与真实 WriteQueue 一致：priority 是队列参数，不传给 fn
+        kwargs.pop("priority", None)
         self.calls.append(fn.__name__)
         return fn(*args, **kwargs)  # 同步执行，模拟写线程
 
@@ -171,7 +173,12 @@ class TestF2PersistWriteQueue:
         return store
 
     def test_persist_routed_through_write_queue(self):
-        """直接模式 PERSIST 的 4 个持久化步骤按序经 write_queue；纯函数不入队。"""
+        """直接模式 PERSIST 步骤按序经 write_queue；纯函数不入队。
+
+        【v5.40】社区 PERSIST 切块：nodes=[] → CLUSTER 产出 1 个空社区
+        （members=[]）→ 恰 1 次 _persist_one_community 块；空社区无成员 →
+        member_sets 空 → 无阶段 3 _persist_communities_prune_edges。剩余
+        步骤（prune/merge/hyperedges）按序入队。"""
         q = _RecordingQueue()
         pipe = DreamPipeline(write_queue=q)
         store = self._make_store()
@@ -186,10 +193,13 @@ class TestF2PersistWriteQueue:
 
         assert q.calls == [
             "_persist_prune",
-            "_persist_communities",
+            "_persist_one_community",
             "_persist_merge",
             "_persist_hyperedges",
         ], f"write_queue 提交顺序/集合不符: {q.calls}"
+        assert "_persist_communities_prune_edges" not in q.calls, (
+            "空社区（members=[]）不应触发阶段 3 湮灭"
+        )
         assert "_persist_merge_get_removed" not in q.calls, (
             "纯函数 _persist_merge_get_removed 不应经 write_queue"
         )

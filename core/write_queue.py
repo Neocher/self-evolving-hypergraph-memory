@@ -42,12 +42,24 @@ handler 恢复
 - 重入：写线程内再 submit → 直接同步执行（防死锁）。
 - 优雅关闭：sentinel 退出 + join(timeout) 兜底；shutdown 先 drain 在途写。
 
+【v5.40 Write-Priority】优先级：
+- 底层从 queue.Queue 升级为 queue.PriorityQueue（单队列天然无「双队列 notify
+  死睡」问题——queue.Queue 的 notify 每队列私有，低队列 blocking get 时高队列
+  put 无人唤醒）。入队元组 `(0 if priority=="high" else 1, seq, task)`，
+  seq 用 itertools.count（保证同优先级 FIFO 且永不比较 _WriteTask）。
+- 低准入闸：priority!=="high"（low/normal）且 qsize() >= low_max → 抛
+  WriteQueueFullError（low_max < maxsize 为 high 预留容量，不破坏
+  max_pending 语义）。high 只在 qsize==maxsize 时被拒（与现状一致）。
+- 外部调用方默认 high（qsubmit setdefault），梦境 PERSIST 显式 low ——
+  切块后写线程块间排空 high，外部写不再被 30-60s 梦境长任务饿到 503。
+
 不引入锁/事务/重构；调用方按"写调用"语义选择 submit（读调用留事件循环）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import queue
 import sys
@@ -91,6 +103,7 @@ class WriteQueue:
         max_pending: int = 100,
         wait_timeout: float = 30.0,
         ping_fn: Optional[Callable[[], bool]] = None,
+        low_max: Optional[int] = None,
     ):
         """
         Args:
@@ -99,8 +112,18 @@ class WriteQueue:
             ping_fn: 【L3/M1】可选引擎存活探针（True=引擎存活，慢写而非死锁）。
                 由 app 注入：独立 daemon 连接 + 1 条 trivial 查询，join(timeout) 兜底。
                 探针通过 → critical 降级为 warning；失败/挂 → 仍 critical。
+            low_max: 【v5.40】低优先级准入闸阈值。low/normal 入队时
+                qsize() >= low_max 即拒（为 high 预留容量）；默认
+                max_pending - max_pending//10（小队列退化为无闸，不破坏
+                max_pending 语义与既有背压测试）。
         """
-        self._q: queue.Queue = queue.Queue(maxsize=max_pending)
+        self._q: queue.PriorityQueue = queue.PriorityQueue(maxsize=max_pending)
+        # 【v5.40】优先级元组序号：同优先级内 FIFO + 元组第三元素永不参与比较
+        self._seq = itertools.count()
+        self._low_max = (
+            low_max if low_max is not None
+            else max(1, max_pending - max_pending // 10)
+        )
         self._wait_timeout = wait_timeout
         self._closed = False
         self._worker = threading.Thread(target=self._run, daemon=True, name="shm-writer-worker")
@@ -138,10 +161,18 @@ class WriteQueue:
 
     # ─── 事件循环侧：唯一入口 ───────────────────────────
 
-    async def submit(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+    async def submit(
+        self,
+        fn: Callable[..., Any],
+        *args,
+        priority: str = "normal",
+        **kwargs,
+    ) -> Any:
         """入队并等待写线程完成，返回 fn 的结果。
 
         - 队列满 → WriteQueueFullError（API 层转 503）
+        - 【v5.40】低准入闸：priority!="high" 且 qsize() >= low_max →
+          WriteQueueFullError（为 high 预留容量，梦境 low 块积压时降级）
         - 写线程执行异常 → 原样抛回
         - 超过 wait_timeout → asyncio.TimeoutError
           ⚠️ 超时只放弃等待：写任务仍在写线程继续执行并真实落库
@@ -159,8 +190,18 @@ class WriteQueue:
             self._restart_worker()
         fut: Future = Future()
         task = _WriteTask(fn=fn, args=args, kwargs=kwargs, fut=fut)
+        # 【v5.40】低准入闸：low/normal 积压达 low_max 即拒（high 不受限，
+        # 仅在 qsize==maxsize 时经 put_nowait 背压）。准入闸在重入检查之后——
+        # 写线程内重入直接同步执行，不入队。
+        if priority != "high" and self._q.qsize() >= self._low_max:
+            raise WriteQueueFullError(
+                f"write queue low-priority gate ({self._q.qsize()}/{self._low_max} "
+                f"pending, high reserved)"
+            )
         try:
-            self._q.put_nowait(task)
+            self._q.put_nowait(
+                (0 if priority == "high" else 1, next(self._seq), task)
+            )
         except queue.Full:
             raise WriteQueueFullError(
                 f"write queue full ({self._q.qsize()}/{self._q.maxsize} pending)"
@@ -244,10 +285,12 @@ class WriteQueue:
     def _run(self) -> None:
         while True:
             item = self._q.get()
-            if item is _SENTINEL:
+            # 【v5.40】PriorityQueue 元组：item = (priority, seq, task)；sentinel
+            # 包装为 (2, seq, _SENTINEL)（最低优先级，drain 后排空才退出）。
+            if item[2] is _SENTINEL:
                 self._q.task_done()
                 break
-            task: _WriteTask = item
+            task: _WriteTask = item[2]
             try:
                 # 【F3】心跳：任务开始前打点（即便任务卡死也能检测）
                 self._touch_activity()
@@ -395,13 +438,14 @@ class WriteQueue:
                     break
                 time.sleep(0.01)  # 轮询 task_done（限时, 不无限阻塞）
         try:
-            self._q.put_nowait(_SENTINEL)
+            self._q.put_nowait((2, next(self._seq), _SENTINEL))
         except queue.Full:
             # 【M3】worker 卡死 + 队列真满时阻塞 put 会永久等空位，join 兜底永远
             # 执行不到 → uvicorn 关闭挂起。改为 get_nowait 循环清空积压：对每个
             # 未完成的 _WriteTask 先 fut.set_exception(WriteQueueClosedError) 再
             # task_done()——等待方立即失败而非各自挂到 wait_for 超时；然后重放
             # sentinel（worker 若恢复则正常退出）。不新增消费者（仍是单写线程）。
+            # 【v5.40】PriorityQueue 元组：item = (priority, seq, task)。
             failed = 0
             while True:
                 try:
@@ -409,8 +453,12 @@ class WriteQueue:
                 except queue.Empty:
                     break
                 try:
-                    if isinstance(item, _WriteTask) and not item.fut.done():
-                        item.fut.set_exception(
+                    if (
+                        isinstance(item, tuple)
+                        and item[2] is not _SENTINEL
+                        and not item[2].fut.done()
+                    ):
+                        item[2].fut.set_exception(
                             WriteQueueClosedError(
                                 "write queue closed during shutdown with pending task"
                             )
@@ -425,7 +473,7 @@ class WriteQueue:
             )
             # 重放 sentinel：积压已清空，队列必有空位
             try:
-                self._q.put_nowait(_SENTINEL)
+                self._q.put_nowait((2, next(self._seq), _SENTINEL))
             except queue.Full:
                 pass
         self._worker.join(timeout=5.0)

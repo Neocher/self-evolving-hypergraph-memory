@@ -172,12 +172,17 @@ async def qsubmit(deps: Services, fn, *args, **kwargs) -> Any:
     - 队列不存在（测试/降级）→ 同步直调，行为与改造前一致
     - 队列满 / 已关闭 / 等待超时 → HTTPException 503（背压拒绝；超时后任务仍会落库，
       调用方不应安全重试——写入均以 uuid 主键天然幂等）
+
+    【v5.40】priority 关键字（默认 "high"）：外部写优先，从 kwargs 提取传给
+    WriteQueue.submit 的 priority 参数，**不传给 fn**（同步直调分支不受污染）；
+    梦境/后台低价值写显式传 priority="normal"/"low" 走低准入闸，为 high 预留容量。
     """
     q = getattr(deps, "write_queue", None)
+    priority = kwargs.pop("priority", "high")
     if q is None:
         return fn(*args, **kwargs)
     try:
-        return await q.submit(fn, *args, **kwargs)
+        return await q.submit(fn, *args, priority=priority, **kwargs)
     except (WriteQueueFullError, WriteQueueClosedError, asyncio.TimeoutError) as e:
         logger.warning("Write queue rejected (status=503): %s", e)
         raise HTTPException(status_code=503, detail=f"write queue busy: {e}") from e
