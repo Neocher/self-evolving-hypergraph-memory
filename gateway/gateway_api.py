@@ -415,6 +415,7 @@ class GatewayAPI:
         strategy: Optional[str] = "auto",
         namespace: Optional[str] = None,
         include_shared: bool = True,
+        include_archived: bool = False,
     ) -> RetrieveResponse:
         """粗到精三级融合检索，带 Cypher 兜底和去重。"""
         start = time.time()
@@ -426,7 +427,7 @@ class GatewayAPI:
             )
 
         try:
-            results_raw = self._svc.query_router.retrieve(query)
+            results_raw = self._svc.query_router.retrieve(query, include_archived=include_archived)
         except Exception as exc:
             self._logger.exception("Query router failed")
             return RetrieveResponse(
@@ -448,8 +449,9 @@ class GatewayAPI:
                     conditions = " OR ".join(
                         f"e.content CONTAINS $w{i}" for i in range(len(words[:5]))
                     )
+                    archived_clause = "" if include_archived else " AND (e.archived IS NULL OR e.archived = false)"
                     cypher = (
-                        f"MATCH (e:EpisodeNode) WHERE {conditions} "
+                        f"MATCH (e:EpisodeNode) WHERE ({conditions}){archived_clause} "
                         f"RETURN e.id AS node_id, e.content AS content LIMIT 10"
                     )
                     fallback_rows = self._svc.graphlite_store.query_cypher(cypher, params)

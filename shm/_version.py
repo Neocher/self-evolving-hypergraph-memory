@@ -1,12 +1,19 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.32.0"
-__version_info__ = (5, 32, 0)
-__version_name__ = "Archive-Supersedes"
+__version__ = "5.32.1"
+__version_info__ = (5, 32, 1)
+__version_name__ = "Gateway-Archive-Align"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.32.1 (2026-08-15) Gateway-Archive-Align:
+  • GatewayAPI.retrieve 加 include_archived: bool = False 参数并透传给
+    query_router（SelfEvolvingRetrieval / 裸 QueryRouter 均已支持）
+  • Cypher 兜底按 include_archived 条件化 — archived_clause 变量，
+    include_archived=True 时不加过滤（主通道返回归档节点，兜底同步）；
+    OR 组加括号 WHERE ({{conditions}}){{archived_clause}} 防 AND 优先级错乱
+
 v5.32.0 (2026-08-15) Archive-Supersedes:
   • 结构化归档 + supersedes 血统链 — 梦境「遗忘」从物理删除改为归档
     （archived=true）+ 建 (old)-[:SUPERSEDES]->(new) 血统边，对标 MindMemOS
