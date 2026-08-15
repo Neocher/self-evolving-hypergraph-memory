@@ -190,6 +190,8 @@ class TextEncoder:
     不依赖 os.environ 运行时读取，防止子进程继承。
     """
 
+    _ONNX_DIR = "onnx"  # 【v5.42】ONNX 产物目录（bge-small-zh-v1.5 导出，512d，CLS+normalize）
+
     def __init__(
         self, model_name: str = "BAAI/bge-small-zh-v1.5", device: str = "cpu"
     ) -> None:
@@ -197,6 +199,7 @@ class TextEncoder:
         self.device = device
         self._model = None
         self._onnx_model = None
+        self._onnx_dim: Optional[int] = None  # 【v5.42】ONNX 输出维度缓存（防 384 硬编码崩 FAISS）
         self._indexed_node_ids: Set[str] = set()
         self._dream_cycle_count: int = 0
         self._needs_rebuild: bool = False
@@ -235,8 +238,13 @@ class TextEncoder:
         return vec
 
     def load(self) -> None:
-        """加载模型。优先 bge-small-zh-v1.5（中文，512维，HF 缓存 snapshot 离线加载），
-        fallback ONNX INT8（384维），再 fallback sentence-transformers（model_name）。"""
+        """加载模型。优先 embedding/onnx/（bge-small-zh-v1.5 导出 ONNX，512d，
+        CLS pooling + L2 归一化，与 ST 路径一致），fallback bge-small-zh-v1.5
+        （PyTorch，HF 缓存 snapshot 离线加载），最后 fallback sentence-transformers。
+
+        【v5.42】ONNX 提到最高优先级：同步 defense R2 embed 走 ONNX 加速
+        （~2ms/条 vs PyTorch ~7ms/条）；ONNX 缺失/加载失败静默回退 PyTorch 零回归。
+        """
         import os as _os
 
         # 进程内强制离线（SentenceTransformer 不支持 local_files_only 参数）
@@ -251,24 +259,26 @@ class TextEncoder:
             logger.info("Embedding device resolved: requested=%s → %s", self.device, resolved)
         self.device = resolved
 
-        # ── 优先: 配置的 model_name（中文 bge-small-zh-v1.5，本地缓存 snapshot，不访问网络）──
-        snapshot = _find_model_snapshot(self.model_name)
-        if snapshot is not None:
+        # ── 优先: ONNX（embedding/onnx/，bge-small-zh-v1.5 导出，512d）──
+        onnx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), self._ONNX_DIR)
+        if _os.path.isdir(onnx_path) and _os.path.exists(_os.path.join(onnx_path, "model.onnx")):
             try:
-                from sentence_transformers import SentenceTransformer
-                logger.info("Loading Chinese embedding model (%s): %s", self.model_name, snapshot)
-                try:
-                    self._model = SentenceTransformer(snapshot, device=self.device)
-                except Exception:
-                    # CUDA 不可用时自动降级 CPU（如 "Torch not compiled with CUDA enabled"）
-                    logger.warning("embedding device=%s failed, retry on cpu", self.device)
-                    self._model = SentenceTransformer(snapshot, device="cpu")
-                    self.device = "cpu"
-                logger.info("Local embedding model loaded: model=%s dim=%d", self.model_name, self.dimension)
+                from optimum.onnxruntime import ORTModelForFeatureExtraction
+                from transformers import AutoTokenizer
+
+                self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
+                self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
+                    onnx_path, provider="CPUExecutionProvider", local_files_only=True
+                )
+                self._onnx_dim = self._infer_onnx_dimension()
+                self.model_name = "BAAI/bge-small-zh-v1.5"  # ONNX 即 bge 导出，语义维度对齐
+                logger.info("ONNX model loaded from %s (dim=%d)", onnx_path, self.dimension)
                 return
             except Exception as e:
-                logger.warning("%s load failed, fallback to bge-small/ONNX/ST: %s", self.model_name, e)
-                self._model = None
+                logger.warning("ONNX model load failed, fallback to sentence-transformers: %s", e)
+                self._onnx_model = None
+                self._tokenizer = None
+                self._onnx_dim = None
 
         # ── 次优先: bge-small-zh-v1.5（中文专用，512维，本地缓存 snapshot）──
         bge_snapshot = _find_bge_snapshot()
@@ -287,26 +297,8 @@ class TextEncoder:
                 logger.info("Local embedding model loaded: dim=%d", self.dimension)
                 return
             except Exception as e:
-                logger.warning("bge-small-zh-v1.5 load failed, fallback to ONNX/ST: %s", e)
+                logger.warning("bge-small-zh-v1.5 load failed, fallback to sentence-transformers: %s", e)
                 self._model = None
-
-        onnx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
-                                   "..", "data", "all-MiniLM-L6-v2-int8")
-        if _os.path.isdir(onnx_path) and _os.path.exists(_os.path.join(onnx_path, "model.onnx")):
-            try:
-                from optimum.onnxruntime import ORTModelForFeatureExtraction
-                from transformers import AutoTokenizer
-
-                self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
-                self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
-                    onnx_path, provider="CPUExecutionProvider", local_files_only=True
-                )
-                logger.info("ONNX INT8 model loaded from %s", onnx_path)
-                return
-            except Exception as e:
-                logger.warning("ONNX INT8 model load failed, fallback to sentence-transformers: %s", e)
-                self._onnx_model = None
-                self._tokenizer = None
 
         from sentence_transformers import SentenceTransformer
         logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
@@ -332,9 +324,11 @@ class TextEncoder:
         if self._onnx_model is not None:
             inputs = self._tokenizer(text, return_tensors="pt", padding=True, truncation=True)
             outputs = self._onnx_model(**inputs)
-            # Mean pooling over token dimension
-            vec = outputs.last_hidden_state.mean(dim=1).squeeze().detach().numpy()
-            return vec.astype(np.float32)
+            # bge v1.5 pooling=CLS + Normalize（实测 1_Pooling/config.json），
+            # 与 ST encode 输出一致（FAISS L2 = cosine）
+            vec = outputs.last_hidden_state[:, 0].squeeze().detach().numpy().astype(np.float32)
+            norm = np.linalg.norm(vec)
+            return vec / norm if norm > 0 else vec
 
         if self._model is None:
             self.load()
@@ -342,8 +336,14 @@ class TextEncoder:
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
         """批量 → embedding 矩阵 (N, dim) float32。
-        
+
         优先 Tier 1（Cloud API 批量），不可用时降级到 Tier 2。
+
+        【v5.42 Write-Throughput】
+        - 缓存去重：consult/populate 现有 _cache（原文 key，LRU 512）——
+          队列 flush 的重复内容不再重复编码
+        - ONNX 分块 32（防 OOM：attention 矩阵峰值估算 >600MB/50 条）
+        - ONNX 路径 CLS pooling + L2 归一化（与 ST encode 一致）
         """
         # Tier 1: Cloud API (批量调用更高效)
         if self._cloud_available:
@@ -355,23 +355,93 @@ class TextEncoder:
                 self._cloud_available = False
                 logger.info("Cloud API degraded, falling back to local model")
 
-        # Tier 2: ONNX batch (preferred)
-        if self._onnx_model is not None:
-            inputs = self._tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
-            outputs = self._onnx_model(**inputs)
-            vecs = outputs.last_hidden_state.mean(dim=1).detach().numpy()
-            return np.array([v.astype(np.float32) for v in vecs])
+        # 【v5.42】缓存 consult：命中直接复用（LRU move_to_end），未命中收集编码
+        hit_vecs: dict[int, np.ndarray] = {}
+        # 【P3】批内去重：唯一原文 → 原序位置列表；同一原文批内重复出现只编码
+        # 一次（去重后仍 populate 缓存，后续批次直接命中）
+        unique_texts: list[str] = []
+        text_positions: dict[str, list[int]] = {}
+        for i, t in enumerate(texts):
+            if t in self._cache:
+                self._cache_hits += 1
+                vec = self._cache.pop(t)
+                self._cache[t] = vec
+                hit_vecs[i] = vec
+            else:
+                if t in text_positions:
+                    text_positions[t].append(i)
+                else:
+                    self._cache_misses += 1
+                    text_positions[t] = [i]
+                    unique_texts.append(t)
 
-        # Tier 3: Local sentence-transformers
-        if self._model is None:
-            self.load()
-        return self._model.encode(texts)
+        if not unique_texts:
+            if not texts:
+                return np.empty((0, self.dimension), dtype=np.float32)
+            return np.stack([hit_vecs[i] for i in range(len(texts))])
+
+        # Tier 2: ONNX batch (preferred, chunked)
+        if self._onnx_model is not None:
+            chunk_vecs: list[np.ndarray] = []
+            for start in range(0, len(unique_texts), 32):
+                chunk = unique_texts[start : start + 32]
+                inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True)
+                outputs = self._onnx_model(**inputs)
+                raw = outputs.last_hidden_state[:, 0].detach().numpy().astype(np.float32)
+                norms = np.linalg.norm(raw, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                chunk_vecs.append(raw / norms)
+            encoded = np.concatenate(chunk_vecs, axis=0)
+        else:
+            # Tier 3: Local sentence-transformers
+            if self._model is None:
+                self.load()
+            encoded = np.asarray(self._model.encode(unique_texts), dtype=np.float32)
+
+        # 组装原序矩阵 + populate 缓存（LRU 512）
+        out = np.zeros((len(texts), encoded.shape[1]), dtype=np.float32)
+        for j, t in enumerate(unique_texts):
+            vec = encoded[j]
+            for pos in text_positions[t]:
+                out[pos] = vec
+            if len(self._cache) >= 512:
+                del self._cache[next(iter(self._cache))]
+            self._cache[t] = vec
+        for i, vec in hit_vecs.items():
+            out[i] = vec
+        return out
+
+    def _infer_onnx_dimension(self) -> Optional[int]:
+        """从 ONNX 模型输出读取维度（bge=512，非硬编码 384）。
+
+        优先静态 shape（优化图输出 (b, s, 512) 第三维静态）；
+        动态 shape 时回退一次空输入推理取实际维度。
+        """
+        try:
+            outputs = self._onnx_model.model.get_outputs()
+            for o in outputs:
+                shape = list(o.shape)
+                if len(shape) >= 2 and isinstance(shape[-1], int) and shape[-1] > 0:
+                    return shape[-1]
+        except Exception:
+            pass
+        try:
+            inputs = self._tokenizer("", return_tensors="pt", padding=True, truncation=True)
+            outputs = self._onnx_model(**inputs)
+            vec = outputs.last_hidden_state[:, 0].detach().numpy()
+            return int(vec.shape[-1])
+        except Exception:
+            return None
 
     @property
     def dimension(self) -> int:
         """实际加载模型的向量维度（bge-small-zh-v1.5=512，ONNX MiniLM=384）。"""
         if self._onnx_model is not None:
-            return 384
+            if self._onnx_dim is not None:
+                return self._onnx_dim
+            self._onnx_dim = self._infer_onnx_dimension()
+            if self._onnx_dim is not None:
+                return self._onnx_dim
         if self._model is not None:
             try:
                 return int(self._model.get_sentence_embedding_dimension())

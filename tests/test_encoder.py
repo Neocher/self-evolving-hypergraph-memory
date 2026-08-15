@@ -50,12 +50,20 @@ class TestFindBgeSnapshot:
 
 class TestLoadPriority:
     def test_load_prefers_bge_snapshot(self):
+        """【v5.42】ONNX 目录缺失时，load() 优先加载 bge snapshot。
+
+        必须把 _ONNX_DIR 指向缺失目录跳过 ONNX 分支：真实 embedding/onnx/
+        存在会触发 import 真实 optimum.onnxruntime，同进程后续 TestDeviceResolution
+        import torch → segfault（exit 139，Codex 终审定位）。
+        """
         fake_model = mock.MagicMock()
         fake_model.get_sentence_embedding_dimension.return_value = 512
         st = _fake_st_module([fake_model])
 
         encoder = TextEncoder()
-        with mock.patch(
+        with mock.patch.object(
+            TextEncoder, "_ONNX_DIR", "onnx_missing_dir_xyz"
+        ), mock.patch(
             "embedding.encoder._find_bge_snapshot", return_value="/fake/snapshot"
         ), mock.patch.dict(sys.modules, {"sentence_transformers": st}):
             encoder.load()
@@ -64,10 +72,12 @@ class TestLoadPriority:
         assert encoder.model_name == "BAAI/bge-small-zh-v1.5"
         assert encoder.dimension == 512
 
-    def test_fallback_chain_bge_onnx_model_name(self):
+    def test_fallback_chain_onnx_bge_model_name(self):
+        """【v5.42】完整 fallback 链（ONNX 优先）：ONNX 失败 → bge 失败 → model_name。"""
         fake_model = mock.MagicMock()
         fake_model.get_sentence_embedding_dimension.return_value = 384
-        # bge 第一次 (cuda) 抛异常 → CPU 重试也抛异常 → 落到 model_name 分支
+        # ONNX 分支（isdir=True 强制进入）抛异常 → 回退 bge：
+        # 第一次 (cuda) 抛异常 → CPU 重试也抛异常 → 落到 model_name 分支
         st = _fake_st_module([RuntimeError("bge cuda fail"), RuntimeError("bge cpu fail"), fake_model])
         onnx_mods = _fake_onnx_modules(RuntimeError("onnx fail"))
 
@@ -131,7 +141,9 @@ class TestDeviceResolution:
         st = _fake_st_module([fake_model])
 
         encoder = TextEncoder(device="auto")
-        with mock.patch(
+        with mock.patch.object(
+            TextEncoder, "_ONNX_DIR", "onnx_missing_dir_xyz"
+        ), mock.patch(
             "embedding.encoder._find_model_snapshot", return_value="/fake/snapshot"
         ), mock.patch("embedding.encoder._resolve_device", return_value="cuda"), \
                 mock.patch.dict(sys.modules, {"sentence_transformers": st}):

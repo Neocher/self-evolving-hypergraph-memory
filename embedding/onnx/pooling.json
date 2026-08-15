@@ -1,0 +1,9 @@
+{
+  "pooling": "cls",
+  "normalize": true,
+  "dimension": 512,
+  "source": "BAAI/bge-small-zh-v1.5",
+  "dtype": "fp32",
+  "int8_available": true,
+  "int8_quality": "recall_drop>2pct_keep_fp32"
+}

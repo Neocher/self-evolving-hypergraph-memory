@@ -835,13 +835,31 @@ async def _process_embed_queue(deps: Services) -> int:
             logger.exception("get_all_connections failed for embed batch")
             conns = {}
 
-    for episode_id, content, created_at in batch:
-        # 隔离节点不加入 FAISS
-        if episode_id in quarantined_set:
-            logger.debug("Embed queue: skip quarantined node %s", episode_id[:12])
-            continue
+    # 【v5.42 Write-Throughput】批量编码：收集非隔离项一次 embed_batch
+    # （to_thread 不阻塞 poll loop），失败回退逐条 embed()（同样 to_thread，
+    # 50 条回退不再同步阻塞 poll loop）。embed_batch 内部有原文缓存去重（E）
+    # + ONNX 分块 32（A1），吞吐 ↑ 且重复内容零重算。
+    pending = [t for t in batch if t[0] not in quarantined_set]
+    if not pending:
+        return 0
+    embs = None
+    if len(pending) > 1:
         try:
-            emb = deps.encoder.embed(content)
+            embs = await asyncio.to_thread(
+                deps.encoder.embed_batch, [c for _, c, _ in pending]
+            )
+        except Exception:
+            logger.warning("embed_batch failed, fallback to per-item embed")
+            embs = None
+
+    for i, (episode_id, content, created_at) in enumerate(pending):
+        try:
+            if embs is not None and i < len(embs):
+                emb = embs[i]
+            else:
+                # 【P1-复审】单条 flush / 批量失败回退也走 to_thread：
+                # 同步 embed 会冻结 poll loop（50 条回退可阻塞百毫秒级）
+                emb = await asyncio.to_thread(deps.encoder.embed, content)
             if emb is not None and deps.faiss_index is not None:
                 faiss_id = int(uuid.uuid5(uuid.NAMESPACE_OID, str(episode_id)).int & ((1 << 63) - 1))
                 emb_array = emb.reshape(1, -1).astype(np.float32)
@@ -850,8 +868,11 @@ async def _process_embed_queue(deps: Services) -> int:
                 try:
                     if deps.hebbian_updater and deps.graphlite_store:
                         # 【P2】conns 已提到批循环外（本批内复用），写随闭包入队
+                        # 【v5.42】priority="normal"：50 条 flush 不全占 high 额度，
+                        # 让 v5.40 低准入闸生效（high 留给外部写）
                         await qsubmit(deps, _run_hebbian_update,
-                                      deps, {episode_id: 1.0}, conns)
+                                      deps, {episode_id: 1.0}, conns,
+                                      priority="normal")
                 except HTTPException:
                     # 【v5.24】poll loop 内队列满/关闭：503 语义无意义，记 WARNING 降级
                     logger.warning("Write queue busy, hebbian update deferred for %s",

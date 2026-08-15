@@ -1,12 +1,36 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.41.0"
-__version_info__ = (5, 41, 0)
-__version_name__ = "Community-Expansion"
-__release_date__ = "2026-08-15"
+__version__ = "5.42.0"
+__version_info__ = (5, 42, 0)
+__version_name__ = "Write-Throughput"
+__release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.42.0 (2026-08-16) Write-Throughput:
+  • 写入加速 — CC 修正真瓶颈=同步 defense R2 embed（每条写必跑，非异步队列）：
+    encoder.load() ONNX 优先（embedding/onnx/，bge-small-zh-v1.5 导出 512d），
+    ~2ms/条 vs PyTorch ~7ms/条（3.4x），batch32 ~1.1ms/条
+  • ONNX 路径事实修正 — 原指向 data/all-MiniLM-L6-v2-int8（384d MiniLM 实际
+    不存在）→ 统一 embedding/onnx/；dimension 从模型输出读（修复 L373-374
+    `if onnx: return 384` 硬编码，bge 512d 不再崩 FAISS）
+  • pooling 实测修正 — bge v1.5 实为 CLS pooling + Normalize（1_Pooling/
+    config.json pooling_mode_cls_token=true，非任务书假设 mean）：ONNX 路径
+    CLS+L2 归一化与 ST encode 一致（cosine=1.000000，FAISS L2=cosine）
+  • int8 质量实测 — 动态 int8（per-tensor 0.967 cosine / per-channel 0.845）
+    与 QDQ 静态量化（0.64，onnxruntime 1.25 校准 bug）均不达 recall 降幅<2%
+    约束（实测降幅 8-23%）→ 落地 fp32 优化图（onnxruntime transformer
+    optimizer 融合 Attention/SkipLN，零损失）；model_int8.onnx 保留待评估
+  • 队列批量编码 — _process_embed_queue 批量 embed_batch + asyncio.to_thread
+    （poll loop 不再被 embed 冻结），失败回退逐条；ONNX 分块 32 防 OOM
+  • 缓存去重 — embed_batch 内 consult/populate 原文缓存（LRU 512，与
+    _cached_embed 同 key），队列 flush 重复内容零重算（不另起 hash 层）
+  • hebbian 优先级 — 队列 flush 的 hebbian qsubmit 加 priority="normal"
+    （50 条 flush 不全占 high 额度，v5.40 低准入闸生效）
+  • 测试: 新增 test_embed_batch 8 用例（batch vs 逐条 cosine>0.999 同实例 /
+    空 / 单条 / 批量失败回退逐条 / ONNX dimension==512 / onnx 缺失静默回退
+    PyTorch 零回归 / fp32 ONNX vs ST recall@10 降幅<2% / 缓存命中零重算）
+
 v5.41.0 (2026-08-15) Community-Expansion:
   • 社区扩召回 — 检索利用 CommunityNode（生产 2849 个）修复 LongMemEval-S
     多会话 Recall@10=0.859 短板：种子（前 5 结果）→ 社区（BM25-on-summary
