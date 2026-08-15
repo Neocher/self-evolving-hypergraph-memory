@@ -490,14 +490,17 @@ class DreamPipeline:
                         for nid in futures[future]:
                             singleton_nodes.append(nid)
 
-        # 合并所有分区
+        # 合并所有分区 — 保留 _detect_communities 的 cid（社区归属），
+        # 跨分量用 next_comm 偏移避免 cid 冲突（每个分量内 cid 独立从 0 编号）
         partition: dict[str, int] = {}
         next_comm = 0
         for sp in sub_results:
             for nid, cid in sp.items():
                 if nid not in partition:
-                    partition[nid] = next_comm
-                    next_comm += 1
+                    partition[nid] = next_comm + cid
+            # 该分量内最大 cid 决定偏移
+            if sp:
+                next_comm += max(sp.values()) + 1
         for nid in singleton_nodes:
             if nid not in partition:
                 partition[nid] = next_comm

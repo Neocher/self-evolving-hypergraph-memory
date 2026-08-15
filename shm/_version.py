@@ -1,12 +1,25 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.35.0"
-__version_info__ = (5, 35, 0)
-__version_name__ = "Core-Boost-MultiSource"
+__version__ = "5.36.0"
+__version_info__ = (5, 36, 0)
+__version_name__ = "Cluster-Fix"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.36.0 (2026-08-15) Cluster-Fix:
+  • 梦境聚类分区合并 bug 修复 — _cluster_step 合并连通分量分区时丢弃
+    _detect_communities 返回的 cid，逐节点分配独立社区 ID（生产 896
+    节点 = 896 社区）→ Leiden/Louvain 24 社区结果全废 → SYNTHESIZE
+    永远只处理单节点社区 → summarize_community（需 ≥2 节点）永不触发
+    → patterns 恒空 → 社区摘要恒为模板废话
+  • 修复: partition[nid] = next_comm + cid 保留社区归属（同分量同 cid
+    的节点归同一社区），跨分量用 next_comm 偏移防 cid 冲突（每个分量
+    内 cid 独立从 0 编号）；singleton 节点沿用 next_comm 逐节点编号
+  • 测试: 新增 test_dream_cluster_fix 3 用例（mock 分区 {{a:0,b:0,c:1}}
+    → 2 社区 / 跨分量偏移 {{a:0,b:0}}+{{c:0,d:0}} → 2 社区 / singleton
+    混合 → 2 社区），旧代码三用例全挂
+
 v5.35.0 (2026-08-15) Core-Boost-MultiSource:
   • 检索 core 优先 — fact_track 数据透传（BM25/实体匹配/回退/超图/向量/
     关键词 六通道组装补齐 + graph_expansion 邻居回查补全）+ core 轨 ×1.1
