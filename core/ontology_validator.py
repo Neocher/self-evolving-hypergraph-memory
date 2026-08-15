@@ -180,10 +180,14 @@ class OntologyValidator:
         graphlite_store=None,
         encoder=None,
         config: Optional[OntologyConfig] = None,
+        extended_types: Optional[dict] = None,
     ):
         self.graphlite = graphlite_store
         self.encoder = encoder
         self.config = config or OntologyConfig()
+        # v5.38.0 Ontology-Evolution: extended 类型合并（实例属性，不硬改模块全局）
+        self._extended_types = dict(extended_types or {})
+        self._ontology_types: Optional[dict] = None  # lazy merge on first use
         self._ontology_synced = False  # lazy sync on first use
         self._candidate_entities: dict[str, int] = {}  # P5
         # P0-②: 语义对齐缓存
@@ -228,10 +232,21 @@ class OntologyValidator:
         entities.extend(e for e in cn_entities if e not in stop_words)
         return list(set(entities))
 
+    def _merged_ontology_types(self) -> dict:
+        """惰性合并 {**extended, **ONTOLOGY_TYPES} — 原生优先，extended 不覆盖。
+
+        v5.38.0 Ontology-Evolution: 不硬改模块全局 ONTOLOGY_TYPES（防污染
+        test_ontology_validator.py:23 的模块级 import）。后展开者优先，
+        故 ONTOLOGY_TYPES 放最后，污染 extended 无法覆盖原生。
+        """
+        if self._ontology_types is None:
+            self._ontology_types = {**self._extended_types, **ONTOLOGY_TYPES}
+        return self._ontology_types
+
     def _classify_ontology_type(self, text: str, entities: List[str]) -> str:
         """根据文本内容推断本体类型。"""
         text_lower = text.lower()
-        for otype, info in ONTOLOGY_TYPES.items():
+        for otype, info in self._merged_ontology_types().items():
             keys = info["conflict_keys"]
             if any(k in text_lower for k in keys):
                 return otype
@@ -1108,7 +1123,7 @@ class OntologyValidator:
         if self.graphlite is not None and entity_name:
             try:
                 rule = CONTRADICTION_RULES.get(
-                    ONTOLOGY_TYPES.get(ontology_type, {}).get(
+                    self._merged_ontology_types().get(ontology_type, {}).get(
                         "contradiction_pattern", "contradictory_claim"
                     )
                 )
@@ -1229,7 +1244,7 @@ class OntologyValidator:
                 try:
                     otype = self._classify_ontology_type(content, entities)
                     rule = CONTRADICTION_RULES.get(
-                        ONTOLOGY_TYPES.get(otype, {}).get(
+                        self._merged_ontology_types().get(otype, {}).get(
                             "contradiction_pattern", "contradictory_claim"
                         )
                     )

@@ -310,6 +310,16 @@ def _init_services() -> Services:
         logger.warning("AdaptiveGate init failed", error=str(e))
 
     # 7b. 本体验证器（[Ontology] 写时+读时验证层）
+    # 7b-0. Schema 自演化 extended 类型：启动加载供 validator 合并（缺失/损坏 → 空 dict 降级）
+    ontology_extended_types = {}
+    ontology_extended_path = "./data/ontology_extended.json"
+    try:
+        from core.ontology_evolution import load_extended
+        ontology_extended_types = load_extended(ontology_extended_path)
+        logger.info("Ontology extended types loaded: %d", len(ontology_extended_types))
+    except Exception as e:
+        logger.warning("Ontology extended load failed (fallback: native only): %s", e)
+
     if svc.graphlite_store is not None:
         try:
             from core.ontology_validator import OntologyValidator
@@ -317,6 +327,7 @@ def _init_services() -> Services:
                 graphlite_store=svc.graphlite_store,
                 encoder=svc.encoder,
                 config=cfg.ontology,
+                extended_types=ontology_extended_types,
             )
             logger.info("OntologyValidator initialized", enabled=cfg.ontology.enabled)
         except Exception as e:
@@ -365,6 +376,19 @@ def _init_services() -> Services:
         except Exception as e:
             logger.warning("LLMClient init skipped (dreams will use TF-IDF fallback): %s", e)
 
+        # 7b-1. Schema 自演化（v5.38.0 Ontology-Evolution）— 构造演化器 + 注入 DreamPipeline
+        ontology_evolution = None
+        try:
+            from core.ontology_evolution import OntologyEvolution
+            ontology_evolution = OntologyEvolution(
+                extended_path=ontology_extended_path,
+                llm_client=llm_client,
+            )
+            svc.ontology_evolution = ontology_evolution
+            logger.info("OntologyEvolution initialized")
+        except Exception as e:
+            logger.warning("OntologyEvolution init failed (fallback: no schema evolution): %s", e)
+
         svc.dream_pipeline = DreamPipeline(
             tau_engine=svc.tau_engine,
             hebbian_updater=svc.hebbian_updater,
@@ -373,6 +397,7 @@ def _init_services() -> Services:
             ontology_validator=svc.ontology_validator if hasattr(svc, 'ontology_validator') else None,
             confidence_calibrator=ConfidenceCalibrator(),
             write_queue=svc.write_queue,
+            ontology_evolution=ontology_evolution,
         )
         # 【P0-2】梦境候选存储（非破坏性模式）
         try:

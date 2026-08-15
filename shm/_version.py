@@ -1,12 +1,34 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.37.1"
-__version_info__ = (5, 37, 1)
-__version_name__ = "Skill-Bridge"
+__version__ = "5.38.0"
+__version_info__ = (5, 38, 0)
+__version_name__ = "Ontology-Evolution"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.38.0 (2026-08-15) Ontology-Evolution:
+  • Schema 自演化 — 对标 MindMemOS：ontology 随数据生长。梦境 SYNTHESIZE 后
+    聚合全部社区 topics/report 做 1 次 LLM 调用（复用 llm_client.chat，
+    temperature=0.1, response_format=json_object）→ new_type /
+    merge_existing / skip 三选一
+  • 新建 core/ontology_evolution.py — load_extended（缺失/损坏 → 空 dict
+    降级）、merged_types（原生优先不覆盖）、evolve_once（守卫：max 1 新类型/轮；
+    ≥2 非泛 conflict_keys；跨类型 key 冲突 → skip first-match-wins；merge 仅
+    合并 conflict_keys 去重不覆盖 description；LLM 失败 → skip 不阻塞；
+    原子写 temp+rename + asyncio.to_thread 落盘）、classify_with_extended
+  • OntologyValidator 惰性合并 — __init__ 加 extended_types 参数 + 实例属性
+    _ontology_types（ONTOLOGY_TYPES 与 extended 合并，原生优先不覆盖），3 处
+    ONTOLOGY_TYPES → self._merged_ontology_types()（:234/:1111/:1232），
+    不硬改模块全局（防污染 test_ontology_validator.py:23 模块级 import）
+  • 梦境接入 — run() SYNTHESIZE 后插入 _ontology_evolution_step(communities)；
+    llm_client 空/失败 → 直接返回不阻塞梦境
+  • app.py 接线 — 启动加载 data/ontology_extended.json（data/ 整体 gitignore）
+    供 OntologyValidator 合并；构造 OntologyEvolution 注入 DreamPipeline
+  • 测试: test_ontology_evolution 8 用例（merge 3 / 加载 2 / 集成 1 /
+    CC 修正 3：跨类型冲突 + 全泛词 + max1），ontology_validator /
+    fact_track / skill_bridge 无回归
+
 v5.37.1 (2026-08-15) Skill-Bridge:
   • 判重硬话（Dedup-Harden，R9 终审修复）— _STEM_WHITELIST 补齐 12 对高频变形：
     analyses→analysis、processes→process、systems→system、documents→document、

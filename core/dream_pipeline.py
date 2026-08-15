@@ -174,6 +174,7 @@ class DreamPipeline:
         ssm_engine=None,
         encoder=None,
         write_queue=None,
+        ontology_evolution=None,
     ) -> None:
         """
         Args:
@@ -186,6 +187,7 @@ class DreamPipeline:
             ssm_engine: SSMEngine 实例（可选，P2 SSM 梦境深度巩固）
             encoder: 编码器实例（可选，用于向量余弦相似度合并 Jaccard）
             write_queue: WriteQueue 实例（可选，存在时 PERSIST 经单写线程 submit 串行执行）
+            ontology_evolution: OntologyEvolution 实例（可选，v5.38.0 SYNTHESIZE 后 Schema 自演化）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
@@ -198,6 +200,7 @@ class DreamPipeline:
         self._ssm_wrapper: Optional[SSMDreamWrapper] = None
         self._ssm_initialized = False
         self._write_queue = write_queue
+        self.ontology_evolution = ontology_evolution
 
     async def run(
         self,
@@ -244,7 +247,11 @@ class DreamPipeline:
         communities = await self._synthesize_step(communities)
         logger.info("Dream %s: SYNTHESIZE — %d reports generated", dream_id, len(communities))
 
-        # Step 3a: SSM 梦境深度巩固 (P2) — 每次 run() 开始时重置 SSM 状态
+        # Step 3a: Ontology 自演化 (v5.38.0) — SYNTHESIZE 后聚合社区 topics/report
+        # 做 1 次 LLM 判断（LLM 延迟不压写读关键路径；llm_client 空/失败 → 直接返回）
+        await self._ontology_evolution_step(communities)
+
+        # Step 3b: SSM 梦境深度巩固 (P2) — 每次 run() 开始时重置 SSM 状态
         if self.ssm_engine is not None:
             if self._ssm_wrapper is None:
                 self._ssm_wrapper = SSMDreamWrapper(self.ssm_engine)
@@ -258,7 +265,7 @@ class DreamPipeline:
             logger.info("Dream %s: SSM CONSOLIDATE — %d communities processed",
                         dream_id, len(communities))
 
-        # Step 3b: CALIBRATE — 信心校准 (Manufactured Confidence, P1)
+        # Step 3c: CALIBRATE — 信心校准 (Manufactured Confidence, P1)
         calibrator_flagged = 0
         calibrator_high = 0
         calibrator_tracked = 0
@@ -710,6 +717,23 @@ class DreamPipeline:
                 nodes, ner_budget=ner_budget, ner_fails=ner_fails
             )
         return communities
+
+    async def _ontology_evolution_step(self, communities: list[dict]) -> None:
+        """Schema 自演化（v5.38.0）：SYNTHESIZE 后聚合社区 → 1 次 LLM 判断。
+
+        llm_client 空 / LLM 失败 → 直接返回（不阻塞梦境管道）。
+        """
+        if self.llm_client is None or self.ontology_evolution is None:
+            return
+        if not communities:
+            return
+        try:
+            result = await self.ontology_evolution.evolve(communities, self.llm_client)
+            action = result.get("action")
+            if action in ("new_type", "merge_existing"):
+                logger.info("Dream: Ontology evolution %s → %s", action, result.get("type"))
+        except Exception:
+            logger.warning("Dream: ontology evolution skipped (non-fatal)", exc_info=True)
 
     def _build_community_feature(self, community: dict) -> np.ndarray:
         """从社区数据构建 9 维 SSM 输入特征向量。"""
