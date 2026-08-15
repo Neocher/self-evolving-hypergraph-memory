@@ -294,7 +294,7 @@ class QueryRouter:
         异常/空语料/TfidfVectorizer 异常时返回 None，保留重试机会。
 
         Returns:
-            state = (vectorizer, doc_ids, doc_contents, doc_tau,
+            state = (vectorizer, doc_ids, doc_contents, doc_tau, doc_fact_track,
                      term_matrix, idf, doc_lens, avgdl)，失败返回 None。
         """
         if self.graphlite_store is None:
@@ -306,7 +306,7 @@ class QueryRouter:
                 "MATCH (e:EpisodeNode) "
                 "WHERE (e.archived IS NULL OR e.archived = false) "
                 "RETURN e.id AS node_id, e.content AS content, "
-                "e.tau_initial AS tau_value "
+                "e.tau_initial AS tau_value, e.fact_track AS fact_track "
                 "ORDER BY e.created_at DESC "
                 "LIMIT $limit",  # 【P1-2】LIMIT 下推数据库侧，避免全库拉取 OOM
                 {"limit": self.config.max_bm25_corpus},
@@ -330,6 +330,7 @@ class QueryRouter:
         doc_ids: list[str] = []
         doc_contents: list[str] = []
         doc_tau: list[float] = []
+        doc_fact_track: list[str] = []
         corpus: list[str] = []
 
         for row in rows:
@@ -337,10 +338,12 @@ class QueryRouter:
                 nid = row.get("node_id", "") or ""
                 content = row.get("content", "") or ""
                 tau = float(row.get("tau_value", 0.0) or 0.0)
+                fact_track = row.get("fact_track", "active") or "active"
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
                 nid = str(row[0]) if row[0] is not None else ""
                 content = str(row[1]) if row[1] is not None else ""
                 tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+                fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
             else:
                 continue
 
@@ -349,6 +352,7 @@ class QueryRouter:
             doc_ids.append(nid)
             doc_contents.append(content)
             doc_tau.append(tau)
+            doc_fact_track.append(fact_track)
             corpus.append(content)
 
         if not corpus:
@@ -370,6 +374,7 @@ class QueryRouter:
             doc_ids = doc_ids[:max_corpus]
             doc_contents = doc_contents[:max_corpus]
             doc_tau = doc_tau[:max_corpus]
+            doc_fact_track = doc_fact_track[:max_corpus]
 
         try:
             # 中文检索：使用字符级 bigram/trigram/4-gram（与 TfidfEncoder 一致），
@@ -393,7 +398,7 @@ class QueryRouter:
                 features=len(idf),
                 avgdl=round(avgdl, 2),
             )
-            return (vectorizer, doc_ids, doc_contents, doc_tau,
+            return (vectorizer, doc_ids, doc_contents, doc_tau, doc_fact_track,
                     tf_matrix, idf, doc_lens, avgdl)
         except Exception:
             logger.exception("BM25: TfidfVectorizer failed")
@@ -405,7 +410,7 @@ class QueryRouter:
         state 由 _build_bm25_index_core 本地计算返回，此处只做赋值，
         锁不横跨 GQL 拉取 + fit（prewarm 超时 zombie 不会永久钉死锁）。
         """
-        (vectorizer, doc_ids, doc_contents, doc_tau,
+        (vectorizer, doc_ids, doc_contents, doc_tau, doc_fact_track,
          term_matrix, idf, doc_lens, avgdl) = state
 
         def _assign() -> None:
@@ -413,6 +418,7 @@ class QueryRouter:
             self._bm25_doc_ids = doc_ids
             self._bm25_doc_contents = doc_contents
             self._bm25_doc_tau = doc_tau
+            self._bm25_doc_fact_track = doc_fact_track
             self._bm25_doc_term_matrix = term_matrix
             self._bm25_idf = idf
             self._bm25_doc_lens = doc_lens
@@ -507,6 +513,8 @@ class QueryRouter:
             return []
 
         top_indices = np.argsort(scores)[::-1][:top_k]
+        # 【Core-Boost】旧索引缓存兼容：无 _bm25_doc_fact_track 时缺省 active
+        fact_tracks = getattr(self, "_bm25_doc_fact_track", [])
         results: list[dict] = []
         for idx in top_indices:
             score = float(scores[idx])
@@ -518,6 +526,7 @@ class QueryRouter:
                     "content": self._bm25_doc_contents[idx],
                     "score": round(score, 6),
                     "tau_value": self._bm25_doc_tau[idx],
+                    "fact_track": fact_tracks[idx] if idx < len(fact_tracks) else "active",
                     "level": "bm25",
                 }
             )
@@ -578,7 +587,7 @@ class QueryRouter:
                 f"MATCH (e:EpisodeNode) WHERE ({where_clause}) "
                 f"AND (e.archived IS NULL OR e.archived = false) "
                 f"RETURN e.id AS node_id, e.content AS content, "
-                f"e.tau_initial AS tau_value "
+                f"e.tau_initial AS tau_value, e.fact_track AS fact_track "
                 f"LIMIT $limit"
             )
             params["limit"] = k * 2
@@ -596,10 +605,12 @@ class QueryRouter:
                 nid = row.get("node_id", "") or ""
                 content = row.get("content", "") or ""
                 tau = float(row.get("tau_value", 0.0) or 0.0)
+                fact_track = row.get("fact_track", "active") or "active"
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
                 nid = str(row[0]) if row[0] is not None else ""
                 content = str(row[1]) if row[1] is not None else ""
                 tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+                fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
             else:
                 continue
 
@@ -628,6 +639,7 @@ class QueryRouter:
                 "content": content,
                 "score": round(best_score, 4),
                 "tau_value": tau,
+                "fact_track": fact_track,
                 "level": "entity_match",
             })
 
@@ -722,8 +734,9 @@ class QueryRouter:
         # 时序衰减
         self._apply_time_decay(all_results)
 
-        # 去重 + 排序（按 content[:100]）
-        return self._deduplicate_and_sort(all_results)
+        # 去重 + 排序收敛到 retrieve() _finish 统一出口（此处不再重复，
+        # 避免与 _finish 的 _deduplicate_and_sort 双重 boost）
+        return all_results
 
     def retrieve(
         self,
@@ -752,7 +765,14 @@ class QueryRouter:
         query = self._normalize_query(query)
 
         def _finish(results: list[dict]) -> list[dict]:
-            return results if include_archived else self._filter_archived(results)
+            # 【Core-Boost】统一出口应用 core 轨 ×1.1 boost + 去重排序——
+            # 覆盖 L1/L2/L3/L4/FUSION/graph_expansion 全部路径（原仅 FUSION/L1
+            # 经 _deduplicate_and_sort，降级链 L2/L3/L4 直接返回原始列表无 boost）。
+            # 【P2】非 include_archived 时先过滤归档再去重：避免同一 content[:100]
+            # 的 archived 高分项在去重时挤掉 active 低分项，再过滤后结果为空。
+            if not include_archived:
+                results = self._filter_archived(results)
+            return self._deduplicate_and_sort(results)
 
         strategy = self.detect_strategy(query)
         logger.info("Retrieval started", query=query[:80], level=level.value, strategy=strategy)
@@ -949,6 +969,7 @@ class QueryRouter:
                 episode["score"] = round(1.0 / (1.0 + float(score)), 4)
                 episode["level"] = "l1_faiss"
                 episode["_source"] = "faiss"
+                episode["fact_track"] = episode.get("fact_track", "active")
                 episode["node_id"] = episode.pop("id", "")
                 results.append(episode)
 
@@ -964,7 +985,8 @@ class QueryRouter:
             except Exception:
                 pass  # 扩散失败静默回退，纯向量结果不受影响
 
-        return self._deduplicate_and_sort(results)
+        # 去重 + 排序收敛到 retrieve() _finish 统一出口（含 core boost）
+        return results
 
     def _graph_expansion(
         self, seeds: list[str], existing_ids: set[str], tail_score: float
@@ -994,6 +1016,9 @@ class QueryRouter:
                 if nid:
                     neighbor_ids.append(nid)
         archived_ids = self._lookup_archived_ids(neighbor_ids)
+        # 【Core-Boost】邻居回查补 fact_track（get_hypergraph_neighbors 只回
+        # id/content/co_occurrence），core 邻居在 _finish 统一出口同样获 ×1.1 boost
+        fact_tracks = self._lookup_fact_track(neighbor_ids)
 
         for sid in seeds:
             for nb in all_neighbors.get(sid, []):
@@ -1010,6 +1035,7 @@ class QueryRouter:
                     "content": content,
                     "score": score,
                     "archived": nid in archived_ids,
+                    "fact_track": fact_tracks.get(nid, "active"),
                     "level": "graph_expansion",
                     "_source": "graph",
                 })
@@ -1079,6 +1105,7 @@ class QueryRouter:
                 "score": round(1.0 / (1.0 + float(score)), 4),
                 "tau_value": episode.get("tau_initial", 0.0),
                 "archived": episode.get("archived", False),
+                "fact_track": episode.get("fact_track", "active"),
                 "level": RetrievalLevel.VECTOR.value,
             })
 
@@ -1110,8 +1137,9 @@ class QueryRouter:
             nid = str(doc_id)
             items.append((nid, str(content), float(score)))
             node_ids.append(nid)
-        # TF-IDF 快照语料在 app.py/system.py fit，无法在此构建期过滤——回查补 archived
+        # TF-IDF 快照语料在 app.py/system.py fit，无法在此构建期过滤——回查补 archived + fact_track
         archived_ids = self._lookup_archived_ids(node_ids)
+        fact_tracks = self._lookup_fact_track(node_ids)
         return [
             {
                 "node_id": doc_id,
@@ -1119,6 +1147,7 @@ class QueryRouter:
                 "score": score,
                 "tau_value": 0.0,
                 "archived": doc_id in archived_ids,
+                "fact_track": fact_tracks.get(doc_id, "active"),
                 "level": RetrievalLevel.KEYWORD.value,
             }
             for doc_id, content, score in items
@@ -1167,7 +1196,8 @@ class QueryRouter:
             cypher = (
                 f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                 f"AND (e.archived IS NULL OR e.archived = false) "
-                f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value "
+                f"RETURN e.id AS node_id, e.content AS content, e.tau_initial AS tau_value, "
+                f"e.fact_track AS fact_track "
                 "LIMIT $limit"
             )
             params["limit"] = self.config.top_k_keyword
@@ -1181,6 +1211,7 @@ class QueryRouter:
                             "content": row.get("content", ""),
                             "score": 0.5,
                             "tau_value": row.get("tau_value", 0.0),
+                            "fact_track": row.get("fact_track", "active"),
                             "level": "graphlite_fallback",
                         }
                     )
@@ -1191,6 +1222,7 @@ class QueryRouter:
                             "content": str(row[1]),
                             "score": 0.5,
                             "tau_value": float(row[2]) if len(row) > 2 else 0.0,
+                            "fact_track": str(row[3]) if len(row) > 3 else "active",
                             "level": "graphlite_fallback",
                         }
                     )
@@ -1289,7 +1321,11 @@ class QueryRouter:
 
     @staticmethod
     def _deduplicate_and_sort(results: list[dict]) -> list[dict]:
-        """按 content[:100] 去重并按 score 降序排列"""
+        """按 content[:100] 去重并按 score 降序排列（core 轨温和 boost ×1.1）。"""
+        # 【Core-Boost】core 事实温和加分：score 非 [0,1] 但乘正因子单调，不破坏排序语义
+        for r in results:
+            if r.get("fact_track") == "core":
+                r["score"] *= 1.1
         seen: set[str] = set()
         unique: list[dict] = []
         for r in sorted(results, key=lambda x: x["score"], reverse=True):
@@ -1323,3 +1359,21 @@ class QueryRouter:
             }
         except Exception:
             return set()
+
+    def _lookup_fact_track(self, node_ids: list[str]) -> dict[str, str]:
+        """批量回查节点 fact_track，返回 {node_id: fact_track}（回查失败返回空，缺省 active）。"""
+        if not node_ids or self.graphlite_store is None:
+            return {}
+        try:
+            if not hasattr(self.graphlite_store, "get_episodes_batch"):
+                return {}
+            eps = self.graphlite_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
+            if not isinstance(eps, (list, tuple)):
+                return {}
+            return {
+                str(ep.get("id", "")): ep.get("fact_track", "active")
+                for ep in eps
+                if isinstance(ep, dict)
+            }
+        except Exception:
+            return {}

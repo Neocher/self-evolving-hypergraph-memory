@@ -522,6 +522,20 @@ async def create_episode(
             episode_data["entity_name"] = val_result.entity_name
         if val_result.entity_value:
             episode_data["entity_value"] = val_result.entity_value
+    # 【Multi-Source】置信度累积提前到 qsubmit 前：≥2 来源确认需在落库前提升 tau_initial
+    if deps.evidence_tracker is not None:
+        try:
+            evidence_count = deps.evidence_tracker.record(
+                req.content, source=req.source,
+                metadata={"episode_id": episode_id},
+            )
+            if evidence_count > 1:
+                logger.info("Evidence tracker: count=%d for %s", evidence_count, req.content[:40])
+            if deps.evidence_tracker.is_multi_source(req.content):
+                episode_data["tau_initial"] = 0.85
+        except Exception:
+            logger.exception("Evidence tracker error (non-fatal)")
+
     # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
     await qsubmit(deps, _write_episode_with_session, deps.graphlite_store,
                   episode_data, req.namespace or None)
@@ -581,18 +595,6 @@ async def create_episode(
                 logger.info("Relation extraction: %d typed edges", len(triples))
         except Exception:
             logger.exception("Relation extraction error (non-fatal)")
-
-    # [Step 2] 置信度累积
-    if deps.evidence_tracker is not None:
-        try:
-            evidence_count = deps.evidence_tracker.record(
-                req.content, source=req.source,
-                metadata={"episode_id": episode_id},
-            )
-            if evidence_count > 1:
-                logger.info("Evidence tracker: count=%d for %s", evidence_count, req.content[:40])
-        except Exception:
-            logger.exception("Evidence tracker error (non-fatal)")
 
     # [Step 3] 实体消歧 — 仅对有一定信息量的内容执行
     if deps.graphlite_store is not None and len(req.content) > 80:

@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.34.0"
-__version_info__ = (5, 34, 0)
-__version_name__ = "Dual-Track-Facts"
+__version__ = "5.35.0"
+__version_info__ = (5, 35, 0)
+__version_name__ = "Core-Boost-MultiSource"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.35.0 (2026-08-15) Core-Boost-MultiSource:
+  • 检索 core 优先 — fact_track 数据透传（BM25/实体匹配/回退/超图/向量/
+    关键词 六通道组装补齐 + graph_expansion 邻居回查补全）+ core 轨 ×1.1
+    温和 boost（retrieve() _finish 统一出口，覆盖 L1/L2/L3/L4/FUSION/
+    graph_expansion 全部路径）
+  • 多源支持度 — EvidenceTracker.is_multi_source（≥2 个不同来源确认同一
+    事实）；write.py 写多源 → tau_initial=0.85 提升持久性（零新增查询、
+    零 embedding，复用写路径现成多源计数）
+  • BM25 旧索引兼容 — 读取 .get("fact_track") 缺省 active，不抛错
+  • score 非 [0,1] 但乘正因子单调，不破坏排序语义
+
 v5.34.0 (2026-08-15) Dual-Track-Facts:
   • 双轨事实记忆 (Dual-Track Facts) — MemSIF 双轨启发：稳定事实 (core)
     不应因 τ 衰减被误归档 (DUM)，事件/临时内容 (active) 随 τ 正常衰减
@@ -22,7 +33,7 @@ v5.34.0 (2026-08-15) Dual-Track-Facts:
     _get_effective_tau_decay 对 core 轨 ×2.0 boost (等效 importance=1.0)
     再走 min/max 钳制；dream_pipeline 用 created_at 重算 τ 时透传 fact_track
   • 顺手修 tau_decay docstring 过期残留 (1 - I·m → 1 + I·m·IMP_BOOST_FACTOR)
-  • 检索 core 优先 + 多源提升：缓做 (v5.35 候选)
+  • 检索 core 优先 + 多源提升：已落地 (v5.35.0)
 
 v5.33.0 (2026-08-15) Source-Trust:
   • 来源信任分级接通 — 写时 source_type 分级落库（direct/tool/inferred，

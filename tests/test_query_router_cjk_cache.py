@@ -191,8 +191,8 @@ class TestM5EpisodeCache:
         svc.faiss_id_map = {}
         svc._faiss_buffer = [(1, [0.1, 0.2], "ep-1"), (2, [0.3, 0.4], "ep-2")]
         assert flush_faiss_buffer(svc) == 2
-        assert cache.get("ep-1") == {"id": "ep-1"}, "flush 应填充 episode cache"
-        assert cache.get("ep-2") == {"id": "ep-2"}
+        assert cache.get("ep-1") == {"id": "ep-1", "fact_track": "active"}, "flush 应填充 episode cache"
+        assert cache.get("ep-2") == {"id": "ep-2", "fact_track": "active"}
         assert "ep-1" in cache
 
         router = QueryRouter.__new__(QueryRouter)

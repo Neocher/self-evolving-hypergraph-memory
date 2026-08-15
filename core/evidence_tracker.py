@@ -186,6 +186,17 @@ class EvidenceTracker:
         import math
         return min(5.0, math.log2(count + 1))
 
+    def is_multi_source(self, content: str) -> bool:
+        """判断一条内容是否被 ≥2 个不同来源确认（多源交叉验证）。"""
+        content_hash = _hash_content(content)
+        ekey = self._source_hash.get(content_hash)
+        if not ekey:
+            return False
+        record = self._evidence.get(ekey)
+        if not record:
+            return False
+        return len(set(record.get("sources", []))) >= 2
+
     # ─── 工具函数 ───────────────────────────────────────────
 
     @staticmethod

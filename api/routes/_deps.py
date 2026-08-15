@@ -234,15 +234,28 @@ def flush_faiss_buffer(deps: Services) -> int:
                 deps.faiss_id_map[int(faiss_id)] = ep_id
         # 【M5】episode 内容缓存填充：faiss_id_map 与 _episode_cache 均为
         # query_router 共享引用，本批写入的节点内容在此预填，检索零回查。
-        # 用最小 dict 记录（命中时经 get_episodes_batch 补全），仅新增写入方。
+        # 【Core-Boost】填充时带上 fact_track（一次性批量回查），否则 L1 缓存
+        # 命中路径 core 节点 fact_track 恒 "active" 丢失 boost。
         cache = getattr(deps, "_episode_cache", None)
         if cache is None:
             # 未显式初始化（测试/降级路径）→ 惰性创建，保证 flush 恒写入
             cache = EpisodeCache()
             deps._episode_cache = cache
+        fact_tracks: dict[str, str] = {}
+        store = getattr(deps, "graphlite_store", None)
+        if store is not None and hasattr(store, "get_episodes_batch"):
+            ep_ids = [ep_id for _faiss_id, _emb, ep_id in batch]
+            try:
+                fact_tracks = {
+                    str(ep.get("id", "")): ep.get("fact_track", "active")
+                    for ep in store.get_episodes_batch(ep_ids)
+                    if isinstance(ep, dict)
+                }
+            except Exception:
+                fact_tracks = {}  # 回查失败 → 缺省 active，不阻断 flush
         for _faiss_id, _emb, ep_id in batch:
             try:
-                cache[ep_id] = {"id": ep_id}
+                cache[ep_id] = {"id": ep_id, "fact_track": fact_tracks.get(ep_id, "active")}
             except Exception:
                 break
         logger.debug("FAISS batch flush: %d vectors added", len(batch))
