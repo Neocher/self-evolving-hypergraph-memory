@@ -1,12 +1,40 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.37.0"
-__version_info__ = (5, 37, 0)
+__version__ = "5.37.1"
+__version_info__ = (5, 37, 1)
 __version_name__ = "Skill-Bridge"
 __release_date__ = "2026-08-15"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.37.1 (2026-08-15) Skill-Bridge:
+  • 判重硬话（Dedup-Harden，R9 终审修复）— _STEM_WHITELIST 补齐 12 对高频变形：
+    analyses→analysis、processes→process、systems→system、documents→document、
+    tools→tool、files→file、notes→note、tables→table、findings→finding、
+    errors→error、comparisons→comparison、evaluations→evaluation（与原有
+    9 对合并共 21 对；data/dream_candidates 实测 systems×39/documents×34/
+    tools×32/analyses×6 等高频复数未归一 → 近重复漏放行）
+    ——research-workflow-analysis vs research workflow analyses 归一后
+    3 token 重叠判重（旧逻辑仅 2 重叠漏判）
+  • 框架停用词补全（R9 终审修复）— consists/various/diverse/includes/
+    include 进 _STOPWORDS：两个不同主题长报告不再因共享 consists+various+
+    report（3 token）被误判重复（旧逻辑实测误杀）
+  • _stem_word 词干盲剥 P1 修复 — 通用尾缀剥离把 cases→cas、speed→spe、
+    summary→summar、status→statu、houses→hous、news→new 剥坏（与 docstring
+    声称守卫矛盾），case/cases、summary/summaries、status/statuses 无法归一
+    → 改显式白名单映射，白名单外单词原样返回（news/analysis/process/status
+    天然不动），零误剥风险
+  • 判重链路增强 — 停用词过滤 → 词干归一 → 排除判重泛词（collection/
+    operational/technical/set/log 进 _DEDUP_GENERIC，仅从重叠计数排除，
+    skill 名/description 保留原文）；重叠阈值 2→3（单/双 token 弱信号不
+    阻断，仅泛词重叠不误杀）
+  • 命名增强 — 长句截断到 _MAX_NAME_WORDS 而非整体作废（保留 ≥2 词下限）；
+    patterns 回退遍历全部（原只试第一个）；纯中文/无拉丁 token 回退 patterns
+    仍失败记 warning 不再静默跳过
+  • 测试: 白名单归一 21 例 + 反例守卫 26 词（speed/sing/thing/red/feed 等
+    不剥）+ analyses 判重公共入口回归 + 不同主题长报告框架词不误杀回归；
+    手动验收脚本补 assert 3/3
+
 v5.37.0 (2026-08-15) Skill-Bridge:
   • 记忆→Skill 一体化 — 梦境巩固产出自动固化为 Hermes skill
     （Memory-Skill-Bridge），SHM 自演化闭环从「记忆内演化」扩展到

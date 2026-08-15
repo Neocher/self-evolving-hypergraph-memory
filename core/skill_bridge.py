@@ -46,14 +46,26 @@ _META_PHRASES = (
 )
 
 # 判重与命名共用的泛词（不承载语义，不参与 token 重叠/命名）
+# 含社区 report 框架语：captures/contains/contain/including（"This cluster captures...,
+# including..." 每个社区摘要必出现）；consists/various/diverse/includes/include
+# （"This report consists of various..." 框架句必现，不同主题报告共享会误判重复）。
 _STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with",
     "at", "by", "from", "this", "that", "these", "those", "it", "its",
     "is", "are", "be", "was", "were", "as", "we", "you", "they", "he",
-    "she", "i", "my", "our", "your", "their", "about", "into", "over",
-    "under", "between", "among", "will", "can", "should", "would",
+    "she", "i", "my", "our", "your", "their", "about", "into", "including",
+    "over", "under", "between", "among", "will", "can", "should", "would",
     "could", "may", "might", "must", "not", "no", "very", "just",
-    "also", "then", "than", "cluster", "clusters",
+    "also", "then", "than", "cluster", "clusters", "captures", "contain",
+    "contains", "consists", "various", "diverse", "includes", "include",
+})
+
+# 判重专用泛词（仅从语义重叠计数中排除；命名/description 中仍保留原文）
+# 高频但不承载判别力：collection/operational/technical/set/logs（logs 词干归一后为 log）。
+# 注意：不入 _STOPWORDS —— 否则 skill 名/description 会缺这些词；
+#       report(s)/research 保留为判重信号词（report vs reports 归一判重依赖它）。
+_DEDUP_GENERIC = frozenset({
+    "collection", "operational", "technical", "set", "log",
 })
 
 # 开头序号/列表符号：1. / 1) / 1、 / - / * / • 等
@@ -70,6 +82,55 @@ def _meaningful_tokens(text: str) -> set[str]:
     """提取有意义 token：词边界分词，排除停用词与纯数字。"""
     words = re.findall(r"[a-z0-9]+", (text or "").lower())
     return {w for w in words if w not in _STOPWORDS and not w.isdigit()}
+
+
+# 判重场景高频词的显式词干归一白名单（复数/变形 → 基础形）。
+# 不做通用尾缀剥离：盲剥会把 cases→cas、speed→spe、summary→summar、
+# status→statu、houses→hous、news→new 剥坏（与 docstring 声称的守卫矛盾）。
+# 判重场景只有几十个高频词，白名单比完整 Porter 词干更可靠、零误剥风险；
+# 白名单外单词原样返回（news/analysis/process/status 天然不动）。
+# 按 data/dream_candidates 实测频率补齐 12 对：analyses/processes/systems/
+# documents/tools/files/notes/tables/findings/errors/comparisons/evaluations
+# （systems×39/documents×34/tools×32/analyses×6 等高频变形未归一 → 近重复漏判）。
+_STEM_WHITELIST = {
+    "reports": "report",
+    "delivery": "deliver",
+    "deliveries": "deliver",
+    "summaries": "summary",
+    "cases": "case",
+    "statuses": "status",
+    "houses": "house",
+    "logs": "log",
+    "sets": "set",
+    "analyses": "analysis",
+    "processes": "process",
+    "systems": "system",
+    "documents": "document",
+    "tools": "tool",
+    "files": "file",
+    "notes": "note",
+    "tables": "table",
+    "findings": "finding",
+    "errors": "error",
+    "comparisons": "comparison",
+    "evaluations": "evaluation",
+}
+
+
+def _stem_word(word: str) -> str:
+    """极简词干归一（判重专用）：report/reports、deliver/delivery 归一到同形。
+
+    显式白名单映射（只收录判重场景高频词的复数/变形，analyses→analysis、
+    processes→process 等），不做通用尾缀剥离；白名单外单词原样返回
+    （cases→case、houses→house、summaries→summary、statuses→status 归一到
+    同形，news/analysis/process/status 不动）。
+    """
+    return _STEM_WHITELIST.get(word, word)
+
+
+def _dedup_tokens(text: str) -> set[str]:
+    """判重专用 token 集：停用词过滤 → 词干归一 → 排除判重泛词。"""
+    return {_stem_word(w) for w in _meaningful_tokens(text)} - _DEDUP_GENERIC
 
 
 def _strip_code_fence(text: str) -> str:
@@ -91,13 +152,17 @@ def _is_raw_json(report: str) -> bool:
     return _strip_code_fence(report).startswith(("{", "["))
 
 
-def _name_from_text(text: str) -> str:
-    """文本 → kebab 名：剥序号/列表符号，过滤纯数字 token 与停用词。"""
+def _name_from_text(text: str, max_words: int = _MAX_NAME_WORDS) -> str:
+    """文本 → kebab 名：剥序号/列表符号，过滤纯数字/停用词，截断到 max_words。
+
+    【v5.37】长句不再整体作废——只取前 max_words 个有效词（原逻辑要求整行词数
+    恰在 [2, _MAX_NAME_WORDS] 内，长 report/pattern 句全部 "cannot derive"）。
+    """
     text = text.strip(" \t#*.")
     text = _LEADING_LIST_RE.sub("", text).strip(" \t#*.")
     words = [w for w in re.findall(r"[a-z0-9]+", text.lower())
              if w not in _STOPWORDS and not w.isdigit()]
-    return "-".join(words)
+    return "-".join(words[:max_words])
 
 
 def extract_reusable_patterns(community_summaries: list) -> list[dict]:
@@ -124,21 +189,21 @@ def extract_reusable_patterns(community_summaries: list) -> list[dict]:
 def generate_skill_name(report: str, patterns: list) -> str:
     """从 report/patterns 提取动作短语 → kebab-case 名。提取失败返回空串（跳过）。
 
-    【v5.37】剥离序号/列表符号、过滤纯数字与停用词；纯中文/无拉丁 token 时回退
-    patterns，仍失败则记 warning（不再静默跳过）。
+    【v5.37】剥离序号/列表符号、过滤纯数字与停用词；长句截断到 _MAX_NAME_WORDS
+    而非整体作废（保留 ≥2 词下限）；纯中文/无拉丁 token 时遍历全部 patterns 回退，
+    仍失败则记 warning（不再静默跳过）。
     """
     for line in str(report or "").split("\n"):
         line = line.strip()
         if not line:
             continue
         name = _name_from_text(line)
-        if 2 <= len(name.split("-")) <= _MAX_NAME_WORDS:
+        if len(name.split("-")) >= 2:
             return name
-    if patterns:
-        first = patterns[0]
-        cand = str(first.get("pattern", first)) if isinstance(first, dict) else str(first)
+    for p in patterns or []:
+        cand = str(p.get("pattern", p)) if isinstance(p, dict) else str(p)
         name = _name_from_text(cand)
-        if 2 <= len(name.split("-")) <= _MAX_NAME_WORDS:
+        if len(name.split("-")) >= 2:
             return name
     if str(report or "").strip() or patterns:
         logger.warning(
@@ -183,10 +248,13 @@ def _scan_existing_skills(skills_dir: str) -> list[dict]:
 def should_create_skill(name: str, existing_skills: list) -> bool:
     """同名判重 + description 语义重叠检测。
 
-    【v5.37】词边界匹配 + 排除停用词：≥2 个非泛词 token 在已有 description 中
-    词边界重叠才判语义重复；单个词（如 feishu）不阻断。
+    【v5.37】判重增强：停用词过滤后先词干归一（report/reports、deliver/delivery
+    同形），再排除判重泛词（collection/operational/technical/set/logs）；≥3 个
+    非泛词归一 token 词边界重叠才判语义重复。单/双词重叠（如 feishu、
+    research+workflow）不阻断；仅泛词重叠（如 collection/operational/technical）
+    不再误杀。
     """
-    name_tokens = _meaningful_tokens(name)
+    name_tokens = _dedup_tokens(name)
     if not name_tokens:
         return False
     for ex in existing_skills or []:
@@ -194,7 +262,7 @@ def should_create_skill(name: str, existing_skills: list) -> bool:
         if _kebab(ex_name) == name:
             return False
         ex_desc = (ex.get("description", "") if isinstance(ex, dict) else "") or ""
-        if len(name_tokens & _meaningful_tokens(ex_desc)) >= 2:
+        if len(name_tokens & _dedup_tokens(ex_desc)) >= 3:
             return False
     return True
 
