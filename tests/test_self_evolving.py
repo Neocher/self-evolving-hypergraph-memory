@@ -158,6 +158,23 @@ class TestSelfEvolvingRetrieval:
         s = se.state()
         assert s["total_calls"] == 1
 
+    def test_retrieve_passthrough_include_archived(self):
+        """v5.32.0 回归测试：include_archived 参数必须透传给底层 QueryRouter
+        （否则 search.py 传参触发 TypeError → 500，曾导致线上故障）。"""
+        received = {}
+
+        class SpyRouter(MockRouter):
+            def retrieve(self, q, include_archived=False):
+                received["include_archived"] = include_archived
+                return [{"content": f"result_{q}", "score": 0.7}]
+
+        se = SelfEvolvingRetrieval(SpyRouter())
+        se.retrieve("hello", include_archived=True)
+        assert received.get("include_archived") is True
+        # 默认 False
+        se.retrieve("world")
+        assert received.get("include_archived") is False
+
     def test_evolve_cycle(self):
         """低质量检索多次后触发演化的完整循环"""
         class BadRouter(MockRouter):

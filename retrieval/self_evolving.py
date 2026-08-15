@@ -465,7 +465,7 @@ class SelfEvolvingRetrieval:
         # 可插拔向量存储实例（设为 None，由外部共享 Services.faiss_index 代替）
         self._vector_store: Optional[BaseVectorStore] = None
 
-    def retrieve(self, query: str):
+    def retrieve(self, query: str, include_archived: bool = False):
         """执行检索 + 质量评估 + 自演化（线程安全）。
 
         【H1-a】锁粒度收窄：不再用方法级大锁包裹整个 _qr.retrieve
@@ -473,9 +473,11 @@ class SelfEvolvingRetrieval:
         且 asyncio.wait_for 超时无法取消 to_thread 线程，超时后 zombie
         线程仍持有大锁 → 后续请求阻塞等锁 → 默认池耗尽 → 永久楔死）。
         改为：
-          1. 无锁调用底层 _qr.retrieve(query)（只读检索，不触碰共享状态）
-          2. 仅在短锁段内更新 _total_calls/logger/guard（共享状态变更段）
+         1. 无锁调用底层 _qr.retrieve(query)（只读检索，不触碰共享状态）
+         2. 仅在短锁段内更新 _total_calls/logger/guard（共享状态变更段）
         共享 QueryRouterConfig 的 setattr 在 GIL 下原子，检索读操作无需互斥。
+
+        include_archived: 透传给底层 QueryRouter（默认 False 排除归档节点）。
         """
         params_before = self.guard.current().snapshot()
         start = time.perf_counter()
@@ -485,7 +487,7 @@ class SelfEvolvingRetrieval:
 
         # 无锁执行检索（读操作，可并发执行，不再串行化）
         try:
-            raw = self._qr.retrieve(query, include_archived=False)
+            raw = self._qr.retrieve(query, include_archived=include_archived)
         except Exception as e:
             logger.error("检索失败: %s", e)
             return []
