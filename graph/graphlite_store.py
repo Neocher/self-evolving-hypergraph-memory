@@ -581,6 +581,22 @@ class GraphLiteStore:
                                str(node_id)[:12], str(replacement_id)[:12], exc_info=True)
         return True
 
+    def unarchive(self, node_id: str) -> bool:
+        """撤销归档（P1 restore 端点可翻转软删）：SET archived=false。
+
+        幂等：未归档节点 SET false 也是 no-op 成功；仅节点不存在返回 False
+        （execute rows_affected=0，与 archive_node 存在性判定一致）。
+        """
+        id_lit = _gql_value(str(node_id))
+        try:
+            affected = self._locked_execute(
+                f"MATCH (e:EpisodeNode {{id: {id_lit}}}) SET e.archived = false"
+            )
+        except Exception:
+            logger.warning("unarchive failed for %s", str(node_id)[:12], exc_info=True)
+            return False
+        return affected is not None and affected > 0
+
     # ─── Hyperedge CRUD ─────────────────────────────
 
     def create_hyperedge_node(self, hyperedge: dict) -> str:

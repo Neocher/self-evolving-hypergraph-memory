@@ -8,6 +8,9 @@ from typing import Any, Optional
 
 from core.defense import MemoryDefenseVerdict
 from core.fact_track import classify_fact_track
+# 【P2-2】裁决权重单一来源：复用 user_profile._SOURCE_WEIGHTS（direct 1.0 /
+# tool 0.7 / inferred 0.5），不再本地重复定义，防权重值漂移。
+from core.user_profile import _SOURCE_WEIGHTS as _SOURCE_TYPE_LEVEL
 
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
@@ -71,6 +74,103 @@ def _upsert_conflict_node(store, conflict_node_id: str, episode_id: str, conflic
         {"id": conflict_node_id,
          "a": episode_id, "b": conflict_id,
          "rule": "write_validate", "t": _now()})
+
+
+# ─── 【P1】显式冲突撤销裁决（TEPA 对标）────────────────────────
+# _SOURCE_TYPE_LEVEL 由顶部 import 自 core.user_profile._SOURCE_WEIGHTS（P2-2 单一来源）
+_TRUST_EPSILON = 0.05
+
+
+def _is_flag_true(v: Any) -> bool:
+    """GraphLite 布尔投影归一化：True / 'true' / 1 视为真（对齐 query_router/
+    dream_pipeline 的 `in (True, "true", 1)` 判别）；None/False/'false'/0 → 假
+    （旧节点无 protected 字段时投影 None → 默认不保护，兼容旧数据）。"""
+    return v is True or v == "true" or v == 1
+
+
+def _decide_winner(new_source_type: str, old_source_type: str,
+                   new_trust: float, old_trust: float, old_tau: float,
+                   old_protected: bool = False, old_fact_track: str = "") -> bool:
+    """裁决等值精确冲突的胜者。Returns True = 新胜（归档旧记忆），False = 旧胜（待人工）。
+
+    - 【P1-R2】防护优先于一切：旧值 protected=True → 绝不自动归档（只建
+      ConflictNode 待人工）；旧值 fact_track=core（稳定事实）且新源未严格更高
+      （新 source_type 级 > 旧 source_type 级）→ 不自动归档
+    - source_type 分级 direct(1.0) > tool(0.7) > inferred(0.5)，级高者胜
+    - 同级 tie-break：生产节点不落库 trust_score（实测 'Null' → 0.5 常量），
+      _revoke_conflicts 用 source_type 权重作新旧信任代理（同级相等）→ 同级
+      实际比较退化为 τ 折损 + recency：τ 缺失（None）按 1.0 不折损，防误归档；
+      τ=0.0 是真实完全衰减（P2-1 用 is None 区分，不做缺失回退）
+    - 仍相近（差 < ε）→ 新胜（TEPA recency 兜底）
+    - 旧值缺 source_type（None）按 inferred 最低处理，由信任比较兜底防误归档高信任旧记忆
+    """
+    new_level = _SOURCE_TYPE_LEVEL.get(new_source_type, 0.5)
+    old_level = _SOURCE_TYPE_LEVEL.get(old_source_type, 0.5)
+    # P1-R2: protected 旧值绝不自动归档（强制提升/防丢失标记，仅建 ConflictNode 待人工）
+    if old_protected:
+        return False
+    # P1-R2: core 稳定事实需新源严格更高（direct > tool > inferred）才可归档；
+    # 同级（含降级）一律不自动归档——修复前同级恒新胜导致稳定事实被静默归档
+    if old_fact_track == "core" and new_level <= old_level:
+        return False
+    if new_level > old_level:
+        return True
+    if new_level < old_level:
+        return False
+    # P2-1: is None 区分"真实 0.0"与"缺失"——0.0 是有效值（零信任/完全衰减），
+    # 不得被 or 当作缺失回退到默认（0.0 trust → 0.0，0.0 τ → 0.0）
+    old_eff = float(old_trust if old_trust is not None else 0.0) * float(
+        old_tau if old_tau is not None else 1.0
+    )
+    if abs(new_trust - old_eff) >= _TRUST_EPSILON:
+        return new_trust > old_eff
+    return True  # recency 兜底
+
+
+async def _revoke_conflicts(deps: Services, val_result, episode_data: dict) -> int:
+    """【P1】新节点落库后执行显式冲突撤销：等值精确冲突且新胜 → 归档败方旧记忆。
+
+    仅 same_entity_diff_value（等值精确）且 _decide_winner 判新胜的冲突才归档；
+    contradictory_claim（CONTAINS 弱匹配）与旧胜/tie 只建 ConflictNode 待人工。
+    归档经 qsubmit(priority="low")（v5.40 低准入闸，不抢 high 写额度）。
+    Returns: 归档数
+    """
+    new_source_type = episode_data.get("source_type", "")
+    # P1-1: 生产节点无 trust_score（create_episode 写路径不落库，实测 'Null' → 0.5
+    # 常量），新旧信任均用 source_type 权重代理（单一来源 _SOURCE_TYPE_LEVEL）；
+    # 同级 tie-break 语义见 _decide_winner docstring（source_type 级 + recency）
+    new_trust = _SOURCE_TYPE_LEVEL.get(new_source_type, 0.5)
+    revoked = 0
+    for c in val_result.contradictions:
+        if c.get("conflict_pattern") != "same_entity_diff_value":
+            continue
+        old_id = c.get("conflict_id", "")
+        if not old_id:
+            continue
+        if not _decide_winner(
+            new_source_type,
+            c.get("conflict_source_type", ""),
+            new_trust,
+            # P1-1: 旧信任 = 旧值 source_type 权重代理（不再读恒 'Null' 的 trust_score）
+            _SOURCE_TYPE_LEVEL.get(c.get("conflict_source_type", ""), 0.5),
+            # P1-2: conflict_tau 已由验证器改读生产字段 tau_initial；
+            # P2-1: is None 区分真实 0.0（完全衰减）与缺失（未衰减按 1.0）
+            float(c.get("conflict_tau") if c.get("conflict_tau") is not None else 1.0),
+            # P1-R2: 防护字段（验证器随 CONTRADICTION_RULES 投影带回）——
+            # protected 旧值绝不归档；core 稳定事实需新源严格更高才归档
+            old_protected=_is_flag_true(c.get("conflict_protected")),
+            old_fact_track=str(c.get("conflict_fact_track") or ""),
+        ):
+            continue
+        try:
+            await qsubmit(deps, deps.graphlite_store.archive_node, old_id,
+                          replacement_id=episode_data["id"], priority="low")
+            revoked += 1
+            logger.info("P1 conflict revoked: %s superseded by %s",
+                        old_id[:12], episode_data["id"][:12])
+        except Exception:
+            logger.warning("P1 conflict archive failed for %s (non-fatal)", old_id[:12])
+    return revoked
 
 
 def _upsert_ontology_entity(store, entity_name: str) -> None:
@@ -540,6 +640,14 @@ async def create_episode(
     await qsubmit(deps, _write_episode_with_session, deps.graphlite_store,
                   episode_data, req.namespace or None)
 
+    # 【P1 显式冲突撤销】新节点落库后仲裁（时序关键：SUPERSEDES 边 MATCH (b)
+    # 需新节点已存在，归档必须在此之后；低优先级不抢 high 写额度）
+    if val_result is not None and val_result.conflict_count > 0:
+        try:
+            await _revoke_conflicts(deps, val_result, episode_data)
+        except Exception:
+            logger.exception("Conflict revocation failed (non-fatal)")
+
     # 【FIX 2026-08-09】写入成功 → 正信号学习（P0-1 learn 闭环）
     # 【P0-1】用 hidden(决策时 SSM 状态)而非 hidden_prev:
     # step() 内 MLP.forward(hidden) 做决策，learn() 重放同一状态.
@@ -743,6 +851,28 @@ async def get_episode(
         created_at=node.get("created_at", 0.0),
         source=node.get("source", "unknown"),
     )
+
+
+@router.post("/episodes/{episode_id}/restore", summary="恢复已归档情节节点")
+async def restore_episode(
+    episode_id: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """撤销 P1 自动归档的软删：翻转 archived=false（SUPERSEDES 血统边保留）。"""
+    start = _now()
+    set_trace_id()
+
+    store = deps.graphlite_store
+    if store is None or not hasattr(store, "unarchive"):
+        raise HTTPException(status_code=503, detail="GraphLite store unavailable")
+    if store.get_episode(episode_id) is None:
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+    ok = await qsubmit(deps, store.unarchive, episode_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found or restore failed")
+
+    record_request("POST", "/episodes/{episode_id}/restore", "200", _now() - start)
+    return {"status": "ok", "episode_id": episode_id, "archived": False}
 
 
 @router.post("/memories/promote", summary="Layer1 → Layer2 提升")

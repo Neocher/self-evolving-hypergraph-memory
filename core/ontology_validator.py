@@ -29,6 +29,19 @@ if not _log.handlers:
 logger = _log
 
 
+def _as_num(v, default: Optional[float]) -> Optional[float]:
+    """GraphLite 缺失属性以字符串 'Null' 返回，归一为 float（None/'Null' → default）。"""
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("", "null"):
+        return default
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return default
+
+
 # ─── 本休类型定义 ────────────────────────────────────────────
 
 # 默认的本体类型体系：每个类型对应一组冲突检测规则
@@ -93,6 +106,13 @@ ONTOLOGY_TYPES: dict[str, dict[str, Any]] = {
 # 等值匹配根治 b64 缺陷: content 整体 b64 编码使 CONTAINS 误报/漏检,
 # 改独立字段 entity_name/entity_value 等值比较, 与字节对齐无关。
 # 已实测: 旧数据无 entity_value 时 NULL <> 'x' 不匹配 → 节点被排除, IS NOT NULL 显式防护兼容旧数据。
+# 【P1-1/P1-2】冲突裁决字段用生产落库字段：生产 create_episode 写路径只写
+# tau_initial（无 trust_score/tau_value，实测返回 'Null' → 裁决退化为常量）。
+# trust_score 死列已移除（旧信任由写路径 source_type 权重代理，见 write.py _revoke_conflicts）；
+# conflict_tau 改读 tau_initial。非等值模板不需 source_type（弱匹配不参与撤销裁决）。
+# 【P1-R2】同带回 protected/fact_track 供 _revoke_conflicts 归档前防护：
+# protected 旧值绝不自动归档；fact_track=core（稳定事实）需新源严格更高才可归档。
+# 旧节点缺字段时投影返回 None → 防护默认不触发（兼容旧数据）。
 CONTRADICTION_RULES: dict[str, str] = {
     "same_entity_diff_value": """
         MATCH (existing:EpisodeNode)
@@ -103,8 +123,10 @@ CONTRADICTION_RULES: dict[str, str] = {
           AND existing.entity_value <> $new_value
         RETURN existing.id AS conflict_id,
                existing.content AS conflict_content,
-               existing.trust_score AS conflict_trust,
-               existing.tau_value AS conflict_tau
+               existing.tau_initial AS conflict_tau,
+               existing.source_type AS conflict_source_type,
+               existing.protected AS conflict_protected,
+               existing.fact_track AS conflict_fact_track
         LIMIT 5
     """,
     "contradictory_claim": """
@@ -114,8 +136,7 @@ CONTRADICTION_RULES: dict[str, str] = {
           AND existing.content CONTAINS $entity_name
         RETURN existing.id AS conflict_id,
                existing.content AS conflict_content,
-               existing.trust_score AS conflict_trust,
-               existing.tau_value AS conflict_tau
+               existing.tau_initial AS conflict_tau
         LIMIT 5
     """,
 }
@@ -1122,11 +1143,10 @@ class OntologyValidator:
 
         if self.graphlite is not None and entity_name:
             try:
-                rule = CONTRADICTION_RULES.get(
-                    self._merged_ontology_types().get(ontology_type, {}).get(
-                        "contradiction_pattern", "contradictory_claim"
-                    )
+                rule_key = self._merged_ontology_types().get(ontology_type, {}).get(
+                    "contradiction_pattern", "contradictory_claim"
                 )
+                rule = CONTRADICTION_RULES.get(rule_key)
                 if not rule:
                     return result
 
@@ -1145,17 +1165,24 @@ class OntologyValidator:
                         {
                             "conflict_id": c.get("conflict_id", ""),
                             "conflict_content": c.get("conflict_content", ""),
-                            "conflict_trust": c.get("conflict_trust", 0.5),
-                            "conflict_tau": c.get("conflict_tau", 0.5),
+                            # P1-2: 生产节点落库的是 tau_initial（非恒 'Null' 的 tau_value）。
+                            # 缺省 None：P1 裁决按 1.0 不折损，防误归档高信任旧记忆；
+                            # τ=0.0 是真实完全衰减（write.py 用 is None 区分，P2-1）。
+                            "conflict_tau": _as_num(c.get("conflict_tau"), None),
+                            # P1-1: 生产无 trust_score 落库，旧信任由 write.py 用
+                            # conflict_source_type 权重代理（见 _revoke_conflicts）
+                            "conflict_source_type": c.get("conflict_source_type", ""),
+                            # P1-R2: 防护字段原样透传（protected/core 稳定事实由
+                            # _revoke_conflicts 归档前裁决，见 write.py）
+                            "conflict_protected": c.get("conflict_protected"),
+                            "conflict_fact_track": c.get("conflict_fact_track", ""),
+                            "conflict_pattern": rule_key,
                         }
                         for c in conflicts[:self.config.max_contradictions_per_fact]
                     ]
 
-                    # 计算置信度：基于已有事实的数量和信任度
-                    avg_trust = np.mean([
-                        c.get("conflict_trust", 0.5)
-                        for c in result.contradictions
-                    ])
+                    # 计算置信度：基于已有事实的数量（信任字段已随 P1-1 移除，
+                    # 原 avg_trust 仅计算不参与 confidence，属死代码）
                     penalty = self.config.conflict_penalty_factor * result.conflict_count
                     result.confidence = max(0.1, 1.0 - penalty)
 
@@ -1222,8 +1249,11 @@ class OntologyValidator:
         validated = []
         for r in results:
             ep_id = r.get("id", "")
-            tau = r.get("tau_value", r.get("tau", 0.5)) or 0.5
-            trust = r.get("trust_score", 0.5)
+            # P2-2: is None 区分真实 0.0（完全衰减）与缺失——tau_value 缺失回退
+            # tau，仍缺失才回退 0.5；0.0 是有效值不得被 or 当缺失吞掉
+            tau = r.get("tau_value", r.get("tau", 0.5))
+            if tau is None:
+                tau = 0.5
             score = r.get("score", 0.0)
             content = r.get("content", r.get("txt_content", ""))
 

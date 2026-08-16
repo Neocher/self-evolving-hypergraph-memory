@@ -1,12 +1,31 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.43.0"
-__version_info__ = (5, 43, 0)
-__version_name__ = "Retrieval-Evolution"
+__version__ = "5.44.0"
+__version_info__ = (5, 44, 0)
+__version_name__ = "Conflict-Revocation"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.44.0 (2026-08-16) Conflict-Revocation:
+  • 显式冲突撤销（P1，对标 TEPA arXiv:2608.07429）— 原有冲突检测
+    （write_validate + ConflictNode）无撤销动作，新旧记忆都 active。
+    本次在写路径内做确定性立即归档：检测到 same_entity_diff_value
+    等值精确冲突 → source_type 分级裁决（direct>tool>inferred）→
+    新胜则 archive_node(old, replacement=new) 建 SUPERSEDES 血统边
+    （qsubmit priority=low 不抢写额度，时序严格在新节点落库后）
+  • 稳定事实防护 — protected 旧节点绝不自动归档（留 ConflictNode 待
+    人工）；fact_track=core 同级/降级不归档（严格更高源才可）；
+    弱匹配 contradictory_claim 只建 ConflictNode
+  • restore 端点 — POST /episodes/{id}/restore 可翻转软删（archived=false）
+  • 修复 GraphLite 'Null' 字符串 bug — 缺失属性返回 'Null' 非 None，
+    float('Null') 抛 ValueError 致冲突检测静默降级；_as_num 归一化
+  • 修复字段失配 — 裁决依赖的 tau_value/trust_score 生产不存在
+    （实际 tau_initial）；trust_score 死列移除，信任比较改 source_type
+    权重代理；or 0.5 回退改 is None 判断
+  • 测试: test_conflict_revocation.py 新建 25 用例（真实 GraphLite +
+    HTTP 全链路），全量 828 passed 1 pre-existing flaky
+
 v5.43.0 (2026-08-16) Retrieval-Evolution:
   • 检索策略自演化真实化（P0，对标 EvolveMem/ERSkill/SAGE）— 原
     SelfEvolvingRetrieval 骨架生产空转（82 次检索零触发）：信号错位
