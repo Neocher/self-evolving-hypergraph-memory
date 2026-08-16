@@ -16,6 +16,7 @@ import asyncio
 import os
 import sys
 import threading
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -200,3 +201,104 @@ def test_fp32_onnx_recall_parity_with_st():
 def _find_bge_snapshot_for_test():
     from embedding.encoder import _find_bge_snapshot
     return _find_bge_snapshot()
+
+
+# ─── 懒加载兜底（Codex R3 回归）────────────────────────
+
+
+class _FakeTensor:
+    """极简张量替身：支持 [:, 0] / squeeze / detach / numpy（防测试环境无 torch）。"""
+
+    def __init__(self, arr):
+        self._arr = np.asarray(arr, dtype=np.float32)
+
+    @property
+    def shape(self):
+        return self._arr.shape
+
+    def __getitem__(self, key):
+        return _FakeTensor(self._arr[key])
+
+    def squeeze(self, *args, **kwargs):
+        return _FakeTensor(self._arr.squeeze(*args, **kwargs))
+
+    def detach(self):
+        return self
+
+    def numpy(self):
+        return self._arr
+
+
+def _fake_onnx_success(dim=512):
+    """构造 ONNX 加载成功路径假模型（tokenizer 记录输入数 → 模型按 batch 返回输出）。"""
+    state = {"n": 1}
+
+    class _FakeORTModel:
+        def __call__(self, **kwargs):
+            n = state["n"]
+            outputs = mock.MagicMock()
+            outputs.last_hidden_state = _FakeTensor(
+                np.random.RandomState(0).rand(n, 3, dim)
+            )
+            return outputs
+
+    class _FakeTokenizer:
+        def __call__(self, texts, **kwargs):
+            state["n"] = len(texts) if isinstance(texts, list) else 1
+            return {"input_ids": _FakeTensor(np.zeros((state["n"], 3)))}
+
+    return _FakeORTModel(), _FakeTokenizer()
+
+
+def test_embed_lazy_load_onnx():
+    """懒加载兜底：未显式 load() 时，首次 embed/embed_batch 自动走 ONNX 成功路径。
+
+    回归 Codex R3：旧代码懒加载守卫在 ONNX 分支之后，load() 优先加载 ONNX
+    时 _model 仍为 None → self._model.encode 抛 AttributeError。
+    """
+    fake_model, fake_tokenizer = _fake_onnx_success(dim=512)
+    opt = mock.MagicMock()
+    opt.ORTModelForFeatureExtraction.from_pretrained = mock.MagicMock(return_value=fake_model)
+    tf = mock.MagicMock()
+    tf.AutoTokenizer.from_pretrained = mock.MagicMock(return_value=fake_tokenizer)
+
+    with mock.patch.object(TextEncoder, "_ONNX_DIR", "onnx_fake_dir_xyz"), \
+            mock.patch("os.path.isdir", return_value=True), \
+            mock.patch("os.path.exists", return_value=True), \
+            mock.patch.dict(sys.modules, {"optimum.onnxruntime": opt, "transformers": tf}):
+        encoder = TextEncoder(device="cpu")
+        # 不调用 load()：懒加载兜底在 embed 内部触发
+        v = encoder.embed("上海天气")
+        m = encoder.embed_batch(["上海天气", "机器学习"])
+
+    assert v.shape == (512,)
+    assert m.shape == (2, 512)
+    assert encoder._onnx_model is fake_model  # 懒加载走到 ONNX
+    assert encoder._model is None             # 未误触发 ST
+
+
+def test_embed_batch_lazy_load_onnx_cold():
+    """embed_batch 冷启动守卫：未 load()、未先 embed()，fresh 实例直调 embed_batch
+    自己触发懒加载走 ONNX 成功路径。
+
+    独立覆盖 embed_batch 侧 `_onnx_model is None and _model is None` 守卫
+    （test_embed_lazy_load_onnx 的 embed_batch 走的是 embed() 预热后的热路径），
+    回归 Codex 终审建议：冷启动守卫两侧分支均需覆盖。
+    """
+    fake_model, fake_tokenizer = _fake_onnx_success(dim=512)
+    opt = mock.MagicMock()
+    opt.ORTModelForFeatureExtraction.from_pretrained = mock.MagicMock(return_value=fake_model)
+    tf = mock.MagicMock()
+    tf.AutoTokenizer.from_pretrained = mock.MagicMock(return_value=fake_tokenizer)
+
+    with mock.patch.object(TextEncoder, "_ONNX_DIR", "onnx_fake_dir_xyz"), \
+            mock.patch("os.path.isdir", return_value=True), \
+            mock.patch("os.path.exists", return_value=True), \
+            mock.patch.dict(sys.modules, {"optimum.onnxruntime": opt, "transformers": tf}):
+        encoder = TextEncoder(device="cpu")
+        # 冷启动：不调用 load()、不先调 embed()，直调 embed_batch 触发自身懒加载守卫
+        m = encoder.embed_batch(["上海天气", "机器学习"])
+
+    assert m.shape == (2, 512)
+    assert encoder._onnx_model is fake_model  # embed_batch 冷启动守卫走到 ONNX
+    assert encoder._model is None             # 未误触发 ST

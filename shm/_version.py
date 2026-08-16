@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.42.0"
-__version_info__ = (5, 42, 0)
-__version_name__ = "Write-Throughput"
+__version__ = "5.42.1"
+__version_info__ = (5, 42, 1)
+__version_name__ = "Lazy-Load-Fix"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.42.1 (2026-08-16) Lazy-Load-Fix:
+  • 懒加载 AttributeError 修复（R3 终审遗留 🟡 P2）— _do_embed/embed_batch
+    懒加载守卫上移到 ONNX 分支前 + 条件合并为 `_onnx_model is None and
+    _model is None`：load() 优先加载 ONNX（只设 _onnx_model 不设 _model），
+    旧守卫位于 ONNX 分支之后 → 未先 load() 的 encoder 首次 embed 即
+    AttributeError: 'NoneType' object has no attribute 'encode'（潜伏隐患，
+    生产因 app.py 启动即 load() 不触发）
+  • 测试: test_embed_lazy_load_onnx + test_embed_batch_lazy_load_onnx_cold
+    （冷启动守卫独立覆盖，TDD 复现→修复），test_encoder + test_embed_batch
+    22 passed；全量 768 passed 1 pre-existing flaky（test_decay_threshold_candidate
+    基线同挂，与本改动无关）
+
 v5.42.0 (2026-08-16) Write-Throughput:
   • 写入加速 — CC 修正真瓶颈=同步 defense R2 embed（每条写必跑，非异步队列）：
     encoder.load() ONNX 优先（embedding/onnx/，bge-small-zh-v1.5 导出 512d），

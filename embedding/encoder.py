@@ -320,6 +320,10 @@ class TextEncoder:
                 self._cloud_available = False
                 logger.info("Cloud API degraded, falling back to local model")
 
+        # 懒加载兜底：本地模型（ONNX 或 ST）未就绪时先 load
+        if self._onnx_model is None and self._model is None:
+            self.load()
+
         # Tier 2: Local model (ONNX preferred)
         if self._onnx_model is not None:
             inputs = self._tokenizer(text, return_tensors="pt", padding=True, truncation=True)
@@ -330,8 +334,6 @@ class TextEncoder:
             norm = np.linalg.norm(vec)
             return vec / norm if norm > 0 else vec
 
-        if self._model is None:
-            self.load()
         return self._model.encode(text)
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
@@ -380,6 +382,10 @@ class TextEncoder:
                 return np.empty((0, self.dimension), dtype=np.float32)
             return np.stack([hit_vecs[i] for i in range(len(texts))])
 
+        # 懒加载兜底：本地模型（ONNX 或 ST）未就绪时先 load
+        if self._onnx_model is None and self._model is None:
+            self.load()
+
         # Tier 2: ONNX batch (preferred, chunked)
         if self._onnx_model is not None:
             chunk_vecs: list[np.ndarray] = []
@@ -394,8 +400,6 @@ class TextEncoder:
             encoded = np.concatenate(chunk_vecs, axis=0)
         else:
             # Tier 3: Local sentence-transformers
-            if self._model is None:
-                self.load()
             encoded = np.asarray(self._model.encode(unique_texts), dtype=np.float32)
 
         # 组装原序矩阵 + populate 缓存（LRU 512）
