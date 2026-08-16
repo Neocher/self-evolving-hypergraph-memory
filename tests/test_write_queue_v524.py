@@ -206,14 +206,25 @@ class TestGatewayConcurrency:
 
 class TestVisualQueue:
     def test_create_visual_node_via_queue(self, client, monkeypatch, tmp_path):
-        """POST /memories/visual 的 VisualNode INSERT 经写队列。"""
+        """POST /memories/visual 的 VisualNode INSERT 经写队列。
+
+        【P1-2】写路径改 CLIP 投影 384d（原 bge encoder 512d 直落缺陷修复）：
+        注入 FakeClip 共享实例，断言落库 embedding 为 384d。
+        """
         import api.routes.visual as visual_mod
         monkeypatch.setattr(visual_mod, "VISUALS_DIR", str(tmp_path))
+
+        class _FakeClip:
+            available = True
+            dimension = 512
+
+            def embed_text(self, text):
+                return np.zeros(512, dtype=np.float32)
+
         q = WriteQueue(wait_timeout=5.0)
         try:
             svc = _make_svc(write_queue=q)
-            svc.encoder = MagicMock()
-            svc.encoder.embed.return_value = np.zeros(384, dtype=np.float32)
+            svc._clip_embedder = _FakeClip()
             image_b64 = base64.b64encode(b"fake-image-bytes").decode()
             resp = client(svc).post("/memories/visual", json={
                 "image_base64": image_b64, "caption": "a cat", "source": "tester",
@@ -222,6 +233,7 @@ class TestVisualQueue:
             svc.graphlite_store.create_visual_node.assert_called_once()
             payload = svc.graphlite_store.create_visual_node.call_args[0][0]
             assert payload["caption"] == "a cat"
+            assert len(payload["embedding"]) == 384, "写路径必须落 384d（CLIP 投影空间）"
             assert q.pending_count() == 0
         finally:
             q.shutdown()
