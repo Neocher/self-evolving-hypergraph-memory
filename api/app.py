@@ -501,6 +501,11 @@ def _init_services() -> Services:
         try:
             from retrieval.self_evolving import SelfEvolvingRetrieval
             svc.query_router = SelfEvolvingRetrieval(svc.query_router)
+            # 启动加载持久化演化参数（无文件/损坏 → 保持 config 初始值）
+            svc.query_router.restore_state()
+            # 梦境侧检索健康探针信号入口（探针直调内层 _qr，不走 retrieve()）
+            if getattr(svc, "dream_pipeline", None) is not None:
+                svc.dream_pipeline.retrieval_guard = svc.query_router
             logger.info("SelfEvolvingRetrieval wrapped")
         except Exception as evo_e:
             logger.warning("SelfEvolvingRetrieval init failed", error=str(evo_e))

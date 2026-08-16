@@ -1,12 +1,30 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.42.1"
-__version_info__ = (5, 42, 1)
-__version_name__ = "Lazy-Load-Fix"
+__version__ = "5.43.0"
+__version_info__ = (5, 43, 0)
+__version_name__ = "Retrieval-Evolution"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.43.0 (2026-08-16) Retrieval-Evolution:
+  • 检索策略自演化真实化（P0，对标 EvolveMem/ERSkill/SAGE）— 原
+    SelfEvolvingRetrieval 骨架生产空转（82 次检索零触发）：信号错位
+    （quality() 衡量"结果多"恰非失败）+ 旋钮错位（规则调 weight_fusion_*
+    非生效旋钮）。CC 设计审查确认根因 → 五轮 Codex 复核闭环
+  • 触发真实化 — 即时硬失败（degraded/延迟>500ms）∪ 周期强制
+    （probe_every=40 + 6h 时间兜底）；触发快照加权防历史稀释
+  • 旋钮真实化 — 规则调生产默认路径真实消费的 top_k_l1/top_k_vector/
+    top_k_keyword（HYPERGRAPH/_hypergraph_retrieve 链路）；删死旋钮演化
+    （tau_weight/vector_weight 无消费者）；同旋钮 delta 增量合并防互覆
+  • 梦境自评探针 — DreamPipeline.retrieval_health_probe()：抽核心节点 →
+    直调内层 _qr → recall@10 → 低召回喂 guard（不污染 _total_calls）
+  • 持久化 — data/retrieval_evolved.json 原子写（tempfile.mkstemp+
+    os.replace），启动 restore_state + validate；apply 空转保护
+  • 修复潜伏 bug — check_revert 的 min_samples=3 从未生效（单样本误回滚）
+  • 测试: test_self_evolving.py 21→56 用例（含真实 FAISS 行为断言 +
+    mutation 验证），全量 803 passed 1 pre-existing flaky
+
 v5.42.1 (2026-08-16) Lazy-Load-Fix:
   • 懒加载 AttributeError 修复（R3 终审遗留 🟡 P2）— _do_embed/embed_batch
     懒加载守卫上移到 ONNX 分支前 + 条件合并为 `_onnx_model is None and

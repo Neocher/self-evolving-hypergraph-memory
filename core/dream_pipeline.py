@@ -175,6 +175,7 @@ class DreamPipeline:
         encoder=None,
         write_queue=None,
         ontology_evolution=None,
+        retrieval_guard=None,
     ) -> None:
         """
         Args:
@@ -188,6 +189,8 @@ class DreamPipeline:
             encoder: 编码器实例（可选，用于向量余弦相似度合并 Jaccard）
             write_queue: WriteQueue 实例（可选，存在时 PERSIST 经单写线程 submit 串行执行）
             ontology_evolution: OntologyEvolution 实例（可选，v5.38.0 SYNTHESIZE 后 Schema 自演化）
+            retrieval_guard: SelfEvolvingRetrieval 实例（可选，检索健康探针信号入口；
+                探针直调其内层 _qr，不调 retrieve() 以免自增 _total_calls 干扰周期触发）
         """
         self.tau_engine = tau_engine
         self.hebbian_updater = hebbian_updater
@@ -201,6 +204,61 @@ class DreamPipeline:
         self._ssm_initialized = False
         self._write_queue = write_queue
         self.ontology_evolution = ontology_evolution
+        self.retrieval_guard = retrieval_guard
+
+    async def retrieval_health_probe(self, nodes: list[dict],
+                                     sample_size: int = 30) -> float:
+        """梦境侧检索健康探针（离线、低频、不污染热路径）。
+
+        抽核心节点（高 τ = 近期写入/重要）→ content 片段作 query → 直调内层
+        QueryRouter（不经 SelfEvolvingRetrieval.retrieve，避免自增
+        _total_calls 干扰周期触发）→ 计算 top-10 命中率（recall）→
+        低召回时喂给 retrieval_guard.report_probe() 作为触发信号。
+        """
+        guard = self.retrieval_guard
+        if guard is None or not nodes:
+            return 0.0
+        inner = getattr(guard, "_qr", None)
+        if inner is None or not hasattr(inner, "retrieve"):
+            return 0.0
+
+        def _tau(n: dict) -> float:
+            try:
+                return float(n.get("tau_value") or n.get("tau_initial") or 1.0)
+            except (TypeError, ValueError):
+                return 1.0
+
+        core = [
+            n for n in sorted(nodes, key=_tau, reverse=True)[:sample_size]
+            if len((n.get("content") or "").strip()) >= 8
+        ]
+        if not core:
+            return 0.0
+
+        hits = 0
+        for node in core:
+            content = (node.get("content") or "").strip()
+            query = content[:40]
+            try:
+                results = await asyncio.to_thread(inner.retrieve, query,
+                                                  include_archived=False)
+            except Exception:
+                continue
+            results = results if isinstance(results, list) else []
+            nid = node.get("id")
+            c60 = content[:60]
+            if any(
+                isinstance(r, dict) and (r.get("node_id") == nid or
+                                         c60 in (r.get("content") or ""))
+                for r in results[:10]
+            ):
+                hits += 1
+
+        recall = hits / max(1, len(core))
+        guard.report_probe(recall, len(core))
+        logger.info("Retrieval health probe: recall@10=%.2f (%d/%d)",
+                    recall, hits, len(core))
+        return recall
 
     async def run(
         self,
@@ -238,6 +296,13 @@ class DreamPipeline:
         # Step 1: GATHER — 收集活跃节点，附加 τ 值
         gathered = self._gather_step(nodes)
         logger.info("Dream %s: GATHER — %d active nodes", dream_id, len(gathered))
+
+        # Step 0: Retrieval 健康探针（离线低频，失败不阻塞梦境）
+        try:
+            await self.retrieval_health_probe(gathered)
+        except Exception:
+            logger.warning("Dream %s: retrieval health probe failed (non-fatal)",
+                           dream_id, exc_info=True)
 
         # Step 2: CLUSTER — 社区检测（在独立线程中运行，避免阻塞事件循环）
         communities = await asyncio.to_thread(self._cluster_step, gathered, connections)
