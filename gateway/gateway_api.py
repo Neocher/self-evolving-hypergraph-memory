@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from api._routes import Services
-from api.routes._deps import qsubmit
+from api.routes._deps import qsubmit, qsubmit_visual_index
 from api.models import (
     HealthStatus,
     HyperedgeListResponse,
@@ -364,14 +364,17 @@ class GatewayAPI:
                 visual_node_id = str(uuid.uuid4())
                 if self._svc.graphlite_store is not None:
                     # 【v5.24】经写队列提交（镜像 write.py 多模态写路径）
-                    await qsubmit(self._svc, self._svc.graphlite_store.create_visual_node, {
+                    vnode = {
                         "id": visual_node_id,
                         "image_path": media_paths[0] if media_paths else "",
                         "caption": merged_text[:1024],
                         "embedding": emb_384.tolist(),
                         "source": source,
                         "created_at": created_at,
-                    })
+                    }
+                    await qsubmit_visual_index(
+                        self._svc, self._svc.graphlite_store.create_visual_node, vnode
+                    )
             except Exception:
                 self._logger.exception("VisualNode creation failed (non-fatal)")
 

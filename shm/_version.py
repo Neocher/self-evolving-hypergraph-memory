@@ -1,12 +1,75 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.45.0"
-__version_info__ = (5, 45, 0)
-__version_name__ = "Poison-Guard"
+__version__ = "5.46.2"
+__version_info__ = (5, 46, 2)
+__version_name__ = "V-Mem-R2-Fixes"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.46.2 (2026-08-16) V-Mem-R2-Fixes:
+  • P2-a V-Mem Codex R2 缺陷修复（2 🟡 P2 + 2 ⚪ P3，判定"需修改"）
+  • 🟡 P2-1 视觉索引与 id_map/meta 非原子交换 — 新增 _visual_lock +
+    _visual_snapshot()（读侧锁内一次性快照 (index, id_map, meta) 一致三元组）；
+    add_visual_node「查重 → index.add → 三字典 swap」与 prewarm「合并 + 构建 +
+    swap」均持锁原子完成 → 杜绝「新 index + 旧 map」fid 错配（重建期）、
+    并发 add fid 碰撞与「新节点已入 index 未入 map」漏召回；_visual_recall
+    全程用快照，空通道改以快照 id_map 判断（count 锁外读会随并发漂移）
+  • 🟡 P2-2 写队列超时路径不更新视觉索引 — qsubmit_visual_index 统一收口
+    （visual.py / write.py / gateway_api 三处 hook）：成功与超时路径都补索引
+    （超时 = 任务已入队将迟到完成、DB 仍会落库，防「节点入库但不可检索」），
+    队列满/关闭（未入队、DB 未落库）不补索引（防幽灵节点）；识别经
+    HTTPException.__cause__ 区分 TimeoutError 与拒绝异常
+  • ⚪ P3-1 存量 512d VisualNode 未迁移 — prewarm 跳过日志 + docstring 标注
+    known-limitation（两空间 bge vs CLIP 本质不可比；生产 VisualNode=0 无存量）
+  • ⚪ P3-2 VERSION_SUMMARY 测试计数修正 — 全量实跑 895 passed +
+    1 pre-existing flaky（test_decay_threshold_candidate 基线同挂）+ 1 skipped
+  • 测试: test_visual_recall 新增 5 用例（并发快照 2：并发 add 无 fid 碰撞 /
+    snapshot 不暴露中间态；超时路径 3：超时 503 但补索引 / 队列满 / 关闭不产生
+    幽灵索引），test_visual_recall + vector_search + retrieve_routes 53 passed，
+    全量 895 passed 1 pre-existing flaky 1 skipped
+
+v5.46.1 (2026-08-16) V-Mem-R1-Fixes:
+  • P2-a V-Mem Codex R1 缺陷修复（2 🟠 P1 + 2 🟡 P2，判定"需修改"）
+  • 🟠 P1-1 视觉索引只在启动 prewarm_visual 构建一次，写入永不入索引 —
+    QueryRouter.add_visual_node() 写路径增量入索引（384d 同空间校验 +
+    幂等查重 + 索引未构建时惰性引导）；visual.py / write.py 多模态 /
+    gateway_api 三处 create_visual_node 后统一 hook（SelfEvolvingRetrieval
+    包装层 _qr 解包透传）；prewarm 重建时合并 _visual_vecs 增量节点，
+    防 DB 快照覆盖并发写入
+  • 🟠 P1-2 /memories/visual 写路径落 512d bge 文本向量被 prewarm 跳过 —
+    方案 Y（两空间 bge vs CLIP 本质不可比，按任务指令选语义一致路径）：
+    写路径改 CLIP 文本 512d @ seed42 投影 → 384d 落库，与 multimodal
+    图像路径/检索 query 同处 CLIP 投影空间，节点立即可检索
+  • 🟡 P2-1 首次检索懒加载 CLIP 拖垮 3s 检索预算 — prewarm 构建成功后
+    to_thread 预热 CLIP（30s 超时静默降级）；_visual_recall 冷启动守卫：
+    真实 ClipEmbedder._model is None → 跳过视觉通道（绝不触发模型加载）
+  • 🟡 P2-2 测试非真实 CLIP — 修正恒真断言（空通道不得挂载 CLIP）+
+    新增增量索引/512d 写路径集成/CLIP 冷启动隔离用例；真实 ClipEmbedder
+    冒烟（模型已缓存时启用，离线 skip）
+  • 测试: test_visual_recall 21 用例 + write_queue_v524 适配，全量
+    884 passed 1 pre-existing flaky（test_decay_threshold_candidate 基线同挂）
+
+v5.46.0 (2026-08-16) V-Mem-Modal-Route:
+  • P2-a V-Mem 模态路由检索 — 多模态写侧（ClipEmbedder/WhisperEmbedder/
+    MediaStore/VisualNode）已完备但检索侧零消费，VisualNode 无法被
+    /memories/retrieve 召回；本次补视觉检索通道（CC 设计审查通过，方案 A）
+  • QueryRouter._visual_recall — 补充非替代：CLIP 512d 文本 query →
+    共享写路径 512→384 投影（seed 42 列归一，与 write.py 逐元素一致）→
+    384d FaissStore 检索 VisualNode → 相对尾分缩放（1/(1+dist) ×
+    min(种子分) × boost 0.6，严格低于文本种子）→ append modality="visual"
+  • prewarm_visual — 启动异步建索引：GQL 拉取 VisualNode（LIMIT
+    visual_limit）→ JSON 字符串 embedding 解析 → 非 384d 防御性跳过；
+    全程 try/except 静默降级；空通道短路（无 GQL、无 CLIP）
+  • 空库零开销 — _visual_index None/ntotal==0 → 直接返回，检索路径
+    不碰 GraphLite 视觉表、不惰性创建 CLIP
+  • 接线 — QueryRouter.services 参数（共享写路径 CLIP/投影）+
+    app.py lifespan prewarm_visual + EpisodicResult.modality 字段
+    （向后兼容，纯增量）
+  • 测试: test_visual_recall 14 用例（端到端 HTTP modality=visual /
+    文本零回归 / 空通道短路 / CLIP 降级 / 投影一致性 seed 42 /
+    embedding JSON 解析），全量 884 passed 1 pre-existing flaky
+
 v5.45.0 (2026-08-16) Poison-Guard:
   • P2-b MAPLE-Guard 内容级投毒检测 (R6) Codex 审核修复
     （2 🟠 P1 + 4 🟡 P2 + 2 ⚪ P3，判定"需修改"）

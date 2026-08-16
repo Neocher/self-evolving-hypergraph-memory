@@ -194,6 +194,38 @@ async def qsubmit(deps: Services, fn, *args, **kwargs) -> Any:
         raise HTTPException(status_code=503, detail=f"write queue busy: {e}") from e
 
 
+def add_visual_node_to_index(deps: Services, node: dict) -> None:
+    """【P1-1/P2-2】写路径增量入视觉索引（SelfEvolvingRetrieval 包装时解包内层 QueryRouter）。
+
+    同步调用 QueryRouter.add_visual_node（自身幂等 + try/except 静默降级，
+    失败不阻断写路径）。
+    """
+    _qr = getattr(deps.query_router, "_qr", deps.query_router)
+    if _qr is not None and hasattr(_qr, "add_visual_node"):
+        _qr.add_visual_node(node)
+
+
+async def qsubmit_visual_index(deps: Services, fn, node: dict) -> Any:
+    """【P2-2】VisualNode 落库 qsubmit + 增量入索引（成功与超时路径都补索引）。
+
+    背景：qsubmit 超时抛 503 但 WriteQueue 迟到完成（DB 仍会落库），旧代码把
+    add_visual_node 放在 qsubmit 之后 → 超时路径不执行 → 节点入库但不可检索
+    直到重启。修复：成功路径照常补索引；超时路径（任务已入队、DB 将迟到落库）
+    同样补索引后仍抛 503（调用方语义不变）。队列满/关闭（任务未入队、DB 未落库）
+    不补索引——避免产生幽灵节点（索引有、DB 无）。add_visual_node 幂等，重复/失败无害。
+    """
+    try:
+        result = await qsubmit(deps, fn, node)
+    except HTTPException as exc:
+        # qsubmit 用 `from e` 携带原始异常：__cause__ 为 asyncio.TimeoutError
+        # 即「已入队、迟到完成（DB 将落库）」→ 补索引；满/关闭 → 不补（防幽灵）
+        if isinstance(getattr(exc, "__cause__", None), asyncio.TimeoutError):
+            add_visual_node_to_index(deps, node)
+        raise
+    add_visual_node_to_index(deps, node)
+    return result
+
+
 # ─── 辅助函数 ──────────────────────────────────────────────
 
 

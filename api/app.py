@@ -485,6 +485,8 @@ def _init_services() -> Services:
             # 【修复】query_router 和 _routes 共享同一个 faiss_id_map 对象
             "faiss_id_map": svc.faiss_id_map,  # 引用传递
             "episode_cache": getattr(svc, "_episode_cache", {}) or EpisodeCache(),  # 【Perf】共享缓存，flush_faiss_buffer 的修改对 query_router 可见
+            # 【P2-a V-Mem】services 引用：视觉通道共享 CLIP 嵌入器 + 512→384 投影
+            "services": svc,
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = QRCfg(
@@ -597,6 +599,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 logger.info("Startup: BM25 prewarm complete")
             except Exception as e:
                 logger.warning("Startup BM25 prewarm skipped (non-fatal): %s", e)
+
+        # 【P2-a V-Mem】启动异步预热视觉索引（失败静默降级，不阻塞启动）
+        if inner_qr is not None and hasattr(inner_qr, "prewarm_visual"):
+            try:
+                await inner_qr.prewarm_visual()
+                logger.info("Startup: visual index prewarm complete")
+            except Exception as e:
+                logger.warning("Startup visual prewarm skipped (non-fatal): %s", e)
 
         # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
         # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；

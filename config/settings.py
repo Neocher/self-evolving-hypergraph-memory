@@ -100,6 +100,15 @@ class CommunityExpansionConfig:
 
 
 @dataclass
+class VisualRecallConfig:
+    """视觉检索配置（v5.46.0 P2-a V-Mem 模态路由）"""
+    enabled: bool = True        # 开关：关闭时行为 = 现状（bit 级一致）
+    boost: float = 0.6          # 视觉分 = 1/(1+dist) × min(种子分) × boost（相对尾分缩放，严格低于文本种子）
+    max_results: int = 5        # 每查询最多追加的视觉结果数
+    visual_limit: int = 10000   # prewarm 拉取 VisualNode 上限
+
+
+@dataclass
 class RetrievalConfig:
     top_k_l1: int = 5              # L1 FAISS 检索 top-K
     top_k_vector: int = 20         # L2 向量检索 top-K
@@ -111,6 +120,7 @@ class RetrievalConfig:
     tau_weight: float = 0.4        # τ 值权重（混合模式）
     vector_weight: float = 0.6     # 向量相似度权重（混合模式）
     community_expansion: CommunityExpansionConfig = field(default_factory=CommunityExpansionConfig)
+    visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
 
 
 @dataclass

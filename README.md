@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v5.45.0** | *8 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v5.46.2** | *8 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >

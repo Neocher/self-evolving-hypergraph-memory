@@ -15,7 +15,7 @@ from core.user_profile import _SOURCE_WEIGHTS as _SOURCE_TYPE_LEVEL
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     _embed_queue, _embed_queue_lock, flush_faiss_buffer,
-    set_trace_id, record_request, qsubmit,
+    set_trace_id, record_request, qsubmit, qsubmit_visual_index,
     Depends, Request, JSONResponse, HTTPException,
     uuid, np, base64, json, time,
     SensoryResponse, SensoryRecord,
@@ -440,14 +440,17 @@ async def write_multimodal(
 
             visual_node_id = str(uuid.uuid4())
             if deps.graphlite_store is not None:
-                await qsubmit(deps, deps.graphlite_store.create_visual_node, {
+                vnode = {
                     "id": visual_node_id,
                     "image_path": media_paths[0] if media_paths else "",
                     "caption": merged_text[:1024],
                     "embedding": emb_384.tolist(),
                     "source": req.source,
                     "created_at": created_at,
-                })
+                }
+                await qsubmit_visual_index(
+                    deps, deps.graphlite_store.create_visual_node, vnode
+                )
         except Exception:
             logger.exception("VisualNode creation failed (non-fatal)")
 

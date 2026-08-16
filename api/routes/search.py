@@ -252,6 +252,7 @@ async def retrieve(
                 retrieval_level=r.get("level", "hypergraph"),
                 created_at=r.get("created_at"),
                 risk_level=r.get("risk_level"),
+                modality=r.get("modality"),
             ))
         elif hasattr(r, "node_id"):
             results.append(EpisodicResult(
@@ -261,6 +262,7 @@ async def retrieve(
                 tau_value=getattr(r, "tau_value", None),
                 retrieval_level=getattr(r, "source", "hypergraph"),
                 risk_level=getattr(r, "risk_level", None),
+                modality=getattr(r, "modality", None),
             ))
 
     # 【User-Profile】旁路上下文：画像命中 → profile_context 注入响应

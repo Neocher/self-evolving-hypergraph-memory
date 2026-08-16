@@ -64,6 +64,11 @@ retrieval:
     boost: 0.6                   # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
     threshold: 0.5               # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
     max_members: 10              # 每社区最大成员召回数
+  visual_recall:                 # v5.46.0 P2-a V-Mem 模态路由检索（补充非替代，关闭=现状）
+    enabled: true                # 开关
+    boost: 0.6                   # 视觉分 = 1/(1+dist) × min(种子分) × boost（相对尾分缩放，严格低于文本种子）
+    max_results: 5               # 每查询最多追加的视觉结果数
+    visual_limit: 10000          # prewarm 拉取 VisualNode 上限
 
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5"  # 中文 embedding 模型（512维，中文专用，CPU 0.05s/条）

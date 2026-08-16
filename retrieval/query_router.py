@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -34,6 +35,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from core.user_profile import profile_hit, profile_values
 from config.settings import get_settings
 from graph.graphlite_store import CircuitBreakerOpen
+from retrieval.vector_store import FaissStore
 
 from observability.logger import get_logger
 
@@ -128,6 +130,7 @@ class QueryRouter:
         config: Optional[QueryRouterConfig] = None,
         faiss_id_map: Optional[dict] = None,
         episode_cache: Optional[dict] = None,
+        services=None,
     ) -> None:
         """
         Args:
@@ -137,12 +140,15 @@ class QueryRouter:
             encoder: 文本嵌入编码器（可选）
             config: 路由配置
             faiss_id_map: FAISS int id → GraphLite UUID string 映射（用于 L1 超图检索反查）
+            services: Services 容器引用（可选，【P2-a V-Mem】共享 CLIP 嵌入器 /
+                512→384 投影，保证视觉 query 与写路径同空间）
         """
         self.graphlite_store = graphlite_store
         self.faiss_index = faiss_index
         self.tfidf_index = tfidf_index
         self.encoder = encoder
         self.faiss_id_map = faiss_id_map if faiss_id_map is not None else {}
+        self._services = services
         # 【M5】共享 Services._episode_cache（EpisodeCache: OrderedDict LRU + TTL）。
         # flush_faiss_buffer 是唯一写入方；传入 None（测试/降级）时退化为裸 dict，
         # 行为与改造前一致（恒空）。
@@ -227,6 +233,26 @@ class QueryRouter:
         # 【P4】BM25 构建进行中标志：构建期间 _bm25_search 返回旧索引/None，
         # 不阻塞事件循环等待构建完成；锁只保护最终 swap（短临界区）。
         self._bm25_building: bool = False
+        # 【P2-a V-Mem】视觉检索通道（prewarm_visual 构建 + add_visual_node 增量，_visual_recall 消费）：
+        #   _visual_index    — 384d FaissStore（VisualNode embedding 空间）
+        #   _visual_id_map   — faiss int id → VisualNode id
+        #   _visual_meta     — VisualNode id → {caption, created_at, image_path}
+        #   _visual_vecs     — VisualNode id → 384d 向量（【P1-1】写路径增量节点
+        #                      留存，供 prewarm 全量重建时合并，防快照覆盖丢节点）
+        #   _visual_projection — 512→384 随机投影（无 services 时本实例自持）
+        #   _visual_built    — prewarm 成功置位（防重复构建）
+        self._visual_index: Optional[FaissStore] = None
+        self._visual_id_map: dict[int, str] = {}
+        self._visual_meta: dict[str, dict] = {}
+        self._visual_vecs: dict[str, np.ndarray] = {}
+        self._visual_projection: Optional[np.ndarray] = None
+        self._visual_built: bool = False
+        # 【P2-1】视觉索引一致性锁：写侧（add_visual_node / prewarm 重建）持锁
+        # 完成「index 变更 + 三个字典 swap」，读侧（_visual_snapshot）锁内一次性
+        # 快照 —— 保证并发下读到全旧或全新的 (index, id_map, meta) 一致三元组，
+        # 杜绝「新 index + 旧 map」的 fid 错配与「新节点已入 index 未入 map」的漏召回。
+        # 锁内只做内存操作（FaissStore.add 自带内部锁），临界区微秒级，读侧性能无损。
+        self._visual_lock = threading.Lock()
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -467,6 +493,346 @@ class QueryRouter:
                            self.config.bm25_build_timeout)
         except Exception:
             logger.exception("BM25: prewarm failed, degrading silently")
+
+    # ──────────────────────────────
+    # 【P2-a V-Mem】视觉检索通道（VisualNode → 384d 索引 → 模态路由补充召回）
+    # ──────────────────────────────
+
+    async def prewarm_visual(self) -> None:
+        """异步预热视觉索引（启动时调用，不阻塞事件循环）。
+
+        链路：GraphLite 拉取 VisualNode（LIMIT visual_limit）→ 解析 embedding
+        （JSON 字符串 → json.loads → f32；维度非 384 防御性跳过 + warning）→
+        FaissStore(384).add + _visual_id_map/_visual_meta/_visual_vecs。
+        【P1-1】与写路径增量（add_visual_node）合并：重建时携带内存中已增量
+        索引的节点（_visual_vecs），防「prewarm DB 快照覆盖丢失并发写入节点」。
+        【P2-1】合并 + 构建 + swap 在 _visual_lock 内原子完成（与 add_visual_node
+        增量、_visual_snapshot 读侧同锁，杜绝重建期间读侧跨结构错配）。
+        【P3-1 known-limitation】存量旧版 512d（bge 文本向量直落）VisualNode
+        被跳过不迁移（两空间 bge vs CLIP 本质不可比，v5.46.0 已改写路径落 384d
+        CLIP 投影空间；生产当前 VisualNode=0 无存量，仅标注不迁移）。
+        【P2-1】构建成功后预热 CLIP（to_thread + 30s 超时），首次检索即就绪，
+        检索路径绝不触发模型加载（3s 检索预算保护，见 _visual_recall 冷启动守卫）。
+        全程 try/except 静默降级：失败/空库/无有效 384d 向量 → _visual_index
+        保持 None，_visual_recall 空通道短路（检索零开销）。
+        """
+        if getattr(self, "_visual_built", False):
+            return
+        try:
+            cfg = get_settings().retrieval.visual_recall
+            if not getattr(cfg, "enabled", True):
+                return
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_visual_nodes"):
+                return
+            visual_limit = int(getattr(cfg, "visual_limit", 10000))
+            rows = await asyncio.to_thread(store.get_visual_nodes, visual_limit)
+            rows = rows if isinstance(rows, list) else []
+            embs: list[np.ndarray] = []
+            id_map: dict[int, str] = {}
+            meta: dict[str, dict] = {}
+            vecs: dict[str, np.ndarray] = {}
+            seen: set[str] = set()
+            fid = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                nid = str(row.get("id", "") or "")
+                if not nid:
+                    continue
+                emb = self._parse_visual_embedding(row.get("embedding"))
+                if emb is None:
+                    continue
+                if emb.shape[0] != 384:
+                    # 【P3-1 known-limitation】旧版 bge 512d 文本向量直落节点跳过
+                    # 不迁移（生产无存量；改路径后新节点均为 384d CLIP 投影空间）
+                    logger.warning(
+                        "Visual prewarm: node %s embedding dim %d != 384, skipping "
+                        "(known-limitation: legacy 512d nodes not migrated)",
+                        nid, emb.shape[0],
+                    )
+                    continue
+                emb_384 = emb.astype(np.float32)
+                embs.append(emb_384)
+                id_map[fid] = nid
+                vecs[nid] = emb_384
+                meta[nid] = {
+                    "caption": str(row.get("caption", "") or ""),
+                    "created_at": row.get("created_at"),
+                    "image_path": str(row.get("image_path", "") or ""),
+                }
+                seen.add(nid)
+                fid += 1
+            # 【P1-1】合并写路径增量节点（_visual_vecs）：prewarm DB 快照之后、
+            # swap 之前提交的节点不被覆盖丢失（按 nid 去重，两处入索引幂等）
+            # 【P2-1】合并 + 构建 + swap 持 _visual_lock 原子完成：与 add_visual_node
+            # 增量互斥（杜绝重建期间 fid 错配），与 _visual_snapshot 读侧同锁一致。
+            with self._visual_lock:
+                existing_vecs = getattr(self, "_visual_vecs", {}) or {}
+                existing_meta = getattr(self, "_visual_meta", {}) or {}
+                for nid, vec in existing_vecs.items():
+                    if nid in seen:
+                        continue
+                    vec_384 = vec.astype(np.float32)
+                    embs.append(vec_384)
+                    id_map[fid] = nid
+                    vecs[nid] = vec_384
+                    meta[nid] = existing_meta.get(nid, {
+                        "caption": "", "created_at": None, "image_path": "",
+                    })
+                    seen.add(nid)
+                    fid += 1
+                if not embs:
+                    logger.debug("Visual prewarm: no valid 384d embeddings, channel stays empty")
+                    return
+                index = FaissStore(dimension=384)
+                index.add(np.stack(embs), np.arange(len(embs), dtype=np.int64))
+                self._visual_index = index
+                self._visual_id_map = id_map
+                self._visual_meta = meta
+                self._visual_vecs = vecs
+                self._visual_built = True
+            logger.info("Visual index prewarmed", nodes=len(embs))
+            # 【P2-1】CLIP 冷启动预热：启动时后台触发模型加载，首次检索即就绪。
+            # 30s 超时静默降级（zombie 线程继续加载，加载完成后 available=True）；
+            # 未加载期间 _visual_recall 冷启动守卫跳过视觉通道，不拖累文本检索。
+            try:
+                clip = self._get_clip_embedder()
+                if clip is not None:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(clip.embed_text, "__shm_visual_warmup__"),
+                        timeout=30.0,
+                    )
+            except Exception:
+                logger.debug("Visual prewarm: CLIP warmup failed/timed out, channel activates on load")
+        except Exception:
+            logger.exception("Visual prewarm failed, degrading silently")
+
+    @staticmethod
+    def _parse_visual_embedding(raw) -> Optional[np.ndarray]:
+        """解析 VisualNode.embedding 字段（GraphLite 落库为 JSON 字符串），失败返回 None。"""
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, (list, tuple)):
+                data = list(raw)
+            else:
+                return None
+            return np.asarray(data, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+
+    def add_visual_node(self, node: dict) -> bool:
+        """【P1-1】写路径增量入索引：VisualNode 创建成功后立即索引，无需重启/prewarm。
+
+        与 prewarm_visual 同空间约束（384d CLIP 投影空间）：非 384d 跳过 +
+        warning（两处策略一致，索引空间纯净）。索引未构建（None）时惰性引导
+        构建——prewarm 空库/未跑时写入节点立即可检索。全程 try/except 静默
+        降级（失败不抛异常、不阻断写路径）；幂等（已索引节点跳过）。
+        【P2-1】查重 → index.add → 三字典 swap 全部在 _visual_lock 内原子完成，
+        与 prewarm 重建、_visual_snapshot 读侧串行化（防 fid 碰撞/中间态）。
+
+        Args:
+            node: create_visual_node 同款 dict（含 id/embedding/caption 等）。
+
+        Returns:
+            True 入索引成功；False 跳过（降级/重复/维度不符/异常）。
+        """
+        try:
+            cfg = get_settings().retrieval.visual_recall
+            if not getattr(cfg, "enabled", True):
+                return False
+            nid = str((node or {}).get("id", "") or "")
+            if not nid:
+                return False
+            # 【P2-1】锁内完成「查重 → index.add → 三字典 swap」：串行化并发增量，
+            # 防 fid 碰撞（两并发调用同读 index.count 取到同一 fid）与读侧看到
+            # 中间态（新 index + 旧 map）。_visual_snapshot 同锁 → 读侧永远拿到
+            # 一致三元组。锁内仅内存操作，写路径（事件循环线程）临界区微秒级。
+            with self._visual_lock:
+                id_map = getattr(self, "_visual_id_map", {}) or {}
+                if nid in id_map.values():
+                    return False  # 已索引（prewarm 已含 / 重复调用）
+                emb = self._parse_visual_embedding((node or {}).get("embedding"))
+                if emb is None:
+                    return False
+                if emb.shape[0] != 384:
+                    logger.warning(
+                        "Visual add: node %s embedding dim %d != 384, skipping",
+                        nid, emb.shape[0],
+                    )
+                    return False
+                index = getattr(self, "_visual_index", None)
+                if index is None:
+                    index = FaissStore(dimension=384)
+                    self._visual_index = index
+                fid = index.count  # append-only：下一个可用 faiss id（同 prewarm 序号）
+                emb_384 = emb.astype(np.float32)
+                index.add(emb_384.reshape(1, -1), np.array([fid], dtype=np.int64))
+                # copy-on-write swap：_visual_snapshot 读侧锁内快照，始终看到完整字典
+                new_id_map = dict(id_map)
+                new_id_map[fid] = nid
+                new_meta = dict(getattr(self, "_visual_meta", {}) or {})
+                new_meta[nid] = {
+                    "caption": str((node or {}).get("caption", "") or ""),
+                    "created_at": (node or {}).get("created_at"),
+                    "image_path": str((node or {}).get("image_path", "") or ""),
+                }
+                new_vecs = dict(getattr(self, "_visual_vecs", {}) or {})
+                new_vecs[nid] = emb_384
+                self._visual_id_map = new_id_map
+                self._visual_meta = new_meta
+                self._visual_vecs = new_vecs
+                logger.info("Visual node added to index", node=nid, fid=fid)
+                return True
+        except Exception:
+            logger.debug("Visual add_visual_node failed, write path unaffected", exc_info=True)
+            return False
+
+    def _get_clip_embedder(self):
+        """惰性获取 CLIP 嵌入器：优先共享写路径实例（services._clip_embedder）。"""
+        svc = getattr(self, "_services", None)
+        clip = getattr(svc, "_clip_embedder", None) if svc is not None else None
+        if clip is None:
+            from multimodal.embedders import ClipEmbedder
+            clip = ClipEmbedder()
+            if svc is not None:
+                svc._clip_embedder = clip
+        return clip
+
+    def _get_projection(self) -> Optional[np.ndarray]:
+        """512→384 随机投影（复用写路径 _clip_projection，query 与索引同空间）。
+
+        与 api/routes/write.py 投影公式逐元素一致：default_rng(42).
+        standard_normal((512, 384)) 后列归一——同一进程内 numpy RNG 序列确定，
+        两处生成矩阵逐元素相等（投影一致性测试保障）。复用优先级：
+        services._clip_projection → 本实例 _visual_projection → 创建并回写。
+        """
+        svc = getattr(self, "_services", None)
+        proj = getattr(svc, "_clip_projection", None) if svc is not None else None
+        if proj is None:
+            proj = getattr(self, "_visual_projection", None)
+        if proj is None:
+            rng = np.random.default_rng(42)
+            proj = rng.standard_normal((512, 384), dtype=np.float32)
+            proj /= np.linalg.norm(proj, axis=0, keepdims=True)
+            self._visual_projection = proj
+            if svc is not None:
+                svc._clip_projection = proj
+        return proj
+
+    def _visual_snapshot(self) -> tuple[Optional[FaissStore], dict, dict]:
+        """【P2-1】原子快照 (index, id_map, meta)：锁内一次性读取三个结构。
+
+        写侧（add_visual_node / prewarm 重建）在同一把锁内完成「index 变更 +
+        三个字典 swap」，故读侧快照必然是全旧或全新的**一致三元组**——避免分步
+        getattr 读到「新 index + 旧 map」（fid 错配）或「新节点已入 index 未入
+        map」（漏召回）。锁内仅三次属性读，微秒级，读路径性能无损。
+        """
+        with self._visual_lock:
+            index = getattr(self, "_visual_index", None)
+            id_map = getattr(self, "_visual_id_map", {}) or {}
+            meta = getattr(self, "_visual_meta", {}) or {}
+        return index, id_map, meta
+
+    def _visual_recall(
+        self,
+        results: list[dict],
+        query: str,
+        raw_query: Optional[str],
+    ) -> list[dict]:
+        """【P2-a V-Mem】视觉通道补充召回：VisualNode append，补充非替代。
+
+        链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
+          1. cfg.visual_recall.enabled 关闭 → 原样返回
+          2. 空通道短路：_visual_index is None / ntotal==0 → 直接返回（无 GQL、无 CLIP）
+          3. CLIP 惰性获取（共享写路径实例）；不可用 → 原样返回
+          4. embed_text(raw_query or query) → 512d（CLIP multilingual 原生支持
+             中文，zh→en 映射是 MiniLM 专用反而有害 → 必须用 raw_query）
+          5. emb @ _get_projection() → 384d（与写路径同投影空间）
+          6. idx.search(emb_384[None], max_results)；score = 1/(1+dist)；
+             score *= min_seed_score * boost（相对尾分缩放，严格低于文本种子）
+          7. append {node_id, content=caption, score, modality="visual",
+             level="visual", _source="visual", created_at, image_path}
+        异常 → 静默 return results（主检索零回归，永不抛异常）。
+        """
+        try:
+            cfg = get_settings().retrieval.visual_recall
+            if not getattr(cfg, "enabled", True):
+                return results
+            # 【P2-1】读侧一次性快照：锁内取 (index, id_map, meta) 一致三元组，
+            # 后续检索全程使用快照，不再次触碰实例属性（写侧并发换字典不影响本次）。
+            # 空通道用快照 id_map 判断（index.count 在锁外读会随并发 add 漂移）
+            index, id_map, meta = self._visual_snapshot()
+            if index is None or not id_map:
+                return results
+            clip = self._get_clip_embedder()
+            if clip is None or not getattr(clip, "available", False):
+                return results
+            # 【P2-1】CLIP 冷启动隔离：真实 ClipEmbedder 模型未加载（_model is None）
+            # → 跳过视觉通道——检索路径绝不触发模型下载/加载（外层 3s 检索超时内），
+            # 由 prewarm_visual 启动预热 / 写路径（visual.py CLIP 编码）负责加载。
+            if getattr(clip, "_model", None) is None:
+                from multimodal.embedders import ClipEmbedder
+                if isinstance(clip, ClipEmbedder):
+                    logger.debug("Visual recall: CLIP not loaded yet, channel skipped")
+                    return results
+            emb = clip.embed_text(raw_query or query)
+            if emb is None:
+                return results
+            emb_512 = np.asarray(emb, dtype=np.float32).reshape(-1)
+            if emb_512.shape[0] != 512:
+                return results
+            proj = self._get_projection()
+            if proj is None:
+                return results
+            emb_384 = emb_512 @ proj  # (512,) @ (512, 384) → (384,)
+            distances, indices = index.search(
+                emb_384[None].astype(np.float32),
+                int(getattr(cfg, "max_results", 5)),
+            )
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            boost = float(getattr(cfg, "boost", 0.6))
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for i in range(indices.shape[1]):
+                fid = int(indices[0][i])
+                if fid < 0:
+                    continue
+                nid = id_map.get(fid, "")
+                if not nid or nid in existing_ids:
+                    continue
+                dist = float(distances[0][i])
+                score = round(1.0 / (1.0 + max(dist, 0.0)) * min_seed_score * boost, 6)
+                if score <= 0.0:
+                    continue
+                m = meta.get(nid, {})
+                extra.append({
+                    "node_id": nid,
+                    "content": m.get("caption", ""),
+                    "score": score,
+                    "modality": "visual",
+                    "level": "visual",
+                    "_source": "visual",
+                    "created_at": m.get("created_at"),
+                    "image_path": m.get("image_path", ""),
+                })
+            if extra:
+                logger.info("Visual recall appended", candidates=len(extra), boost=boost)
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Visual recall degraded, returning original results", exc_info=True
+            )
+            return results
 
     def _bm25_search(self, query: str, k: int = 20) -> list[dict]:
         """BM25 关键词检索。
@@ -791,6 +1157,10 @@ class QueryRouter:
             # （闭包可捕获 query/query_embedding/raw_query；候选经
             # _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大）
             results = self._community_expansion(results, query, query_embedding, raw_query)
+            # 【P2-a V-Mem 视觉召回】补充非替代：_filter_archived 前 append VisualNode
+            # （视觉节点无 archived 字段，走 _filter_archived 恒保留；候选同样经
+            # _deduplicate_and_sort 单点去重 + score 钳制，相对尾分缩放严格低于种子）
+            results = self._visual_recall(results, query, raw_query)
             if not include_archived:
                 results = self._filter_archived(results)
             return self._deduplicate_and_sort(results)
