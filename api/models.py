@@ -193,6 +193,7 @@ class EpisodicResult(BaseModel):
     community_id: Optional[str] = Field(default=None, description="所属社区 ID")
     created_at: Optional[float] = Field(default=None, description="创建时间戳")
     retrieval_level: str = Field(default="hypergraph", description="来自哪级检索")
+    risk_level: Optional[str] = Field(default=None, description="R6 内容风险级别 none/high/critical")
 
 
 class RetrieveResponse(BaseModel):

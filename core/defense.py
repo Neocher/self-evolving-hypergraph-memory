@@ -1,7 +1,7 @@
 """
 记忆投毒防御系统
 ================
-5 条规则检测并防御记忆投毒攻击。
+6 条规则检测并防御记忆投毒攻击。
 
 使用方式:
     engine = MemoryDefenseEngine(config=DefenseConfig(), encoder=svc.encoder)
@@ -29,6 +29,8 @@ from enum import Enum, auto
 from typing import Any, Optional
 
 import numpy as np
+
+from core.content_guard import scan_content, RISK_CRITICAL, RISK_HIGH
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,9 @@ class DefenseConfig:
     initial_trust: float = 1.0               # 新来源初始信任值
     block_trust_threshold: float = 0.3       # 信任值低于此值时阻断
     quarantine_trust_threshold: float = 0.5  # 信任值低于此值时隔离
+
+    # R6 — 内容级投毒模式检测（纯正则, 无 LLM/embedding/网络）
+    r6_enabled: bool = True
 
 
 # ─── 写入历史（滑动窗口） ──────────────────────────────────
@@ -195,7 +200,7 @@ class MemoryDefenseEngine:
     """
     记忆投毒防御引擎。
 
-    在记忆写入前调用 pre_check() 执行 5 条规则判定，
+    在记忆写入前调用 pre_check() 执行 6 条规则判定，
     返回 Verdict 指导调用方处理。
     """
 
@@ -233,7 +238,7 @@ class MemoryDefenseEngine:
         created_at: Optional[float] = None,
     ) -> tuple[MemoryDefenseVerdict, str]:
         """
-        执行 5 条规则检测，返回判定结果和原因。
+        执行 6 条规则检测，返回判定结果和原因。
 
         Args:
             content: 写入内容
@@ -270,13 +275,18 @@ class MemoryDefenseEngine:
         if not r3_pass:
             reasons.append(r3_reason)
 
+        # 【P2-b】R6 内容级投毒模式检测: 纯正则无 I/O, 无锁直接计算
+        r6_pass, r6_reason, r6_flag = self._check_r6(content)
+        if not r6_pass:
+            reasons.append(r6_reason)
+
         # 【P0-2】R1/R4/R5 检查 + 状态更新 → threading.Lock 短临界区: 纯内存计数
         # 亚毫秒, 无 I/O 无 await。直接在事件循环内同步执行 —— 不经过线程池:
         # R1/R4/R5 是纯内存计数操作, 池化只让并发写入排队 worker (Codex 实测
         # 8 线程 2583ms/条, 新瓶颈是线程池而非锁); 锁内 µs 级不阻塞事件循环。
         # （R2 的 _R2_EXECUTOR 保留: embedding 是 CPU 重活才需要池。）
         # 【M2-b】锁等待独立短超时: 超时 fail-closed → QUARANTINE (独立 reason)。
-        result = self._run_r1_r4_r5_locked(source, content, ts, r2_flag, r3_flag)
+        result = self._run_r1_r4_r5_locked(source, content, ts, r2_flag, r3_flag, r6_flag)
         if result is None:
             logger.warning("Defense rules lock wait timed out after %.1fs, quarantining write",
                            _LOCK_WAIT_TIMEOUT)
@@ -296,6 +306,7 @@ class MemoryDefenseEngine:
 
     def _run_r1_r4_r5_locked(self, source: str, content: str, ts: float,
                               r2_flag: EscalationFlag, r3_flag: EscalationFlag,
+                              r6_flag: EscalationFlag,
                               ) -> Optional[tuple[MemoryDefenseVerdict, list[str]]]:
         """P0-2: R1/R4/R5 检查 + 状态更新, threading.Lock 短临界区。
 
@@ -320,8 +331,8 @@ class MemoryDefenseEngine:
             r5_pass, r5_reason, r5_flag = self._check_r5(source)
             if not r5_pass:
                 reasons.append(r5_reason)
-            # 聚合升级 (R1/R4 恒 NONE, R5 可 BLOCK; r2_flag/r3_flag 由调用方传入)
-            for flag in (r1_flag, r2_flag, r3_flag, r4_flag, r5_flag):
+            # 聚合升级 (R1/R4 恒 NONE, R5 可 BLOCK; r2/r3/r6_flag 由调用方传入)
+            for flag in (r1_flag, r2_flag, r3_flag, r4_flag, r5_flag, r6_flag):
                 if flag != EscalationFlag.NONE:
                     verdict = self._escalate(verdict, flag)
             # 根据判定结果执行操作 (与旧实现完全一致)
@@ -496,6 +507,25 @@ class MemoryDefenseEngine:
                 f"R5: trust decay — trust score {trust:.2f} for '{source}' "
                 f"below quarantine threshold {self.config.quarantine_trust_threshold}"
             ), EscalationFlag.NONE
+        return True, "", EscalationFlag.NONE
+
+    # ── R6: 内容级投毒模式检测 ───────────────────────────
+
+    def _check_r6(self, content: str) -> tuple[bool, str, EscalationFlag]:
+        """内容级投毒模式检测 (R6): 纯正则扫描, 无 LLM/embedding/网络。
+
+        severity→verdict 映射 (模块级常量, 不进 YAML):
+          critical → BLOCK   (指令注入 / 异常标记)
+          high     → NONE    (URL 钓鱼: 只记录 reason, 不升级 verdict)
+          none     → 通过
+        """
+        if not self.config.r6_enabled:
+            return True, "", EscalationFlag.NONE
+        risk = scan_content(content)
+        if risk.risk_level == RISK_CRITICAL:
+            return False, f"R6: content injection — {risk.reason}", EscalationFlag.BLOCK
+        if risk.risk_level == RISK_HIGH:
+            return False, f"R6: content poisoning — {risk.reason}", EscalationFlag.NONE
         return True, "", EscalationFlag.NONE
 
     # ── 内部辅助 ─────────────────────────────────────────

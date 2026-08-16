@@ -515,29 +515,15 @@ def _init_services() -> Services:
 
     # 10. 记忆投毒防御引擎（可独立于 GraphLite 运行）
     try:
-        from core.defense import MemoryDefenseEngine, DefenseConfig as CoreDefenseConfig
-        _dcfg = cfg.defense
+        from core.defense import MemoryDefenseEngine
+        # 【v5.45.0 P2-2】cfg.defense 已是 core.defense.DefenseConfig 实例
+        # （settings.py 复用 core 版, 双定义消除）→ 直接传入, 删除手工逐字段映射。
         svc.defense_engine = MemoryDefenseEngine(
-            config=CoreDefenseConfig(
-                enabled=_dcfg.enabled,
-                silent=_dcfg.silent,
-                max_writes_per_window=_dcfg.max_writes_per_window,
-                write_window_seconds=_dcfg.write_window_seconds,
-                drift_cosine_threshold=_dcfg.drift_cosine_threshold,
-                drift_reference_window=_dcfg.drift_reference_window,
-                max_entity_cooccurrence=_dcfg.max_entity_cooccurrence,
-                max_repeat_exact=_dcfg.max_repeat_exact,
-                repeat_dedup_window=_dcfg.repeat_dedup_window,
-                trust_decay_per_block=_dcfg.trust_decay_per_block,
-                trust_recovery_writes=_dcfg.trust_recovery_writes,
-                initial_trust=_dcfg.initial_trust,
-                block_trust_threshold=_dcfg.block_trust_threshold,
-                quarantine_trust_threshold=_dcfg.quarantine_trust_threshold,
-            ),
+            config=cfg.defense,
             encoder=svc.encoder,
         )
         logger.info("DefenseEngine initialized",
-                     enabled=_dcfg.enabled, silent=_dcfg.silent)
+                     enabled=cfg.defense.enabled, silent=cfg.defense.silent)
     except Exception as e:
         errors.append(f"DefenseEngine: {e}")
         logger.warning("DefenseEngine init failed (fallback: no defense)", error=str(e))

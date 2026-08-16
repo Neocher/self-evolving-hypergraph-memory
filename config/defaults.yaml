@@ -117,6 +117,7 @@ defense:
   initial_trust: 1.0               # R5: 新来源初始信任值
   block_trust_threshold: 0.3       # R5: 阻断信任阈值
   quarantine_trust_threshold: 0.5  # R5: 隔离信任阈值
+  r6_enabled: true                 # R6: 内容级投毒模式检测开关（纯正则, severity映射固定不进YAML）
 
 shm_client:
   base_url: "http://127.0.0.1:8000"  # SHM 服务地址（MCP/CLI/SDK 连接用）

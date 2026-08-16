@@ -147,12 +147,18 @@ def init_services(svc: Services) -> None:
     if svc._episode_cache is None:
         svc._episode_cache = EpisodeCache()
     # 初始化记忆投毒防御引擎 + 隔离存储
+    # 【P1-1】app.py 已用 cfg.defense 构造 defense_engine（含 YAML 各阈值）并
+    # quarantine_store（含启动 refresh 同步）→ 已存在则跳过创建，防 DefenseConfig()
+    # 默认值覆盖 YAML 配置（与 v5.44.1 双定义同类：配置静默失效）。仅 None 时兜底
+    # 创建（app.py 初始化失败 / 测试直接注入容器路径）。
     try:
-        svc.defense_engine = MemoryDefenseEngine(config=DefenseConfig(), encoder=svc.encoder)
+        if svc.defense_engine is None:
+            svc.defense_engine = MemoryDefenseEngine(config=DefenseConfig(), encoder=svc.encoder)
     except Exception:
         logger.warning("DefenseEngine init failed (non-fatal)")
     try:
-        svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
+        if svc.quarantine_store is None:
+            svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
     except Exception:
         logger.warning("QuarantineStore init failed (non-fatal)")
     _services = svc

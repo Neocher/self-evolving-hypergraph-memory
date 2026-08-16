@@ -1,12 +1,34 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.44.1"
-__version_info__ = (5, 44, 1)
-__version_name__ = "Ontology-Config-Drift-Fix"
+__version__ = "5.45.0"
+__version_info__ = (5, 45, 0)
+__version_name__ = "Poison-Guard"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.45.0 (2026-08-16) Poison-Guard:
+  • P2-b MAPLE-Guard 内容级投毒检测 (R6) Codex 审核修复
+    （2 🟠 P1 + 4 🟡 P2 + 2 ⚪ P3，判定"需修改"）
+  • 🟠 P1-1 GatewayAPI 检索路径补 scan_content → MCP/A2A/ACP 外部
+    agent 拿到真实 risk_level（修复前恒 None，与 search.py 同模式，
+    去重后循环 fail-open 标记）
+  • 🟠 P1-2 critical 正则误报收紧 — 裸 "system prompt" / "你是一个
+    管理员" / "I am now an assistant" 不再误判 critical（默认
+    silent=True 下误隔离=良记忆数据损失）；需命令/覆盖语境
+    （ignore/override/现在/从此/不再是 等）才触发；新增 3 负例回归
+  • 🟡 P2-1 R6 写端点级接线测试 — TestClient POST /memories/episodes
+    注入内容 → quarantine 标记 / r6_enabled=False 正常写入
+  • 🟡 P2-2 DefenseConfig 双定义消除 — settings.py 删除本地类 import
+    复用 core.defense 版（同 v5.44.1 OntologyConfig 方案 A），
+    app.py 逐字段手工映射删除
+  • 🟡 P2-3 对抗输入性能用例 — 长 ignore 链 / 长 URL 无 TLD /
+    长零宽字符串，断言 < 100ms 防灾难性回溯
+  • ⚪ P3-1 控制字符阈值注释自洽（实现为严格大于 8，注释与实现一致）
+  • ⚪ P3-2 defense.py pre_check docstring 5→6 条规则
+  • 测试: test_content_guard + test_defense_perf + test_write_routes
+    全绿 + py_compile
+
 v5.44.1 (2026-08-16) Ontology-Config-Drift-Fix:
   • 修复 OntologyConfig 双定义漂移（生产冒烟发现）— config/settings.py
     本地 OntologyConfig 缺 conflict_penalty_factor（core 版有），cfg.ontology

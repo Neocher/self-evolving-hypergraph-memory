@@ -38,6 +38,7 @@ from api.models import (
     resolve_source_type,
 )
 from graph.hyperedge import HyperedgeType as CoreHyperedgeType
+from core.content_guard import scan_content
 from observability.health import HealthChecker
 
 
@@ -504,6 +505,16 @@ class GatewayAPI:
                     deduped.append(r)
             results_raw = deduped
 
+        # 【P2-b】R6 内容级投毒标记: 纯正则扫描 (无 LLM/embedding/网络), fail-open → None
+        # 与 api/routes/search.py 同模式 —— MCP/A2A/ACP 外部 agent 拿到真实 risk_level
+        # (修复前恒 None)。不改 score、不删结果、不打补丁 content, 只附加元数据。
+        for r in results_raw:
+            if isinstance(r, dict):
+                try:
+                    r["risk_level"] = scan_content(r.get("content", "")).risk_level
+                except Exception:
+                    r["risk_level"] = None
+
         # 降级标记
         if results_raw:
             first_level = (
@@ -519,6 +530,7 @@ class GatewayAPI:
                 content=r.get("content", ""),
                 score=r.get("score", 0.0),
                 retrieval_level=r.get("level", "hypergraph"),
+                risk_level=r.get("risk_level"),
             )
             for r in results_raw
         ]

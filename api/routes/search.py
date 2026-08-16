@@ -18,6 +18,8 @@ from api.routes._deps import (
 
 from graph.graphlite_store import CircuitBreakerOpen
 
+from core.content_guard import scan_content
+
 # 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
 # 超时返回空结果而非无限挂起 + 线程泄漏（与写路径超时对称）
 _RETRIEVE_TIMEOUT = 3.0  # 【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边遍历超时立即降级返回向量结果, 不空等
@@ -228,6 +230,15 @@ async def retrieve(
         except Exception as val_err:
             logger.warning("Ontology validation failed, using raw scores", error=str(val_err))
 
+    # 【P2-b】R6 内容级投毒标记: 纯正则扫描 (无 LLM/embedding/网络), fail-open → None
+    # 不改 score、不删结果、不打补丁 content —— 只附加 risk_level 元数据 (读路径元数据)
+    for r in results_raw[:req.top_k]:
+        if isinstance(r, dict):
+            try:
+                r["risk_level"] = scan_content(r.get("content", "")).risk_level
+            except Exception:
+                r["risk_level"] = None
+
     results: list[EpisodicResult] = []
     for r in results_raw[:req.top_k]:
         if isinstance(r, dict):
@@ -240,6 +251,7 @@ async def retrieve(
                 hyperedge_id=r.get("hyperedge_id"),
                 retrieval_level=r.get("level", "hypergraph"),
                 created_at=r.get("created_at"),
+                risk_level=r.get("risk_level"),
             ))
         elif hasattr(r, "node_id"):
             results.append(EpisodicResult(
@@ -248,6 +260,7 @@ async def retrieve(
                 score=getattr(r, "score", 0.0),
                 tau_value=getattr(r, "tau_value", None),
                 retrieval_level=getattr(r, "source", "hypergraph"),
+                risk_level=getattr(r, "risk_level", None),
             ))
 
     # 【User-Profile】旁路上下文：画像命中 → profile_context 注入响应

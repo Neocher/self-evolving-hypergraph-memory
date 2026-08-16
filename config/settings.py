@@ -20,6 +20,10 @@ import yaml
 from typing import get_type_hints
 
 from core.ontology_validator import OntologyConfig
+# 【v5.45.0 P2-2】复用 core.defense 版 DefenseConfig —— 消除双定义永久漂移
+# （同 v5.44.1 OntologyConfig 方案 A）。core.defense 不依赖 config.settings,
+# 无循环 import; 字段一致由 _build_settings 的 __dataclass_fields__ 过滤保证。
+from core.defense import DefenseConfig
 
 
 def _get_defaults_path() -> Path:
@@ -137,25 +141,6 @@ class RetryConfig:
     base_delay: float = 1.0
     backoff: float = 2.0
     max_total_timeout: float = 0.0
-
-
-@dataclass
-class DefenseConfig:
-    """记忆投毒防御配置"""
-    enabled: bool = True
-    silent: bool = True
-    max_writes_per_window: int = 20
-    write_window_seconds: float = 60.0
-    drift_cosine_threshold: float = 0.65
-    drift_reference_window: int = 10
-    max_entity_cooccurrence: int = 15
-    max_repeat_exact: int = 5
-    repeat_dedup_window: float = 300.0
-    trust_decay_per_block: float = 0.2
-    trust_recovery_writes: int = 20
-    initial_trust: float = 1.0
-    block_trust_threshold: float = 0.3
-    quarantine_trust_threshold: float = 0.5
 
 
 @dataclass
