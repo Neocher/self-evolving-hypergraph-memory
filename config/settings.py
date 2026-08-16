@@ -19,6 +19,8 @@ from typing import Any, Optional
 import yaml
 from typing import get_type_hints
 
+from core.ontology_validator import OntologyConfig
+
 
 def _get_defaults_path() -> Path:
     """获取 defaults.yaml 的绝对路径（相对于本文件所在目录）。"""
@@ -161,20 +163,6 @@ class CommunityConfig:
     template_threshold: int = 5
     jaccard_threshold: float = 0.8
     max_keywords: int = 10
-
-
-@dataclass
-class OntologyConfig:
-    """本体验证器配置"""
-    enabled: bool = True
-    write_validation: bool = True
-    read_validation: bool = True
-    confidence_threshold: float = 0.3
-    contradiction_threshold: float = 0.7
-    max_contradictions_per_fact: int = 5
-    reject_on_contradiction: bool = False
-    rules_path: str = "./data/ontology_rules.yaml"
-    semantic_threshold: float = 0.85  # 语义归一化余弦相似度阈值
 
 
 @dataclass

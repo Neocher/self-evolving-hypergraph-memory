@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.44.0"
-__version_info__ = (5, 44, 0)
-__version_name__ = "Conflict-Revocation"
+__version__ = "5.44.1"
+__version_info__ = (5, 44, 1)
+__version_name__ = "Ontology-Config-Drift-Fix"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.44.1 (2026-08-16) Ontology-Config-Drift-Fix:
+  • 修复 OntologyConfig 双定义漂移（生产冒烟发现）— config/settings.py
+    本地 OntologyConfig 缺 conflict_penalty_factor（core 版有），cfg.ontology
+    传给 OntologyValidator → write_validate L1186 AttributeError → except
+    → passed=True 静默降级 → 冲突检测/撤销永不触发（历史遗留漂移，P1 暴露）
+  • 修复：settings.py 删除本地类，import 复用 core.ontology_validator 版
+    （消除双定义永久漂移；死字段 rules_path 零消费方随删）
+  • 生产验证：P1 conflict revoked 日志确认撤销真实触发（user/direct
+    覆盖 agent/inferred → SUPERSEDES 血统边建立）
+  • 测试: test_ontology_validator + test_conflict_revocation 76 passed +
+    回归 51 passed，全量 828 passed 1 pre-existing flaky
+
 v5.44.0 (2026-08-16) Conflict-Revocation:
   • 显式冲突撤销（P1，对标 TEPA arXiv:2608.07429）— 原有冲突检测
     （write_validate + ConflictNode）无撤销动作，新旧记忆都 active。
