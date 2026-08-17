@@ -50,6 +50,8 @@ class AttributeDef:
     min_value: Optional[float] = None   # 数值类型最小值
     max_value: Optional[float] = None   # 数值类型最大值
     enum_values: Optional[List[str]] = None  # 枚举值列表
+    # 【P0-1】temporal 属性走 PropertyVerNode 时间版本链（默认 False 向后兼容，零迁移）
+    temporal: bool = False
 
 
 @dataclass

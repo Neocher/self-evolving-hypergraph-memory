@@ -37,6 +37,10 @@ from core.retry import with_retry
 SHM_SCHEMA = "/shm"
 SHM_GRAPH = "default"
 
+# 【P0-1 实体-属性-时间】每 (entity_id, attr_name) 属性版本上限（决策 5：
+# 写时惰性裁剪，超限 DETACH DELETE 最旧；不复用 tau 衰减）
+PROPERTY_MAX_VERSIONS = 8
+
 # 熔断器计数的「基础设施异常」集合（P0: 异常类型不匹配 → 熔断器死代码）:
 # - SDK 层: GraphLiteConnectionError / QueryError 是 graphlite_sdk.error 自有的异常
 #   （GraphLiteError 子类），与内置 ConnectionError 无继承关系。connection.py 的
@@ -596,6 +600,335 @@ class GraphLiteStore:
             logger.warning("unarchive failed for %s", str(node_id)[:12], exc_info=True)
             return False
         return affected is not None and affected > 0
+
+    # ─── Property Version CRUD（P0-1 实体-属性-时间三维建模）────────
+
+    def create_property_version(
+        self,
+        entity_id: str,
+        attr_name: str,
+        value: str,
+        valid_from: Optional[float] = None,
+        supersedes_id: Optional[str] = None,
+        superseded_by: Optional[str] = None,
+    ) -> str:
+        """INSERT PropertyVerNode {id, entity_id, attr_name, value, valid_from, expired_at}。
+
+        - 新版本不写 expired_at 字段（缺省 → expired_at IS NULL 即当前有效，同
+          archived 的「缺失字段匹配 IS NULL」语义）
+        - supersedes_id 非空 → 旧版本打 expired_at + 建 (old)-[:SUPERSEDES]->(new)
+          血统边（复用 archive_node 双 MATCH + INSERT 范式）。GraphLite 一条
+          execute 多条语句只执行第一条（多语句静默截断坑）→「SET expired_at」与
+          「INSERT 边」必须拆为两条独立 execute。
+        - superseded_by 非空（乱序中段插入，Codex R3 P1）→ 新版本打
+          expired_at = 后继 valid_from + 建 (new)-[:SUPERSEDES]->(succ) 边，
+          保证任意乱序下血统链完整：P.expired_at=now、new.expired_at=S.valid_from、
+          P→new、new→S 四条语义全部落盘。
+        """
+        pid = str(uuid.uuid4())
+        now = valid_from if valid_from is not None else time.time()
+        # 【R4】superseded_by 相关变量预初始化（supersedes_id 块内可能引用）
+        succ_lit: str = ""
+        succ_ts: float = now
+        # 【H1】id/entity_id/attr_name/value 均外部可达，经 _gql_value 转义
+        id_lit = _gql_value(pid)
+        eid_lit = _gql_value(str(entity_id))
+        name_lit = _gql_value(attr_name)
+        val_lit = _gql_value(str(value))
+        self._locked_execute(
+            f"INSERT (p:PropertyVerNode {{id: {id_lit}, entity_id: {eid_lit}, "
+            f"attr_name: {name_lit}, value: {val_lit}, valid_from: {now}}})"
+        )
+        # 【R6-P1 使用时机修复】若有后继（中段插入），先读取后继 valid_from →
+        # succ_ts（后续所有补偿都用正确的后继时间，而非初始化的 now）。
+        # 【R6-P1b】读取失败 → 抛异常回滚（不得以 now 静默继续，否则产生
+        # expired_at == valid_from 的失效版本）。
+        if superseded_by:
+            assert superseded_by is not None
+            succ_lit = _gql_value(str(superseded_by))
+            try:
+                rows = self.execute_cypher(
+                    "MATCH (s:PropertyVerNode {id: $sid}) RETURN s.valid_from AS vf",
+                    {"sid": str(superseded_by)},
+                )
+                if rows and rows[0].get("vf") is not None:
+                    succ_ts = float(rows[0]["vf"])
+                else:
+                    # 【R7-P1】读不到后继行/vf=None → 一致性错误，回滚后重抛
+                    # （不得静默保留 succ_ts=now，否则产生 expired_at==valid_from 失效版本）
+                    raise QueryError(
+                        f"successor property version not found: {str(superseded_by)[:12]}"
+                    )
+            except Exception:
+                # 回滚：删新节点后重抛（读取失败属一致性错误，不静默）
+                try:
+                    self._locked_execute(
+                        f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) DETACH DELETE p"
+                    )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: rollback after succ read failed "
+                        "new=%s", pid[:12], exc_info=True)
+                logger.warning(
+                    "create_property_version: read successor valid_from failed, "
+                    "rolled back new=%s succ=%s",
+                    pid[:12], str(superseded_by)[:12], exc_info=True)
+                raise
+        if supersedes_id:
+            old_lit = _gql_value(str(supersedes_id))
+            # 【R4-P1 中段插入】supersedes_id 与 superseded_by 同时非空时，
+            # 需删除旧的 (P)-[:SUPERSEDES]->(S) 边——否则血统链是分支图而非单链
+            # （2021→2014→2016 后 2014 同时保留 2014→2021 与 2014→2016）。
+            if superseded_by:
+                try:
+                    # 【R4-P1 实测】GraphLite 不支持双 MATCH 链式 DELETE
+                    # （MATCH (a),(b) MATCH (a)-[s]->(b) DELETE s 静默无效，
+                    # count 仍 1）——必须用单 MATCH 边模式直接删
+                    self._locked_execute(
+                        f"MATCH (a:PropertyVerNode {{id: {old_lit}}})"
+                        f"-[s:SUPERSEDES]->"
+                        f"(b:PropertyVerNode {{id: {succ_lit}}}) DELETE s"
+                    )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: DELETE old P->S edge failed "
+                        "(non-fatal) old=%s succ=%s",
+                        str(supersedes_id)[:12], str(superseded_by)[:12], exc_info=True)
+            try:
+                self._locked_execute(
+                    f"MATCH (p:PropertyVerNode {{id: {old_lit}}}) SET p.expired_at = {now}"
+                )
+            except Exception:
+                # P2-3 补偿：新版本已 INSERT 但旧版本过期标记失败 → 清理新版本，
+                # 保持链一致（新版本已存在但旧版本未过期 = 半链）
+                # 【R5-P1】中段插入时 P→S 边已被删除，补偿需恢复它（链不断裂）
+                try:
+                    self._locked_execute(
+                        f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) DETACH DELETE p"
+                    )
+                    if superseded_by:
+                        assert superseded_by is not None
+                        self._locked_execute(
+                            f"MATCH (a:PropertyVerNode {{id: {old_lit}}}), "
+                            f"(b:PropertyVerNode {{id: {_gql_value(str(superseded_by))}}}) "
+                            f"INSERT (a)-[:SUPERSEDES]->(b)"
+                        )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: compensation cleanup failed "
+                        "for new=%s old=%s", pid[:12], str(supersedes_id)[:12], exc_info=True)
+                logger.warning(
+                    "create_property_version: SET expired_at failed, rolled back "
+                    "new=%s old=%s", pid[:12], str(supersedes_id)[:12], exc_info=True)
+                raise
+            try:
+                self._locked_execute(
+                    f"MATCH (a:PropertyVerNode {{id: {old_lit}}}), "
+                    f"(b:PropertyVerNode {{id: {id_lit}}}) "
+                    f"INSERT (a)-[:SUPERSEDES]->(b)"
+                )
+            except Exception:
+                # P2-3 补偿：血统边插入失败 → 清理新版本 + 恢复旧版本过期标记。
+                # 【R4-P2】中段插入时 pred 原已过期于 succ.valid_from（非 NULL），
+                # 补偿应恢复原值 succ_ts 而非 NULL。
+                # 【R5-P1】中段插入时 P→S 边已被删除，补偿需恢复它（链不断裂）
+                try:
+                    self._locked_execute(
+                        f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) DETACH DELETE p"
+                    )
+                    if superseded_by:
+                        assert superseded_by is not None
+                        self._locked_execute(
+                            f"MATCH (p:PropertyVerNode {{id: {old_lit}}}) "
+                            f"SET p.expired_at = {succ_ts}"
+                        )
+                        self._locked_execute(
+                            f"MATCH (a:PropertyVerNode {{id: {old_lit}}}), "
+                            f"(b:PropertyVerNode {{id: {_gql_value(str(superseded_by))}}}) "
+                            f"INSERT (a)-[:SUPERSEDES]->(b)"
+                        )
+                    else:
+                        self._locked_execute(
+                            f"MATCH (p:PropertyVerNode {{id: {old_lit}}}) "
+                            f"SET p.expired_at = NULL"
+                        )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: compensation cleanup failed "
+                        "for new=%s old=%s", pid[:12], str(supersedes_id)[:12], exc_info=True)
+                logger.warning(
+                    "create_property_version: SUPERSEDES edge failed, rolled back "
+                    "new=%s old=%s", pid[:12], str(supersedes_id)[:12], exc_info=True)
+                raise
+        if superseded_by:
+            # 【R6】succ_lit/succ_ts 已在前置块读取（R6-P1 时机修复）
+            try:
+                self._locked_execute(
+                    f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) SET p.expired_at = {succ_ts}"
+                )
+            except Exception:
+                # 【R4-P1 superseded_by 失败补偿】SET new.expired_at 失败 → 回滚：
+                # 删新节点 + 恢复 pred 到原 expired_at（succ_ts）+ 恢复被删的 P→S 边。
+                # 【R5-P1】pred.expired_at 恢复 succ_ts 而非 NULL（非最新节点必有 expired_at 不变式）
+                try:
+                    self._locked_execute(
+                        f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) DETACH DELETE p"
+                    )
+                    if supersedes_id:
+                        old_lit2 = _gql_value(str(supersedes_id))
+                        self._locked_execute(
+                            f"MATCH (p:PropertyVerNode {{id: {old_lit2}}}) "
+                            f"SET p.expired_at = {succ_ts}"
+                        )
+                        self._locked_execute(
+                            f"MATCH (a:PropertyVerNode {{id: {old_lit2}}}), "
+                            f"(b:PropertyVerNode {{id: {succ_lit}}}) "
+                            f"INSERT (a)-[:SUPERSEDES]->(b)"
+                        )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: superseded_by compensation cleanup "
+                        "failed new=%s succ=%s",
+                        pid[:12], str(superseded_by)[:12], exc_info=True)
+                logger.warning(
+                    "create_property_version: SET new expired_at failed, rolled back "
+                    "new=%s succ=%s", pid[:12], str(superseded_by)[:12], exc_info=True)
+                raise
+            try:
+                self._locked_execute(
+                    f"MATCH (a:PropertyVerNode {{id: {id_lit}}}), "
+                    f"(b:PropertyVerNode {{id: {succ_lit}}}) "
+                    f"INSERT (a)-[:SUPERSEDES]->(b)"
+                )
+            except Exception:
+                # 【R4-P1 superseded_by 边失败补偿】new→succ 边失败 → 回滚：
+                # 删新节点 + 恢复 pred expired_at=succ_ts（非 NULL）+ 恢复 P→S 边。
+                # 【R5-P1】pred.expired_at 恢复 succ_ts 而非 NULL（非最新节点必有 expired_at 不变式）
+                try:
+                    self._locked_execute(
+                        f"MATCH (p:PropertyVerNode {{id: {id_lit}}}) DETACH DELETE p"
+                    )
+                    if supersedes_id:
+                        old_lit2 = _gql_value(str(supersedes_id))
+                        self._locked_execute(
+                            f"MATCH (p:PropertyVerNode {{id: {old_lit2}}}) "
+                            f"SET p.expired_at = {succ_ts}"
+                        )
+                        self._locked_execute(
+                            f"MATCH (a:PropertyVerNode {{id: {old_lit2}}}), "
+                            f"(b:PropertyVerNode {{id: {succ_lit}}}) "
+                            f"INSERT (a)-[:SUPERSEDES]->(b)"
+                        )
+                except Exception:
+                    logger.warning(
+                        "create_property_version: superseded_by edge compensation "
+                        "cleanup failed new=%s succ=%s",
+                        pid[:12], str(superseded_by)[:12], exc_info=True)
+                logger.warning(
+                    "create_property_version: SUPERSEDES edge to successor failed, "
+                    "rolled back new=%s succ=%s",
+                    pid[:12], str(superseded_by)[:12], exc_info=True)
+                raise
+        return pid
+
+    def get_latest_property_version(self, entity_id: str, attr_name: str) -> Optional[dict]:
+        """当前最新（未过期）版本：expired_at IS NULL + valid_from DESC 取第一。
+
+        写路径（entity_resolver 版本编排）调用 → execute_cypher（P2-2 写路径熔断
+        中立：不 record_success/failure）；失败原样上抛由调用方 try/except 兜底。
+        """
+        rows = self.execute_cypher(
+            "MATCH (p:PropertyVerNode) "
+            "WHERE p.entity_id = $eid AND p.attr_name = $name "
+            "AND (p.expired_at IS NULL) "
+            "RETURN p.id AS id, p.entity_id AS entity_id, p.attr_name AS attr_name, "
+            "p.value AS value, p.valid_from AS valid_from, p.expired_at AS expired_at "
+            "ORDER BY p.valid_from DESC LIMIT 1",
+            {"eid": str(entity_id), "name": attr_name},
+        )
+        return rows[0] if rows else None
+
+    def get_property_versions(self, entity_id: str, attr_name: str) -> list[dict]:
+        """(entity_id, attr_name) 全部版本（valid_from ASC 旧→新），供惰性裁剪。
+
+        写路径调用 → execute_cypher（熔断中立）；失败原样上抛由调用方兜底。
+        """
+        return self.execute_cypher(
+            "MATCH (p:PropertyVerNode) "
+            "WHERE p.entity_id = $eid AND p.attr_name = $name "
+            "RETURN p.id AS id, p.entity_id AS entity_id, p.attr_name AS attr_name, "
+            "p.value AS value, p.valid_from AS valid_from, p.expired_at AS expired_at "
+            "ORDER BY p.valid_from ASC",
+            {"eid": str(entity_id), "name": attr_name},
+        )
+
+    def prune_property_versions(
+        self, entity_id: str, attr_name: str,
+        max_versions: int = PROPERTY_MAX_VERSIONS,
+    ) -> int:
+        """写时惰性裁剪（决策 5）：每 (entity_id, attr_name) 保留最近 N=8 版。
+
+        超限时 DETACH DELETE 最旧版本（含其 SUPERSEDES 血统边）。单条独立
+        execute（多语句截断坑）。返回删除数；未超限返回 0。
+        """
+        versions = self.get_property_versions(entity_id, attr_name)
+        if len(versions) <= max_versions:
+            return 0
+        removed = 0
+        for v in versions[: len(versions) - max_versions]:
+            vid = v.get("id", "")
+            if not vid:
+                continue
+            try:
+                self._locked_execute(
+                    f"MATCH (p:PropertyVerNode {{id: {_gql_value(str(vid))}}}) "
+                    f"DETACH DELETE p"
+                )
+                removed += 1
+            except Exception:
+                logger.warning("prune_property_versions: delete failed for %s (non-fatal)",
+                               str(vid)[:12])
+        return removed
+
+    def get_property_versions_for_entities(self, entity_ids: list[str]) -> list[dict]:
+        """批量取多个实体的全部属性版本（检索通道 _property_temporal_retrieve 用）。
+
+        【P1-2 实体归一化匹配】候选经 normalize_entity_name（小写 + 去尾词
+        Inc/Corp/Ltd/Company 等）后与写入 entity_id 做前缀匹配——写侧原始
+        subject（"Apple Inc"）与读侧短名/小写（"Apple"/"apple"）对齐，
+        LOWER(entity_id) 前缀命中（'apple' 命中 'Apple Inc'）。
+
+        复用 query_cypher 永不抛异常契约：空输入 / 查询失败 → []（静默降级，
+        主检索零回归）。valid_from DESC（最新在前）。
+        """
+        if not entity_ids:
+            return []
+        from core.entity_resolver import normalize_entity_name
+        # 候选归一化 → 前缀模式（'apple%'）；去重保序
+        patterns: list[str] = []
+        seen: set[str] = set()
+        for eid in entity_ids:
+            norm = normalize_entity_name(eid)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            # N6: 前缀匹配加词边界后置过滤——精确 OR 空格后缀（"apple" 命中
+            # "Apple Inc" 但不命中 "Applebee's"/"Applejack"）
+            norm_lit = _gql_value(norm)[1:-1]
+            patterns.append(
+                f"(LOWER(p.entity_id) = '{norm_lit}' "
+                f"OR LOWER(p.entity_id) LIKE '{norm_lit} %')"
+            )
+        if not patterns:
+            return []
+        where = " OR ".join(patterns)
+        return self.query_cypher(
+            "MATCH (p:PropertyVerNode) "
+            f"WHERE {where} "
+            "RETURN p.id AS id, p.entity_id AS entity_id, p.attr_name AS attr_name, "
+            "p.value AS value, p.valid_from AS valid_from, p.expired_at AS expired_at "
+            "ORDER BY p.valid_from DESC"
+        )
 
     # ─── Hyperedge CRUD ─────────────────────────────
 

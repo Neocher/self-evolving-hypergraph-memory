@@ -26,6 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 
@@ -40,6 +41,39 @@ from retrieval.vector_store import FaissStore
 from observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 【P0-1 实体-属性-时间】属性版本链检索通道常量（append 相对尾分缩放，严格低于种子）
+_PROPERTY_BOOST = 0.6
+_PROPERTY_MAX_RESULTS = 5
+# 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
+_PROPERTY_CANDIDATE_STOPWORDS = frozenset({
+    "how", "what", "when", "why", "where", "which", "who", "whose", "whom",
+    "the", "this", "that", "these", "those", "and", "or", "but", "for", "with",
+    "from", "into", "onto", "upon", "about", "than", "then", "there", "here",
+    "i", "we", "you", "he", "she", "it", "they", "me", "us", "him", "her",
+    "my", "your", "our", "their", "its", "in", "on", "at", "is", "are", "was",
+    "were", "be", "been", "being", "do", "does", "did", "can", "could", "will",
+    "would", "should", "shall", "may", "might", "must", "please", "tell", "give",
+    "show", "find", "search", "list", "explain", "describe", "summarize",
+    "summarise", "what's", "how's", "don't", "doesn't", "didn't", "not",
+})
+# 【P0-1-R2 N5】查询属性词 → attr_name 匹配片段（中文属性词 → 英文 attr_name 同义词）
+_PROPERTY_QUERY_TERM_MAP = {
+    "收入": "revenue",
+    "营收": "revenue",
+    "市值": "market_cap",
+    "估值": "valuation",
+    "价格": "price",
+    "金额": "amount",
+    "利润": "profit",
+    "销量": "sales",
+    "销售额": "sales",
+    "用户数": "users",
+    "员工数": "employees",
+    "收购": "acquired_value",
+    "并购": "acquired_value",
+    "投资": "invested_value",
+}
 
 # 【User-Profile】内存常驻用户画像（app.py 启动时全量重建后经 set_user_profile
 # 注入；单实例服务模块级共享，_deduplicate_and_sort 静态方法可直接读取）。
@@ -1161,6 +1195,9 @@ class QueryRouter:
             # （视觉节点无 archived 字段，走 _filter_archived 恒保留；候选同样经
             # _deduplicate_and_sort 单点去重 + score 钳制，相对尾分缩放严格低于种子）
             results = self._visual_recall(results, query, raw_query)
+            # 【P0-1 属性时间版本链】补充非替代：实体属性版本 append（PropertyVerNode
+            # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
+            results = self._property_temporal_retrieve(results, query, raw_query)
             if not include_archived:
                 results = self._filter_archived(results)
             return self._deduplicate_and_sort(results)
@@ -1562,6 +1599,272 @@ class QueryRouter:
             return (scores / (scores + 1.0)).tolist()
         except Exception:
             return [0.0] * len(summaries)
+
+    # ──────────────────────────────
+    # 【P0-1 实体-属性-时间】属性时间版本链检索通道（PropertyVerNode）
+    # ──────────────────────────────
+
+    def _extract_query_entities(self, text: str) -> list[str]:
+        """从查询文本提取候选实体名（对齐 relation_extractor 的 subject 形态）。
+
+        英文首字母大写词序列（含空格分隔多词）+ 中文组织/机构后缀词 + 小写英文词
+        （P1-2："apple 收入" → "apple"，经 normalize_entity_name 与写侧
+        "Apple Inc" 对齐）；停用词过滤 + 去重保序，最多 5 个候选（防长查询爆炸）。
+        """
+        candidates: list[str] = []
+        for m in re.finditer(r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b', text):
+            candidates.append(m.group(1))
+        for m in re.finditer(
+            r'([\u4e00-\u9fff]{2,8}(?:公司|集团|科技|有限|大学|银行|研究院))', text
+        ):
+            candidates.append(m.group(1))
+        # P1-2: 小写英文词（"apple 收入"）；停用词过滤后可能成为候选
+        for m in re.finditer(r'\b([a-z]{2,})\b', text):
+            candidates.append(m.group(1))
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in candidates:
+            cl = c.lower()
+            if cl in seen or cl in _PROPERTY_CANDIDATE_STOPWORDS:
+                continue
+            seen.add(cl)
+            out.append(c)
+            if len(out) >= 5:
+                break
+        return out
+
+    def _property_time_mode(self, query: str) -> tuple[str, Optional[float]]:
+        """判定查询的时间意图（P0-1 属性时间检索）。
+
+        - latest: 含"最近/现在/最新/刚刚/当前"或 recent/now/latest/current
+          （绝对最近词，非相对时间词）
+        - at_time: 含 4 位年份（"2014"/"2020年"）→ 返回 (mode, 该年 12 月 31 日
+          23:59:59 ts，P2-1 年末语义——年中生效版本不丢)；相对时间词（昨天/今天/
+          earlier 等）→ 换算成 at_ts 走 at_time（P2-2，不再误归 latest）
+        - current: 无时间意图 → 取全部未过期版本
+        """
+        q = query.lower()
+        latest_hints = ("最近", "现在", "最新", "刚刚", "当前",
+                        "recent", "now", "latest", "current", "just now")
+        if any(kw in q for kw in latest_hints):
+            return "latest", None
+        # P2-2: 相对时间词换算 at_ts 走 at_time；不可换算的（上一条/之前说的等）
+        # 不命中 latest —— 回落年份/current 判定
+        rel_ts = self._relative_time_at_ts(q)
+        if rel_ts is not None:
+            return "at_time", rel_ts
+        m = re.search(r'(?:19|20)\d{2}', q)
+        if m:
+            # P2-1: 年份查询取年末（Dec 31 23:59:59），非年初
+            ts = datetime(int(m.group(0)), 12, 31, 23, 59, 59).timestamp()
+            return "at_time", ts
+        return "current", None
+
+    @staticmethod
+    def _relative_time_at_ts(q: str) -> Optional[float]:
+        """相对时间词 → at_ts（可换算的走 at_time）；不可换算返回 None。
+
+        可换算（P0-1-R2 N4 修复）:
+        - 数字 + 单位 + 前/ago（"5分钟前" / "5 minutes ago" / "3 days ago"）
+        - 昨天/yesterday/earlier（1 天前）
+        - 今天/today（当前时刻——当日 0 点会漏掉当天稍晚生效的版本）
+        - last/previous + 单位（last year/month/week/day → 对应时长）
+        - 裸 last/previous（1 天前）与字面"几分钟前"（5 分钟前）向后兼容
+        "上一条/之前说的"等无明确锚点的相对词返回 None → 不误归 latest（P2-2）。
+        """
+        now = time.time()
+        ql = q.lower()
+        # 数字 + 单位 + 前/ago（须有明确相对后缀，防 "2021 年" 被误判成 2021 年前）
+        m = re.search(
+            r'(\d+)\s*(分钟|小时|天|周|月|年|minute|hour|day|week|month|year)'
+            r's?\s*(前|ago)', ql,
+        )
+        if m:
+            n = int(m.group(1))
+            seconds_per_unit = {
+                "分钟": 60, "小时": 3600, "天": 86400, "周": 7 * 86400,
+                "月": 30 * 86400, "年": 365 * 86400,
+                "minute": 60, "hour": 3600, "day": 86400, "week": 7 * 86400,
+                "month": 30 * 86400, "year": 365 * 86400,
+            }
+            return now - n * seconds_per_unit[m.group(2)]
+        if any(k in ql for k in ("今天", "today")):
+            return now
+        if any(k in ql for k in ("昨天", "yesterday", "earlier")):
+            return now - 86400.0
+        # last/previous + 单位（先于裸 last/previous 判定）
+        unit_seconds = {
+            "year": 365 * 86400, "month": 30 * 86400,
+            "week": 7 * 86400, "day": 86400,
+        }
+        for unit, secs in unit_seconds.items():
+            if f"last {unit}" in ql or f"previous {unit}" in ql:
+                return now - secs
+        if any(k in ql for k in ("last", "previous")):
+            return now - 86400.0
+        if "几分钟前" in ql:
+            return now - 300.0
+        return None
+
+    @staticmethod
+    def _is_property_expired(v: dict) -> bool:
+        """属性版本是否已过期（GraphLite 缺失属性可能返回 'Null' 字符串，统一归一）。"""
+        raw = v.get("expired_at")
+        return raw not in (None, "", "Null", False)
+
+    @staticmethod
+    def _pick_property_versions(rows: list[dict], mode: str,
+                                at_ts: Optional[float]) -> list[dict]:
+        """按时间意图筛选属性版本：每 (entity_id, attr_name) 取 1 个版本。
+
+        rows 已按 valid_from DESC（store 契约）：
+        - latest/current → 首个未过期版本（即最新有效版）
+        - at_time → 首个 valid_from ≤ at_ts 且目标时点未过期（expired_at IS NULL
+          或 > at_ts，P2-1）的版本（DESC 序 = 该时点前最新）；无匹配 → 该属性跳过
+        """
+        picked: dict[tuple[str, str], dict] = {}
+        for v in rows:
+            eid = v.get("entity_id", "")
+            attr = v.get("attr_name", "")
+            if not eid or not attr:
+                continue
+            key = (eid, attr)
+            if key in picked:
+                continue
+            if mode == "at_time":
+                vf = v.get("valid_from")
+                try:
+                    vf_ts = float(vf) if vf is not None else None
+                except (TypeError, ValueError):
+                    vf_ts = None
+                if vf_ts is None or vf_ts > at_ts:
+                    continue
+                # P2-1: 目标时点该版本必须尚未过期（expired_at IS NULL 或 > at_ts）
+                if QueryRouter._is_property_expired(v):
+                    try:
+                        exp_ts = float(v.get("expired_at"))
+                    except (TypeError, ValueError):
+                        exp_ts = None
+                    if exp_ts is None or exp_ts <= at_ts:
+                        continue
+            else:
+                if QueryRouter._is_property_expired(v):
+                    continue
+            picked[key] = v
+        return list(picked.values())
+
+    @staticmethod
+    def _property_content(v: dict) -> str:
+        """属性版本 → 检索内容描述（供 _deduplicate_and_sort 去重 + 展示）。"""
+        eid = v.get("entity_id", "")
+        attr = v.get("attr_name", "")
+        value = v.get("value", "")
+        vf = v.get("valid_from")
+        ts = ""
+        try:
+            vf_f = float(vf) if vf is not None else None
+            if vf_f is not None:
+                ts = time.strftime("%Y-%m-%d", time.localtime(vf_f))
+        except (TypeError, ValueError):
+            pass
+        return f"[属性] {eid} 的 {attr}: {value}（自 {ts} 生效）"
+
+    @staticmethod
+    def _extract_property_terms(query: str, attr_names: set[str]) -> list[str]:
+        """从查询提取属性词（attr_name 匹配片段）；无属性意图 → 空列表（不过滤）。
+
+        - 中文属性词 → 英文 attr_name 同义词（"收入" → "revenue"，P0-1-R2 N5）
+        - 英文词仅保留出现在已知 attr_name 中的（实体名等非属性词不误当属性词）
+        """
+        terms: set[str] = set()
+        for zh, en in _PROPERTY_QUERY_TERM_MAP.items():
+            if zh in query:
+                terms.add(en)
+        for m in re.finditer(r'[a-z]{2,}', query.lower()):
+            w = m.group(0)
+            if w in _PROPERTY_CANDIDATE_STOPWORDS:
+                continue
+            if any(w in an for an in attr_names):
+                terms.add(w)
+        return sorted(terms)
+
+    def _property_temporal_retrieve(self, results: list[dict], query: str,
+                                    raw_query: Optional[str]) -> list[dict]:
+        """【P0-1 属性时间版本链】补充非替代：查询实体 → PropertyVerNode 版本 append。
+
+        链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
+          1. raw_query 提取候选实体（_extract_query_entities）
+          2. store.get_property_versions_for_entities(候选) → 全部版本（valid_from DESC）
+          3. 时间意图（_property_time_mode）：latest（最近/现在）→ 最新未过期版；
+             at_time（含年份）→ 该时点前最新版；current → 全部未过期版
+          4. 评分 = min(种子分) × boost(0.6)（相对尾分缩放，严格低于种子）
+          5. append {node_id, content, score, level="property_temporal",
+             _source="property", attr_name, entity_id, valid_from}
+        异常/无候选/无命中/无种子分 → 静默返回原 results（主检索零回归）。
+        """
+        try:
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_property_versions_for_entities"):
+                return results
+            candidates = self._extract_query_entities(raw_query or query)
+            if not candidates:
+                return results
+            rows = store.get_property_versions_for_entities(candidates)
+            if not isinstance(rows, list) or not rows:
+                return results
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            mode, at_ts = self._property_time_mode(query)
+            versions = self._pick_property_versions(rows, mode, at_ts)
+            if not versions:
+                return results
+            # N5: 属性词过滤 —— query 出现属性词 → 只保留匹配 attr_name 的版本
+            # （"Apple 收入" 不再返回 acquired_value 等无关属性）
+            attr_terms = self._extract_property_terms(
+                query, {str(v.get("attr_name", "")).lower() for v in versions}
+            )
+            if attr_terms:
+                versions = [
+                    v for v in versions
+                    if any(t in str(v.get("attr_name", "")).lower() for t in attr_terms)
+                ]
+                if not versions:
+                    return results
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for v in versions:
+                vid = v.get("id", "")
+                if not vid or vid in existing_ids:
+                    continue
+                score = round(min_seed_score * _PROPERTY_BOOST, 6)
+                if score <= 0.0:
+                    continue
+                extra.append({
+                    "node_id": vid,
+                    "content": self._property_content(v),
+                    "score": score,
+                    "level": "property_temporal",
+                    "_source": "property",
+                    "attr_name": v.get("attr_name", ""),
+                    "entity_id": v.get("entity_id", ""),
+                    "valid_from": v.get("valid_from"),
+                })
+            if extra:
+                extra = extra[:_PROPERTY_MAX_RESULTS]
+                logger.info("Property temporal appended",
+                            candidates=len(extra), boost=_PROPERTY_BOOST)
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Property temporal retrieve degraded, returning original results",
+                exc_info=True,
+            )
+            return results
 
     def _vector_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None

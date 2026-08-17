@@ -211,11 +211,22 @@ def _run_hebbian_update(deps: Services, active: dict, conns: dict) -> None:
     deps.hebbian_updater.update(active, conns)
 
 
-def _run_entity_resolver(deps: Services, content: str) -> dict:
-    """【v5.24】实体消歧整体在写线程执行（link_aliases 的 ALIAS_OF 写不再阻塞 loop）。"""
+def _run_entity_resolver(deps: Services, content: str, triples=None) -> dict:
+    """【v5.24】实体消歧整体在写线程执行（link_aliases 的 ALIAS_OF 写不再阻塞 loop）。
+    【P0-1】接入属性时间版本链：triples.attributes → PropertyVerNode 版本编排
+    （同样在写线程 qsubmit 内执行；失败仅日志，不阻断主写入）。"""
     from core.entity_resolver import EntityResolver
     resolver = EntityResolver(graphlite_store=deps.graphlite_store)
-    return resolver.process(content)
+    result = resolver.process(content)
+    try:
+        prop_count = resolver.update_properties_from_triples(triples or [])
+        if prop_count:
+            result["property_version_count"] = prop_count
+            logger.info("Property version chain: %d version(s) for %s",
+                        prop_count, content[:40])
+    except Exception:
+        logger.exception("Property version chain update failed (non-fatal)")
+    return result
 
 
 @router.post("/memories/sensory", summary="写入感觉缓冲区 (Layer1)")
@@ -707,11 +718,12 @@ async def create_episode(
         except Exception:
             logger.exception("Relation extraction error (non-fatal)")
 
-    # [Step 3] 实体消歧 — 仅对有一定信息量的内容执行
+    # [Step 3] 实体消歧 + P0-1 属性时间版本链 — 仅对有一定信息量的内容执行
     if deps.graphlite_store is not None and len(req.content) > 80:
         try:
             # 【v5.24】整个同步调用包闭包入队（link_aliases 的 ALIAS_OF 写在写线程）
-            result = await qsubmit(deps, _run_entity_resolver, deps, req.content)
+            # 【P0-1】triples 一并传入闭包：属性版本链（PropertyVerNode）同样在写线程执行
+            result = await qsubmit(deps, _run_entity_resolver, deps, req.content, triples)
             if result.get("alias_count", 0) > 0:
                 logger.info("Entity resolver: %d alias edges, %d entities",
                             result["alias_count"], len(result.get("entities", [])))

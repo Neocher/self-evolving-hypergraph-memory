@@ -22,6 +22,45 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
+# ─── 年份解析（P1-1 时间维注入）───────────────────────────────
+
+# 4 位年份（19xx/20xx），供属性版本 valid_from 注入
+# P0-1-R2 N1: \b 在中文语境不生效（"2021年"中 "1年" 无词边界）→ 用数字前后瞻
+# （与读侧年份正则一致），中文年份可匹配
+YEAR_RE = re.compile(r'(?<!\d)(?:19|20)\d{2}(?!\d)')
+
+# 句子边界标点（年份/属性解析限单句，避免跨句误抓）
+_SENTENCE_BOUNDARY = re.compile(r'[.!?。！？\n]')
+
+
+def _sentence_window(text: str, start: int, end: int) -> str:
+    """提取 (start, end) 片段所在句子窗口文本（句子边界：_SENTENCE_BOUNDARY）。
+
+    供年份解析与属性值搜索共用：限定单句，防止把后续句子的年份/金额误归
+    当前三元组（P0-1-R2 N3）。
+    """
+    # 句子左边界：匹配起点前的最后一个句子分隔符
+    left = 0
+    for m in _SENTENCE_BOUNDARY.finditer(text[:start]):
+        left = m.end()
+    # 句子右边界：匹配终点后的第一个句子分隔符
+    rest = _SENTENCE_BOUNDARY.search(text[end:])
+    right = end + rest.start() if rest else len(text)
+    return text[left:right]
+
+
+def extract_year_in_sentence(text: str, start: int, end: int) -> Optional[str]:
+    """在匹配片段所在句子内解析 4 位年份（"in 2014" / "2021年" / 裸 "2014"）。
+
+    P1-1：RelationExtractor 解析文本中的年份，写入 RelationTriple.attributes
+    （attr_year），供 entity_resolver 注入属性版本 valid_from。限定句子窗口，
+    防止把后续句子的年份误归当前三元组。
+    """
+    window = _sentence_window(text, start, end)
+    m = YEAR_RE.search(window)
+    return m.group(0) if m else None
+
+
 # ─── 关系模式定义 ────────────────────────────────────────────
 
 # 每条模式: (关系类型, 正则表达式, 属性提取函数)
@@ -214,14 +253,20 @@ class RelationExtractor:
                 if subject.lower() == obj.lower():
                     continue  # 自己关联自己
 
-                # 提取额外属性
+                # 提取额外属性（N3：限定句子窗口，防全文 search 跨句误抓金额）
                 attrs: Dict[str, Any] = {}
                 if attr_pattern:
-                    am = attr_pattern.search(text)
+                    window = _sentence_window(text, m.start(), m.end())
+                    am = attr_pattern.search(window)
                     if am:
                         val = am.group(1).strip() if am.lastindex and am.lastindex >= 1 else ""
                         if val:
                             attrs["value"] = val
+
+                # P1-1: 句子内年份 → attr_year（供属性版本 valid_from 注入）
+                year = extract_year_in_sentence(text, m.start(), m.end())
+                if year:
+                    attrs["attr_year"] = year
 
                 triple_key = (rel_type, subject.lower(), obj.lower())
                 if triple_key in seen:

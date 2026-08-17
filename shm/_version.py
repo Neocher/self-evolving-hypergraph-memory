@@ -1,12 +1,35 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.46.2"
-__version_info__ = (5, 46, 2)
-__version_name__ = "V-Mem-R2-Fixes"
+__version__ = "5.47.0"
+__version_info__ = (5, 47, 0)
+__version_name__ = "Entity-Property-Time"
 __release_date__ = "2026-08-16"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.47.0 (2026-08-16) Entity-Property-Time:
+  • P0-1 实体-属性-时间三维建模 — 补齐与 MindMemOS 差距三大结构性缺失之一：
+    实体中心 + 属性时间版本链（消息级扁平存储 → 属性可追溯），最小正解
+  • 存储 — 新增 PropertyVerNode 节点 {{id, entity_id, attr_name, value, valid_from,
+    expired_at}}；更新建新版本，旧版本 expired_at 打标 + (old)-[:SUPERSEDES]->(new)
+    血统边（复用 archive_node 双 MATCH + INSERT 范式；GraphLite 多语句只执行
+    第一条 → SET expired_at 与 INSERT 边拆独立 execute）
+  • 写入 — entity_resolver 编排 + graphlite_store 原语：RelationTriple.attributes
+    （ACQUIRED 金额等，正则确定性零 LLM）→ attr_name 派生 {{relation}}_{{key}}；
+    无 MERGE → 查存在→插 两段式幂等（同值 no-op）；valid_from 严格单调
+    （同微秒/时钟回拨 → 旧版 + 1ms，排序稳定）
+  • 版本约束 — 每 (entity_id, attr_name) 保留最近 N=8 版，写时惰性裁剪
+    （超限 DETACH DELETE 最旧；不复用 tau 衰减）
+  • schema — AttributeDef 末尾追加 temporal: bool = False（纯 dataclass 默认值，
+    向后兼容零迁移脚本）
+  • 检索 — 新增 _property_temporal_retrieve 通道（仿 _community_expansion append
+    模式，_finish 去重/排序前追加）：候选实体（英文大写词序列 + 中文组织名 +
+    停用词过滤）→ PropertyVerNode；时间意图复用 _time_keywords：最近/现在 →
+    最新未过期版；含年份 → 该时点前最新版；无时间词 → 全部未过期版；扩展分 =
+    min(种子分) × 0.6（相对尾分缩放严格低于种子）；无 archived 字段恒保留
+  • 测试: test_property_temporal 14 用例（版本创建 / supersedes 链 / 时间检索
+    最近与具体年份 / N=8 裁剪 / 向后兼容 / HTTP 全链路 / 静默降级）
+
 v5.46.2 (2026-08-16) V-Mem-R2-Fixes:
   • P2-a V-Mem Codex R2 缺陷修复（2 🟡 P2 + 2 ⚪ P3，判定"需修改"）
   • 🟡 P2-1 视觉索引与 id_map/meta 非原子交换 — 新增 _visual_lock +
