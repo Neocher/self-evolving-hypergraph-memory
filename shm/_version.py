@@ -1,8 +1,8 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.47.1"
-__version_info__ = (5, 47, 1)
-__version_name__ = "TauDecay-NonAdaptive-Fix"
+__version__ = "5.48.0"
+__version_info__ = (5, 48, 0)
+__version_name__ = "Agentic-Retrieval"
 __release_date__ = "2026-08-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
@@ -17,6 +17,27 @@ v5.47.1 (2026-08-17) TauDecay-NonAdaptive-Fix:
     导致 tau_decay_seconds=100 配置实际生效 300s，test_decay_threshold_candidate
     边界断言失败（基线 932 passed + 1 failed）
   • 验证: TestTauDecay 8 passed + 全量 933 passed 0 failed
+
+v5.48.0 (2026-08-17) Agentic-Retrieval:
+  • P0-2 Agentic 检索规划 — 多步锚点检索 + session 时间锚注入（CC 设计 →
+    OpenCode 实施 → Codex R1-R5 五轮复核闭环）
+  • session_ts 参数注入 — 相对时间词（yesterday/last year/today）按 session
+    时间锚而非墙钟解析（None 回落 time.time() 向后兼容）；全链路透传
+    （REST /memories/retrieve、GatewayAPI、self_evolving、MCP v1+v2、
+    A2A/ACP）；_relative_time_at_ts/_property_time_mode/_apply_time_decay
+    now 下沉为参数
+  • _agentic_retrieve 多步编排（agentic_enabled 默认关，第 1 轮 = 现有
+    FUSION 全路径字节级等价）— 意图分类（time/identity/attribute/event/
+    multi_hop）→ 通道路由 → 证据不足才 refine → 锚点提取（实体+属性+时间）
+    发起第二轮；三重防死循环（seen 节点去重 / max_steps=3 硬上限 /
+    min_new 锚点枯竭提前停）
+  • 规则原语 — _classify_intent/_route_channels/_sufficiency_check/
+    _extract_anchors/_channels_from_anchors；英文属性词表 + 词边界匹配
+    （\\b，market_cap ↔ market cap 归一）；撇号收缩还原表
+    （don't/let's/ain't/o'clock/y'all → 停用词，防伪实体）
+  • 测试: test_agentic_retrieve 30 + test_mcp_session_ts 3 + R2-R4 回归
+    （全量 987 passed，+38 新增零回归）
+>>>>>>> f8eeb75 (v5.48.0 P0-2 Agentic-Retrieval: 多步锚点检索 + session 时间锚注入)
 
 v5.47.0 (2026-08-16) Entity-Property-Time:
   • P0-1 实体-属性-时间三维建模 — 补齐与 MindMemOS 差距三大结构性缺失之一：

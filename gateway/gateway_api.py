@@ -424,6 +424,7 @@ class GatewayAPI:
         namespace: Optional[str] = None,
         include_shared: bool = True,
         include_archived: bool = False,
+        session_ts: Optional[float] = None,
     ) -> RetrieveResponse:
         """粗到精三级融合检索，带 Cypher 兜底和去重。"""
         start = time.time()
@@ -435,7 +436,9 @@ class GatewayAPI:
             )
 
         try:
-            results_raw = self._svc.query_router.retrieve(query, include_archived=include_archived)
+            results_raw = self._svc.query_router.retrieve(
+                query, include_archived=include_archived, session_ts=session_ts,
+            )
         except Exception as exc:
             self._logger.exception("Query router failed")
             return RetrieveResponse(

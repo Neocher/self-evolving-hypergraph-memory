@@ -113,6 +113,7 @@ async def shm_search_memory(
     top_k: int = 10,
     namespace: str = "",
     include_shared: bool = True,
+    session_ts: Optional[float] = None,
 ) -> str:
     """搜索 SHM 记忆库。三层检索（超图→向量→关键词降级），支持跨Agent搜索。
 
@@ -121,12 +122,15 @@ async def shm_search_memory(
         top_k: 返回结果数上限 (1-50)
         namespace: 限定检索命名空间。空=搜全部+shared
         include_shared: 是否包含其他Agent共享的记忆
+        session_ts: session 时间锚（相对时间词解析基准，None 回落墙钟）
     """
     payload: dict = {"query": query, "top_k": min(top_k, 50)}
     if namespace:
         payload["namespace"] = namespace
     if not include_shared:
         payload["include_shared"] = False
+    if session_ts is not None:
+        payload["session_ts"] = session_ts
 
     result = await _shm_post("/memories/retrieve", payload)
     if "error" in result:

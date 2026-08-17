@@ -495,6 +495,7 @@ def _init_services() -> Services:
             top_k_l1=rcfg.top_k_l1,
             top_k_vector=rcfg.top_k_vector,
             top_k_keyword=rcfg.top_k_keyword,
+            agentic_enabled=getattr(rcfg, "agentic_enabled", False),
         )
         svc.query_router = QueryRouter(**qr_kwargs)
         logger.info("QueryRouter initialized")

@@ -532,7 +532,8 @@ class SelfEvolvingRetrieval:
         # 可插拔向量存储实例（设为 None，由外部共享 Services.faiss_index 代替）
         self._vector_store: Optional[BaseVectorStore] = None
 
-    def retrieve(self, query: str, include_archived: bool = False):
+    def retrieve(self, query: str, include_archived: bool = False,
+                 session_ts: Optional[float] = None):
         """执行检索 + 质量评估 + 自演化（线程安全）。
 
         【H1-a】锁粒度收窄：不再用方法级大锁包裹整个 _qr.retrieve
@@ -549,13 +550,15 @@ class SelfEvolvingRetrieval:
           - 即时硬失败：degraded（0 结果）或 latency 超阈值
 
         include_archived: 透传给底层 QueryRouter（默认 False 排除归档节点）。
+        session_ts: session 时间锚（P0-2；透传给 QueryRouter，None 回落墙钟）。
         """
         params_before = self.guard.current().snapshot()
         start = time.perf_counter()
 
         # 无锁执行检索（读操作，可并发执行；演化参数仅在 apply 后同步到 cfg）
         try:
-            raw = self._qr.retrieve(query, include_archived=include_archived)
+            raw = self._qr.retrieve(query, include_archived=include_archived,
+                                    session_ts=session_ts)
         except Exception as e:
             logger.error("检索失败: %s", e)
             return []

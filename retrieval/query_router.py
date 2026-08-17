@@ -25,7 +25,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -56,6 +56,10 @@ _PROPERTY_CANDIDATE_STOPWORDS = frozenset({
     "would", "should", "shall", "may", "might", "must", "please", "tell", "give",
     "show", "find", "search", "list", "explain", "describe", "summarize",
     "summarise", "what's", "how's", "don't", "doesn't", "didn't", "not",
+    # 【R3 P2-1】常见介词/助动词补全——"of/to/has/had" 等小写英文词不再当伪实体
+    "of", "to", "has", "had", "have", "by", "an", "as", "am",
+    # 【R4 P2-1】let（let's 还原）/all（y'all 还原）不再当伪实体
+    "let", "all",
 })
 # 【P0-1-R2 N5】查询属性词 → attr_name 匹配片段（中文属性词 → 英文 attr_name 同义词）
 _PROPERTY_QUERY_TERM_MAP = {
@@ -74,6 +78,55 @@ _PROPERTY_QUERY_TERM_MAP = {
     "并购": "acquired_value",
     "投资": "invested_value",
 }
+# 【P1-3】英文属性词表（revenue/market_cap/income/age/occupation/salary 等）
+# → attr_name 直接命中（意图分类先于检索，此时无 store 的 attr_names 可用）。
+# "market_cap" 在查询中可能写作 "market cap"（空格），匹配时兼容两种写法。
+_PROPERTY_EN_TERMS = frozenset({
+    "revenue", "income", "salary", "age", "occupation", "market_cap",
+    "valuation", "price", "amount", "profit", "sales", "users",
+    "employees", "acquired_value", "invested_value",
+})
+# 【P1-3】时间词/年份数字不当实体（"What happened in 2023" 误判 event 根治）：
+# 小写英文词（动词/时间词）已由候选提取器排除（仅取首字母大写专名 + 中文机构词），
+# 此处再防首字母大写的时间词（Yesterday/Today）与 4 位年份数字混入实体。
+_TIME_WORD_STOPWORDS = frozenset({
+    "yesterday", "today", "tomorrow", "year", "month", "week", "day",
+    "ago", "recent", "recently", "last", "next", "previous", "earlier",
+    "later", "now", "current", "latest", "date", "time",
+    "happened", "happen", "happens", "happening",
+})
+# 【P1-2】时间锚哨兵：计入 _AnchorSet.all 参与 seen_anchors 差集（时间锚也是有效
+# 新锚点，仅时间锚触发下轮不被截断）；字符串哨兵不与实体/属性词名冲突。
+_TIME_ANCHOR_SENTINEL = "__time_anchor__"
+
+# 【R3 P2-1】常见英文缩写还原表：撇号缩写先还原为完整词再提取实体，
+# 防 "don't" 被 \b[a-z]{2,}\b 切成 "don" 漏过滤（还原后 "do"/"not" 均在停用表）。
+# 仅覆盖已知缩写；所有格（Apple's）不在表中，保持原样不影响专名提取。
+_EN_CONTRACTION_MAP = {
+    "don't": "do not", "doesn't": "does not", "didn't": "did not",
+    "isn't": "is not", "aren't": "are not", "wasn't": "was not",
+    "weren't": "were not", "hasn't": "has not", "haven't": "have not",
+    "hadn't": "had not", "can't": "can not", "couldn't": "could not",
+    "won't": "will not", "wouldn't": "would not", "shouldn't": "should not",
+    "mustn't": "must not", "it's": "it is", "that's": "that is",
+    "what's": "what is", "there's": "there is", "here's": "here is",
+    "who's": "who is", "he's": "he is", "she's": "she is",
+    "i'm": "i am", "you're": "you are", "we're": "we are",
+    "they're": "they are", "i've": "i have", "you've": "you have",
+    "we've": "we have", "they've": "they have",
+    # 【R4 P2-1】补 let's/ain't/o'clock/y'all：防 "Let's find Apple" 切出 "Let" 伪实体
+    "let's": "let us", "ain't": "is not", "o'clock": "of the clock",
+    "y'all": "you all",
+}
+
+
+def _expand_contractions(text: str) -> str:
+    """撇号缩写还原（大小写不敏感，弯撇号先归一），消除 "don't" 切出 "don" 的伪实体。"""
+    text = text.replace("\u2019", "'").replace("\u2018", "'")
+    for k, v in _EN_CONTRACTION_MAP.items():
+        # 【R4 P3-1】\b 词边界防子串误替换（如 "she's" 内的 "he's" 被先替换）
+        text = re.sub(r"\b" + re.escape(k) + r"\b", v, text, flags=re.IGNORECASE)
+    return text
 
 # 【User-Profile】内存常驻用户画像（app.py 启动时全量重建后经 set_user_profile
 # 注入；单实例服务模块级共享，_deduplicate_and_sort 静态方法可直接读取）。
@@ -135,6 +188,44 @@ class QueryRouterConfig:
     graph_expansion_hop: int = 1  # 固定 1 跳（防图爆炸）
     graph_expansion_max: int = 20  # 扩散补充最大条数
     graph_expansion_alpha: float = 0.8  # 扩散新节点分数 = 归一化共现 × 向量尾分 × α
+    # Agentic 检索配置（P0-2，默认关 = 单轮 FUSION 全路径，字节级向后兼容）
+    agentic_enabled: bool = False  # 多步锚点检索编排开关（默认关）
+    agentic_max_steps: int = 3  # 含首轮最多 3 轮（死循环硬上限）
+    agentic_min_new: int = 3  # 每轮须新增 ≥3 条未见过锚点，否则提前停
+    agentic_score_gap: float = 0.25  # 首轮 top-k 归一化分差 < 该值判证据不足
+    agentic_top_k: int = 12  # 每轮召回 top-k（充分性/锚点提取窗口）
+
+
+@dataclass
+class _IntentPlan:
+    """P0-2 意图分类结果（规则原语 _classify_intent 输出）。
+
+    intent ∈ {time, identity, attribute, event, multi_hop}；at_ts 为 session_ts
+    锚定后的时间锚（相对时间词/年份换算，cat=2 时间推理根治点）。
+    """
+
+    intent: str
+    time_mode: str = "current"  # latest / at_time / current
+    at_ts: Optional[float] = None  # 时间锚（相对时间词换算 / 年份年末）
+    time_key: Optional[str] = None  # 相对时间锚稳定语义键（绝对时间/无锚 → None）
+    entities: list[str] = field(default_factory=list)  # 候选实体名
+    property_terms: list[str] = field(default_factory=list)  # 属性词（英文 attr_name）
+
+
+@dataclass
+class _AnchorSet:
+    """P0-2 证据消息锚点集（_extract_anchors 输出，供下一轮 refine）。
+
+    all = 实体 ∪ 属性词 ∪ 时间锚哨兵（全部锚点）；_agentic_retrieve 维护
+    seen_anchors 求差得 new（真正未见过的新锚点），len(new) 用于
+    agentic_min_new 枯竭判定——修复前每轮直接重算并集，相同锚点重复满足 min_new。
+    """
+
+    all: list[str] = field(default_factory=list)
+    new: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
+    time_anchor: Optional[float] = None
+    property_terms: list[str] = field(default_factory=list)
 
 
 class QueryRouter:
@@ -1064,13 +1155,17 @@ class QueryRouter:
         return results[:k]
 
     @staticmethod
-    def _apply_time_decay(results: list[dict]) -> list[dict]:
+    def _apply_time_decay(results: list[dict], now_ts: Optional[float] = None) -> list[dict]:
         """时序衰减加权。
 
         对每个结果的 τ 值做时间衰减加权：
         score = score * (1 + 1 / (1 + exp(-τ / 60)))
 
         τ 值越高（越重要/新鲜），衰减因子的 boost 越大（1x ~ 2x）。
+
+        now_ts: session 时间锚（P0-2 now 下沉参数；当前衰减基于 learnable τ 参数
+        （tau_value），与墙钟无关——now_ts 仅为签名一致性透传，供单轮/agentic 多轮
+        路径同签名调用，不改变现有 τ 衰减语义）。
         """
         for r in results:
             tau = float(r.get("tau_value", 0.0))
@@ -1083,6 +1178,7 @@ class QueryRouter:
         vector_results: list[dict],
         bm25_results: list[dict],
         entity_results: list[dict],
+        now_ts: Optional[float] = None,
     ) -> list[dict]:
         """三路结果加权融合。
 
@@ -1149,7 +1245,7 @@ class QueryRouter:
         all_results = list(fused.values())
 
         # 时序衰减
-        self._apply_time_decay(all_results)
+        self._apply_time_decay(all_results, now_ts)
 
         # 去重 + 排序收敛到 retrieve() _finish 统一出口（此处不再重复，
         # 避免与 _finish 的 _deduplicate_and_sort 双重 boost）
@@ -1161,6 +1257,7 @@ class QueryRouter:
         query_embedding: Optional[np.ndarray] = None,
         level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
         include_archived: bool = False,
+        session_ts: Optional[float] = None,
     ) -> list[dict]:
         """多信号检索融合入口。
 
@@ -1173,6 +1270,9 @@ class QueryRouter:
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
             level: 检索级别（默认从 L1 开始，传入 FUSION 使用并行融合）
             include_archived: 是否包含已归档节点（默认 False，排除 archived=true）
+            session_ts: session 时间锚（P0-2 时间推理根治；None 回落墙钟）。注入
+                到相对时间词解析（_relative_time_at_ts/_property_time_mode），
+                使"昨天/last year"等相对词对历史 session 按 session_ts 而非墙钟换算。
 
         Returns:
             检索结果列表 [...]
@@ -1197,7 +1297,8 @@ class QueryRouter:
             results = self._visual_recall(results, query, raw_query)
             # 【P0-1 属性时间版本链】补充非替代：实体属性版本 append（PropertyVerNode
             # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
-            results = self._property_temporal_retrieve(results, query, raw_query)
+            # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
+            results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
             if not include_archived:
                 results = self._filter_archived(results)
             return self._deduplicate_and_sort(results)
@@ -1205,9 +1306,18 @@ class QueryRouter:
         strategy = self.detect_strategy(query)
         logger.info("Retrieval started", query=query[:80], level=level.value, strategy=strategy)
 
+        # 【P0-2 Agentic】多步锚点检索编排（默认关）：agentic_enabled=True 且
+        # level==FUSION 才走新路径（【P1-4】不再劫持 HYPERGRAPH/VECTOR/KEYWORD），
+        # 首轮 = _route_channels(plan) + 三路融合（现有 FUSION 全路径）；False 时
+        # 完全走下方既有单轮路径，字节级等价。
+        if self.config.agentic_enabled and level == RetrievalLevel.FUSION:
+            return self._agentic_retrieve(
+                query, raw_query, query_embedding, session_ts, include_archived,
+            )
+
         # F — 三路并行融合（向量 + BM25 + 实体匹配）
         if level == RetrievalLevel.FUSION:
-            return _finish(self._fusion_retrieve(query, query_embedding, raw_query))
+            return _finish(self._fusion_retrieve(query, query_embedding, raw_query, now_ts=session_ts))
 
         # 从指定级别开始，逐级尝试（空结果自动级联）
         results: list[dict] = []
@@ -1216,31 +1326,31 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
                 self._tag_degraded(r, level="l1_circuit_breaker")
                 return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
                 self._tag_degraded(r, level="l1_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived)
+            return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
 
         if level == RetrievalLevel.VECTOR:
             try:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L2 empty, cascading to L3")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts)
             self._tag_degraded(r, level="l2_empty")
             return r
 
@@ -1259,6 +1369,7 @@ class QueryRouter:
         query: str,
         query_embedding: Optional[np.ndarray] = None,
         raw_query: Optional[str] = None,
+        now_ts: Optional[float] = None,
     ) -> list[dict]:
         """三路并行融合检索。
 
@@ -1335,7 +1446,293 @@ class QueryRouter:
             entity=len(entity_results),
         )
 
-        return self._fuse_results(vector_results, bm25_results, entity_results)
+        return self._fuse_results(vector_results, bm25_results, entity_results, now_ts)
+
+    # ──────────────────────────────
+    # 【P0-2 Agentic】多步锚点检索编排（规则原语 + 编排器，全私有）
+    # ──────────────────────────────
+
+    @staticmethod
+    def _classify_property_terms(query: str) -> list[str]:
+        """轻量属性词检测：中英文属性词 → 英文 attr_name（无需 store 的 attr_names 集合）。
+
+        与 _extract_property_terms 的区别：后者需已知 attr_names 过滤英文词；
+        此处用中英文属性词映射做意图分类（分类先于检索，此时无 attr_names 可用）。
+        【P1-3】补英文属性词表（revenue/market_cap 等）——"Apple revenue" 不再漏判属性意图。
+        【R2 N2-P2】词边界匹配（\\b）——"age" 不再命中 "agent"/"manager"、"sales"
+        不再命中 "salesforce"；下划线属性名归一化（market_cap ↔ market cap）后 \\b 判断。
+        """
+        terms: set[str] = set()
+        for zh, en in _PROPERTY_QUERY_TERM_MAP.items():
+            if zh in query:
+                terms.add(en)
+        ql = query.lower()
+        for en in _PROPERTY_EN_TERMS:
+            variants = {en}
+            if "_" in en:
+                variants.add(en.replace("_", " "))
+            if any(re.search(r'\b' + re.escape(v) + r'\b', ql) for v in variants):
+                terms.add(en)
+        return sorted(terms)
+
+    def _classify_intent(self, query: str, session_ts: Optional[float]) -> _IntentPlan:
+        """规则分类查询意图 → _IntentPlan（cat=1 跨消息 / cat=2 时间推理 分流）。
+
+        判定优先级（首匹配）：
+          - time:      有时间意图且无实体/属性词 → 纯时间推理（property_temporal）
+          - attribute: 有属性词 → 实体属性查询（property_temporal + fusion）
+          - event:     有时间意图且有实体 → 事件回忆（fusion + hypergraph）
+          - identity:  有实体无时间/属性 → 身份/实体回忆（entity + fusion）
+          - multi_hop: 无明确信号 → 跨消息关联（fusion，首轮证据不足才 refine）
+        """
+        time_mode, at_ts = self._property_time_mode(query, session_ts)
+        time_key = self._time_anchor_key(query) if at_ts is not None else None
+        entities = self._extract_query_entities(query)
+        property_terms = self._classify_property_terms(query)
+        has_time = time_mode != "current"
+        if has_time and not entities and not property_terms:
+            intent = "time"
+        elif property_terms:
+            intent = "attribute"
+        elif has_time and entities:
+            intent = "event"
+        elif entities:
+            intent = "identity"
+        else:
+            intent = "multi_hop"
+        return _IntentPlan(
+            intent=intent,
+            time_mode=time_mode,
+            at_ts=at_ts,
+            time_key=time_key,
+            entities=entities,
+            property_terms=property_terms,
+        )
+
+    @staticmethod
+    def _route_channels(plan: _IntentPlan) -> list[str]:
+        """意图 → 检索通道列表（fusion 为三路融合基础通道，恒执行）。
+
+          time      → property_temporal（时间版本链，cat=2）
+          identity  → entity + fusion（实体精确匹配，融合已含 entity）
+          attribute → property_temporal + fusion
+          event     → fusion + hypergraph（图扩散，事件关联）
+          multi_hop → fusion（跨消息关联，首轮证据不足经锚点 refine）
+        """
+        mapping: dict[str, list[str]] = {
+            "time": ["property_temporal"],
+            "identity": ["entity", "fusion"],
+            "attribute": ["property_temporal", "fusion"],
+            "event": ["fusion", "hypergraph"],
+            "multi_hop": ["fusion"],
+        }
+        return list(mapping.get(plan.intent, ["fusion"]))
+
+    @staticmethod
+    def _channels_from_anchors(
+        anchors: Optional[_AnchorSet], plan: _IntentPlan
+    ) -> list[str]:
+        """由锚点集派生下一轮补充通道（cat=1 跨消息 refine）。
+
+        新实体 → entity；属性词/时间锚 → property_temporal；event 意图保持 hypergraph。
+        fusion 基础通道恒执行，故不重复列入。
+        """
+        if anchors is None:
+            return []
+        channels: list[str] = []
+        if anchors.entities:
+            channels.append("entity")
+        if anchors.property_terms or anchors.time_anchor is not None:
+            channels.append("property_temporal")
+        if plan.intent == "event":
+            channels.append("hypergraph")
+        return channels
+
+    def _sufficiency_check(self, results: list[dict], plan: _IntentPlan) -> bool:
+        """证据充分性判定：top-k 归一化分差 ≥ agentic_score_gap 且 distinct 节点数 ≥ agentic_min_new。
+
+        - 归一化分差 = (max - min) / max（top-1 相对 top-k 的区分优势幅度）；
+          分差过小 → 结果拥挤、区分度不足 → 判证据不足（需 refine）
+        - distinct 节点数过少 → 证据稀薄 → 判证据不足
+        """
+        top = results[: self.config.agentic_top_k]
+        if not top:
+            return False
+        scores = [float(r.get("score") or 0.0) for r in top]
+        hi, lo = max(scores), min(scores)
+        if hi <= 0.0:
+            return False
+        gap = (hi - lo) / hi
+        distinct = len({r.get("node_id") for r in top if r.get("node_id")})
+        return gap >= self.config.agentic_score_gap and distinct >= self.config.agentic_min_new
+
+    def _extract_anchors(
+        self, top_results: list[dict], plan: _IntentPlan,
+        session_ts: Optional[float] = None,
+    ) -> _AnchorSet:
+        """从证据消息（top 结果 content）提取实体 + 时间锚 + 属性词（cat=1 锚点 refine）。
+
+        时间锚：优先 plan.at_ts（分类阶段已按 session_ts 解析）；否则从证据文本解析
+        相对时间词/年份（【P1-2】按 session_ts 而非墙钟）。all = 实体 ∪ 属性词 ∪
+        时间锚哨兵（全部锚点），由编排器求差得 new。
+        """
+        entities: list[str] = []
+        property_terms: list[str] = []
+        for r in top_results:
+            text = r.get("content", "") or ""
+            if not text:
+                continue
+            entities.extend(self._extract_query_entities(text))
+            property_terms.extend(self._classify_property_terms(text))
+
+        time_anchor = plan.at_ts
+        time_key = plan.time_key  # 相对时间锚稳定语义键（绝对时间/无锚 → None）
+        if time_anchor is None:
+            for r in top_results:
+                text = r.get("content", "") or ""
+                if not text:
+                    continue
+                _, ats = self._property_time_mode(text, session_ts)
+                if ats is not None:
+                    time_anchor = ats
+                    time_key = self._time_anchor_key(text)
+                    break
+
+        def _dedup(items: list[str]) -> list[str]:
+            seen: set[str] = set()
+            out: list[str] = []
+            for it in items:
+                k = it.lower()
+                if not it or k in seen:
+                    continue
+                seen.add(k)
+                out.append(it)
+            return out
+
+        entities = _dedup(entities)[:5]
+        property_terms = _dedup(property_terms)
+        all_anchors = list(dict.fromkeys(entities + property_terms))
+        if time_anchor is not None:
+            # 【R2 N3-P2】时间锚 key 唯一化：不同时间锚（"yesterday" vs "2023"）值
+            # 唯一，可各自作为新锚点计数（修复前统一哨兵 → 永不新增）。
+            # 【R3 P3-1】相对时间锚用稳定语义键（time_key），绝对时间保留 timestamp。
+            anchor_key = time_key if time_key is not None else time_anchor
+            all_anchors.append(f"{_TIME_ANCHOR_SENTINEL}:{anchor_key}")
+        return _AnchorSet(
+            all=all_anchors, entities=entities, time_anchor=time_anchor,
+            property_terms=property_terms,
+        )
+
+    def _hypergraph_supplement(self, results: list[dict]) -> list[dict]:
+        """超图扩散补充：从融合种子沿超边扩散邻居（event 意图通道）。
+
+        复用 _graph_expansion（相对尾分缩放，append 非替代）；失败静默返回原 results。
+        """
+        try:
+            if not results or self.graphlite_store is None:
+                return results
+            # 【P2-1】先按 score 降序再取头尾——未排序时 results[:5]/[-1]
+            # 非真实 top/lowest（_fuse_results 输出为 dict 无序集合）
+            ranked = sorted(results, key=lambda r: r.get("score") or 0.0, reverse=True)
+            seeds = [r.get("node_id") for r in ranked[:5] if r.get("node_id")]
+            if not seeds:
+                return results
+            existing_ids = {r.get("node_id") for r in results}
+            tail_score = float(ranked[-1].get("score") or 0.0)
+            expansion = self._graph_expansion(seeds, existing_ids, tail_score)
+            if expansion:
+                return results + expansion
+        except Exception:
+            logger.debug("Agentic hypergraph supplement degraded", exc_info=True)
+        return results
+
+    def _agentic_round(
+        self,
+        channels: list[str],
+        query: str,
+        query_embedding: Optional[np.ndarray],
+        raw_query: Optional[str],
+        session_ts: Optional[float],
+        include_archived: bool,
+        at_ts: Optional[float] = None,
+    ) -> list[dict]:
+        """单轮检索：三路融合（基础）+ 路由补充通道（property_temporal/hypergraph）。
+
+        与单轮 FUSION 全路径（retrieve _finish）对齐：社区 + 视觉补充 append、
+        归档过滤；去重/排序/boost 统一收敛到编排器末尾 _deduplicate_and_sort
+        （单点 boost，避免多轮双重放大）。"entity" 通道已由三路融合的实体匹配覆盖。
+        at_ts：编排器已解析的时间锚（plan.at_ts / 证据时间锚），透传给
+        _property_temporal_retrieve 不重算。
+        """
+        results = self._fusion_retrieve(query, query_embedding, raw_query, now_ts=session_ts)
+        if "property_temporal" in channels:
+            results = self._property_temporal_retrieve(
+                results, query, raw_query, now_ts=session_ts, at_ts=at_ts,
+            )
+        if "hypergraph" in channels:
+            results = self._hypergraph_supplement(results)
+        results = self._community_expansion(results, query, query_embedding, raw_query)
+        results = self._visual_recall(results, query, raw_query)
+        if not include_archived:
+            results = self._filter_archived(results)
+        return results
+
+    def _agentic_retrieve(
+        self,
+        query: str,
+        raw_query: Optional[str],
+        query_embedding: Optional[np.ndarray],
+        session_ts: Optional[float],
+        include_archived: bool,
+    ) -> list[dict]:
+        """P0-2 多步锚点检索编排器（agentic_enabled=True 且 level=FUSION 时替代单轮）。
+
+        三重防死循环：
+          1. seen 集合 —— 每轮过滤已见 node_id（同节点不跨轮重复累积）
+          2. agentic_max_steps —— 硬上限（含首轮最多 N 轮）
+          3. agentic_min_new —— 锚点枯竭（真正未见过的新锚点 < min_new）提前停
+
+        首轮 = _route_channels(plan)（cat=2 时间锚注入 + cat=1 意图分流），
+        后续轮 = _channels_from_anchors（证据消息锚点 refine）。
+        """
+        plan = self._classify_intent(query, session_ts)
+        seen: set[str] = set()
+        seen_anchors: set[str] = set()
+        results: list[dict] = []
+        anchors: Optional[_AnchorSet] = None
+
+        for step in range(1, self.config.agentic_max_steps + 1):
+            channels = (
+                self._route_channels(plan)
+                if step == 1
+                else self._channels_from_anchors(anchors, plan)
+            )
+            at_ts = plan.at_ts if step == 1 else (anchors.time_anchor if anchors else None)
+            round_results = self._agentic_round(
+                channels, query, query_embedding, raw_query, session_ts,
+                include_archived, at_ts=at_ts,
+            )
+            # 三重防护 1：去已见节点（防跨轮重复累积）
+            fresh = [r for r in round_results if r.get("node_id") not in seen]
+            results.extend(fresh)
+            seen.update(r.get("node_id") for r in fresh if r.get("node_id"))
+            results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+
+            if step == self.config.agentic_max_steps:
+                break  # 三重防护 2：硬上限
+            if self._sufficiency_check(results[: self.config.agentic_top_k], plan):
+                break  # 证据充分，不再 refine
+            anchors = self._extract_anchors(results[: self.config.agentic_top_k], plan, session_ts)
+            # 【P1-1】增量枯竭判定：新锚点 = all - seen_anchors（差集），
+            # 相同锚点不再重复满足 min_new。
+            # 【R2 N5-P3】大小写归一：Apple vs APPLE 计为同一锚点（lower 后差集）。
+            new_anchors = [a for a in anchors.all if a.lower() not in seen_anchors]
+            anchors.new = new_anchors
+            if len(new_anchors) < self.config.agentic_min_new:
+                break  # 三重防护 3：锚点枯竭
+            seen_anchors.update(a.lower() for a in anchors.all)
+
+        return self._deduplicate_and_sort(results)
 
     def _hypergraph_retrieve(
         self, query: str, query_embedding: Optional[np.ndarray] = None
@@ -1608,9 +2005,11 @@ class QueryRouter:
         """从查询文本提取候选实体名（对齐 relation_extractor 的 subject 形态）。
 
         英文首字母大写词序列（含空格分隔多词）+ 中文组织/机构后缀词 + 小写英文词
-        （P1-2："apple 收入" → "apple"，经 normalize_entity_name 与写侧
-        "Apple Inc" 对齐）；停用词过滤 + 去重保序，最多 5 个候选（防长查询爆炸）。
+        （【R2 N1-P1】"apple 收入" → "apple"，经 normalize_entity_name 与写侧
+        "Apple Inc" 对齐，防属性检索静默失效）。        停用词 + 时间词/动词停用词过滤 +
+        去重保序，最多 5 个候选。
         """
+        text = _expand_contractions(text)
         candidates: list[str] = []
         for m in re.finditer(r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b', text):
             candidates.append(m.group(1))
@@ -1618,7 +2017,8 @@ class QueryRouter:
             r'([\u4e00-\u9fff]{2,8}(?:公司|集团|科技|有限|大学|银行|研究院))', text
         ):
             candidates.append(m.group(1))
-        # P1-2: 小写英文词（"apple 收入"）；停用词过滤后可能成为候选
+        # 【R2 N1-P1】恢复小写英文词提取（P1-3 删过头 → "apple 收入" 属性检索静默
+        # 失效）；时间词/动词（happened/year 等）仍由 _TIME_WORD_STOPWORDS 滤除。
         for m in re.finditer(r'\b([a-z]{2,})\b', text):
             candidates.append(m.group(1))
         seen: set[str] = set()
@@ -1627,13 +2027,17 @@ class QueryRouter:
             cl = c.lower()
             if cl in seen or cl in _PROPERTY_CANDIDATE_STOPWORDS:
                 continue
+            # 【R2 N4-P3】删年份过滤死分支：候选仅来自字母/中文正则，永不产生
+            # 4 位数字（年份 "2023" 本就不会被提取），re.fullmatch 恒 False。
+            if cl in _TIME_WORD_STOPWORDS:
+                continue
             seen.add(cl)
             out.append(c)
             if len(out) >= 5:
                 break
         return out
 
-    def _property_time_mode(self, query: str) -> tuple[str, Optional[float]]:
+    def _property_time_mode(self, query: str, now_ts: Optional[float] = None) -> tuple[str, Optional[float]]:
         """判定查询的时间意图（P0-1 属性时间检索）。
 
         - latest: 含"最近/现在/最新/刚刚/当前"或 recent/now/latest/current
@@ -1642,6 +2046,8 @@ class QueryRouter:
           23:59:59 ts，P2-1 年末语义——年中生效版本不丢)；相对时间词（昨天/今天/
           earlier 等）→ 换算成 at_ts 走 at_time（P2-2，不再误归 latest）
         - current: 无时间意图 → 取全部未过期版本
+
+        now_ts: session 时间锚（P0-2 下沉；None 回落墙钟 time.time()）。
         """
         q = query.lower()
         latest_hints = ("最近", "现在", "最新", "刚刚", "当前",
@@ -1650,7 +2056,7 @@ class QueryRouter:
             return "latest", None
         # P2-2: 相对时间词换算 at_ts 走 at_time；不可换算的（上一条/之前说的等）
         # 不命中 latest —— 回落年份/current 判定
-        rel_ts = self._relative_time_at_ts(q)
+        rel_ts = self._relative_time_at_ts(q, now_ts)
         if rel_ts is not None:
             return "at_time", rel_ts
         m = re.search(r'(?:19|20)\d{2}', q)
@@ -1661,7 +2067,7 @@ class QueryRouter:
         return "current", None
 
     @staticmethod
-    def _relative_time_at_ts(q: str) -> Optional[float]:
+    def _relative_time_at_ts(q: str, now_ts: Optional[float] = None) -> Optional[float]:
         """相对时间词 → at_ts（可换算的走 at_time）；不可换算返回 None。
 
         可换算（P0-1-R2 N4 修复）:
@@ -1671,8 +2077,12 @@ class QueryRouter:
         - last/previous + 单位（last year/month/week/day → 对应时长）
         - 裸 last/previous（1 天前）与字面"几分钟前"（5 分钟前）向后兼容
         "上一条/之前说的"等无明确锚点的相对词返回 None → 不误归 latest（P2-2）。
+
+        now_ts: session 时间锚（P0-2 下沉参数）——对历史 session 用 session_ts 而非
+        墙钟，根治 cat=2 时间推理（否则"昨天"对历史 session 恒按当前墙钟错算）。
+        None 时回落 time.time()。
         """
-        now = time.time()
+        now = now_ts if now_ts is not None else time.time()
         ql = q.lower()
         # 数字 + 单位 + 前/ago（须有明确相对后缀，防 "2021 年" 被误判成 2021 年前）
         m = re.search(
@@ -1704,6 +2114,41 @@ class QueryRouter:
             return now - 86400.0
         if "几分钟前" in ql:
             return now - 300.0
+        return None
+
+    @staticmethod
+    def _time_anchor_key(q: str) -> Optional[str]:
+        """相对时间词的稳定语义键（跨轮稳定）；绝对时间（年份/日期）返回 None。
+
+        【R3 P3-1】无 session_ts 时 _relative_time_at_ts 用 time.time()，每轮
+        timestamp 不同 → 同一 "today" 被当新锚点，可能空转到 max_steps。按语义词
+        规范化后（__time_anchor__:today）跨轮恒等；绝对时间仍保留 timestamp。
+        判定顺序与 _relative_time_at_ts 一致（数字+单位/今天/昨天/last+N/裸 last）。
+        """
+        ql = q.lower()
+        m = re.search(
+            r'(\d+)\s*(分钟|小时|天|周|月|年|minute|hour|day|week|month|year)'
+            r's?\s*(前|ago)', ql,
+        )
+        if m:
+            unit = {
+                "分钟": "minute", "小时": "hour", "天": "day", "周": "week",
+                "月": "month", "年": "year",
+                "minute": "minute", "hour": "hour", "day": "day",
+                "week": "week", "month": "month", "year": "year",
+            }[m.group(2)]
+            return f"{m.group(1)}_{unit}_ago"
+        if any(k in ql for k in ("今天", "today")):
+            return "today"
+        if any(k in ql for k in ("昨天", "yesterday", "earlier")):
+            return "yesterday"
+        for unit in ("year", "month", "week", "day"):
+            if f"last {unit}" in ql or f"previous {unit}" in ql:
+                return f"last_{unit}"
+        if any(k in ql for k in ("last", "previous")):
+            return "last"
+        if "几分钟前" in ql:
+            return "few_minutes_ago"
         return None
 
     @staticmethod
@@ -1770,12 +2215,26 @@ class QueryRouter:
         return f"[属性] {eid} 的 {attr}: {value}（自 {ts} 生效）"
 
     @staticmethod
+    def _attr_name_matches(term: str, attr_name: str) -> bool:
+        """属性词 ↔ attr_name 词边界匹配（下划线归一：market_cap ↔ market cap）。
+
+        【R3 P2-2】"age" 不命中 "manager"/"agent"、"sales" 不命中 "salesforce"
+        （子串假阳性根治）；下划线属性名与空格写法视作同词。
+        """
+        attr = attr_name.lower().replace("_", " ")
+        t = term.lower().replace("_", " ")
+        return bool(re.search(r"\b" + re.escape(t) + r"\b", attr))
+
+    @staticmethod
     def _extract_property_terms(query: str, attr_names: set[str]) -> list[str]:
         """从查询提取属性词（attr_name 匹配片段）；无属性意图 → 空列表（不过滤）。
 
         - 中文属性词 → 英文 attr_name 同义词（"收入" → "revenue"，P0-1-R2 N5）
         - 英文词仅保留出现在已知 attr_name 中的（实体名等非属性词不误当属性词）
         """
+        # 【R4 P3-3】先还原撇号缩写（与 _extract_query_entities 一致），
+        # 否则 [a-z]{2,} 永不产出撇号 token，停用表中 "don't" 等是死条件。
+        query = _expand_contractions(query)
         terms: set[str] = set()
         for zh, en in _PROPERTY_QUERY_TERM_MAP.items():
             if zh in query:
@@ -1784,12 +2243,14 @@ class QueryRouter:
             w = m.group(0)
             if w in _PROPERTY_CANDIDATE_STOPWORDS:
                 continue
-            if any(w in an for an in attr_names):
+            if any(QueryRouter._attr_name_matches(w, an) for an in attr_names):
                 terms.add(w)
         return sorted(terms)
 
     def _property_temporal_retrieve(self, results: list[dict], query: str,
-                                    raw_query: Optional[str]) -> list[dict]:
+                                    raw_query: Optional[str],
+                                    now_ts: Optional[float] = None,
+                                    at_ts: Optional[float] = None) -> list[dict]:
         """【P0-1 属性时间版本链】补充非替代：查询实体 → PropertyVerNode 版本 append。
 
         链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
@@ -1801,6 +2262,9 @@ class QueryRouter:
           5. append {node_id, content, score, level="property_temporal",
              _source="property", attr_name, entity_id, valid_from}
         异常/无候选/无命中/无种子分 → 静默返回原 results（主检索零回归）。
+
+        at_ts：编排器已按 session_ts 解析的时间锚（plan.at_ts / 证据时间锚），
+        非 None 时直接按 at_time 取该时点前版本、不重算（【P1-2】）。
         """
         try:
             store = getattr(self, "graphlite_store", None)
@@ -1818,7 +2282,10 @@ class QueryRouter:
             )
             if min_seed_score <= 0.0:
                 return results
-            mode, at_ts = self._property_time_mode(query)
+            if at_ts is not None:
+                mode = "at_time"
+            else:
+                mode, at_ts = self._property_time_mode(query, now_ts)
             versions = self._pick_property_versions(rows, mode, at_ts)
             if not versions:
                 return results
@@ -1830,7 +2297,7 @@ class QueryRouter:
             if attr_terms:
                 versions = [
                     v for v in versions
-                    if any(t in str(v.get("attr_name", "")).lower() for t in attr_terms)
+                    if any(QueryRouter._attr_name_matches(t, str(v.get("attr_name", ""))) for t in attr_terms)
                 ]
                 if not versions:
                     return results

@@ -96,6 +96,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "搜索查询文本"},
                 "top_k": {"type": "integer", "description": "返回结果数", "default": 5},
                 "namespace": {"type": "string", "description": "命名空间过滤（可选）", "default": ""},
+                "session_ts": {"type": "number", "description": "session 时间锚（相对时间词解析基准，可选）"},
             },
             "required": ["query"],
         },
@@ -139,6 +140,8 @@ def _handle_call(tool_name: str, args: dict) -> dict:
         }
         if args.get("namespace"):
             payload["namespace"] = args["namespace"]
+        if args.get("session_ts") is not None:
+            payload["session_ts"] = args["session_ts"]
         result = _shm_post("/memories/retrieve", payload)
         if "error" in result:
             return {"content": [{"type": "text", "text": f"❌ {result['error']}"}]}

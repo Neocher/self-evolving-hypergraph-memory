@@ -13,7 +13,7 @@ class _FakeQueryRouter:
     def __init__(self):
         self.calls = []
 
-    def retrieve(self, query, include_archived=False):
+    def retrieve(self, query, include_archived=False, session_ts=None):
         self.calls.append({"query": query, "include_archived": include_archived})
         return [{"content": f"result_{query}", "score": 0.7}]
 

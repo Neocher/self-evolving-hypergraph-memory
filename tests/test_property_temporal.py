@@ -494,6 +494,22 @@ class TestP22RelativeTimeWords:
         assert mode == "at_time" and at_ts is not None
 
 
+class TestR3PropertyFilterWordBoundary:
+    """R3 P2-2: 生产属性过滤链词边界——"Apple age" 不命中 "manager" 属性。"""
+
+    def test_apple_age_does_not_hit_manager(self, graphlite_store):
+        resolver = EntityResolver(graphlite_store=graphlite_store)
+        resolver._update_property_version("Apple", "manager", "Tim Cook", valid_from=_year_ts(2020))
+        resolver._update_property_version("Apple", "age", "45", valid_from=_year_ts(2020))
+        router = _make_router(graphlite_store, [
+            _seed_result("ep1", "Apple 的业务情况"),
+        ])
+        out = router.retrieve("Apple age")
+        attrs = [r["attr_name"] for r in out if r.get("level") == "property_temporal"]
+        assert "age" in attrs, f"Apple age 应命中 age 属性: {attrs}"
+        assert "manager" not in attrs, f"age 不应命中 manager 属性（子串假阳性）: {attrs}"
+
+
 class TestP23AtomicWriteCompensation:
 
     def _patch_execute_fail_on(self, store, fail_substr: str):

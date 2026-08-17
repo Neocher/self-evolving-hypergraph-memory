@@ -180,6 +180,10 @@ class RetrieveRequest(BaseModel):
     namespace: Optional[str] = Field(default=None, description="限定检索的命名空间")
     include_shared: bool = Field(default=True, description="是否同时检索 visibility=shared 的记忆")
     include_archived: bool = Field(default=False, description="是否包含已归档记忆（默认排除）")
+    session_ts: Optional[float] = Field(
+        default=None,
+        description="session 时间锚（相对时间词解析基准，None 回落墙钟）",
+    )
 
 
 class EpisodicResult(BaseModel):

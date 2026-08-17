@@ -40,8 +40,8 @@ async def retrieve(
     set_trace_id()
     degraded = False
 
-    # 【Perf】结果缓存命中（键含 include_archived，避免 True/False 互相污染缓存）
-    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}"
+    # 【Perf】结果缓存命中（键含 include_archived/session_ts，避免互相污染缓存）
+    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:ts:{req.session_ts}"
     with _result_cache_lock:
         if cache_key in _result_cache:
             latency = (_now() - start) * 1000
@@ -60,6 +60,7 @@ async def retrieve(
             asyncio.to_thread(
                 deps.query_router.retrieve, req.query,
                 include_archived=req.include_archived,
+                session_ts=req.session_ts,
             ),
             timeout=_RETRIEVE_TIMEOUT,
         )

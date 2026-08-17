@@ -59,7 +59,7 @@ class MockRouter:
         self._results = (results if results is not None
                          else [{"content": "result", "score": 0.7, "node_id": "r1"}])
 
-    def retrieve(self, q, include_archived=False):
+    def retrieve(self, q, include_archived=False, session_ts=None):
         return self._results
 
     def state(self):
@@ -408,7 +408,7 @@ class TestSelfEvolvingRetrieval:
         received = {}
 
         class SpyRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 received["include_archived"] = include_archived
                 return [{"content": f"result_{q}", "score": 0.7, "node_id": "r1"}]
 
@@ -421,7 +421,7 @@ class TestSelfEvolvingRetrieval:
     def test_retrieve_exception_returns_list(self):
         """P1-1 回归：底层抛异常 → []（list），且不计入调用统计"""
         class RaisingRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 raise RuntimeError("simulated retrieval failure")
 
         se = make_se(RaisingRouter())
@@ -487,7 +487,7 @@ class TestSelfEvolvingRetrieval:
                 super().__init__()
                 self.calls = 0
 
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 self.calls += 1
                 if self.calls <= 3:
                     return []
@@ -503,7 +503,7 @@ class TestSelfEvolvingRetrieval:
     def test_periodic_forced_evaluation(self):
         """周期强制触发：probe_every 次检索后即使非降级也评估"""
         class LowQualityRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 return [{"content": f"r_{q}", "score": 0.2, "node_id": "r1"}]
 
         se = make_se(LowQualityRouter(), probe_every=2)
@@ -516,7 +516,7 @@ class TestSelfEvolvingRetrieval:
     def test_periodic_healthy_no_change(self):
         """周期评估但检索健康 → 无演化"""
         class GoodRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 return [{"content": f"result_{i}_{q}", "score": 0.9 - i * 0.05,
                          "node_id": f"n{i}"} for i in range(8)]
 
@@ -531,7 +531,7 @@ class TestSelfEvolvingRetrieval:
         修复前 probe_every=100 对低流量过长（100 次检索才周期评估），
         时间兜底保证慢流量下也定期触发。"""
         class LowQualityRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 return [{"content": f"r_{q}", "score": 0.2, "node_id": "r1"}]
 
         se = make_se(LowQualityRouter(), probe_every=10**9, probe_interval_s=0.02)
@@ -546,7 +546,7 @@ class TestSelfEvolvingRetrieval:
         """P2：周期/时间兜底路径诊断只合并 retrieve 源——probe 合成快照
         不污染生产周期诊断（修复前 recent_poor(10) 不带 source 混入 probe）"""
         class LowQualityRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 return [{"content": f"r_{q}", "score": 0.2, "node_id": "r1"}]
 
         se = make_se(LowQualityRouter(), probe_every=10**9, probe_interval_s=0.02)
@@ -575,7 +575,7 @@ class TestSelfEvolvingRetrieval:
     def test_latency_hard_fail_triggers_evolution(self):
         """即时硬失败：延迟超阈值 → 触发演化"""
         class SlowRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 time.sleep(0.55)  # > latency_threshold_ms=500
                 return [{"content": f"result_{q}", "score": 0.7, "node_id": "r1"}]
 
@@ -590,7 +590,7 @@ class TestSelfEvolvingRetrieval:
         快照 quality≈0.85（8 条高分多样结果 + 550ms）会被 recent_poor 过滤；
         修复前 _evolve 取不到快照 → 延迟规则永不生效。"""
         class SlowHighQualityRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 time.sleep(0.55)
                 return [{"content": f"r{i}_{q}", "score": 0.9 - i * 0.02,
                          "node_id": f"n{i}"} for i in range(8)]
@@ -630,7 +630,7 @@ class TestSelfEvolvingRetrieval:
         后，硬失败触发（0 结果 + 延迟超阈值）→ _evolve 聚合 → 最终建议
         仍扩大候选集（断言 guard 实际生效值 + cfg 同步，非单快照 diagnose）。"""
         class EmptySlowRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 time.sleep(0.55)
                 return []
 
@@ -707,7 +707,7 @@ class TestProbe:
     def test_probe_recall_low_triggers_evolution(self):
         """梦境探针：低召回 → report_probe → 演化触发（不污染 total_calls）"""
         class EmptyRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 return []
 
         se = make_se(EmptyRouter())
@@ -722,7 +722,7 @@ class TestProbe:
         nodes = self._nodes()
 
         class RecallRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 for n in nodes:
                     if (n["content"] or "").startswith(q):
                         return [{"node_id": n["id"], "content": n["content"],
@@ -772,7 +772,7 @@ class TestSelfEvolvingRetrievalConcurrency:
 
     def test_concurrent_retrieve_no_race(self):
         class SlowRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 time.sleep(0.002)
                 return [{"content": f"result_{q}", "score": 0.7, "node_id": "r1"}]
 
@@ -801,7 +801,7 @@ class TestSelfEvolvingRetrievalConcurrency:
     def test_concurrent_retrieve_low_quality_evolves_safely(self):
         """低质量并发检索触发演化路径（guard.apply/回滚/探索）也不抛异常"""
         class BadRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 time.sleep(0.001)
                 return []
 
@@ -829,7 +829,7 @@ class TestSelfEvolvingRetrievalConcurrency:
         import time as _time
 
         class SlowRouter(MockRouter):
-            def retrieve(self, q, include_archived=False):
+            def retrieve(self, q, include_archived=False, session_ts=None):
                 _time.sleep(0.1)  # 模拟 100ms 检索
                 return [{"content": f"result_{q}", "score": 0.7, "node_id": "r1"}]
 

@@ -121,6 +121,7 @@ class RetrievalConfig:
     vector_weight: float = 0.6     # 向量相似度权重（混合模式）
     community_expansion: CommunityExpansionConfig = field(default_factory=CommunityExpansionConfig)
     visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
+    agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
 
 
 @dataclass

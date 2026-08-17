@@ -67,6 +67,9 @@ class RetrieveRequest(BaseModel):
     top_k: int = Field(20, description="返回结果数")
     namespace: Optional[str] = Field(None, description="命名空间过滤")
     include_shared: bool = Field(True, description="是否包含共享记忆")
+    session_ts: Optional[float] = Field(
+        None, description="session 时间锚（相对时间词解析基准，None 回落墙钟）",
+    )
 
 
 class SearchVectorRequest(BaseModel):
@@ -203,6 +206,7 @@ def register_routes(app: FastAPI, api: GatewayAPI) -> None:
             top_k=req.top_k,
             namespace=req.namespace,
             include_shared=req.include_shared,
+            session_ts=req.session_ts,
         )
         return {
             "query": result.query,
