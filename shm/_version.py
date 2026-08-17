@@ -2,7 +2,7 @@
 
 __version__ = "5.47.1"
 __version_info__ = (5, 47, 1)
-__version_name__ = "Entity-Property-Time"
+__version_name__ = "TauDecay-NonAdaptive-Fix"
 __release_date__ = "2026-08-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
