@@ -259,9 +259,17 @@ class OntologyValidator:
         v5.38.0 Ontology-Evolution: 不硬改模块全局 ONTOLOGY_TYPES（防污染
         test_ontology_validator.py:23 的模块级 import）。后展开者优先，
         故 ONTOLOGY_TYPES 放最后，污染 extended 无法覆盖原生。
+        【v5.50.0 P0-2】过滤非类型键：extended 顶层含 attr_aliases（别名表
+        {canonical: [alias...]}，无 conflict_keys）时，_classify_ontology_type
+        访问 info["conflict_keys"] 会 KeyError → 写入 500。仅保留
+        isinstance(v, dict) and "conflict_keys" in v 的项（保留键/别名表被滤除）。
         """
         if self._ontology_types is None:
-            self._ontology_types = {**self._extended_types, **ONTOLOGY_TYPES}
+            merged = {**self._extended_types, **ONTOLOGY_TYPES}
+            self._ontology_types = {
+                k: v for k, v in merged.items()
+                if isinstance(v, dict) and "conflict_keys" in v
+            }
         return self._ontology_types
 
     def _classify_ontology_type(self, text: str, entities: List[str]) -> str:

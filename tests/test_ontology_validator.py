@@ -239,6 +239,20 @@ class TestWriteValidate:
         result = validator.write_validate("")
         assert result.passed is True
 
+    def test_extended_types_attr_aliases_no_keyerror(self):
+        """【P0-2】extended_types 含 attr_aliases（无 conflict_keys）→ write_validate 不抛 KeyError。
+
+        别名表 {canonical: [alias...]} 非类型 dict，_merged_ontology_types 应过滤掉，
+        _classify_ontology_type 访问 info["conflict_keys"] 不再 KeyError → 写入不 500。
+        """
+        validator = OntologyValidator(
+            config=OntologyConfig(enabled=True),
+            extended_types={"attr_aliases": {"revenue": ["营业额"]}},
+        )
+        result = validator.write_validate("张三出生于1990年")
+        assert result.passed is True
+        assert result.ontology_type == "person_birth"
+
     def test_no_entity_text_passes(self, graphlite_validator: OntologyValidator, graphlite_store):
         """无实体的文本不应触发矛盾检测。"""
         result = graphlite_validator.write_validate("今天天气不错")

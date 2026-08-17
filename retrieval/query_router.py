@@ -261,6 +261,7 @@ class QueryRouter:
         faiss_id_map: Optional[dict] = None,
         episode_cache: Optional[dict] = None,
         services=None,
+        attr_aliases: Optional[dict] = None,
     ) -> None:
         """
         Args:
@@ -272,6 +273,8 @@ class QueryRouter:
             faiss_id_map: FAISS int id → GraphLite UUID string 映射（用于 L1 超图检索反查）
             services: Services 容器引用（可选，【P2-a V-Mem】共享 CLIP 嵌入器 /
                 512→384 投影，保证视觉 query 与写路径同空间）
+            attr_aliases: 属性别名归一表 {canonical: [alias...]}（【v5.50.0 P2】；
+                空表 → 属性通道检索逐字节等价零回归）
         """
         self.graphlite_store = graphlite_store
         self.faiss_index = faiss_index
@@ -279,6 +282,10 @@ class QueryRouter:
         self.encoder = encoder
         self.faiss_id_map = faiss_id_map if faiss_id_map is not None else {}
         self._services = services
+        # 【R4 P1-7】构造注入路径 dict 校验：启动时 api/app.py 注入
+        # extended JSON 顶层 attr_aliases，可能是 truthy 的 list/string（文件损坏），
+        # 未校验则 :2396 `.items()` 抛 AttributeError 被外层 try 吞掉 → 属性通道静默降级。
+        self._attr_aliases = attr_aliases if isinstance(attr_aliases, dict) else {}
         # 【M5】共享 Services._episode_cache（EpisodeCache: OrderedDict LRU + TTL）。
         # flush_faiss_buffer 是唯一写入方；传入 None（测试/降级）时退化为裸 dict，
         # 行为与改造前一致（恒空）。
@@ -2327,12 +2334,59 @@ class QueryRouter:
         t = term.lower().replace("_", " ")
         return bool(re.search(r"\b" + re.escape(t) + r"\b", attr))
 
+    def set_attr_aliases(self, aliases: Optional[dict]) -> None:
+        """运行时替换属性别名表（v5.50.0 P1-5）。
+
+        梦境 attr_op 写盘后经 retrieval_guard 更新内层 _qr，新学别名无需重启即生效。
+        空/None → 清空（属性通道检索逐字节等价零回归）。
+        非 dict（list/string 等手工损坏或旧文件）→ 降级空 dict（【R3 P3-2】）。
+        """
+        if not isinstance(aliases, dict):
+            aliases = {}
+        self._attr_aliases = aliases
+
     @staticmethod
-    def _extract_property_terms(query: str, attr_names: set[str]) -> list[str]:
+    def _expand_attr_aliases(terms: list[str], aliases: dict) -> list[str]:
+        """【v5.50.0 P2】属性词归一：term 命中 alias 表 → 扩展出 canonical。
+
+        纯增量（只可能多命中）；空表/无命中 → 返回原 terms。去重保序，原 term
+        恒保留，命中 alias 时追加 canonical（下划线/大小写归一后反查）。
+        """
+        if not terms or not aliases:
+            return list(terms)
+        alias_to_canonical: dict[str, str] = {}
+        for canonical, alias_list in aliases.items():
+            if not isinstance(alias_list, (list, tuple, set)):
+                continue
+            for a in alias_list:
+                k = str(a).lower().replace("_", " ")
+                if k:
+                    alias_to_canonical[k] = canonical
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in terms:
+            tk = str(t).lower()
+            if tk not in seen:
+                seen.add(tk)
+                out.append(t)
+            canon = alias_to_canonical.get(str(t).lower().replace("_", " "))
+            if canon is not None and canon.lower() not in seen:
+                seen.add(canon.lower())
+                out.append(canon)
+        return out
+
+    @staticmethod
+    def _extract_property_terms(query: str, attr_names: set[str],
+                                aliases: Optional[dict] = None) -> list[str]:
         """从查询提取属性词（attr_name 匹配片段）；无属性意图 → 空列表（不过滤）。
 
         - 中文属性词 → 英文 attr_name 同义词（"收入" → "revenue"，P0-1-R2 N5）
         - 英文词仅保留出现在已知 attr_name 中的（实体名等非属性词不误当属性词）
+        - 【v5.50.0 P1-1】英文词命中 alias 表（即便不是现存 attr_name）也纳入，
+          否则"只存 revenue、查 income"时 income 永不进 terms → 别名学习缺口。
+        - 【v5.50.0 P1-4】alias 直接子串匹配：中文 alias（"营业额"）与多词英文
+          alias 非 [a-z]{2,} 单 token，英文 token 提取收不到 → 直接
+          `a in query.lower()` 覆盖（query 已 lower + 空格归一）。
         """
         # 【R4 P3-3】先还原撇号缩写（与 _extract_query_entities 一致），
         # 否则 [a-z]{2,} 永不产出撇号 token，停用表中 "don't" 等是死条件。
@@ -2341,11 +2395,30 @@ class QueryRouter:
         for zh, en in _PROPERTY_QUERY_TERM_MAP.items():
             if zh in query:
                 terms.add(en)
-        for m in re.finditer(r'[a-z]{2,}', query.lower()):
+        alias_words: set[str] = set()
+        for canonical, alias_list in (aliases or {}).items():
+            if not isinstance(alias_list, (list, tuple, set)):
+                continue
+            for a in alias_list:
+                w = str(a).lower().replace("_", " ")
+                if w:
+                    alias_words.add(w)
+        # 【v5.50.0 P1-4】alias 直接子串匹配（覆盖中文 + 多词英文 alias）。
+        # 下划线已归一为空格；query.lower() 使英文 alias 大小写不敏感。
+        # 【R3 P1-6】子串匹配仅限含 CJK 或空格的 alias：纯 ASCII 单 token alias
+        # （income/age/sales）走下方精确 token + 词边界通道，防 "Apple incoming"
+        # 误命中 income（→ 扩出 revenue 并错误过滤属性版本）。
+        ql = query.lower()
+        for a in alias_words:
+            if (" " in a or any(ord(ch) > 127 for ch in a)) and a in ql:
+                terms.add(a)
+        for m in re.finditer(r'[a-z]{2,}', ql):
             w = m.group(0)
             if w in _PROPERTY_CANDIDATE_STOPWORDS:
                 continue
             if any(QueryRouter._attr_name_matches(w, an) for an in attr_names):
+                terms.add(w)
+            elif w in alias_words:
                 terms.add(w)
         return sorted(terms)
 
@@ -2393,9 +2466,15 @@ class QueryRouter:
                 return results
             # N5: 属性词过滤 —— query 出现属性词 → 只保留匹配 attr_name 的版本
             # （"Apple 收入" 不再返回 acquired_value 等无关属性）
+            # 【v5.50.0 P1-1】alias 表传入提取阶段：alias 非现存 attr_name 时也能
+            # 被识别为候选 term（否则 _expand_attr_aliases 收不到该 term）。
+            aliases = getattr(self, "_attr_aliases", None) or {}
             attr_terms = self._extract_property_terms(
-                query, {str(v.get("attr_name", "")).lower() for v in versions}
+                query, {str(v.get("attr_name", "")).lower() for v in versions}, aliases
             )
+            # 【v5.50.0 P2】属性词别名归一：term 命中 alias 表 → 扩展出 canonical
+            # （空表/None → 恒等短路，检索零回归）
+            attr_terms = self._expand_attr_aliases(attr_terms, aliases)
             if attr_terms:
                 versions = [
                     v for v in versions

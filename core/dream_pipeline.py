@@ -787,6 +787,8 @@ class DreamPipeline:
         """Schema 自演化（v5.38.0）：SYNTHESIZE 后聚合社区 → 1 次 LLM 判断。
 
         llm_client 空 / LLM 失败 → 直接返回（不阻塞梦境管道）。
+        【v5.50.0 P1-5】写盘成功（new_type/merge_existing/attr_op，含正交同轮）后
+        刷新活动路由器 alias map —— 新学别名无需重启即生效。
         """
         if self.llm_client is None or self.ontology_evolution is None:
             return
@@ -797,8 +799,37 @@ class DreamPipeline:
             action = result.get("action")
             if action in ("new_type", "merge_existing"):
                 logger.info("Dream: Ontology evolution %s → %s", action, result.get("type"))
+            if action in ("new_type", "merge_existing", "attr_op"):
+                self._refresh_attr_aliases()
         except Exception:
             logger.warning("Dream: ontology evolution skipped (non-fatal)", exc_info=True)
+
+    def _refresh_attr_aliases(self) -> None:
+        """【v5.50.0 P1-5】从 extended 文件重载 attr_aliases → 刷新活动路由器。
+
+        retrieval_guard（SelfEvolvingRetrieval）委托内层 _qr.set_attr_aliases；
+        无 guard / 无 set_attr_aliases / 加载失败 → 静默降级（重启生效）。
+        """
+        guard = self.retrieval_guard
+        if guard is None or not hasattr(guard, "set_attr_aliases"):
+            return
+        evo = self.ontology_evolution
+        if evo is None:
+            return
+        try:
+            aliases = (evo.load() or {}).get("attr_aliases") or {}
+            # 【R3 P3-2】文件顶层 attr_aliases 非 dict（list/string 损坏）→ 降级空 dict，
+            # 防 _extract_property_terms 的 .items() 抛异常被外层 try 吞掉致属性通道静默降级。
+            if not isinstance(aliases, dict):
+                aliases = {}
+        except Exception:
+            logger.warning("Dream: attr alias refresh skipped (load failed)", exc_info=True)
+            return
+        try:
+            guard.set_attr_aliases(aliases)
+            logger.info("Dream: attr alias map refreshed (%d canonicals)", len(aliases))
+        except Exception:
+            logger.warning("Dream: attr alias refresh skipped (guard failed)", exc_info=True)
 
     def _build_community_feature(self, community: dict) -> np.ndarray:
         """从社区数据构建 9 维 SSM 输入特征向量。"""

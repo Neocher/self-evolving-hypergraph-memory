@@ -658,6 +658,16 @@ class SelfEvolvingRetrieval:
 
         return raw
 
+    def set_attr_aliases(self, aliases: Optional[dict]) -> None:
+        """透传属性别名表刷新到内层 QueryRouter（v5.50.0 P1-5）。
+
+        梦境 attr_op 写盘后调用：guard 持有 SelfEvolvingRetrieval 包装，
+        _qr 为内层 QueryRouter；空/None → 清空。
+        """
+        inner = getattr(self, "_qr", None)
+        if inner is not None and hasattr(inner, "set_attr_aliases"):
+            inner.set_attr_aliases(aliases)
+
     def report_probe(self, recall: float, sample_size: int) -> None:
         """梦境探针信号入口：不经 retrieve()，不污染 _total_calls。
 

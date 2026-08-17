@@ -1,12 +1,34 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.49.0"
-__version_info__ = (5, 49, 0)
-__version_name__ = "Mesa-Synthesis"
+__version__ = "5.50.0"
+__version_info__ = (5, 50, 0)
+__version_name__ = "Schema-AttrOps"
 __release_date__ = "2026-08-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.50.0 (2026-08-17) Schema-AttrOps:
+  • P2 Schema 演化深化 — 属性别名合并 + 中文映射学习的零回归最小闭环
+    （CC 设计 D1-D6 通过，P0 范围实施）
+  • 存储只读查询 — graphlite_store.get_distinct_attr_names()：
+    PropertyVerNode.attr_name distinct 清单（复用 query_cypher 永不抛
+    契约，GraphLite 失败 → []），供 LLM 决策别名合并的 canonical 候选
+  • ontology_evolution 别名写入 — _apply_attr_ops(parsed, current,
+    distinct_attrs) 纯函数：attr_ops 数组（op=merge_alias, canonical,
+    aliases）→ extended JSON 顶层 attr_aliases（canonical → alias 列表）；
+    守卫 max 1 attr_op/轮 + canonical/alias 非泛词 + canonical ∈
+    distinct_attrs（孤儿 alias 无消费方 → skip）；evolve_once 签名加
+    distinct_attrs（None → skip attr_ops），_build_prompt 注入属性名清单；
+    与类型决策正交可同轮发生，落盘复用 _extended_only + _atomic_write
+  • 检索通道内消费 — QueryRouter._expand_attr_aliases(terms, aliases)
+    纯函数（term 命中 alias → 追加 canonical，去重保序）；_property_
+    temporal_retrieve 在 _extract_property_terms 后、_attr_name_matches
+    过滤前插入归一（空表恒等短路）；QueryRouter __init__ 加 attr_aliases
+    参数 + app.py 注入 ontology_extended.attr_aliases
+  • 零回归 — attr_aliases 为空（默认）时检索逐字节等价
+  • 测试: 新增 test_schema_attr_ops（distinct 查询 / _apply_attr_ops 守卫 /
+    alias 扩展 / 通道内消费走公共入口）
+
 v5.49.0 (2026-08-17) Mesa-Synthesis:
   • P1 MESA 记忆增强检索 — 检索利用 CommunityNode 摘要合成「梦境产物」节点：
     种子（前 5 结果）→ get_communities_by_seeds → BM25-on-summary 相关度 →

@@ -38,6 +38,11 @@ _GENERIC_KEYS: frozenset[str] = frozenset({
     "相关", "一个", "这个", "那个", "什么", "如何", "可以", "进行",
 })
 
+# 保留键：extended JSON 顶层非类型键（attr_aliases 别名表）。类型决策命名空间
+# 不得把它当类型渲染/merge/new_type —— 否则别名表被当类型 dict 污染 conflict_keys。
+# 【v5.50.0 P1-2】
+_RESERVED_KEYS: frozenset[str] = frozenset({"attr_aliases"})
+
 # 新类型默认 contradiction_pattern（与原生 same_entity_diff_value 对齐）
 _DEFAULT_PATTERN = "same_entity_diff_value"
 
@@ -157,6 +162,8 @@ def _register_new_type(prop: dict, current: dict):
     name = prop.get("name", "")
     if not name:
         return None, {"action": "skip", "reason": "bad_type_name"}
+    if name in _RESERVED_KEYS:
+        return None, {"action": "skip", "reason": "type_reserved"}
     if name in current:
         return None, {"action": "skip", "reason": "type_exists"}
     keys = prop.get("conflict_keys") or []
@@ -210,6 +217,8 @@ def _apply_merge(parsed: dict, current: dict):
     type_name = str(parsed.get("type") or parsed.get("merge_type") or "").strip()
     if not type_name or type_name not in current:
         return None, {"action": "skip", "reason": "merge_target_missing"}
+    if type_name in _RESERVED_KEYS:
+        return None, {"action": "skip", "reason": "merge_target_reserved"}
     if type_name in ONTOLOGY_TYPES:
         return None, {"action": "skip", "reason": "merge_target_native"}
     new_keys = [str(k).strip() for k in (parsed.get("conflict_keys") or []) if str(k).strip()]
@@ -222,15 +231,63 @@ def _apply_merge(parsed: dict, current: dict):
     return current, {"action": "merge_existing", "type": type_name}
 
 
+def _apply_attr_ops(parsed: dict, current: dict,
+                    distinct_attrs: Optional[list]) -> tuple[Optional[dict], dict]:
+    """attr_ops 分支（v5.50.0 P2）：属性别名合并，与类型决策正交（可同轮发生）。
+
+    LLM 响应 attr_ops 数组 [{"op": "merge_alias", "canonical": str, "aliases": [str]}]：
+    - 守卫：max 1 attr_op/轮（顺序尝试第一个过守卫的）；canonical/alias 均过
+      _is_generic_key（非泛词）；canonical 必须 ∈ distinct_attrs（否则孤儿
+      alias 无消费方 → skip）
+    - 写入：extended JSON 顶层 "attr_aliases": {"<canonical>": ["<alias1>", ...]}
+      （canonical 对齐 {relation}_{key} 格式）。attr_aliases 非原生类型键，
+      经 _extended_only 落盘保留；别名去重保序，canonical 自身不进 alias 表。
+    """
+    ops = parsed.get("attr_ops")
+    if distinct_attrs is None or not isinstance(ops, list) or not ops:
+        return None, {"action": "skip", "reason": "no_attr_op"}
+    distinct_set = {str(a).strip() for a in distinct_attrs if str(a).strip()}
+    last: Optional[dict] = None
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("op", "")).strip() != "merge_alias":
+            continue
+        canonical = str(op.get("canonical", "")).strip()
+        aliases = [str(a).strip() for a in (op.get("aliases") or []) if str(a).strip()]
+        # 守卫 1：canonical 非泛词 + ∈ distinct_attrs（孤儿 alias 无消费方 → skip）
+        if _is_generic_key(canonical) or canonical not in distinct_set:
+            last = {"action": "skip", "reason": "attr_canonical_missing_or_generic"}
+            continue
+        # 守卫 2：至少 1 个非泛 alias（泛词 alias 全滤后为空 → skip）
+        non_generic = [a for a in aliases if not _is_generic_key(a)]
+        # 【P3-1】canonical 自身不进 alias 表（自别名无消费方且污染归一表）
+        non_generic = [a for a in non_generic if a.lower() != canonical.lower()]
+        if not non_generic:
+            last = {"action": "skip", "reason": "attr_aliases_generic"}
+            continue
+        aliases_map = current.setdefault("attr_aliases", {})
+        if not isinstance(aliases_map, dict):
+            aliases_map = {}
+            current["attr_aliases"] = aliases_map
+        existing = aliases_map.get(canonical) or []
+        aliases_map[canonical] = list(dict.fromkeys([*existing, *non_generic]))
+        return current, {"action": "attr_op", "canonical": canonical, "aliases": non_generic}
+    return None, last or {"action": "skip", "reason": "attr_op_guard_rejected"}
+
+
 # ─── LLM prompt ──────────────────────────────────────────────
 
 
-def _build_prompt(communities: list, current: dict) -> str:
-    """聚合社区 topics/report + 注入当前类型名/description。"""
+def _build_prompt(communities: list, current: dict,
+                  distinct_attrs: Optional[list] = None) -> str:
+    """聚合社区 topics/report + 注入当前类型名/description + 属性名清单。"""
     type_blocks = "\n".join(
         f"- {name}: {info.get('description', '') or '; '.join(info.get('conflict_keys', []))}"
         for name, info in current.items()
+        if name not in _RESERVED_KEYS
     )
+    attr_lines = "\n".join(f"- {a}" for a in (distinct_attrs or [])) or "(none)"
     comm_blocks = []
     for c in communities:
         if not isinstance(c, dict):
@@ -246,6 +303,9 @@ After dream consolidation, decide whether the schema needs to evolve.
 Existing ontology types (name: description):
 {type_blocks}
 
+Existing property attribute names (attr_name; candidates for alias canonicalization):
+{attr_lines}
+
 Aggregated community summaries from this dream round:
 {combined}
 
@@ -260,27 +320,40 @@ Decide ONE of three actions:
    Use its exact name in "type", list only the new keys in "conflict_keys".
 3. "skip": nothing worthwhile this round.
 
+OPTIONALLY, also provide "attr_ops" to normalize synonymous attribute names:
+[{{"op": "merge_alias", "canonical": "<attr_name from list above>",
+  "aliases": ["<alias1>", ...]}}]
+- canonical MUST be one of the existing attribute names listed above.
+- aliases must be specific discriminative attribute words (not generic).
+- at most 1 attr_op is applied per round; omit "attr_ops" (or set []) if none.
+
 Respond with a single JSON object only:
 {{"action": "new_type"|"merge_existing"|"skip", "type": "<name>",
-  "description": "<text>", "conflict_keys": ["k1", "k2"]}}
+  "description": "<text>", "conflict_keys": ["k1", "k2"],
+  "attr_ops": [{{"op": "merge_alias", "canonical": "<name>", "aliases": ["a1"]}}]}}
 Do not add any text outside the JSON object."""
 
 
 # ─── 主入口 ──────────────────────────────────────────────────
 
 
-async def evolve_once(summaries: list, llm_client, extended_path: str) -> dict:
-    """聚合 → 1 次 LLM → new_type / merge_existing / skip。
+async def evolve_once(summaries: list, llm_client, extended_path: str,
+                      distinct_attrs: Optional[list] = None) -> dict:
+    """聚合 → 1 次 LLM → new_type / merge_existing / skip（+ attr_ops 别名合并）。
+
+    distinct_attrs: 现有属性名清单（get_distinct_attr_names 产物）。None → 跳过
+    attr_ops（仅类型决策）；非 None 时 attr_ops 与类型决策正交，可同轮发生。
 
     Returns:
         {"action": "new_type", "type": str} |
         {"action": "merge_existing", "type": str} |
+        {"action": "attr_op", "canonical": str, "aliases": [str]} |
         {"action": "skip", "reason": str}
     """
     if llm_client is None:
         return {"action": "skip", "reason": "no_llm_client"}
     current = merged_types(load_extended(extended_path))
-    prompt = _build_prompt(summaries, current)
+    prompt = _build_prompt(summaries, current, distinct_attrs)
     try:
         response = await llm_client.chat(
             messages=[{"role": "user", "content": prompt}],
@@ -303,25 +376,38 @@ async def evolve_once(summaries: list, llm_client, extended_path: str) -> dict:
 
     action = str(parsed.get("action", "skip")).strip().lower()
     mutation, result = None, None
-    if action == "skip":
-        return {"action": "skip", "reason": "llm_decided"}
     if action == "merge_existing":
         mutation, result = _apply_merge(parsed, current)
     elif action == "new_type":
         mutation, result = _apply_new_type(parsed, current)
+    elif action == "skip":
+        mutation, result = None, {"action": "skip", "reason": "llm_decided"}
     else:
         return {"action": "skip", "reason": f"unknown_action:{action}"}
+
+    # 【v5.50.0 P2】attr_ops 与类型决策正交（可同轮发生）；类型 skip 但 attr_op
+    # 通过守卫时仍落盘（base 回落 current）。类型决策成功优先返回，仅类型 skip
+    # 时 attr_op 结果才作为返回值（attr_op 仍作为正交副作用落盘）。
+    if distinct_attrs is not None:
+        base = mutation if mutation is not None else current
+        mutation, attr_result = _apply_attr_ops(parsed, base, distinct_attrs)
+        if attr_result is not None and attr_result.get("action") == "attr_op" \
+                and result.get("action") == "skip":
+            result = attr_result
 
     # 落盘：asyncio.to_thread（不进事件循环；失败不声称成功）
     if mutation is not None:
         ok = await asyncio.to_thread(_atomic_write, extended_path, _extended_only(mutation))
         if not ok:
             logger.warning("Ontology evolution persist failed — %s NOT saved",
-                           result.get("type"))
+                           result.get("type") or result.get("canonical"))
             return {"action": "skip", "reason": "persist_failed"}
         if result["action"] in ("new_type", "merge_existing"):
             logger.info("Ontology evolution: %s → %s",
                         result["action"], result.get("type"))
+        elif result["action"] == "attr_op":
+            logger.info("Ontology evolution: attr_op → %s (%d aliases)",
+                        result.get("canonical"), len(result.get("aliases", [])))
     return result
 
 
@@ -341,9 +427,11 @@ class OntologyEvolution:
     llm_client 为空 → skip 不阻塞；JSON 落盘 asyncio.to_thread。
     """
 
-    def __init__(self, extended_path: Optional[str] = None, llm_client=None):
+    def __init__(self, extended_path: Optional[str] = None, llm_client=None,
+                 graphlite_store=None):
         self.extended_path = extended_path or _DEFAULT_EXTENDED_PATH
         self.llm_client = llm_client
+        self.graphlite_store = graphlite_store
 
     def load(self) -> dict:
         return load_extended(self.extended_path)
@@ -352,8 +440,22 @@ class OntologyEvolution:
         return merged_types(self.load())
 
     async def evolve(self, summaries: list, llm_client=None) -> dict:
-        """1 次 LLM 调用入口（llm_client 空 → skip 不阻塞）。"""
-        return await evolve_once(summaries, llm_client or self.llm_client, self.extended_path)
+        """1 次 LLM 调用入口（llm_client 空 → skip 不阻塞）。
+
+        【v5.50.0 P0-1】生产路径取 distinct 属性清单：从 graphlite_store 拉取
+        PropertyVerNode distinct attr_name 传给 evolve_once，触发 attr_ops（此前
+        恒 distinct_attrs=None → attr_ops 死代码）。无 store / 拉取失败 → None
+        （仅类型决策，跳过 attr_ops）。
+        """
+        distinct_attrs = None
+        store = getattr(self, "graphlite_store", None)
+        if store is not None and hasattr(store, "get_distinct_attr_names"):
+            try:
+                distinct_attrs = store.get_distinct_attr_names()
+            except Exception:
+                distinct_attrs = None
+        return await evolve_once(summaries, llm_client or self.llm_client,
+                                 self.extended_path, distinct_attrs=distinct_attrs)
 
     def classify(self, text: str, entities: list) -> str:
         return classify_with_extended(text, entities, self.load())

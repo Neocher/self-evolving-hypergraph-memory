@@ -405,6 +405,7 @@ def _init_services() -> Services:
             ontology_evolution = OntologyEvolution(
                 extended_path=ontology_extended_path,
                 llm_client=llm_client,
+                graphlite_store=svc.graphlite_store,
             )
             svc.ontology_evolution = ontology_evolution
             logger.info("OntologyEvolution initialized")
@@ -509,6 +510,8 @@ def _init_services() -> Services:
             "episode_cache": getattr(svc, "_episode_cache", {}) or EpisodeCache(),  # 【Perf】共享缓存，flush_faiss_buffer 的修改对 query_router 可见
             # 【P2-a V-Mem】services 引用：视觉通道共享 CLIP 嵌入器 + 512→384 投影
             "services": svc,
+            # 【v5.50.0 P2】属性别名归一表注入（extended JSON 顶层 attr_aliases；空 → 零回归）
+            "attr_aliases": ontology_extended_types.get("attr_aliases"),
         }
         rcfg = cfg.retrieval
         qr_kwargs["config"] = _build_router_config(rcfg)

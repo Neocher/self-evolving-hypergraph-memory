@@ -930,6 +930,27 @@ class GraphLiteStore:
             "ORDER BY p.valid_from DESC"
         )
 
+    def get_distinct_attr_names(self) -> list[str]:
+        """【v5.50.0 P2】全部属性名清单（PropertyVerNode.attr_name distinct）。
+
+        只读，复用 query_cypher 永不抛异常契约（GraphLite 失败 → []）；
+        供 ontology_evolution 注入 prompt + 校验 attr_ops canonical 有消费方。
+        Python 侧去重保序（DISTINCT 引擎侧去重 + 跨行防御）。
+        """
+        rows = self.query_cypher(
+            "MATCH (p:PropertyVerNode) RETURN DISTINCT p.attr_name AS attr_name"
+        )
+        names: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("attr_name", "") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
     # ─── Hyperedge CRUD ─────────────────────────────
 
     def create_hyperedge_node(self, hyperedge: dict) -> str:
