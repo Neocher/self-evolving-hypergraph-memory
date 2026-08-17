@@ -155,6 +155,15 @@ class TestEvolvableParams:
         assert p.tau_weight == 0.5
         assert p.top_k_vector == 20  # 缺失字段用 dataclass 默认
 
+    def test_validate_mesa_boost_upper_bound(self):
+        """P2-1：mesa_boost 上界 0.59（< community boost 0.6），超出拒绝。"""
+        p = EvolvableParams()
+        p.mesa_boost = 0.7
+        errs = p.validate()
+        assert any("mesa_boost" in e for e in errs)
+        p.mesa_boost = 0.59
+        assert p.validate() == []
+
 
 class TestFailureLogger:
     def _snap(self, query, num, score, distinct, degraded):
@@ -321,6 +330,68 @@ class TestDiagnosisEngine:
         for k in ("weight_fusion_vector", "weight_fusion_bm25",
                   "weight_fusion_entity", "tau_weight", "vector_weight"):
             assert k not in result.suggested
+
+    def _mesa_snap(self, hit_count: int, score: float = 0.0) -> RetrievalSnapshot:
+        return RetrievalSnapshot(
+            timestamp=time.time(), query="t", params_before={},
+            num_results=10, top_scores=[0.7], avg_score=0.7,
+            top_distinct=5, latency_ms=100, degraded=False,
+            mesa_hit_count=hit_count,
+            mesa_avg_score=score,
+        )
+
+    def test_rule6_mesa_boost_clamped_upper(self):
+        """P2-1：mesa_boost 命中多且强 → 提升但上界钳制 0.59（不越 community 0.6）。"""
+        engine = DiagnosisEngine()
+        p = EvolvableParams(mesa_boost=0.58)
+        result = engine.diagnose([self._mesa_snap(2, score=0.5)], p, mesa_enabled=True)
+        assert result.suggested.get("mesa_boost") == pytest.approx(0.59), \
+            f"应钳制到 0.59: {result.suggested.get('mesa_boost')}"
+
+    def test_rule6_weak_hits_not_raised(self):
+        """P3-2：命中多但合成分弱（avg_score<0.3）→ 不升 mesa_boost（噪声命中）。"""
+        engine = DiagnosisEngine()
+        p = EvolvableParams(mesa_boost=0.4)
+        result = engine.diagnose([self._mesa_snap(2, score=0.1)], p, mesa_enabled=True)
+        assert "mesa_boost" not in result.suggested, \
+            f"弱命中（score<0.3）不应升 mesa_boost: {result.suggested}"
+
+    def test_rule6_skipped_when_mesa_disabled(self):
+        """P3-1：mesa_enabled=False → 规则 6 跳过，不调 mesa_boost（防参数漂移）。"""
+        engine = DiagnosisEngine()
+        p = EvolvableParams(mesa_boost=0.4)
+        snap = self._mesa_snap(0)
+        result = engine.diagnose([snap], p, mesa_enabled=False)
+        assert "mesa_boost" not in result.suggested, \
+            f"mesa_enabled=False 不应调 mesa_boost: {result.suggested}"
+        # 对照：开启时同样零命中 → 应降 mesa_boost
+        result_on = engine.diagnose([snap], p, mesa_enabled=True)
+        assert result_on.suggested.get("mesa_boost") == pytest.approx(0.375)
+
+    def test_rule6_probe_snapshot_not_lower_mesa_boost(self):
+        """P1-3：规则 6 只基于 source=="retrieve" 快照——probe 合成快照
+        （source="probe"、mesa_hit_count=0）不触发 mesa_boost 调整（探针不误降）。"""
+        engine = DiagnosisEngine()
+        p = EvolvableParams(mesa_boost=0.4)
+        snap = RetrievalSnapshot(
+            timestamp=time.time(), query="<health-probe>", params_before={},
+            num_results=0, top_scores=[], avg_score=0.2, top_distinct=0,
+            latency_ms=0.0, degraded=True, source="probe", mesa_hit_count=0,
+        )
+        result = engine.diagnose([snap], p, mesa_enabled=True)
+        assert "mesa_boost" not in result.suggested, \
+            f"probe 快照不应调 mesa_boost（探针不误降）: {result.suggested}"
+
+    def test_rule6_retrieve_snapshot_still_adjusts(self):
+        """P1-3 对照：source=="retrieve" 快照正常调整 mesa_boost（零命中降 / 命中多且强升）。"""
+        engine = DiagnosisEngine()
+        p = EvolvableParams(mesa_boost=0.4)
+        result = engine.diagnose([self._mesa_snap(0)], p, mesa_enabled=True)
+        assert result.suggested.get("mesa_boost") == pytest.approx(0.375), \
+            f"retrieve 零命中应降 mesa_boost: {result.suggested}"
+        result_up = engine.diagnose([self._mesa_snap(2, score=0.5)], p, mesa_enabled=True)
+        assert result_up.suggested.get("mesa_boost") == pytest.approx(0.425), \
+            f"retrieve 命中多且强应升 mesa_boost: {result_up.suggested}"
 
 
 class TestEvolutionGuard:
@@ -560,9 +631,9 @@ class TestSelfEvolvingRetrieval:
         captured: dict = {}
         orig_diagnose = se.diagnoser.diagnose
 
-        def spy(snaps, params):
+        def spy(snaps, params, mesa_enabled=False):
             captured["snaps"] = list(snaps)
-            return orig_diagnose(snaps, params)
+            return orig_diagnose(snaps, params, mesa_enabled=mesa_enabled)
 
         se.diagnoser.diagnose = spy
         time.sleep(0.05)
@@ -759,6 +830,13 @@ class TestProbe:
         se.report_probe(recall=0.1, sample_size=30)
         assert all(s.source == "probe" for s in se.logger.snapshots
                    if s.query == "<health-probe>")
+
+    def test_probe_snapshot_has_mesa_hit_count(self):
+        """P3-1：report_probe 合成快照显式带 mesa_hit_count=0（不依赖缺省）。"""
+        se = make_se(MockRouter())
+        se.report_probe(recall=0.1, sample_size=30)
+        snaps = [s for s in se.logger.snapshots if s.query == "<health-probe>"]
+        assert snaps and snaps[0].mesa_hit_count == 0
 
     def test_probe_no_guard_or_empty_nodes_safe(self):
         """无 guard / 空节点 → 返回 0.0 不抛错"""

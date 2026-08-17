@@ -1,12 +1,30 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.48.0"
-__version_info__ = (5, 48, 0)
-__version_name__ = "Agentic-Retrieval"
+__version__ = "5.49.0"
+__version_info__ = (5, 49, 0)
+__version_name__ = "Mesa-Synthesis"
 __release_date__ = "2026-08-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.49.0 (2026-08-17) Mesa-Synthesis:
+  • P1 MESA 记忆增强检索 — 检索利用 CommunityNode 摘要合成「梦境产物」节点：
+    种子（前 5 结果）→ get_communities_by_seeds → BM25-on-summary 相关度 →
+    阈值闸口（0.5）→ 合成节点 append（node_id=community_id 可回溯，
+    content=summary）
+  • 相对尾分缩放 — 合成分 = relevance × min(种子分) × mesa_boost(0.4)，严格
+    低于种子（0.4<1）且低于 community_expansion 成员（0.4<0.6）；fact_track=
+    "active" 不误吃 core ×1.1；无 archived 字段（_filter_archived 恒保留）
+  • 默认关零回归 — mesa.enabled=False（与 community 默认开不同），关闭时主检索
+    字节级等价；GraphLite 失败/开关关闭 → 静默返回原 results
+  •     自演化接入 — EvolvableParams.mesa_boost + validate[0,0.59] + _sync_params 同步；
+    RetrievalSnapshot.mesa_hit_count/mesa_avg_score 统计；DiagnosisEngine 规则
+    （命中多且强→升；零命中→降；中间/弱命中→维持）
+  • 配置 — MesaConfig + defaults.yaml mesa 段 + QueryRouterConfig mesa_* 字段 +
+    api/app.py QRCfg 透传
+  • 测试: 新增 test_mesa_synthesis（默认关零回归 / 合成节点 / score 数学保证 /
+    阈值 / max_nodes / 异常降级）
+
 v5.47.1 (2026-08-17) TauDecay-NonAdaptive-Fix:
   • 修复非自适应 τ 衰减钳制回归 — enable_adaptive=False 时 _get_effective_
     tau_decay 直接返回配置的 tau_decay_seconds（恢复 v5.31.3 语义，完全尊重
@@ -37,7 +55,6 @@ v5.48.0 (2026-08-17) Agentic-Retrieval:
     （don't/let's/ain't/o'clock/y'all → 停用词，防伪实体）
   • 测试: test_agentic_retrieve 30 + test_mcp_session_ts 3 + R2-R4 回归
     （全量 987 passed，+38 新增零回归）
->>>>>>> f8eeb75 (v5.48.0 P0-2 Agentic-Retrieval: 多步锚点检索 + session 时间锚注入)
 
 v5.47.0 (2026-08-16) Entity-Property-Time:
   • P0-1 实体-属性-时间三维建模 — 补齐与 MindMemOS 差距三大结构性缺失之一：

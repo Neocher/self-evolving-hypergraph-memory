@@ -69,6 +69,11 @@ retrieval:
     boost: 0.6                   # 视觉分 = 1/(1+dist) × min(种子分) × boost（相对尾分缩放，严格低于文本种子）
     max_results: 5               # 每查询最多追加的视觉结果数
     visual_limit: 10000          # prewarm 拉取 VisualNode 上限
+  mesa:                          # v5.49.0 MESA 记忆增强检索（默认关）
+    enabled: false               # 开关
+    boost: 0.4                   # 合成分 = relevance × min(种子分) × boost（严格 < community boost 0.6）
+    threshold: 0.5               # BM25-on-summary 相关度阈值（对齐 community_expansion）
+    max_nodes: 5                 # 每查询最多合成节点数
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
 
 embedding:

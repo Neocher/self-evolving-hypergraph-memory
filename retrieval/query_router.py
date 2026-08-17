@@ -194,6 +194,11 @@ class QueryRouterConfig:
     agentic_min_new: int = 3  # 每轮须新增 ≥3 条未见过锚点，否则提前停
     agentic_score_gap: float = 0.25  # 首轮 top-k 归一化分差 < 该值判证据不足
     agentic_top_k: int = 12  # 每轮召回 top-k（充分性/锚点提取窗口）
+    # MESA 记忆增强检索配置（v5.49.0，默认关零回归；mesa_boost 由自演化同步）
+    mesa_enabled: bool = False  # MESA 合成节点通道开关（默认关，与 community 默认开不同）
+    mesa_boost: float = 0.4  # 合成分 = relevance × min(种子分) × mesa_boost（严格 < community boost 0.6）
+    mesa_threshold: float = 0.5  # BM25-on-summary 相关度阈值（对齐 community_expansion）
+    mesa_max_nodes: int = 5  # 每查询最多合成节点数
 
 
 @dataclass
@@ -1291,6 +1296,9 @@ class QueryRouter:
             # （闭包可捕获 query/query_embedding/raw_query；候选经
             # _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大）
             results = self._community_expansion(results, query, query_embedding, raw_query)
+            # 【v5.49.0 MESA 记忆增强检索】补充非替代：社区摘要合成节点 append
+            # （node_id=community_id 可回溯，content=summary；无 archived 字段恒保留）
+            results = self._mesa_synthesis(results, query, raw_query)
             # 【P2-a V-Mem 视觉召回】补充非替代：_filter_archived 前 append VisualNode
             # （视觉节点无 archived 字段，走 _filter_archived 恒保留；候选同样经
             # _deduplicate_and_sort 单点去重 + score 钳制，相对尾分缩放严格低于种子）
@@ -1672,6 +1680,9 @@ class QueryRouter:
         if "hypergraph" in channels:
             results = self._hypergraph_supplement(results)
         results = self._community_expansion(results, query, query_embedding, raw_query)
+        # 【P1-1】MESA 合成节点补充：与 retrieve() _finish 顺序一致（community → mesa → visual）。
+        # 修复前 agentic 路径缺此步 → MESA 静默跳过 + 自演化统计 mesa_hit_count=0 误判。
+        results = self._mesa_synthesis(results, query, raw_query)
         results = self._visual_recall(results, query, raw_query)
         if not include_archived:
             results = self._filter_archived(results)
@@ -1996,6 +2007,97 @@ class QueryRouter:
             return (scores / (scores + 1.0)).tolist()
         except Exception:
             return [0.0] * len(summaries)
+
+    def _mesa_synthesis(
+        self,
+        results: list[dict],
+        query: str,
+        raw_query: str,
+    ) -> list[dict]:
+        """【v5.49.0 MESA 记忆增强检索】补充非替代：种子 → 社区摘要 → 合成节点 append。
+
+        链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
+          1. seeds = 前 5 个检索结果的 node_id
+          2. get_communities_by_seeds(seeds) → 所属社区；relevance = BM25(query, summary)
+          3. relevance < threshold(0.5) 丢弃；相关社区 → 合成节点（社区摘要 = 梦境产物）
+          4. 合成分 = relevance × min(种子分) × boost(0.4)（相对尾分缩放，严格低于
+             种子，也低于 community_expansion.boost=0.6 的社区原始成员）
+        【数学保证】mesa_boost=0.4 < community_expansion.boost=0.6 → 合成节点低于本社区
+        原始成员；0.4 < 1 → 低于种子。合成节点 node_id=community_id（跨查询可回溯），
+        content=summary（社区摘要），fact_track="active"（不给 core 标记避免误吃 ×1.1）。
+        开关关闭/GraphLite 异常 → 静默返回原 results（默认关零回归，主检索永不抛异常）。
+        """
+        try:
+            cfg = self.config
+            if not getattr(cfg, "mesa_enabled", False) or not results:
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_communities_by_seeds"):
+                return results
+            seeds = [r.get("node_id") for r in results[:5] if r.get("node_id")]
+            if not seeds:
+                return results
+            communities = store.get_communities_by_seeds(seeds)
+            if not isinstance(communities, list) or not communities:
+                return results
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            boost = float(getattr(cfg, "mesa_boost", 0.4))
+            # 【P2-3】运行时 clamp：mesa_boost 不得超过 community boost 的 95%，
+            # 确保合成节点严格低于社区原始成员（配置期校验只挡默认 0.6 的常见误配，
+            # community boost 调低如 0.5 时 0.59 仍超 → 此处兜底钳制）。
+            community_boost = float(
+                getattr(get_settings().retrieval.community_expansion, "boost", 0.6)
+            )
+            boost = min(boost, community_boost * 0.95)
+            threshold = float(getattr(cfg, "mesa_threshold", 0.5))
+            max_nodes = int(getattr(cfg, "mesa_max_nodes", 5))
+            # 【P2-2】下界守卫：max_nodes<=0 不合成任何节点——修复前循环先 append 再
+            # break（append 后 `if len(extra) >= max_nodes: break`），0/-1 时首个候选仍合成 1 条。
+            if max_nodes <= 0:
+                return results
+            relevance = self._community_relevance(
+                raw_query or query,
+                [c.get("summary", "") or "" for c in communities],
+            )
+            extra: list[dict] = []
+            for comm, rel_score in zip(communities, relevance):
+                if rel_score < threshold:
+                    continue
+                comm_id = comm.get("community_id", "") or ""
+                summary = comm.get("summary", "") or ""
+                if not comm_id or not summary:
+                    continue
+                score = round(rel_score * min_seed_score * boost, 6)
+                if score <= 0.0:
+                    continue
+                extra.append({
+                    "node_id": comm_id,
+                    "content": summary,
+                    "score": score,
+                    "level": "mesa_synthesis",
+                    "_source": "mesa",
+                    "fact_track": "active",
+                })
+                if len(extra) >= max_nodes:
+                    break
+            if extra:
+                logger.info(
+                    "Mesa synthesis appended",
+                    candidates=len(extra),
+                    boost=boost,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Mesa synthesis degraded, returning original results", exc_info=True
+            )
+            return results
 
     # ──────────────────────────────
     # 【P0-1 实体-属性-时间】属性时间版本链检索通道（PropertyVerNode）

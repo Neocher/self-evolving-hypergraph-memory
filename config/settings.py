@@ -109,6 +109,27 @@ class VisualRecallConfig:
 
 
 @dataclass
+class MesaConfig:
+    """MESA 记忆增强检索配置（v5.49.0 MESA 合成节点通道）"""
+    enabled: bool = False       # 开关：关闭时行为 = 现状（bit 级一致；默认关，与 community 默认开不同）
+    boost: float = 0.4          # 合成分 = relevance × min(种子分) × boost（严格 < community_expansion.boost=0.6）
+    threshold: float = 0.5      # BM25-on-summary 相关度阈值（对齐 community_expansion）
+    max_nodes: int = 5          # 每查询最多合成节点数
+
+    def __post_init__(self) -> None:
+        # 【P2-2】max_nodes 下界校验：0/负数会让 _mesa_synthesis 先 append 再
+        # break 仍合成 1 条——配置期 fail-fast 拒绝非法值。
+        if self.max_nodes < 1:
+            raise ValueError(f"MesaConfig.max_nodes={self.max_nodes} 必须 >= 1")
+        # 【P2-3】boost 上界校验：严格 < community_expansion.boost=0.6（取 0.59
+        # 与 self_evolving._MESA_BOOST_MAX 对齐，float 精度下不越 0.6）——配置期
+        # fail-fast 拒绝非法值；community boost 调低场景由 _mesa_synthesis 运行时
+        # clamp（min(boost, community_boost*0.95)）兜底。
+        if not 0.0 <= self.boost <= 0.59:
+            raise ValueError(f"MesaConfig.boost={self.boost} 超出 [0, 0.59]")
+
+
+@dataclass
 class RetrievalConfig:
     top_k_l1: int = 5              # L1 FAISS 检索 top-K
     top_k_vector: int = 20         # L2 向量检索 top-K
@@ -121,6 +142,7 @@ class RetrievalConfig:
     vector_weight: float = 0.6     # 向量相似度权重（混合模式）
     community_expansion: CommunityExpansionConfig = field(default_factory=CommunityExpansionConfig)
     visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
+    mesa: MesaConfig = field(default_factory=MesaConfig)
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
 
 

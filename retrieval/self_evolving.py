@@ -43,6 +43,11 @@ from observability.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 【P2-1】mesa_boost 演化上界：严格 < community_expansion.boost=0.6（query_router.py
+# _mesa_synthesis 数学保证「合成节点低于本社区原始成员」）。用 0.59（非 0.6 开区间）
+# 避免 float 精度下边界值破坏分数契约；validate 与规则 6 共用此常量保证一致。
+_MESA_BOOST_MAX = 0.59
+
 
 # ═══════════════════════════════════════════════════════════
 # 1. 可演化配置空间 (Evolvable Config Space)
@@ -76,6 +81,8 @@ class EvolvableParams:
     # — BM25 —
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
+    # — MESA 记忆增强检索（v5.49.0）—
+    mesa_boost: float = 0.4  # 合成分 = relevance × min(种子分) × mesa_boost
 
     @classmethod
     def from_config(cls, cfg) -> "EvolvableParams":
@@ -93,6 +100,8 @@ class EvolvableParams:
             v = getattr(self, w)
             if not 0.0 <= v <= 1.0:
                 errs.append(f"{w}={v} 超出 [0,1]")
+        if not 0.0 <= self.mesa_boost <= _MESA_BOOST_MAX:
+            errs.append(f"mesa_boost={self.mesa_boost} 超出 [0,{_MESA_BOOST_MAX}]")
         for k in ["top_k_l1", "top_k_fusion", "top_k_vector", "top_k_keyword"]:
             if getattr(self, k) < 1:
                 errs.append(f"{k}={getattr(self, k)} < 1")
@@ -122,6 +131,8 @@ class RetrievalSnapshot:
     degraded: bool
     user_feedback: Optional[float] = None  # 人工/隐式反馈（如有）
     source: str = "retrieve"  # 快照来源: retrieve=生产检索 / probe=梦境探针合成
+    mesa_hit_count: int = 0  # 【v5.49.0 MESA】最终结果中 level=="mesa_synthesis" 条数
+    mesa_avg_score: float = 0.0  # 【v5.49.0 MESA】合成节点平均分（score 非原始相关度，命中强度信号）
 
     def quality(self) -> float:
         """综合质量评分 0~1"""
@@ -211,7 +222,8 @@ class DiagnosisEngine:
         self._damping = damping  # 阻尼因子 (0~1)，越小越不敏感
 
     def diagnose(self, snapshots: list[RetrievalSnapshot],
-                 current_params: EvolvableParams) -> DiagnosisResult:
+                 current_params: EvolvableParams,
+                 mesa_enabled: bool = False) -> DiagnosisResult:
         if not snapshots:
             return DiagnosisResult("无快照", 0.0, {})
 
@@ -220,6 +232,12 @@ class DiagnosisEngine:
         avg_s = sum(s.avg_score for s in snapshots) / len(snapshots)
         avg_d = sum(s.top_distinct for s in snapshots) / len(snapshots)
         avg_lat = sum(s.latency_ms for s in snapshots) / len(snapshots)
+        # 【P1-3】规则 6 只基于 source=="retrieve" 快照计算/调整：probe 合成快照
+        # 固定 mesa_hit_count=0，与 MESA 检索质量无关，混入会持续误降 mesa_boost。
+        retrieve_snaps = [s for s in snapshots
+                          if getattr(s, "source", "retrieve") == "retrieve"]
+        avg_mesa_hit = sum(getattr(s, "mesa_hit_count", 0) for s in retrieve_snaps) / max(1, len(retrieve_snaps))
+        avg_mesa_score = sum(getattr(s, "mesa_avg_score", 0.0) for s in retrieve_snaps) / max(1, len(retrieve_snaps))
 
         suggested: dict[str, float | int] = {}
         reasons: list[str] = []
@@ -291,6 +309,25 @@ class DiagnosisEngine:
             suggested["top_k_l1"] = min(100, current_params.top_k_l1 + 1)
             reasons.append("降级触发，扩大L1候选集")
             confidence = min(0.85, confidence + 0.2 * d)
+
+        # 规则 6: MESA 合成命中信号（v5.49.0）— 命中多且强（avg_hit≥1 且
+        # avg_score≥0.3）→ 升 mesa_boost；零命中（avg_hit==0）→ 降；
+        # 中间值/弱命中（0<hit<1 或 avg_score<0.3）→ 维持（不调整）
+        # 【P2-1】上界 _MESA_BOOST_MAX（< community boost 0.6），保持合成节点低于
+        # 社区成员契约；【P3-1】mesa_enabled=False 跳过（不调 mesa_boost）——MESA
+        # 关闭时 avg_mesa_hit 恒 0，否则每轮持续降 mesa_boost 造成参数漂移。
+        # 【P3-2】mesa_avg_score 作为命中质量信号消费：命中多但合成分弱
+        # （avg_score<0.3，合成节点相关性差）→ 不升（噪声命中不值得提 boost）。
+        # 【P1-3】retrieve_snaps 非空才调整——纯 probe 触发（无 retrieve 快照）跳过
+        # MESA 调整，探针固定零命中不误降 mesa_boost。
+        if mesa_enabled and retrieve_snaps and avg_mesa_hit >= 1 and avg_mesa_score >= 0.3:
+            suggested["mesa_boost"] = min(_MESA_BOOST_MAX, round(current_params.mesa_boost + 0.05 * d, 4))
+            reasons.append(f"MESA 合成命中多且强(hit={avg_mesa_hit:.1f},score={avg_mesa_score:.2f})，提升 mesa_boost")
+            confidence = min(0.7, confidence + 0.1 * d)
+        elif mesa_enabled and retrieve_snaps and avg_mesa_hit == 0:
+            suggested["mesa_boost"] = max(0.0, round(current_params.mesa_boost - 0.05 * d, 4))
+            reasons.append(f"MESA 合成命中少(hit={avg_mesa_hit:.1f})，降低 mesa_boost")
+            confidence = min(0.7, confidence + 0.1 * d)
 
         if not suggested:
             return DiagnosisResult("检索正常，无需调整", 0.3, {})
@@ -570,6 +607,13 @@ class SelfEvolvingRetrieval:
         scores = [r.get("score", 0.5) for r in results[:10]] if results else [0.0]
         contents = [r.get("content", "")[:100] for r in results[:10]]
         distinct = len(set(contents))
+        # 【v5.49.0 MESA】统计合成节点命中：条数 + 平均分（命中率/强度信号）
+        mesa_nodes = [r for r in results if r.get("level") == "mesa_synthesis"]
+        mesa_hit_count = len(mesa_nodes)
+        mesa_avg_score = (
+            sum(float(r.get("score") or 0.0) for r in mesa_nodes) / mesa_hit_count
+            if mesa_hit_count else 0.0
+        )
 
         snapshot = RetrievalSnapshot(
             timestamp=time.time(),
@@ -581,6 +625,8 @@ class SelfEvolvingRetrieval:
             top_distinct=distinct,
             latency_ms=elapsed,
             degraded=len(results) == 0,
+            mesa_hit_count=mesa_hit_count,
+            mesa_avg_score=round(mesa_avg_score, 6),
         )
 
         # 【H1-a】短锁段：仅保护共享状态变更（_total_calls/logger/guard），
@@ -632,6 +678,7 @@ class SelfEvolvingRetrieval:
                 latency_ms=0.0,
                 degraded=True,
                 source="probe",
+                mesa_hit_count=0,  # 【P3-1】探针结果不统计 MESA 命中，显式 0
             )
             self.logger.log(snap)
             self._last_probe_time = time.time()
@@ -654,6 +701,7 @@ class SelfEvolvingRetrieval:
         cfg.top_k_vector = p.top_k_vector
         cfg.bm25_k1 = p.bm25_k1
         cfg.bm25_b = p.bm25_b
+        cfg.mesa_boost = p.mesa_boost
 
     def _evolve(self, trigger_snapshot: Optional[RetrievalSnapshot] = None):
         """执行一轮演化：诊断 → 应用 → 同步 → 持久化
@@ -680,7 +728,10 @@ class SelfEvolvingRetrieval:
         if not poor:
             return
 
-        result = self.diagnoser.diagnose(poor, self.guard.current())
+        result = self.diagnoser.diagnose(
+            poor, self.guard.current(),
+            mesa_enabled=bool(getattr(self._qr.config, "mesa_enabled", False)),
+        )
         if result.suggested:
             ok, msg = self.guard.apply(result.suggested)
             if ok:

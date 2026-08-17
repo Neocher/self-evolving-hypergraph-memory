@@ -132,6 +132,28 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
         logger.warning("Dream scheduler state persist failed (non-fatal)")
 
 
+def _build_router_config(rcfg):
+    """从 RetrievalConfig 构建 QueryRouterConfig。
+
+    【P1-2】MESA 字段用 getattr 显式缺省（非 `and/or`）——`or` 会把合法零值
+    （boost=0.0 / threshold=0.0 / max_nodes=0）误替换为缺省值，静默覆盖操作者配置。
+    """
+    from retrieval.query_router import QueryRouterConfig as QRCfg
+    mesa = getattr(rcfg, "mesa", None)
+    return QRCfg(
+        tau_weight=rcfg.tau_weight,
+        vector_weight=rcfg.vector_weight,
+        top_k_l1=rcfg.top_k_l1,
+        top_k_vector=rcfg.top_k_vector,
+        top_k_keyword=rcfg.top_k_keyword,
+        agentic_enabled=getattr(rcfg, "agentic_enabled", False),
+        mesa_enabled=getattr(mesa, "enabled", False),
+        mesa_boost=getattr(mesa, "boost", 0.4),
+        mesa_threshold=getattr(mesa, "threshold", 0.5),
+        mesa_max_nodes=getattr(mesa, "max_nodes", 5),
+    )
+
+
 def _init_services() -> Services:
     """初始化所有服务组件，单个组件失败不影响整体启动。"""
     import os
@@ -445,7 +467,7 @@ def _init_services() -> Services:
 
     # 9. 查询路由
     try:
-        from retrieval.query_router import QueryRouter, QueryRouterConfig as QRCfg
+        from retrieval.query_router import QueryRouter
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
         import numpy as np
@@ -489,14 +511,7 @@ def _init_services() -> Services:
             "services": svc,
         }
         rcfg = cfg.retrieval
-        qr_kwargs["config"] = QRCfg(
-            tau_weight=rcfg.tau_weight,
-            vector_weight=rcfg.vector_weight,
-            top_k_l1=rcfg.top_k_l1,
-            top_k_vector=rcfg.top_k_vector,
-            top_k_keyword=rcfg.top_k_keyword,
-            agentic_enabled=getattr(rcfg, "agentic_enabled", False),
-        )
+        qr_kwargs["config"] = _build_router_config(rcfg)
         svc.query_router = QueryRouter(**qr_kwargs)
         logger.info("QueryRouter initialized")
 
