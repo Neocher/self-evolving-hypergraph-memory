@@ -236,7 +236,7 @@ class TauDecayEngine:
             base = self.config.tau_decay_seconds
             if fact_track == "core":
                 base *= IMP_BOOST_FACTOR
-            return max(self.config.tau_decay_min, min(base, self.config.tau_decay_max))
+            return base
         
         # 重要性调制：高重要性 → 衰减更慢（τ_decay 更大）
         I = info.importance  # [0, 1]

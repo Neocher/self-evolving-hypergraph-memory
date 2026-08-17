@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.47.0"
-__version_info__ = (5, 47, 0)
+__version__ = "5.47.1"
+__version_info__ = (5, 47, 1)
 __version_name__ = "Entity-Property-Time"
-__release_date__ = "2026-08-16"
+__release_date__ = "2026-08-17"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.47.1 (2026-08-17) TauDecay-NonAdaptive-Fix:
+  • 修复非自适应 τ 衰减钳制回归 — enable_adaptive=False 时 _get_effective_
+    tau_decay 直接返回配置的 tau_decay_seconds（恢复 v5.31.3 语义，完全尊重
+    配置），不再被 tau_decay_min=300 / tau_decay_max=7200 钳制；双轨特性
+    fact_track=="core" 的 ×2.0 IMP_BOOST_FACTOR 保留，自适应分支
+    （enable_adaptive=True）钳制逻辑不变
+  • 回归来源 — v5.34.0 双轨事实特性把 min/max 钳制错误带入非自适应分支，
+    导致 tau_decay_seconds=100 配置实际生效 300s，test_decay_threshold_candidate
+    边界断言失败（基线 932 passed + 1 failed）
+  • 验证: TestTauDecay 8 passed + 全量 933 passed 0 failed
+
 v5.47.0 (2026-08-16) Entity-Property-Time:
   • P0-1 实体-属性-时间三维建模 — 补齐与 MindMemOS 差距三大结构性缺失之一：
     实体中心 + 属性时间版本链（消息级扁平存储 → 属性可追溯），最小正解
