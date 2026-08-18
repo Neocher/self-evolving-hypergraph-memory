@@ -117,8 +117,10 @@ def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
         else:
             is_owner = False
     if not is_owner:
-        # 防御性超时：拥有者线程异常消亡时防无限等待（正常路径拥有者 finally 必置位）
-        ev.wait(timeout=max(_sanitize_timeout(timeout) * 2 + 5.0, 15.0))
+        # 防御性超时：拥有者线程异常消亡时防无限等待（正常路径拥有者 finally 必置位）。
+        # 【R2 P2】收紧到检索预算同量级（timeout + 2s ≈ 3.5s，外层 3s/5s wait_for），
+        # 防慢故障（DNS 悬挂/拥有者消亡）长时间占用 to_thread worker。
+        ev.wait(timeout=_sanitize_timeout(timeout) + 2.0)
         return _cache_hit(q)
 
     try:

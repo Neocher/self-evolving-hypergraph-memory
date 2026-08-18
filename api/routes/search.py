@@ -31,7 +31,8 @@ _RETRIEVE_TIMEOUT = 3.0
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
-# 超时即跳过该降级分支（短于主检索超时，兜底只做尽力而为的补充）。
+# 超时即跳过该降级分支。注意：10.0 实际长于主检索超时（3.0/5.0s）——主检索
+# 超时返回空后，兜底仍有 10s 窗口尽力补充（非"短于"语义，2026-08-19 R2 修正注释）。
 _DEGRADE_TIMEOUT = 10.0
 
 
@@ -69,6 +70,11 @@ def _query_router_config(qr):
     qr_vars = getattr(qr, "__dict__", None)
     if isinstance(qr_vars, dict) and "_qr" in qr_vars:
         qr = qr_vars["_qr"]
+        qr_vars = getattr(qr, "__dict__", None)
+    # 解包后优先读实例 __dict__：getattr 对 MagicMock/鸭子对象会返回真值
+    # 子 mock（恒真 → auto 误判 FUSION），vars() 只返回真实赋值过的键。
+    if isinstance(qr_vars, dict):
+        return qr_vars.get("config")
     return getattr(qr, "config", None)
 
 
@@ -131,6 +137,14 @@ async def retrieve(
     except asyncio.TimeoutError:
         logger.warning("Retrieval timed out after %.1fs, returning empty results",
                        retrieve_timeout)
+        # 【R2 P2-3】超时监控上下文：标注 level/strategy/HyDE 状态，
+        # 便于生产 p95 调整 5.0s 启发式预算（HyDE 开启时超时是重点观察对象）。
+        logger.warning(
+            "Retrieval timeout ctx: level=%s strategy=%s hyde_enabled=%s",
+            level.value if hasattr(level, "value") else level,
+            req.strategy or "auto",
+            getattr(qr_config, "hyde_enabled", False),
+        )
         results_raw = []
         degraded = True
     except Exception as exc:
