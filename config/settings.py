@@ -146,12 +146,18 @@ class RetrievalConfig:
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
     rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
     rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）
+    hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
+    hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
         # 静默跳过重排（配置期 fail-fast 拒绝非法值）。
         if self.rerank_input_k < 1:
             raise ValueError(f"RetrievalConfig.rerank_input_k={self.rerank_input_k} 必须 >= 1")
+        # 【P3b】hyde_mode 枚举校验：检索路径只分 dual/replace 两分支，非法值会
+        # 静默落回单路与操作者意图不符（配置期 fail-fast 拒绝非法值）。
+        if self.hyde_mode not in ("dual", "replace"):
+            raise ValueError(f"RetrievalConfig.hyde_mode={self.hyde_mode} 必须 ∈ {{dual, replace}}")
 
 
 @dataclass

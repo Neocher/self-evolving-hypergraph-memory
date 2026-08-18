@@ -1,12 +1,30 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.51.0"
-__version_info__ = (5, 51, 0)
-__version_name__ = "Rerank-Fusion"
-__release_date__ = "2026-08-18"
+__version__ = "5.52.0"
+__version_info__ = (5, 52, 0)
+__version_name__ = "HyDE-Query-Enhance"
+__release_date__ = "2026-08-19"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.52.0 (2026-08-19) HyDE-Query-Enhance:
+  • 生产管道集成 HyDE 假设文档增强检索（P3b）— LLM 生成假设段落与原始
+    查询一起参与融合检索（评测 recall 7.5%→11.7% +49%，补齐 P3a 排序
+    优化无法创造的缺失候选）
+  • retrieval/hyde.py — urllib 同步直连 api.deepseek.com/chat/completions
+    （无 /v1 前缀、显式禁代理 ProxyHandler({{}})，评测实测 httpx 直连 404、
+    curl 直连通）；deepseek-chat（DEEPSEEK_MODEL 可覆盖），max_tokens=150
+    temperature=0.3；模块级 OrderedDict LRU（256/TTL 3600s）+ 线程锁
+  • 失败降级防每查询重试 — 确定性失败（缺 key/HTTP 401/403）永久跳过标记；
+    瞬时失败（超时/5xx/网络错）60s 冷却窗口；任何异常 → None 零回归
+  • QueryRouter.retrieve(hyde=...) — 镜像 rerank 参数模式（None → 读
+    config.hyde_enabled 默认关，关闭路径逐字节等价）；hyde_mode dual
+    （原始+假设双路合并默认）/ replace（仅假设向量单路省一半成本）
+  • 配置 — QueryRouterConfig + RetrievalConfig（__post_init__ 校验 mode
+    ∈ {{dual, replace}}）+ defaults.yaml hyde_enabled/hyde_mode/hyde_timeout
+    + api/app.py getattr 透传
+  • 测试: test_hyde_production（关闭路径等价 / dual 双路 spy / LLM 失败
+    单路 / replace 向量替换 / 失败降级单元）+ 全量回归
 v5.51.0 (2026-08-18) Rerank-Fusion:
   • 生产管道集成 bge-reranker 重排（P3a）— 补齐 vs MindMemOS
     最大差距路径（v5.47 RAG v4 管道含 rerank 时 69.5%）

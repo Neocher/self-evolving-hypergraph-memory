@@ -36,6 +36,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from core.user_profile import profile_hit, profile_values
 from config.settings import get_settings
 from graph.graphlite_store import CircuitBreakerOpen
+from retrieval.hyde import generate_hypothesis
 from retrieval.vector_store import FaissStore
 
 from observability.logger import get_logger
@@ -234,6 +235,10 @@ class QueryRouterConfig:
     # bge-reranker 重排配置（P3a，默认开；仅 FUSION 路径生效，失败静默降级）
     rerank_enabled: bool = True  # 重排开关（retrieve(rerank=False) 可显式关）
     rerank_input_k: int = 40  # 送入 reranker 的头部候选数（尾部保持原序 append）
+    # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
+    hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
+    hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
+    hyde_timeout: float = 2.0  # LLM 生成超时（秒），失败静默降级单路
 
 
 @dataclass
@@ -1350,6 +1355,7 @@ class QueryRouter:
         include_archived: bool = False,
         session_ts: Optional[float] = None,
         rerank: Optional[bool] = None,
+        hyde: Optional[bool] = None,
     ) -> list[dict]:
         """多信号检索融合入口。
 
@@ -1367,6 +1373,10 @@ class QueryRouter:
                 使"昨天/last year"等相对词对历史 session 按 session_ts 而非墙钟换算。
             rerank: bge-reranker 重排开关（P3a）。None → 读 config.rerank_enabled；
                 仅 level==FUSION 时生效；False 显式关闭（关闭路径逐字节等价旧行为）。
+            hyde: HyDE 假设文档增强开关（P3b）。None → 读 config.hyde_enabled
+                （默认关）；仅 level==FUSION 时生效；True 时 LLM 生成假设段落
+                参与检索（dual 双路合并 / replace 仅假设向量），生成失败静默
+                降级现状单路；False 显式关闭（逐字节等价旧行为）。
 
         Returns:
             检索结果列表 [...]
@@ -1423,6 +1433,23 @@ class QueryRouter:
 
         # F — 三路并行融合（向量 + BM25 + 实体匹配）
         if level == RetrievalLevel.FUSION:
+            # 【P3b】HyDE 假设文档增强（默认关零回归）：仅 FUSION 生效；
+            # hyde=None → 读 config.hyde_enabled；生成失败/未启用 → 现状单路。
+            hyde_enabled = self.config.hyde_enabled if hyde is None else hyde
+            if hyde_enabled:
+                hypo = generate_hypothesis(raw_query, timeout=self.config.hyde_timeout)
+                if hypo:
+                    hypo_emb = self._encode_query(hypo)
+                    if hypo_emb is not None:
+                        if self.config.hyde_mode == "dual":
+                            base = self._fusion_retrieve(
+                                query, query_embedding, raw_query, now_ts=session_ts)
+                            extra = self._fusion_retrieve(
+                                hypo, hypo_emb, raw_query, now_ts=session_ts)
+                            return _finish(base + extra)  # _deduplicate_and_sort 天然去重合并
+                        # replace：单路，query_embedding 替换为假设向量
+                        return _finish(self._fusion_retrieve(
+                            query, hypo_emb, raw_query, now_ts=session_ts))
             return _finish(self._fusion_retrieve(query, query_embedding, raw_query, now_ts=session_ts))
 
         # 从指定级别开始，逐级尝试（空结果自动级联）

@@ -153,6 +153,8 @@ def _build_router_config(rcfg):
         mesa_max_nodes=getattr(mesa, "max_nodes", 5),
         rerank_enabled=getattr(rcfg, "rerank_enabled", True),
         rerank_input_k=getattr(rcfg, "rerank_input_k", 40),
+        hyde_enabled=getattr(rcfg, "hyde_enabled", False),
+        hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
     )
 
 
