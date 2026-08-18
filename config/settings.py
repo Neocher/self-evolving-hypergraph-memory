@@ -148,6 +148,7 @@ class RetrievalConfig:
     rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
+    hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，

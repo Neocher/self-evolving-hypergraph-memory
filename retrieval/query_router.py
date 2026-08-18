@@ -238,7 +238,16 @@ class QueryRouterConfig:
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
-    hyde_timeout: float = 2.0  # LLM 生成超时（秒），失败静默降级单路
+    hyde_timeout: float = 1.5  # LLM 生成超时（秒）【P3b R1 P0-2】2.0→1.5：3s 检索预算内
+    # 预留 1.5s LLM + 融合检索，失败静默降级单路
+
+    def __post_init__(self) -> None:
+        # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
+        # dual/replace 两分支，非法值会静默落回单路与操作者意图不符（配置期 fail-fast）。
+        if self.hyde_mode not in ("dual", "replace"):
+            raise ValueError(
+                f"QueryRouterConfig.hyde_mode={self.hyde_mode} 必须 ∈ {{dual, replace}}"
+            )
 
 
 @dataclass

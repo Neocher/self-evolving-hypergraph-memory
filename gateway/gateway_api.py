@@ -19,7 +19,7 @@ import numpy as np
 
 from api._routes import Services
 from api.routes._deps import qsubmit, qsubmit_visual_index
-from api.routes.search import _level_from_strategy, _RETRIEVE_TIMEOUT, _DEGRADE_TIMEOUT
+from api.routes.search import _level_from_strategy, _query_router_config, _retrieve_timeout, _DEGRADE_TIMEOUT
 from api.models import (
     HealthStatus,
     HyperedgeListResponse,
@@ -437,23 +437,31 @@ class GatewayAPI:
                 results=[], total_found=0, latency_ms=0, degraded=True,
             )
 
+        # 【P3b R1 P0-1】config 感知 strategy→level（rerank/hyDE 任一开启时 auto→FUSION，
+        # 与 REST 入口一致）：_query_router_config 解 _qr 取 QueryRouter.config。
+        # 【P3b R1 P0-2】超时预算用 _retrieve_timeout（FUSION+HyDE→5.0s，否则 3.0s）。
+        qr = self._svc.query_router
+        qr_config = _query_router_config(qr)
+        level = _level_from_strategy(strategy, qr_config)
+        retrieve_timeout = _retrieve_timeout(level, qr_config)
+
         try:
             # 【P3a R2】全同步检索链路移入线程池，避免阻塞事件循环（镜像 REST 入口）。
             # rerank=None → 读 config.rerank_enabled（config 默认 True 保持开启）。
             # 【P3a R3 P2-2】套 wait_for：GraphLite/FAISS 挂起时超时返回 degraded 空结果，
-            # 不再无限挂起（与 REST 入口 _RETRIEVE_TIMEOUT 对称）。注：超时只解绑 await，
+            # 不再无限挂起（与 REST 入口 _retrieve_timeout 对称）。注：超时只解绑 await，
             # 不终止底层线程。
             results_raw = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._svc.query_router.retrieve, query,
                     include_archived=include_archived, session_ts=session_ts,
-                    level=_level_from_strategy(strategy), rerank=None,
+                    level=level, rerank=None,
                 ),
-                timeout=_RETRIEVE_TIMEOUT,
+                timeout=retrieve_timeout,
             )
         except asyncio.TimeoutError:
             self._logger.warning(
-                "Retrieval timed out after %.1fs, returning empty results", _RETRIEVE_TIMEOUT
+                "Retrieval timed out after %.1fs, returning empty results", retrieve_timeout
             )
             return RetrieveResponse(
                 query=query, strategy_used=strategy or "auto",

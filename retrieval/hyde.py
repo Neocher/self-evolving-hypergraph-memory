@@ -18,6 +18,8 @@
 
 缓存：模块级 OrderedDict LRU（容量 256 / TTL 3600s，threading.Lock 保护），
 key = 原始 query（评测 200 问不重复 LLM 调用）。
+【P3b R1 P2】single-flight：per-key 进行中 Event（_inflight）——并发相同未缓存
+query 只触发一次 LLM 调用，其余线程等 Event 置位后读缓存结果（网络调用在锁外）。
 """
 
 from __future__ import annotations
@@ -40,7 +42,11 @@ _DEFAULT_MODEL = "deepseek-chat"
 _PROMPT_TEMPLATE = (
     "Based on the question below, write a short factual paragraph "
     "(3-5 sentences) that would contain the answer. "
-    "Make it concrete and specific.\n\n"
+    "Make it concrete and specific. "
+    # 【P3b R1 P2】语言一致性约束：中文查询生成中文假设段落（bge-small-zh 对英文
+    # 失效，语种不匹配 → 向量相似度噪声）；追加在指令段末尾，Question:/Hypothetical
+    # passage: 结构不变（评测脚本子串断言与等效性不变）。
+    "Write in the same language as the question.\n\n"
     "Question: {query}\n\n"
     "Hypothetical passage:"
 )
@@ -52,6 +58,9 @@ _COOLDOWN_S = 60.0
 # 模块级状态（进程常驻；单实例服务共享）
 _cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
 _lock = threading.Lock()
+# 【P3b R1 P2】single-flight 进行中表：key=原始 query → Event（拥有者 finally 置位）。
+_inflight: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
 _PERM_FAILED = False
 _last_fail_ts = 0.0
 
@@ -66,6 +75,9 @@ def _sanitize_timeout(timeout: float) -> float:
 
 def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
     """生成查询的假设文档段落；任何失败 → None（检索路径零回归）。
+
+    【P3b R1 P2】single-flight：并发相同未缓存 query 只触发一次 LLM 调用——
+    后到线程登记到 _inflight 后等待拥有者完成（Event 置位）再读缓存，不重复触网。
 
     Args:
         query: 原始查询文本（未归一化；缓存 key 即原文）
@@ -82,62 +94,93 @@ def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
     if _PERM_FAILED or now - _last_fail_ts < _COOLDOWN_S:
         return None
 
-    # 缓存命中（TTL 内）直接返回；TTL 过期视为 miss（下方重建后覆盖）
-    with _lock:
-        hit = _cache.get(q)
-        if hit is not None and now - hit[0] < _CACHE_TTL_S:
-            _cache.move_to_end(q)
-            return hit[1]
-
-    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not key:
+    def _cache_hit(q: str) -> Optional[str]:
+        """缓存命中（TTL 内）返回段落；TTL 过期视为 miss。"""
         with _lock:
-            _PERM_FAILED = True
-        logger.warning("HyDE disabled: DEEPSEEK_API_KEY not set (permanent skip)")
+            hit = _cache.get(q)
+            if hit is not None and time.time() - hit[0] < _CACHE_TTL_S:
+                _cache.move_to_end(q)
+                return hit[1]
         return None
 
-    model = os.environ.get("DEEPSEEK_MODEL", "").strip() or _DEFAULT_MODEL
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": _PROMPT_TEMPLATE.format(query=q)}],
-        "max_tokens": 150,
-        "temperature": 0.3,
-    }
-    req = urllib.request.Request(
-        _API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-    )
-    # 显式禁代理：评测脚本实测走系统代理（Vercel HTML 404），禁代理直连成功
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    hit = _cache_hit(q)
+    if hit is not None:
+        return hit
+
+    # 【P3b R1 P2】single-flight 登记：已有线程在生成 → 等待其完成（网络调用在锁外）
+    with _inflight_lock:
+        ev = _inflight.get(q)
+        if ev is None:
+            ev = threading.Event()
+            _inflight[q] = ev
+            is_owner = True
+        else:
+            is_owner = False
+    if not is_owner:
+        # 防御性超时：拥有者线程异常消亡时防无限等待（正常路径拥有者 finally 必置位）
+        ev.wait(timeout=max(_sanitize_timeout(timeout) * 2 + 5.0, 15.0))
+        return _cache_hit(q)
+
     try:
-        with opener.open(req, timeout=_sanitize_timeout(timeout)) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        hypo = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
-        hypo = (hypo or "").strip()
-        if not hypo:
-            raise ValueError("empty hypothesis from LLM")
-        with _lock:
-            _cache[q] = (time.time(), hypo)
-            while len(_cache) > _CACHE_CAPACITY:
-                _cache.popitem(last=False)
-        return hypo
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
+        # 拥有者：等锁期间可能已被并发完成，二次查缓存
+        hit = _cache_hit(q)
+        if hit is not None:
+            return hit
+
+        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if not key:
             with _lock:
                 _PERM_FAILED = True
-            logger.warning("HyDE disabled: HTTP %d (permanent skip)", e.code)
-        else:
-            # 5xx / 429 / 其他 4xx：瞬时失败走冷却窗口
+            logger.warning("HyDE disabled: DEEPSEEK_API_KEY not set (permanent skip)")
+            return None
+
+        model = os.environ.get("DEEPSEEK_MODEL", "").strip() or _DEFAULT_MODEL
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": _PROMPT_TEMPLATE.format(query=q)}],
+            "max_tokens": 150,
+            "temperature": 0.3,
+        }
+        req = urllib.request.Request(
+            _API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        )
+        # 显式禁代理：评测脚本实测走系统代理（Vercel HTML 404），禁代理直连成功
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=_sanitize_timeout(timeout)) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            hypo = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
+            hypo = (hypo or "").strip()
+            if not hypo:
+                raise ValueError("empty hypothesis from LLM")
+            with _lock:
+                _cache[q] = (time.time(), hypo)
+                while len(_cache) > _CACHE_CAPACITY:
+                    _cache.popitem(last=False)
+            return hypo
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                with _lock:
+                    _PERM_FAILED = True
+                logger.warning("HyDE disabled: HTTP %d (permanent skip)", e.code)
+            else:
+                # 5xx / 429 / 其他 4xx：瞬时失败走冷却窗口
+                with _lock:
+                    _last_fail_ts = time.time()
+                logger.warning("HyDE transient failure: HTTP %d (cooldown %.0fs)",
+                               e.code, _COOLDOWN_S)
+            return None
+        except Exception:
+            # 超时（URLError/TimeoutError）/ 网络错 / JSON 解析错 → 冷却窗口
             with _lock:
                 _last_fail_ts = time.time()
-            logger.warning("HyDE transient failure: HTTP %d (cooldown %.0fs)",
-                           e.code, _COOLDOWN_S)
-        return None
-    except Exception:
-        # 超时（URLError/TimeoutError）/ 网络错 / JSON 解析错 → 冷却窗口
-        with _lock:
-            _last_fail_ts = time.time()
-        logger.debug("HyDE failure (cooldown %.0fs)", _COOLDOWN_S)
-        return None
+            logger.debug("HyDE failure (cooldown %.0fs)", _COOLDOWN_S)
+            return None
+    finally:
+        # 无论成败都释放 flight 并唤醒等待者（等待者读缓存或返回 None）
+        with _inflight_lock:
+            _inflight.pop(q, None)
+        ev.set()

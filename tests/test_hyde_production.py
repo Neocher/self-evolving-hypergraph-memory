@@ -7,6 +7,9 @@ P3b 测试 — HyDE 假设文档增强检索生产管道集成
   - LLM 失败（generate_hypothesis → None）→ 单路等价（_fusion_retrieve 1 次）
   - replace 模式 → 单路但 query_embedding 为 hypo 向量
   - generate_hypothesis 失败降级单元（永久跳过 / 冷却 / 缓存 / 401 / 5xx）
+  - 【P3b R1】关闭路径完整链路快照对比（不 mock _finish 内增强通道）/ 中文查询
+    prompt 语言一致性约束 / _level_from_strategy 配置感知（P0-1）/ _retrieve_timeout
+    （P0-2 超时预算）
 
 集成用例全部走公共入口 retrieve(level=FUSION)，禁直调检索内部方法（防假绿）。
 运行: python -m pytest tests/test_hyde_production.py -v
@@ -22,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from api.routes.search import _level_from_strategy, _retrieve_timeout
 from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
 
 
@@ -49,7 +53,20 @@ def _enhance_passthrough_stack(router) -> ExitStack:
 
 
 class TestHydeClosedPath:
-    """hyde=None + config 默认关 → 现状单路逐字节等价（无 _hyde 标记、不触 LLM）。"""
+    """hyde=None + config 默认关 → 现状单路逐字节等价（无 _hyde 标记、不触 LLM）。
+
+    【P3b R1】完整链路等价强化：不 mock _finish 内增强通道（community/mesa/视觉/
+    属性真实跑零依赖 router），参考快照对比——不只 call_count。
+    """
+
+    def _run(self, router, docs, **retrieve_kwargs):
+        with patch.object(router, "_fusion_retrieve",
+                          return_value=[dict(d) for d in docs]) as fr:
+            with patch.object(router, "_encode_query") as eq:
+                with patch("retrieval.query_router.generate_hypothesis") as gh:
+                    out = router.retrieve("memory", level=RetrievalLevel.FUSION,
+                                          **retrieve_kwargs)
+        return out, fr, eq, gh
 
     def test_disabled_default_is_single_path(self):
         router = _make_router()  # hyde_enabled=False
@@ -57,12 +74,7 @@ class TestHydeClosedPath:
             {"node_id": "a", "content": "alpha memory", "score": 0.9},
             {"node_id": "b", "content": "beta memory", "score": 0.7},
         ]
-        with _enhance_passthrough_stack(router):
-            with patch.object(router, "_fusion_retrieve",
-                              return_value=[dict(d) for d in docs]) as fr:
-                with patch.object(router, "_encode_query") as eq:
-                    with patch("retrieval.query_router.generate_hypothesis") as gh:
-                        out = router.retrieve("memory", level=RetrievalLevel.FUSION)
+        out, fr, eq, gh = self._run(router, docs)
 
         gh.assert_not_called()
         eq.assert_not_called()
@@ -76,15 +88,41 @@ class TestHydeClosedPath:
     def test_explicit_false_overrides_config_on(self):
         router = _make_router(hyde_enabled=True)
         docs = [{"node_id": "a", "content": "alpha", "score": 0.9}]
-        with _enhance_passthrough_stack(router):
-            with patch.object(router, "_fusion_retrieve",
-                              return_value=[dict(d) for d in docs]) as fr:
-                with patch("retrieval.query_router.generate_hypothesis") as gh:
-                    out = router.retrieve("memory", level=RetrievalLevel.FUSION, hyde=False)
+        out, fr, eq, gh = self._run(router, docs, hyde=False)
 
         gh.assert_not_called()
         assert fr.call_count == 1
         assert [r["node_id"] for r in out] == ["a"]
+
+    def test_full_chain_snapshot_identical_across_closed_paths(self):
+        """【P3b R1】参考快照对比：config 关 / hyde=True 且 LLM 失败 / 显式 hyde=False
+        三条关闭路径完整链路输出逐字节一致（_finish 真实运行，不 mock 增强通道）。"""
+        router = _make_router()  # hyde_enabled=False
+        docs = [
+            {"node_id": "a", "content": "alpha memory", "score": 0.9},
+            {"node_id": "b", "content": "beta memory", "score": 0.7},
+        ]
+
+        baseline, fr_b, _, gh_b = self._run(router, docs)  # 参考快照：config 默认关
+        explicit_off, fr_e, _, gh_e = self._run(router, docs, hyde=False)
+
+        # hyde=True + LLM 失败（generate_hypothesis → None）→ 静默降级单路
+        with patch.object(router, "_fusion_retrieve",
+                          return_value=[dict(d) for d in docs]) as fr_d:
+            with patch.object(router, "_encode_query") as eq_d:
+                with patch("retrieval.query_router.generate_hypothesis",
+                           return_value=None) as gh_deg:
+                    degraded = router.retrieve("memory", level=RetrievalLevel.FUSION,
+                                               hyde=True)
+
+        assert gh_b.call_count == 0 and gh_e.call_count == 0
+        assert gh_deg.call_count == 1  # hyde=True 触发一次 LLM 尝试（失败降级）
+        assert eq_d.call_count == 0
+        assert fr_b.call_count == fr_e.call_count == fr_d.call_count == 1
+        # 完整链路（真实 _finish：去重/排序/增强通道）输出逐字节一致
+        assert degraded == baseline
+        assert explicit_off == baseline
+        assert all("_hyde" not in r for r in degraded), "降级路径不得有 _hyde 标记"
 
 
 class TestHydeDualMode:
@@ -108,7 +146,7 @@ class TestHydeDualMode:
                                return_value="Hypothetical passage") as gh:
                         out = router.retrieve("memory", level=RetrievalLevel.FUSION)
 
-        gh.assert_called_once_with("memory", timeout=2.0)  # raw_query + config 超时
+        gh.assert_called_once_with("memory", timeout=1.5)  # raw_query + config 超时（P0-2 2.0→1.5）
         eq.assert_called_once_with("Hypothetical passage")
         assert fr.call_count == 2, "dual 模式应双路检索"
         assert seen[0][0] == "memory" and seen[0][1] is None  # 原始 query 路
@@ -301,3 +339,89 @@ class TestHydeGenerateFailureDegradation:
             hyde.generate_hypothesis("q")
         body = json.loads(opener.open.call_args.args[0].data)
         assert body["model"] == "deepseek-chat-v3"
+
+    def test_chinese_query_prompt_has_language_constraint(self, monkeypatch):
+        """【P3b R1 P2】中文查询 → prompt 含语言一致性约束（bge-small-zh 语种匹配）。"""
+        from retrieval import hyde
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        opener = _make_ok_opener()
+        with patch.object(hyde.urllib.request, "build_opener", return_value=opener):
+            hyde.generate_hypothesis("记忆是什么")
+        body = json.loads(opener.open.call_args.args[0].data)
+        prompt = body["messages"][0]["content"]
+        assert "Write in the same language as the question." in prompt
+        # 模板结构保留（评测脚本等效性不变）
+        assert "Question: 记忆是什么" in prompt
+        assert "Hypothetical passage:" in prompt
+
+
+# ─── P3b R1：配置感知 level 映射（P0-1）+ 超时预算 helper（P0-2）────────────
+
+class TestLevelFromStrategyConfigAware:
+    """_level_from_strategy(strategy, config)：hybrid 恒 FUSION；auto/空/None 且
+    rerank/hyDE 任一开启 → FUSION；其余回落 HYPERGRAPH（零回归）。"""
+
+    def test_hybrid_always_fusion(self):
+        assert _level_from_strategy("hybrid") == RetrievalLevel.FUSION
+        assert _level_from_strategy("hybrid", QueryRouterConfig()) == RetrievalLevel.FUSION
+
+    def test_auto_with_rerank_enabled_is_fusion(self):
+        # rerank_enabled=True（默认）→ 生产 auto 请求进入 FUSION
+        cfg = QueryRouterConfig(rerank_enabled=True)
+        assert _level_from_strategy("auto", cfg) == RetrievalLevel.FUSION
+
+    def test_auto_with_hyde_enabled_is_fusion(self):
+        cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=True)
+        assert _level_from_strategy("auto", cfg) == RetrievalLevel.FUSION
+
+    def test_auto_without_rerank_hyde_is_hypergraph(self):
+        cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=False)
+        assert _level_from_strategy("auto", cfg) == RetrievalLevel.HYPERGRAPH
+
+    def test_empty_and_none_with_config_are_hypergraph_without_flags(self):
+        cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=False)
+        assert _level_from_strategy("", cfg) == RetrievalLevel.HYPERGRAPH
+        assert _level_from_strategy(None, cfg) == RetrievalLevel.HYPERGRAPH
+
+    def test_none_config_keeps_old_behavior(self):
+        # config 缺省（None，旧调用方/无 config 的 mock router）→ auto 回落 HYPERGRAPH
+        assert _level_from_strategy("auto", None) == RetrievalLevel.HYPERGRAPH
+        assert _level_from_strategy("", None) == RetrievalLevel.HYPERGRAPH
+        assert _level_from_strategy(None, None) == RetrievalLevel.HYPERGRAPH
+
+    def test_tau_first_and_unknown_stay_hypergraph(self):
+        cfg = QueryRouterConfig()  # rerank_enabled=True 也不影响显式策略
+        assert _level_from_strategy("tau_first", cfg) == RetrievalLevel.HYPERGRAPH
+        assert _level_from_strategy("vector_first", cfg) == RetrievalLevel.HYPERGRAPH
+        assert _level_from_strategy("garbage", cfg) == RetrievalLevel.HYPERGRAPH
+
+
+class TestRetrieveTimeout:
+    """_retrieve_timeout(level, config)：FUSION+HyDE → 5.0；否则 3.0（零回归）。"""
+
+    def test_fusion_with_hyde_is_5s(self):
+        cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=True)
+        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 5.0
+
+    def test_fusion_without_hyde_is_3s(self):
+        cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=False)
+        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 3.0
+
+    def test_hypergraph_is_3s_even_with_hyde(self):
+        cfg = QueryRouterConfig(hyde_enabled=True)
+        assert _retrieve_timeout(RetrievalLevel.HYPERGRAPH, cfg) == 3.0
+
+    def test_none_config_is_3s(self):
+        assert _retrieve_timeout(RetrievalLevel.FUSION, None) == 3.0
+
+
+class TestQueryRouterConfigHydeModeValidation:
+    """【P3b R1 P2】QueryRouterConfig.__post_init__ 校验 hyde_mode ∈ {dual, replace}。"""
+
+    def test_invalid_hyde_mode_raises(self):
+        with pytest.raises(ValueError):
+            QueryRouterConfig(hyde_mode="triple")
+
+    def test_valid_modes_ok(self):
+        QueryRouterConfig(hyde_mode="dual")
+        QueryRouterConfig(hyde_mode="replace")

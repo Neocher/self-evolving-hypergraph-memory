@@ -22,9 +22,19 @@ v5.52.0 (2026-08-19) HyDE-Query-Enhance:
     （原始+假设双路合并默认）/ replace（仅假设向量单路省一半成本）
   • 配置 — QueryRouterConfig + RetrievalConfig（__post_init__ 校验 mode
     ∈ {{dual, replace}}）+ defaults.yaml hyde_enabled/hyde_mode/hyde_timeout
-    + api/app.py getattr 透传
+    （1.5s）+ api/app.py getattr 透传
   • 测试: test_hyde_production（关闭路径等价 / dual 双路 spy / LLM 失败
     单路 / replace 向量替换 / 失败降级单元）+ 全量回归
+  • Codex R1 修复轮（同版本补丁）— P0-1 生产 auto→FUSION 接线：
+    _level_from_strategy 加 config 参数（rerank/hyDE 任一开启时 auto 进
+    FUSION，补齐 P3a 宣称但未落地的三路融合生产生效；REST+GatewayAPI
+    双入口解 _qr 取 QueryRouter.config）；P0-2 检索超时预算 helper
+    _retrieve_timeout（FUSION+HyDE→5.0s，否则 3.0s）+ hyde_timeout 2.0→1.5
+    （QueryRouterConfig/RetrievalConfig/defaults.yaml/app.py 四处接线）；
+    P2 QueryRouterConfig.__post_init__ 校验 hyde_mode + HyDE prompt 语言
+    一致性约束（中文查询生成中文假设段落）+ 缓存 single-flight（并发同
+    query 仅一次 LLM 调用）+ 测试增强（全链路快照对比/中文 prompt/配置
+    感知映射/超时预算）
 v5.51.0 (2026-08-18) Rerank-Fusion:
   • 生产管道集成 bge-reranker 重排（P3a）— 补齐 vs MindMemOS
     最大差距路径（v5.47 RAG v4 管道含 rerank 时 69.5%）

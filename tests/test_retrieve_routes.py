@@ -148,7 +148,7 @@ class TestRetrieveEndpoint:
         set_user_profile({"preferences": {"咖啡": {"weight": 1.0, "sources": 1}}})
         try:
             router = QueryRouter.__new__(QueryRouter)
-            router.config = QueryRouterConfig()
+            router.config = QueryRouterConfig(rerank_enabled=False)  # P0-1 钉住 auto→HYPERGRAPH（画像 boost 路径）
             router._zh_en_tech_map = {}
             router._time_keywords = set()
             # 注入 score=1.0 且命中画像的原始检索结果（模拟画像命中加分前置状态）
@@ -215,9 +215,12 @@ class TestRetrieveR3Fix:
         显式标记，正常 l1_faiss 无该标记 → degraded=False。
         """
         from api.routes._deps import _result_cache, _result_cache_lock
-        from retrieval.query_router import RetrievalLevel
+        from retrieval.query_router import RetrievalLevel, QueryRouterConfig
 
         mock_qr = MagicMock()
+        # 【P3b R1 P0-1】显式关 rerank/hyDE：新行为下 auto+rerank_enabled=True → FUSION，
+        # 本测试意图是 L1 hypergraph 降级检测（auto→HYPERGRAPH），需钉住旧映射。
+        mock_qr.config = QueryRouterConfig(rerank_enabled=False)
         mock_qr.retrieve.return_value = [{
             "node_id": "n_l1", "content": "l1 faiss normal result",
             "score": 0.9, "level": "l1_faiss", "tau_value": 1.0,
@@ -254,7 +257,7 @@ class TestRetrieveR3Fix:
             faiss_index=MagicMock(),
             tfidf_index=None,
             encoder=MagicMock(),
-            config=QueryRouterConfig(),
+            config=QueryRouterConfig(rerank_enabled=False),  # P0-1 钉住 auto→HYPERGRAPH（本测试测真实 L1 路径）
             faiss_id_map={0: "node_l1_real"},
             episode_cache={"node_l1_real": {
                 "id": "node_l1_real", "content": "l1 faiss real entry result",
@@ -304,7 +307,7 @@ class TestRetrieveR3Fix:
         from api.routes._deps import _result_cache, _result_cache_lock
 
         router = QueryRouter.__new__(QueryRouter)
-        router.config = QueryRouterConfig()
+        router.config = QueryRouterConfig(rerank_enabled=False)  # P0-1 钉住 auto→HYPERGRAPH（本测试测 L1→L2 级联）
         router._zh_en_tech_map = {}
         router._time_keywords = set()
         router._hypergraph_retrieve = MagicMock(return_value=[])

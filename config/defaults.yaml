@@ -79,6 +79,7 @@ retrieval:
   rerank_input_k: 40             # 送入 reranker 的头部候选数（尾部保持原序 append）
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
+  hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
 
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5"  # 中文 embedding 模型（512维，中文专用，CPU 0.05s/条）

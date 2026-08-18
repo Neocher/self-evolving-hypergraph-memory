@@ -155,6 +155,7 @@ def _build_router_config(rcfg):
         rerank_input_k=getattr(rcfg, "rerank_input_k", 40),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
+        hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
     )
 
 

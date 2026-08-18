@@ -23,8 +23,11 @@ from core.content_guard import scan_content
 from retrieval.query_router import RetrievalLevel
 
 # 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
-# 超时返回空结果而非无限挂起（与写路径超时对称）。注：超时只解绑 await，不终止底层线程
-_RETRIEVE_TIMEOUT = 3.0  # 【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边遍历超时立即降级返回向量结果, 不空等
+# 超时返回空结果而非无限挂起（与写路径超时对称）。注：超时只解绑 await，不终止底层线程。
+# 【P3b R1 P0-2】基线 3.0s；FUSION+HyDE 开启时 _retrieve_timeout 放宽到 5.0s
+# （LLM 生成假设段落预留预算）。【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边
+# 遍历超时立即降级返回向量结果, 不空等
+_RETRIEVE_TIMEOUT = 3.0
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
@@ -32,16 +35,51 @@ _RETRIEVE_TIMEOUT = 3.0  # 【PERF 2026-08-07】15s→3s: 大库下实体匹配/
 _DEGRADE_TIMEOUT = 10.0
 
 
-def _level_from_strategy(strategy) -> "RetrievalLevel":
-    """策略字符串 → 检索级别（CC 方案 B：hybrid→FUSION，其余回落 HYPERGRAPH 零回归）。
+def _level_from_strategy(strategy, config=None) -> "RetrievalLevel":
+    """策略字符串 → 检索级别（CC 方案 A：hybrid → FUSION；auto/空/None 且
+    rerank/hyDE 任一开启 → FUSION；其余回落 HYPERGRAPH 零回归）。
 
-    strategy 为任意 Optional[str]（api/models.py 未收窄）：仅 "hybrid" 映射到
-    FUSION（生产接通 bge-reranker 重排，修复 P0 生产入口死代码）；auto/
-    tau_first/vector_first/None/未知字符串均回落 HYPERGRAPH，保持现状零回归。
+    strategy 为任意 Optional[str]（api/models.py 未收窄）：
+      - "hybrid" → FUSION（显式覆盖，不变）
+      - "auto"/""/None 且 config.rerank_enabled or config.hyde_enabled 为真 → FUSION
+        （补齐 P3a 宣称但从未落地的生产三路融合：rerank_enabled=true 默认 → 生产
+        auto 请求进入 FUSION 接通 bge-reranker 重排；config 缺省/不可得（None）时
+        保持旧行为回落 HYPERGRAPH）
+      - 其余（tau_first/vector_first/未知）→ HYPERGRAPH（降级链不变）
     """
-    if isinstance(strategy, str) and strategy.strip().lower() == "hybrid":
+    s = strategy.strip().lower() if isinstance(strategy, str) else None
+    if s == "hybrid":
+        return RetrievalLevel.FUSION
+    if s in (None, "", "auto") and config is not None and (
+        getattr(config, "rerank_enabled", False) or getattr(config, "hyde_enabled", False)
+    ):
         return RetrievalLevel.FUSION
     return RetrievalLevel.HYPERGRAPH
+
+
+def _query_router_config(qr):
+    """取 QueryRouter.config（SelfEvolvingRetrieval 包装时解 _qr）。
+
+    用 vars() 检查实例 __dict__ 而非 getattr(qr, "_qr", qr) 缺省——后者对
+    MagicMock 测试替身会触发属性自动创建（假 _qr 子 mock），误解包后 config
+    取到空 mock 恒真 → auto 误判 FUSION（P0-1 生产接线回归测试暴露）。
+    """
+    if qr is None:
+        return None
+    qr_vars = getattr(qr, "__dict__", None)
+    if isinstance(qr_vars, dict) and "_qr" in qr_vars:
+        qr = qr_vars["_qr"]
+    return getattr(qr, "config", None)
+
+
+def _retrieve_timeout(level, config) -> float:
+    """检索超时预算（秒）【P3b R1 P0-2 方案 B】：FUSION 且 HyDE 开启 → 5.0
+    （LLM 生成假设段落预留预算），否则 3.0（原 _RETRIEVE_TIMEOUT——HyDE 默认关，
+    关闭路径零回归）。config 缺省（None）按 hyde_enabled=False 处理。
+    """
+    if level == RetrievalLevel.FUSION and getattr(config, "hyde_enabled", False):
+        return 5.0
+    return _RETRIEVE_TIMEOUT
 
 
 @router.post("/memories/retrieve", summary="粗到精三级检索（带降级）")
@@ -56,9 +94,15 @@ async def retrieve(
 
     # 【Perf】结果缓存命中（键含 include_archived/session_ts/namespace/strategy，避免互相污染缓存）
     # 【P3a R3 P1-2/P2-1】ns 维度：路由按 namespace 过滤，同 query 不同 ns 不能串缓存；
-    # strategy_raw 维度：auto/tau_first/vector_first 都映射 HYPERGRAPH 但 strategy_used
-    # 按原始值回显，不能共用缓存（否则命中时 strategy_used 回显错误）。
-    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:shared:{req.include_shared}:ts:{req.session_ts}:ns:{req.namespace or ''}:strategy:{_level_from_strategy(req.strategy).value}:strategy_raw:{req.strategy or ''}"
+    # strategy_raw 维度：auto/tau_first/vector_first 大多映射 HYPERGRAPH（auto 在
+    # rerank/hyDE 开启时映射 FUSION）但 strategy_used 按原始值回显，不能共用缓存
+    # （否则命中时 strategy_used 回显错误）。
+    # 【P3b R1 P0-1】config 感知映射：rerank/hyDE 任一开启时 auto 进 FUSION——
+    # 取 QueryRouter.config（SelfEvolvingRetrieval 包装时解 _qr），与 _retrieve_timeout 共用。
+    qr = deps.query_router
+    qr_config = _query_router_config(qr)
+    level = _level_from_strategy(req.strategy, qr_config)
+    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:shared:{req.include_shared}:ts:{req.session_ts}:ns:{req.namespace or ''}:strategy:{level.value}:strategy_raw:{req.strategy or ''}"
     with _result_cache_lock:
         if cache_key in _result_cache:
             latency = (_now() - start) * 1000
@@ -67,9 +111,10 @@ async def retrieve(
             cached.latency_ms = round(latency, 2)
             return cached
 
-    if deps.query_router is None:
+    if qr is None:
         raise HTTPException(status_code=503, detail="Query router not available")
 
+    retrieve_timeout = _retrieve_timeout(level, qr_config)
     try:
         # 【P1-3】全同步检索链路（FAISS/sklearn/GraphLite）移到线程池，避免阻塞事件循环
         # 【H2】外层 wait_for：GraphLite/FAISS 挂起时超时返回空结果（降级），不无限挂起
@@ -78,14 +123,14 @@ async def retrieve(
                 deps.query_router.retrieve, req.query,
                 include_archived=req.include_archived,
                 session_ts=req.session_ts,
-                level=_level_from_strategy(req.strategy),
+                level=level,
                 rerank=None,
             ),
-            timeout=_RETRIEVE_TIMEOUT,
+            timeout=retrieve_timeout,
         )
     except asyncio.TimeoutError:
         logger.warning("Retrieval timed out after %.1fs, returning empty results",
-                       _RETRIEVE_TIMEOUT)
+                       retrieve_timeout)
         results_raw = []
         degraded = True
     except Exception as exc:
