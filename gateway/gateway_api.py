@@ -9,6 +9,7 @@ GatewayAPI — 统一的 SHM 核心接口
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -18,6 +19,7 @@ import numpy as np
 
 from api._routes import Services
 from api.routes._deps import qsubmit, qsubmit_visual_index
+from api.routes.search import _level_from_strategy, _RETRIEVE_TIMEOUT, _DEGRADE_TIMEOUT
 from api.models import (
     HealthStatus,
     HyperedgeListResponse,
@@ -436,8 +438,27 @@ class GatewayAPI:
             )
 
         try:
-            results_raw = self._svc.query_router.retrieve(
-                query, include_archived=include_archived, session_ts=session_ts,
+            # 【P3a R2】全同步检索链路移入线程池，避免阻塞事件循环（镜像 REST 入口）。
+            # rerank=None → 读 config.rerank_enabled（config 默认 True 保持开启）。
+            # 【P3a R3 P2-2】套 wait_for：GraphLite/FAISS 挂起时超时返回 degraded 空结果，
+            # 不再无限挂起（与 REST 入口 _RETRIEVE_TIMEOUT 对称）。注：超时只解绑 await，
+            # 不终止底层线程。
+            results_raw = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._svc.query_router.retrieve, query,
+                    include_archived=include_archived, session_ts=session_ts,
+                    level=_level_from_strategy(strategy), rerank=None,
+                ),
+                timeout=_RETRIEVE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "Retrieval timed out after %.1fs, returning empty results", _RETRIEVE_TIMEOUT
+            )
+            return RetrieveResponse(
+                query=query, strategy_used=strategy or "auto",
+                results=[], total_found=0,
+                latency_ms=(time.time() - start) * 1000, degraded=True,
             )
         except Exception as exc:
             self._logger.exception("Query router failed")
@@ -465,8 +486,13 @@ class GatewayAPI:
                         f"MATCH (e:EpisodeNode) WHERE ({conditions}){archived_clause} "
                         f"RETURN e.id AS node_id, e.content AS content LIMIT 10"
                     )
-                    fallback_rows = self._svc.graphlite_store.query_cypher(cypher, params)
+                    # 【P1-2】degraded 置位于 wait_for 之前：超时/异常跳 except 时该行已执行，
+                    # 确保 Cypher 兜底超时/异常 → 空结果 + degraded=True（对齐 REST 语义）。
                     degraded = True
+                    fallback_rows = await asyncio.wait_for(
+                        asyncio.to_thread(self._svc.graphlite_store.query_cypher, cypher, params),
+                        timeout=_DEGRADE_TIMEOUT,
+                    )
                     for row in fallback_rows:
                         if isinstance(row, (list, tuple)):
                             nid, c = row[0], row[1] if len(row) > 1 else ""
@@ -480,8 +506,20 @@ class GatewayAPI:
                             "score": 0.5,
                             "level": "graphlite_fallback",
                         })
+            except asyncio.TimeoutError:
+                self._logger.warning("Cypher fallback timed out after %.1fs, skipping", _DEGRADE_TIMEOUT)
             except Exception:
                 self._logger.exception("Cypher fallback failed")
+
+        # 降级标记
+        # 【P2-2】在去重/命名空间过滤前基于 results_raw 原始结果判断：过滤后 results_raw
+        # 变空会丢失 _degradation_level 降级信号。Cypher 兜底已在上方自行置 degraded=True，
+        # 这里用 or 保留不覆盖。
+        if results_raw:
+            degraded = degraded or any(
+                isinstance(r, dict) and "_degradation_level" in r
+                for r in results_raw
+            )
 
         # 去重 + 命名空间过滤
         if results_raw:
@@ -490,18 +528,24 @@ class GatewayAPI:
             ns_set: Optional[set[str]] = None
             if namespace and self._svc.graphlite_store is not None:
                 try:
-                    ns_rows = self._svc.graphlite_store.query_cypher(
-                        "MATCH (s:SessionNode {id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
-                        "RETURN e.id",
-                        {"ns": namespace},
+                    ns_rows = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._svc.graphlite_store.query_cypher,
+                            "MATCH (s:SessionNode {id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
+                            "RETURN e.id",
+                            {"ns": namespace},
+                        ),
+                        timeout=_DEGRADE_TIMEOUT,
                     )
                     ns_set = {
                         str(r.get("e.id", "") or r.get("id", "")) if isinstance(r, dict) else str(r[0])
                         for r in ns_rows
                         if isinstance(r, dict) or (isinstance(r, (list, tuple)) and r)
                     } if ns_rows else set()
+                except asyncio.TimeoutError:
+                    self._logger.warning("Namespace prefetch timed out after %.1fs, skipping filter", _DEGRADE_TIMEOUT)
                 except Exception:
-                    pass
+                    self._logger.warning("Namespace query failed, skipping namespace filter")
             for r in results_raw:
                 key = r.get("content", "")[:100]
                 if key and key not in seen:
@@ -520,15 +564,6 @@ class GatewayAPI:
                     r["risk_level"] = scan_content(r.get("content", "")).risk_level
                 except Exception:
                     r["risk_level"] = None
-
-        # 降级标记
-        if results_raw:
-            first_level = (
-                results_raw[0].get("level", "hypergraph")
-                if isinstance(results_raw[0], dict)
-                else "hypergraph"
-            )
-            degraded = first_level != "hypergraph"
 
         results = [
             EpisodicResult(

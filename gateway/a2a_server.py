@@ -70,6 +70,9 @@ class RetrieveRequest(BaseModel):
     session_ts: Optional[float] = Field(
         None, description="session 时间锚（相对时间词解析基准，None 回落墙钟）",
     )
+    strategy: Optional[str] = Field(
+        "auto", description="检索策略（auto/hybrid 等；hybrid→FUSION 重排）",
+    )
 
 
 class SearchVectorRequest(BaseModel):
@@ -207,6 +210,7 @@ def register_routes(app: FastAPI, api: GatewayAPI) -> None:
             namespace=req.namespace,
             include_shared=req.include_shared,
             session_ts=req.session_ts,
+            strategy=req.strategy,
         )
         return {
             "query": result.query,
@@ -279,7 +283,17 @@ def register_routes(app: FastAPI, api: GatewayAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期 — 启动时预热初始化。"""
-    _build_gateway()
+    gw = _build_gateway()
+    # 【P3a R2】启动异步预热 bge-reranker（冷启动护栏）：复用内层 QueryRouter
+    # 的 prewarm_reranker，失败静默降级不阻塞启动（与 api/app.py 同模式）。
+    qr = getattr(gw._svc, "query_router", None)
+    inner_qr = getattr(qr, "_qr", qr) if qr is not None else None
+    if inner_qr is not None and hasattr(inner_qr, "prewarm_reranker"):
+        try:
+            await inner_qr.prewarm_reranker()
+            logger.info("A2A gateway: reranker prewarm complete")
+        except Exception as e:
+            logger.warning("A2A gateway: reranker prewarm skipped (non-fatal): %s", e)
     yield
 
 

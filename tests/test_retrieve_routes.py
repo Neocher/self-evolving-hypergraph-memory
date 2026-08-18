@@ -174,6 +174,217 @@ class TestRetrieveEndpoint:
             set_user_profile({})
 
 
+class TestRetrieveR3Fix:
+    """R3 修复回归：P1-1 hybrid→FUSION 降级误判 / P1-2 cache key 含 namespace。"""
+
+    def test_hybrid_fusion_not_degraded(self, client, mock_services):
+        """P1-1: hybrid→FUSION 正常结果（level=fusion_*）不应被标 degraded。"""
+        from api.routes._deps import _result_cache, _result_cache_lock
+        from retrieval.query_router import RetrievalLevel
+
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = [{
+            "node_id": "n_fusion", "content": "fusion result content",
+            "score": 0.9, "level": "fusion_multi", "tau_value": 1.0,
+        }]
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.return_value = []
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            resp = client.post("/memories/retrieve", json={
+                "query": "p1-1-fusion-probe-query",
+                "top_k": 5,
+                "strategy": "hybrid",
+            })
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["degraded"] is False, "hybrid→FUSION 正常结果不得标 degraded"
+            assert mock_qr.retrieve.call_args.kwargs["level"] == RetrievalLevel.FUSION, (
+                "hybrid 策略必须透传 FUSION level（防路由丢接线假绿）"
+            )
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+    def test_default_auto_l1_faiss_not_degraded(self, client, mock_services):
+        """P1-1 回归（R4）：默认 auto → HYPERGRAPH 正常路径 level=l1_faiss 不得标 degraded。
+
+        修复前降级判断猜 level 前缀：l1_faiss != "hypergraph" 且不属 fusion_* →
+        误标 degraded=True（默认 auto 检索全 degraded）。修复后基于 _degradation_level
+        显式标记，正常 l1_faiss 无该标记 → degraded=False。
+        """
+        from api.routes._deps import _result_cache, _result_cache_lock
+        from retrieval.query_router import RetrievalLevel
+
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = [{
+            "node_id": "n_l1", "content": "l1 faiss normal result",
+            "score": 0.9, "level": "l1_faiss", "tau_value": 1.0,
+        }]
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.return_value = []
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            resp = client.post("/memories/retrieve", json={
+                "query": "r4-p1-default-auto-l1-probe-query",
+                "top_k": 5,
+            })
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["degraded"] is False, "默认 auto 正常 l1_faiss 结果不得标 degraded"
+            assert mock_qr.retrieve.call_args.kwargs["level"] == RetrievalLevel.HYPERGRAPH
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+    def test_l1_faiss_real_hypergraph_retrieve_not_degraded(self, client, mock_services):
+        """P3: 走真实 QueryRouter._hypergraph_retrieve 的 l1_faiss 入口（不 mock retrieve 返回值）。
+
+        构造真实 QueryRouter（faiss_index + faiss_id_map + _episode_cache），经
+        /memories/retrieve 公共入口 → retrieve(level=HYPERGRAPH) → _hypergraph_retrieve
+        真实执行，返回 level=l1_faiss 结果；断言 degraded=False 且无降级标记。
+        """
+        from retrieval.query_router import QueryRouter, QueryRouterConfig
+        from api.routes._deps import _result_cache, _result_cache_lock
+
+        router = QueryRouter(
+            graphlite_store=None,
+            faiss_index=MagicMock(),
+            tfidf_index=None,
+            encoder=MagicMock(),
+            config=QueryRouterConfig(),
+            faiss_id_map={0: "node_l1_real"},
+            episode_cache={"node_l1_real": {
+                "id": "node_l1_real", "content": "l1 faiss real entry result",
+                "tau_value": 1.0, "fact_track": "active",
+            }},
+        )
+        router.encoder.embed.return_value = np.zeros(512, dtype=np.float32)
+        router.faiss_index.search.return_value = (
+            np.array([[0.1]]),
+            np.array([[0]]),
+        )
+        mock_services.query_router = router
+        mock_services.graphlite_store.query_cypher.return_value = []
+
+        def _passthrough(results, *args, **kwargs):
+            return results
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            with patch.object(router, "_community_expansion", side_effect=_passthrough), \
+                 patch.object(router, "_mesa_synthesis", side_effect=_passthrough), \
+                 patch.object(router, "_visual_recall", side_effect=_passthrough), \
+                 patch.object(router, "_property_temporal_retrieve", side_effect=_passthrough):
+                resp = client.post("/memories/retrieve", json={
+                    "query": "p3-l1-faiss-real-entry-query",
+                    "top_k": 5,
+                })
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["degraded"] is False, "真实 l1_faiss 正常路径不得标 degraded"
+            results = body["results"]
+            assert results, "真实 _hypergraph_retrieve 应返回结果"
+            assert results[0]["node_id"] == "node_l1_real"
+            assert results[0]["retrieval_level"] == "l1_faiss"
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+    def test_l1_empty_cascade_degraded(self, client, mock_services):
+        """P1-1: L1 空→VECTOR 级联路径打 _degradation_level=l1_empty → degraded=True。
+
+        修复前 L1 空级联不打标，degraded 恒 False。修复后经真实 retrieve 级联
+        （_hypergraph_retrieve 空 → _vector_retrieve 命中）打标，endpoint 返回 degraded=True。
+        """
+        from retrieval.query_router import QueryRouter, QueryRouterConfig
+        from api.routes._deps import _result_cache, _result_cache_lock
+
+        router = QueryRouter.__new__(QueryRouter)
+        router.config = QueryRouterConfig()
+        router._zh_en_tech_map = {}
+        router._time_keywords = set()
+        router._hypergraph_retrieve = MagicMock(return_value=[])
+        router._vector_retrieve = MagicMock(return_value=[{
+            "node_id": "n_l2", "content": "l2 cascade result", "score": 0.9,
+            "level": "vector", "tau_value": 1.0, "fact_track": "active",
+        }])
+        mock_services.query_router = router
+        mock_services.graphlite_store.query_cypher.return_value = []
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            resp = client.post("/memories/retrieve", json={
+                "query": "l1-empty-cascade-query",
+                "top_k": 5,
+            })
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["degraded"] is True, "L1 空级联应标 degraded=True"
+            assert body["results"], "L2 结果应返回"
+            assert body["results"][0]["retrieval_level"] == "vector"
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+    def test_cypher_fallback_queryerror_degraded(self, client, mock_services):
+        """P1-2: REST 兜底 query_cypher 抛真实 SDK QueryError → 空结果 + degraded=True。
+
+        修复前 degraded=True 置于 wait_for 之后，非超时异常跳外层 except 时该行
+        未执行 → degraded 恒 False。修复后置位于 wait_for 之前，异常仍 degraded=True。
+        """
+        from graphlite_sdk.error import QueryError
+        from api.routes._deps import _result_cache, _result_cache_lock
+
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = []
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.side_effect = QueryError(
+            "simulated cypher fallback failure"
+        )
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            resp = client.post("/memories/retrieve", json={
+                "query": "cypher-fallback-queryerror-probe",
+                "top_k": 5,
+            })
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["degraded"] is True, "Cypher 兜底抛 QueryError 应标 degraded=True"
+            assert body["results"] == []
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+    def test_namespace_distinct_cache_keys(self, client, mock_services):
+        """P1-2: 同 query 不同 namespace 不得共用缓存（retrieve 调用 2 次）。"""
+        from api.routes._deps import _result_cache, _result_cache_lock
+
+        mock_qr = MagicMock()
+        mock_qr.retrieve.return_value = []
+        mock_services.query_router = mock_qr
+        mock_services.graphlite_store.query_cypher.return_value = []
+
+        with _result_cache_lock:
+            _result_cache.clear()
+        try:
+            q = "p1-2-namespace-probe-query"
+            r1 = client.post("/memories/retrieve", json={"query": q, "top_k": 5, "namespace": "nsA"})
+            assert r1.status_code == 200, r1.text
+            r2 = client.post("/memories/retrieve", json={"query": q, "top_k": 5, "namespace": "nsB"})
+            assert r2.status_code == 200, r2.text
+            assert mock_qr.retrieve.call_count == 2, "同 query 不同 namespace 不得命中缓存"
+        finally:
+            with _result_cache_lock:
+                _result_cache.clear()
+
+
 class TestSearchVectorEndpoint:
     """向量检索端点测试"""
 

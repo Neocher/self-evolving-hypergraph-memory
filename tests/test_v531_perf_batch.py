@@ -361,6 +361,112 @@ class TestP6FusionParallel:
         router._fuse_results = lambda *a, **k: "FUSED"  # type: ignore[method-assign]
         assert router._fusion_retrieve("memory", raw_query="memory") == "FUSED"
 
+    def test_entity_channel_queryerror_tags_degraded(self):
+        """P1-1 loud-store 旁路用例：store 自身 query_cypher 直接抛 SDK QueryError →
+        融合结果打 _degradation_level=fusion_channel_skip。
+
+        【P3a R7】此用例降级为 loud-store 旁路（store 直接抛异常的旁路），不再是
+        降级信号唯一依据：真实 GraphLiteStore.query_cypher 有永不抛异常契约（返回
+        [] + thread-local 信号），由 TestP3aR7EntityDegradation 走真实 query_cypher
+        契约验证（打桩 _locked_query，不替换 query_cypher）。
+        """
+        from graphlite_sdk.error import QueryError
+
+        router = _fusion_router()
+        router._vector_retrieve = lambda *a, **k: [{"node_id": "v1", "content": "vector hit", "score": 0.9}]  # type: ignore[method-assign]
+        router._bm25_search = lambda *a, **k: []  # type: ignore[method-assign]
+
+        class _BoomStore:
+            def query_cypher(self, *a, **k):
+                raise QueryError("entity channel down")
+
+        router.graphlite_store = _BoomStore()  # type: ignore[attr-defined]
+        router._fuse_results = lambda *a, **k: [{"node_id": "v1", "content": "vector hit", "score": 0.9}]  # type: ignore[method-assign]
+
+        result = router._fusion_retrieve("memory system", raw_query="memory system")
+        assert any(
+            r.get("_degradation_level") == "fusion_channel_skip" for r in result
+        ), "entity 通道抛 QueryError 应使融合结果带 fusion_channel_skip 降级标记"
+
+
+# ─── P3a R7: entity 通道降级信号（thread-local）──────────────────
+
+class _FakeRows:
+    def __init__(self, rows):
+        self.rows = rows
+
+
+class TestP3aR7EntityDegradation:
+    """P3a R7：thread-local 降级信号——query_cypher 永不抛异常契约下，基础设施
+    降级（熔断 open / 重试耗尽）以返回 [] 表现，_entity_match 读同线程标志区分
+    「正常无匹配」与「基础设施降级」。测试打桩 _locked_query 走真实 query_cypher
+    契约（不替换 query_cypher，杜绝假绿）。"""
+
+    def _store(self):
+        from graph.graphlite_store import GraphLiteStore
+        return GraphLiteStore()
+
+    def test_retry_exhausted_sets_degraded_flag(self):
+        """重试耗尽：_locked_query 抛 QueryError → query_cypher 返回 [] 且标志 True。"""
+        from graphlite_sdk.error import QueryError
+
+        store = self._store()
+        store._locked_query = MagicMock(side_effect=QueryError("infra down"))
+        with patch("time.sleep", return_value=None):
+            rows = store.query_cypher("MATCH (n) RETURN n")
+        assert rows == []
+        assert store.last_query_infra_degraded() is True
+
+    def test_circuit_open_sets_degraded_flag(self):
+        """熔断 open：allow_request False → query_cypher 返回 [] 且标志 True。"""
+        store = self._store()
+        store.circuit_breaker.allow_request = lambda: False
+        rows = store.query_cypher("MATCH (n) RETURN n")
+        assert rows == []
+        assert store.last_query_infra_degraded() is True
+
+    def test_success_clears_degraded_flag(self):
+        """成功路径：_locked_query 返回 rows → query_cypher 返回 rows 且标志 False。"""
+        store = self._store()
+        store._locked_query = MagicMock(return_value=_FakeRows([{"node_id": "n1"}]))
+        rows = store.query_cypher("MATCH (n) RETURN n")
+        assert rows == [{"node_id": "n1"}]
+        assert store.last_query_infra_degraded() is False
+
+    def test_app_error_does_not_flag_degraded(self):
+        """应用错误：_locked_query 抛 RuntimeError → query_cypher 返回 [] 且标志 False（不误报）。"""
+        store = self._store()
+        store._locked_query = MagicMock(side_effect=RuntimeError("bad gql"))
+        rows = store.query_cypher("MATCH (n) RETURN n")
+        assert rows == []
+        assert store.last_query_infra_degraded() is False
+
+    def test_fusion_entity_infra_degradation_tags_channel_skip(self):
+        """端到端（关键）：真实 store 注入 QueryRouter 走 _fusion_retrieve（ThreadPoolExecutor），
+        断言融合结果带 fusion_channel_skip——验证 thread-local 在同池线程正确传递。
+
+        不 monkeypatch _entity_match / query_cypher：_locked_query 抛 QueryError →
+        真实 query_cypher 重试耗尽置 thread-local 信号 → _entity_match 读同线程信号
+        抛 _EntityChannelDegraded → per-channel handler 打标（杜绝假绿）。
+        """
+        from graphlite_sdk.error import QueryError
+
+        store = self._store()
+        store._locked_query = MagicMock(side_effect=QueryError("entity channel down"))
+
+        router = _fusion_router()
+        router.graphlite_store = store
+        router._vector_retrieve = lambda *a, **k: [{"node_id": "v1", "content": "vector hit", "score": 0.9}]  # type: ignore[method-assign]
+        router._bm25_search = lambda *a, **k: []  # type: ignore[method-assign]
+        router._fuse_results = lambda *a, **k: [{"node_id": "v1", "content": "vector hit", "score": 0.9}]  # type: ignore[method-assign]
+
+        with patch("time.sleep", return_value=None):
+            result = router._fusion_retrieve("memory system", raw_query="memory system")
+
+        assert any(
+            r.get("_degradation_level") == "fusion_channel_skip" for r in result
+        ), "entity 通道基础设施降级应使融合结果带 fusion_channel_skip 降级标记"
+
 
 # ─── P8 merge 截断 ─────────────────────────────────────────
 

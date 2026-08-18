@@ -62,9 +62,21 @@ def _safe_float_tau(value) -> float:
         return 0.0
 
 
+class _EntityChannelDegraded(Exception):
+    """entity 通道基础设施降级哨兵（private）。
+
+    query_cypher 永不抛异常契约下，基础设施降级（熔断 open / 重试耗尽）表现为
+    返回 []。_entity_match 读 thread-local 降级信号区分「正常无匹配」与「基础设施
+    降级」，后者抛本哨兵 → _fusion_retrieve 现有 per-channel `except Exception`
+    捕获并置 fusion_channel_skipped=True（降级信号不漏报）。
+    """
+
+
 # 【P0-1 实体-属性-时间】属性版本链检索通道常量（append 相对尾分缩放，严格低于种子）
 _PROPERTY_BOOST = 0.6
 _PROPERTY_MAX_RESULTS = 5
+# 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
+_RERANK_PREWARM_TIMEOUT = 60.0
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
 _PROPERTY_CANDIDATE_STOPWORDS = frozenset({
     "how", "what", "when", "why", "where", "which", "who", "whose", "whom",
@@ -219,6 +231,9 @@ class QueryRouterConfig:
     mesa_boost: float = 0.4  # 合成分 = relevance × min(种子分) × mesa_boost（严格 < community boost 0.6）
     mesa_threshold: float = 0.5  # BM25-on-summary 相关度阈值（对齐 community_expansion）
     mesa_max_nodes: int = 5  # 每查询最多合成节点数
+    # bge-reranker 重排配置（P3a，默认开；仅 FUSION 路径生效，失败静默降级）
+    rerank_enabled: bool = True  # 重排开关（retrieve(rerank=False) 可显式关）
+    rerank_input_k: int = 40  # 送入 reranker 的头部候选数（尾部保持原序 append）
 
 
 @dataclass
@@ -410,6 +425,12 @@ class QueryRouter:
         # 杜绝「新 index + 旧 map」的 fid 错配与「新节点已入 index 未入 map」的漏召回。
         # 锁内只做内存操作（FaissStore.add 自带内部锁），临界区微秒级，读侧性能无损。
         self._visual_lock = threading.Lock()
+        # 【P3a】bge-reranker 懒加载状态：__init__ 不加载模型（CPU ~5-15s / ~400MB），
+        # 首次 FUSION 检索经 _get_reranker 双重检查锁加载；失败置 _rerank_failed=True
+        # 永久跳过（不再重试），主检索零回归降级。
+        self._reranker = None
+        self._rerank_failed = False
+        self._rerank_lock = threading.Lock()
 
     def _normalize_query(self, query: str) -> str:
         """查询归一化：修复中文/英文混合输入，提升跨语言检索质量。
@@ -650,6 +671,32 @@ class QueryRouter:
                            self.config.bm25_build_timeout)
         except Exception:
             logger.exception("BM25: prewarm failed, degrading silently")
+
+    async def prewarm_reranker(self) -> None:
+        """【P3a R1】启动异步预热 bge-reranker（冷启动护栏）。
+
+        _get_reranker 双重检查锁懒加载模型（CPU ~5-15s），若留待 FUSION 首次
+        检索才触发，会撞上 REST 3s 检索超时（_RETRIEVE_TIMEOUT）导致 FUSION
+        请求超时降级。启动段预热让首次 FUSION 检索即就绪；模型加载放线程池
+        不阻塞事件循环。幂等：已加载（_reranker 非 None）或已失败
+        （_rerank_failed=True）直接返回；失败由 _get_reranker 置 _rerank_failed
+        永久标记，_rerank_results 自动降级原列表（零超时风险）。
+        """
+        if getattr(self, "_reranker", None) is not None or getattr(self, "_rerank_failed", False):
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._get_reranker),
+                timeout=_RERANK_PREWARM_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            self._rerank_failed = True
+            logger.warning("reranker prewarm timed out after %.1fs, rerank disabled",
+                           _RERANK_PREWARM_TIMEOUT)
+        except Exception:
+            self._rerank_failed = True
+            logger.warning("reranker prewarm failed (non-fatal), rerank disabled",
+                           exc_info=True)
 
     # ──────────────────────────────
     # 【P2-a V-Mem】视觉检索通道（VisualNode → 384d 索引 → 模态路由补充召回）
@@ -1133,8 +1180,20 @@ class QueryRouter:
             params["limit"] = k * 2
             rows = self.graphlite_store.query_cypher(cypher, params)
         except Exception:
+            # 【P1-1】SDK 通道故障（QueryError/ConnectionError）向上抛，不静默吞成 []：
+            # _fusion_retrieve 的 per-channel except Exception 会捕获并置
+            # fusion_channel_skipped=True（entity 通道降级信号不漏报）。
+            # 正常无匹配是 query_cypher 返回空 rows（非异常），仍走下方正常 return []。
             logger.exception("Entity match OR query failed")
-            return []
+            raise
+
+        # 【P3a R7】thread-local 降级信号：query_cypher 永不抛异常契约下，基础设施
+        # 降级（熔断 open / 重试耗尽）表现为返回 []（非异常）。读同线程标志区分
+        # 「正常无匹配」与「基础设施降级」，后者抛 _EntityChannelDegraded →
+        # _fusion_retrieve per-channel handler 置 fusion_channel_skipped=True。
+        degraded_fn = getattr(self.graphlite_store, "last_query_infra_degraded", None)
+        if not rows and degraded_fn is not None and degraded_fn():
+            raise _EntityChannelDegraded("entity channel infra degraded")
 
         seen_ids: set[str] = set()
         results: list[dict] = []
@@ -1290,6 +1349,7 @@ class QueryRouter:
         level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
         include_archived: bool = False,
         session_ts: Optional[float] = None,
+        rerank: Optional[bool] = None,
     ) -> list[dict]:
         """多信号检索融合入口。
 
@@ -1305,6 +1365,8 @@ class QueryRouter:
             session_ts: session 时间锚（P0-2 时间推理根治；None 回落墙钟）。注入
                 到相对时间词解析（_relative_time_at_ts/_property_time_mode），
                 使"昨天/last year"等相对词对历史 session 按 session_ts 而非墙钟换算。
+            rerank: bge-reranker 重排开关（P3a）。None → 读 config.rerank_enabled；
+                仅 level==FUSION 时生效；False 显式关闭（关闭路径逐字节等价旧行为）。
 
         Returns:
             检索结果列表 [...]
@@ -1336,7 +1398,16 @@ class QueryRouter:
             results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
             if not include_archived:
                 results = self._filter_archived(results)
-            return self._deduplicate_and_sort(results)
+            sorted_results = self._deduplicate_and_sort(results)
+            # 【P3a】bge-reranker 重排：仅在 FUSION 且 rerank 开启时触发，在去重+boost+钳制
+            # 之后重排头部覆盖 score，尾部原序保留。rerank=None → 读 config.rerank_enabled；
+            # 异常/模型失败静默降级原列表（零回归）。
+            if level == RetrievalLevel.FUSION:
+                rerank_enabled = self.config.rerank_enabled if rerank is None else rerank
+                sorted_results = self._rerank_results(
+                    sorted_results, raw_query, bool(rerank_enabled)
+                )
+            return sorted_results
 
         strategy = self.detect_strategy(query)
         logger.info("Retrieval started", query=query[:80], level=level.value, strategy=strategy)
@@ -1372,7 +1443,9 @@ class QueryRouter:
             if results:
                 return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            return self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
+            self._tag_degraded(r, level="l1_empty")
+            return r
 
         if level == RetrievalLevel.VECTOR:
             try:
@@ -1393,11 +1466,15 @@ class QueryRouter:
         try:
             results = self._keyword_retrieve(query)
         except Exception as e:
-            return _finish(self._graphlite_text_fallback(query, str(e)))
+            r = _finish(self._graphlite_text_fallback(query, str(e)))
+            self._tag_degraded(r, level="l3_error")
+            return r
         if results:
             return _finish(results)
         logger.info("L3 empty, trying L4 GraphLite fallback")
-        return _finish(self._graphlite_text_fallback(query, "L3 empty"))
+        r = _finish(self._graphlite_text_fallback(query, "L3 empty"))
+        self._tag_degraded(r, level="l3_empty")
+        return r
 
     def _fusion_retrieve(
         self,
@@ -1448,6 +1525,7 @@ class QueryRouter:
         def _run_entity():
             return self._entity_match(query, cfg.top_k_keyword)
 
+        fusion_channel_skipped = False
         with ThreadPoolExecutor(max_workers=3) as pool:
             futures: dict = {}
             futures["vector"] = pool.submit(_run_vector)
@@ -1463,9 +1541,11 @@ class QueryRouter:
                     result = fut.result()
                 except FAISSUnavailable:
                     logger.warning("Fusion: %s channel unavailable, skipping", channel)
+                    fusion_channel_skipped = True
                     continue
                 except Exception:
                     logger.exception("Fusion: %s channel failed", channel)
+                    fusion_channel_skipped = True
                     continue
                 if channel == "vector":
                     vector_results = result
@@ -1481,7 +1561,12 @@ class QueryRouter:
             entity=len(entity_results),
         )
 
-        return self._fuse_results(vector_results, bm25_results, entity_results, now_ts)
+        fused = self._fuse_results(vector_results, bm25_results, entity_results, now_ts)
+        # 【P3】通道级降级也算降级信号：FAISSUnavailable/异常跳过某通道时打标
+        # （部分通道降级语义；正常全通道不打标，不误报）。
+        if fusion_channel_skipped:
+            self._tag_degraded(fused, level="fusion_channel_skip")
+        return fused
 
     # ──────────────────────────────
     # 【P0-2 Agentic】多步锚点检索编排（规则原语 + 编排器，全私有）
@@ -2801,10 +2886,136 @@ class QueryRouter:
             return None
 
     @staticmethod
-    def _tag_degraded(results: list[dict], level: str) -> None:
+    def _tag_degraded(results, level: str) -> None:
+        """给结果逐条打降级标记（防御式：仅对 list[dict] 生效，非 list 静默跳过）。
+
+        【P3a R5】FUSION 通道级降级打标新增后，旧测试/极端路径可能让 results
+        非 list（如 mock 返回字符串）；打标是元数据增强，不应对非 list 结果
+        抛 TypeError（会破坏既有契约）。
+
+        【P3a R6 P2-1】标签保留语义：`_degradation_level not in r` 是「先打先留」
+        （first-writer-wins）。多级级联时内层先打标（如 l3_empty 比 l1_empty 更具体），
+        外层后打不覆盖——保留最内层具体原因，诊断价值最高。
+        """
+        if not isinstance(results, list):
+            return
         for r in results:
-            if "_degradation_level" not in r:
+            if isinstance(r, dict) and "_degradation_level" not in r:
                 r["_degradation_level"] = level
+
+    def _get_reranker(self):
+        """【P3a】懒加载 bge-reranker CrossEncoder（双重检查锁 + 失败永久标记）。
+
+        仅 FUSION + rerank_enabled 时被 _rerank_results 调用。模型加载较慢
+        （CPU ~5-15s），放 __init__ 会拖慢启动，故懒加载；sentence_transformers
+        为可选依赖，函数内 import（未安装时 ImportError → _rerank_failed=True
+        永久跳过，不再重试）。并发线程经双重检查锁保证只加载一次。
+        """
+        if getattr(self, "_reranker", None) is not None:
+            return self._reranker
+        if getattr(self, "_rerank_failed", False):
+            return None
+        lock = getattr(self, "_rerank_lock", None) or threading.Lock()
+        self._rerank_lock = lock
+        with lock:
+            if getattr(self, "_reranker", None) is not None:
+                return self._reranker
+            if getattr(self, "_rerank_failed", False):
+                return None
+            try:
+                import os as _os
+
+                # 离线加载（同 embedding/encoder.py 模式）：进程内强制离线防网络挂起。
+                # bge-reranker-base 是标准 XLMRobertaForSequenceClassification，无需
+                # trust_remote_code（该参数会强制网络拉取远程代码，离线环境每次失败
+                # 重试 ~30s 后才报错）。模型名命中本地 HF 缓存 snapshot 直接加载。
+                _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                from sentence_transformers import CrossEncoder
+
+                self._reranker = CrossEncoder(
+                    "BAAI/bge-reranker-base",
+                    device="cpu",
+                )
+                return self._reranker
+            except Exception:
+                self._rerank_failed = True
+                logger.warning(
+                    "bge-reranker unavailable, rerank disabled (permanent)",
+                    exc_info=True,
+                )
+                return None
+
+    def _rerank_results(
+        self,
+        results: list[dict],
+        raw_query: Optional[str],
+        enabled: bool,
+    ) -> list[dict]:
+        """【P3a】bge-reranker 重排（仅 FUSION 头部，尾部原序保留）。
+
+        - enabled=False / _rerank_failed / len<2 → 原列表直接返回
+        - 取 top min(rerank_input_k, len) 头部候选，空 content 跳过（视觉节点无文本）
+        - CrossEncoder 打分 → sigmoid 归一化 → 覆盖头部 score 重排；尾部原序 append
+        - 【F4】unscorable（空 content）保持其在 head 中的原始相对位置（不统一 append
+          到可打分节点之后）
+        - 【F5】predict 返回长度失配 → 静默降级原列表（防部分候选被丢）
+        - 【F6】NaN/Inf 防护：nan_to_num 后 sigmoid，防 SDK 返回 NaN/Inf 破坏 score 契约
+        - 任何异常 → 原列表返回（静默降级，主检索零回归）
+
+        顺序契约：调用方（_finish）先执行 _deduplicate_and_sort（去重+boost+钳制），
+        再调用本方法；返回后顺序即最终顺序，不再二次排序。
+        """
+        if not enabled or getattr(self, "_rerank_failed", False) or len(results) < 2:
+            return results
+        try:
+            reranker = self._get_reranker()
+            if reranker is None:
+                return results
+            k = min(int(self.config.rerank_input_k), len(results))
+            head = results[:k]
+            tail = results[k:]
+            scorable: list[tuple[str, dict]] = []
+            for r in head:
+                content = str(r.get("content", "") or "").strip()
+                if content:
+                    scorable.append((content, r))
+            if len(scorable) < 2:
+                return results
+            query_text = raw_query or ""
+            pairs = [(query_text, c[:3000]) for c, _ in scorable]
+            scores = reranker.predict(pairs)
+            logits = np.asarray(scores, dtype=np.float64).reshape(-1)
+            # 【F5】长度失配 → 静默降级原列表（防部分候选被丢）
+            if len(logits) != len(scorable):
+                return results
+            # 【F6】NaN/Inf 防护：SDK 返回 NaN/Inf 会破坏 EpisodicResult score 契约
+            # （nan→0.0，±inf→±50，经下方 clip+sigmoid 收敛到 (0,1) 有效分）
+            logits = np.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+            # sigmoid 归一化：logit 可能极大 → clip 防 exp 溢出（numpy 溢出 warning）
+            probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -50.0, 50.0)))
+            order = np.argsort(-probs)
+            reranked_scorable: list[dict] = []
+            for idx in order:
+                i = int(idx)
+                r = scorable[i][1]
+                r["score"] = float(probs[i])
+                reranked_scorable.append(r)
+            # 【F4】按 head 顺序归并：scorable 位置填入重排后的下一候选，
+            # 空 content 位置原样保留其原始相对位置（而非 append 到所有可打分节点后）。
+            merged: list[dict] = []
+            sc_iter = iter(reranked_scorable)
+            for r in head:
+                if str(r.get("content", "") or "").strip():
+                    merged.append(next(sc_iter))
+                else:
+                    merged.append(r)
+            return merged + tail
+        except Exception:
+            logger.debug(
+                "rerank degraded, returning original results", exc_info=True
+            )
+            return results
 
     @staticmethod
     def _deduplicate_and_sort(results: list[dict]) -> list[dict]:

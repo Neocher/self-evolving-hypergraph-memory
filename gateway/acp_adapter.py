@@ -88,12 +88,14 @@ class SHMACPAdapter:
         namespace = params.get("namespace")
         # 【R2 N6-P3】透传 session_ts（None 默认，向后兼容）——时间锚下沉到网关层。
         session_ts = params.get("session_ts")
+        strategy = params.get("strategy")
         try:
             result = await self._gateway.retrieve(
                 query=query,
                 top_k=top_k,
                 namespace=namespace,
                 session_ts=session_ts,
+                strategy=strategy,
             )
             return {
                 "status": "ok",

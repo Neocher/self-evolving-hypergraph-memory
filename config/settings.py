@@ -144,6 +144,14 @@ class RetrievalConfig:
     visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
     mesa: MesaConfig = field(default_factory=MesaConfig)
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
+    rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
+    rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）
+
+    def __post_init__(self) -> None:
+        # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
+        # 静默跳过重排（配置期 fail-fast 拒绝非法值）。
+        if self.rerank_input_k < 1:
+            raise ValueError(f"RetrievalConfig.rerank_input_k={self.rerank_input_k} 必须 >= 1")
 
 
 @dataclass

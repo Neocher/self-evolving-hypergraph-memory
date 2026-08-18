@@ -39,6 +39,7 @@ from typing import Optional
 
 # 可插拔向量存储工厂
 from retrieval.vector_store import VectorStoreFactory, BaseVectorStore
+from retrieval.query_router import RetrievalLevel
 from observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +48,10 @@ logger = get_logger(__name__)
 # _mesa_synthesis 数学保证「合成节点低于本社区原始成员」）。用 0.59（非 0.6 开区间）
 # 避免 float 精度下边界值破坏分数契约；validate 与规则 6 共用此常量保证一致。
 _MESA_BOOST_MAX = 0.59
+
+# 【P3a R6 P2-3】清结果缓存最小间隔（秒）：连续多轮演化触发 _sync_params 时，
+# 60s 内不重复清空 result cache（清缓存代价高且演化低频，无需每轮都清）。
+_CACHE_CLEAR_MIN_INTERVAL_S = 60.0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -561,6 +566,7 @@ class SelfEvolvingRetrieval:
         self._latency_threshold_ms = latency_threshold_ms
         self._probe_interval_s = float(probe_interval_s)
         self._last_probe_time = time.time()
+        self._last_cache_clear_ts = 0.0  # 【P3a R6 P2-3】上次清缓存时间戳
         self._lock = threading.Lock()
         self._persist_path = persist_path or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -570,7 +576,9 @@ class SelfEvolvingRetrieval:
         self._vector_store: Optional[BaseVectorStore] = None
 
     def retrieve(self, query: str, include_archived: bool = False,
-                 session_ts: Optional[float] = None):
+                 session_ts: Optional[float] = None,
+                 level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
+                 rerank: Optional[bool] = None):
         """执行检索 + 质量评估 + 自演化（线程安全）。
 
         【H1-a】锁粒度收窄：不再用方法级大锁包裹整个 _qr.retrieve
@@ -588,6 +596,9 @@ class SelfEvolvingRetrieval:
 
         include_archived: 透传给底层 QueryRouter（默认 False 排除归档节点）。
         session_ts: session 时间锚（P0-2；透传给 QueryRouter，None 回落墙钟）。
+        level: 检索级别（P3a R1；透传给 QueryRouter，默认 HYPERGRAPH）。生产
+            REST 入口经 _level_from_strategy 将 hybrid→FUSION，接通 bge-reranker。
+        rerank: bge-reranker 重排开关（P3a R1；透传，None → 读 config.rerank_enabled）。
         """
         params_before = self.guard.current().snapshot()
         start = time.perf_counter()
@@ -595,7 +606,7 @@ class SelfEvolvingRetrieval:
         # 无锁执行检索（读操作，可并发执行；演化参数仅在 apply 后同步到 cfg）
         try:
             raw = self._qr.retrieve(query, include_archived=include_archived,
-                                    session_ts=session_ts)
+                                    session_ts=session_ts, level=level, rerank=rerank)
         except Exception as e:
             logger.error("检索失败: %s", e)
             return []
@@ -712,6 +723,20 @@ class SelfEvolvingRetrieval:
         cfg.bm25_k1 = p.bm25_k1
         cfg.bm25_b = p.bm25_b
         cfg.mesa_boost = p.mesa_boost
+
+        # 【P2-1】检索配置已演化，结果缓存基于旧参数失效——惰性 import 清空
+        # （api.routes._deps 较重且避免顶层循环依赖；演化低频，代价可忽略）。
+        # 【P3a R6 P2-3】加最小间隔：连续多轮演化时 60s 内不重复清（getattr 兜底
+        # __new__ 绕过 __init__ 的测试路径）。
+        now = time.time()
+        if now - getattr(self, "_last_cache_clear_ts", 0.0) < _CACHE_CLEAR_MIN_INTERVAL_S:
+            return
+        self._last_cache_clear_ts = now
+        try:
+            from api.routes._deps import clear_result_cache
+            clear_result_cache()
+        except Exception:
+            logger.warning("Result cache clear failed", exc_info=True)
 
     def _evolve(self, trigger_snapshot: Optional[RetrievalSnapshot] = None):
         """执行一轮演化：诊断 → 应用 → 同步 → 持久化

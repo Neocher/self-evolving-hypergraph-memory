@@ -253,6 +253,15 @@ _result_cache_max: int = 128
 _result_cache_lock: threading.Lock = threading.Lock()
 
 
+def clear_result_cache() -> None:
+    """清空检索结果缓存（检索配置演化后旧缓存失效）。
+
+    由 retrieval/self_evolving.py 演化成功同步参数后调用（惰性 import 防循环依赖）。
+    """
+    with _result_cache_lock:
+        _result_cache.clear()
+
+
 def flush_faiss_buffer(deps: Services) -> int:
     """
     将 FAISS 缓冲区中的待写入项批量写入索引。

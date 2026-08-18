@@ -75,6 +75,8 @@ retrieval:
     threshold: 0.5               # BM25-on-summary 相关度阈值（对齐 community_expansion）
     max_nodes: 5                 # 每查询最多合成节点数
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
+  rerank_enabled: true           # bge-reranker 重排开关（默认开，仅 FUSION 生效）
+  rerank_input_k: 40             # 送入 reranker 的头部候选数（尾部保持原序 append）
 
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5"  # 中文 embedding 模型（512维，中文专用，CPU 0.05s/条）

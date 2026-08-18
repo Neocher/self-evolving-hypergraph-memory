@@ -80,12 +80,14 @@ class SHMClient:
 
     def retrieve(self, query: str, top_k: int = 20,
                  namespace: str | None = None,
-                 include_shared: bool = True) -> Dict[str, Any]:
+                 include_shared: bool = True,
+                 strategy: str | None = "auto") -> Dict[str, Any]:
         return self._post("/memories/retrieve", {
             "query": query,
             "top_k": top_k,
             "namespace": namespace,
             "include_shared": include_shared,
+            "strategy": strategy,
         })
 
     def search_vector(self, query: str, limit: int = 10) -> Dict[str, Any]:
@@ -148,6 +150,7 @@ def _make_parser() -> argparse.ArgumentParser:
     p_ret.add_argument("query", help="检索文本")
     p_ret.add_argument("--top-k", type=int, default=20, help="返回结果数")
     p_ret.add_argument("--namespace", "-n", default=None, help="限定命名空间")
+    p_ret.add_argument("--strategy", default="auto", help="检索策略 (auto/hybrid)")
 
     # search
     p_src = sub.add_parser("search", help="纯向量检索")
@@ -221,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
                 data = client.retrieve(
                     args.query, top_k=args.top_k,
                     namespace=args.namespace,
+                    strategy=args.strategy,
                 )
                 if use_json:
                     print(json.dumps(data, ensure_ascii=False, indent=2))

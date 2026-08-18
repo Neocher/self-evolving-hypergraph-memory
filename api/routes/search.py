@@ -20,14 +20,28 @@ from graph.graphlite_store import CircuitBreakerOpen
 
 from core.content_guard import scan_content
 
+from retrieval.query_router import RetrievalLevel
+
 # 【H2】外部检索超时（秒）：QueryRouter.retrieve 挂起（GraphLite/FAISS 卡死）时
-# 超时返回空结果而非无限挂起 + 线程泄漏（与写路径超时对称）
+# 超时返回空结果而非无限挂起（与写路径超时对称）。注：超时只解绑 await，不终止底层线程
 _RETRIEVE_TIMEOUT = 3.0  # 【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边遍历超时立即降级返回向量结果, 不空等
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
 # 超时即跳过该降级分支（短于主检索超时，兜底只做尽力而为的补充）。
 _DEGRADE_TIMEOUT = 10.0
+
+
+def _level_from_strategy(strategy) -> "RetrievalLevel":
+    """策略字符串 → 检索级别（CC 方案 B：hybrid→FUSION，其余回落 HYPERGRAPH 零回归）。
+
+    strategy 为任意 Optional[str]（api/models.py 未收窄）：仅 "hybrid" 映射到
+    FUSION（生产接通 bge-reranker 重排，修复 P0 生产入口死代码）；auto/
+    tau_first/vector_first/None/未知字符串均回落 HYPERGRAPH，保持现状零回归。
+    """
+    if isinstance(strategy, str) and strategy.strip().lower() == "hybrid":
+        return RetrievalLevel.FUSION
+    return RetrievalLevel.HYPERGRAPH
 
 
 @router.post("/memories/retrieve", summary="粗到精三级检索（带降级）")
@@ -40,8 +54,11 @@ async def retrieve(
     set_trace_id()
     degraded = False
 
-    # 【Perf】结果缓存命中（键含 include_archived/session_ts，避免互相污染缓存）
-    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:ts:{req.session_ts}"
+    # 【Perf】结果缓存命中（键含 include_archived/session_ts/namespace/strategy，避免互相污染缓存）
+    # 【P3a R3 P1-2/P2-1】ns 维度：路由按 namespace 过滤，同 query 不同 ns 不能串缓存；
+    # strategy_raw 维度：auto/tau_first/vector_first 都映射 HYPERGRAPH 但 strategy_used
+    # 按原始值回显，不能共用缓存（否则命中时 strategy_used 回显错误）。
+    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:shared:{req.include_shared}:ts:{req.session_ts}:ns:{req.namespace or ''}:strategy:{_level_from_strategy(req.strategy).value}:strategy_raw:{req.strategy or ''}"
     with _result_cache_lock:
         if cache_key in _result_cache:
             latency = (_now() - start) * 1000
@@ -61,6 +78,8 @@ async def retrieve(
                 deps.query_router.retrieve, req.query,
                 include_archived=req.include_archived,
                 session_ts=req.session_ts,
+                level=_level_from_strategy(req.strategy),
+                rerank=None,
             ),
             timeout=_RETRIEVE_TIMEOUT,
         )
@@ -94,6 +113,10 @@ async def retrieve(
                           f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
                 # 【H2】【H2-a】Cypher 兜底移入线程池 + 套 wait_for：
                 # GraphLite 卡死时超时即跳过兜底，不再无限挂起
+                # 【P1-2】degraded 置位于 wait_for 之前（对齐 gateway_api.py:491）：
+                # query_cypher 抛非超时异常（QueryError/ConnectionError）跳外层
+                # except 时该行已执行，确保兜底失败 → 空结果 + degraded=True。
+                degraded = True
                 try:
                     fallback_rows = await asyncio.wait_for(
                         asyncio.to_thread(deps.graphlite_store.query_cypher, cypher, params),
@@ -103,7 +126,6 @@ async def retrieve(
                     logger.warning("Cypher fallback timed out after %.1fs, skipping",
                                    _DEGRADE_TIMEOUT)
                     fallback_rows = []
-                degraded = True
                 for row in fallback_rows:
                     if isinstance(row, (list, tuple)):
                         nid, content = row[0], row[1] if len(row) > 1 else ""
@@ -120,6 +142,16 @@ async def retrieve(
                 logger.info("Cypher fallback provided %d results", len(results_raw))
         except Exception:
             logger.exception("Cypher fallback failed")
+
+    # 检查是否降级
+    # 【P2-2】在去重/命名空间/隔离过滤前基于 results_raw 原始结果判断：过滤后
+    # results_raw 变空会丢失 _degradation_level 降级信号。Cypher 兜底 / 检索超时
+    # 已在上方自行置 degraded=True，这里用 or 保留不覆盖。
+    if results_raw:
+        degraded = degraded or any(
+            isinstance(r, dict) and "_degradation_level" in r
+            for r in results_raw
+        )
 
     # 【Defense】隔离节点排除
     if results_raw and deps.quarantine_store is not None:
@@ -190,11 +222,6 @@ async def retrieve(
         if len(deduped) < len(results_raw):
             logger.debug("Dedup removed %d duplicate results", len(results_raw) - len(deduped))
         results_raw = deduped
-
-    # 检查是否降级
-    if results_raw:
-        first_level = results_raw[0].get("level", "hypergraph") if isinstance(results_raw[0], dict) else "hypergraph"
-        degraded = first_level != "hypergraph"
 
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:

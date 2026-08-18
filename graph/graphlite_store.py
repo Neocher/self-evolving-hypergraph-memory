@@ -318,6 +318,13 @@ class GraphLiteStore:
         # 挂起），所有 _session.query/execute 统一经 _locked_query/_locked_execute 串行化。
         # RLock 可重入——写线程内嵌套调用不死锁。
         self._session_lock = threading.RLock()
+        # 【P3a R7】thread-local 降级信号：query_cypher 永不抛异常契约下，基础设施
+        # 降级（熔断 open / 重试耗尽）表现为返回 []。记录「最近一次 query_cypher 是否
+        # 基础设施降级」，供 _entity_match 区分「正常无匹配」与「基础设施降级」。
+        # thread-local 而非共享 bool：QueryRouter 单例被线程池共享，共享 bool 有确定性
+        # 假阴性（A 线程失败 B 线程成功 → A 读 False）；thread-local 在 _fusion_retrieve
+        # 同池线程上同步读写，零竞态，4 条路径全写标志无陈旧。
+        self._local = threading.local()
 
     @property
     def conn(self):
@@ -1297,15 +1304,18 @@ class GraphLiteStore:
           （如 result 无 rows）不逃出永不抛异常契约，按应用错误防御性返回 []
         """
         if not self.circuit_breaker.allow_request():
+            self._local.last_infra_degraded = True
             return []
         q = self._interpolate(query, params)
         try:
             result = self._locked_query(q)
             self.circuit_breaker.record_success()
+            self._local.last_infra_degraded = False
             return list(result.rows)
         except _INFRA_EXCEPTIONS:
             raise  # 交给 with_retry 重试；失败计数由 query_cypher 重试耗尽后统一记录
         except Exception:
+            self._local.last_infra_degraded = False  # 应用错误不误报
             return []  # 应用错误不计数、不重试
 
     def query_cypher(self, query: str, params: Optional[dict] = None) -> list:
@@ -1327,7 +1337,12 @@ class GraphLiteStore:
                 self.circuit_breaker.record_failure(e)  # 重试耗尽 → 统一计失败
             except CircuitBreakerOpen:
                 pass  # 跳闸 → 静默返回 []（永不抛异常契约）
+            self._local.last_infra_degraded = True  # 重试耗尽/跳闸 → 基础设施降级
             return []  # 重试耗尽 → 静默降级
+
+    def last_query_infra_degraded(self) -> bool:
+        """最近一次 query_cypher 是否基础设施降级（thread-local，25 调用方零感知）。"""
+        return getattr(self._local, "last_infra_degraded", False)
 
     # ─── Helpers ────────────────────────────────────
 

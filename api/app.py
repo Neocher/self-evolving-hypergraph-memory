@@ -151,6 +151,8 @@ def _build_router_config(rcfg):
         mesa_boost=getattr(mesa, "boost", 0.4),
         mesa_threshold=getattr(mesa, "threshold", 0.5),
         mesa_max_nodes=getattr(mesa, "max_nodes", 5),
+        rerank_enabled=getattr(rcfg, "rerank_enabled", True),
+        rerank_input_k=getattr(rcfg, "rerank_input_k", 40),
     )
 
 
@@ -626,6 +628,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 logger.info("Startup: visual index prewarm complete")
             except Exception as e:
                 logger.warning("Startup visual prewarm skipped (non-fatal): %s", e)
+
+        # 【P3a R1】启动异步预热 bge-reranker（冷启动护栏，失败静默降级不阻塞启动）
+        if inner_qr is not None and hasattr(inner_qr, "prewarm_reranker"):
+            try:
+                await inner_qr.prewarm_reranker()
+                logger.info("Startup: reranker prewarm complete")
+            except Exception as e:
+                logger.warning("Startup reranker prewarm skipped (non-fatal): %s", e)
 
         # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
         # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；

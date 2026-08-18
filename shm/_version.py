@@ -1,12 +1,25 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.50.1"
-__version_info__ = (5, 50, 1)
-__version_name__ = "NullTauFix"
+__version__ = "5.51.0"
+__version_info__ = (5, 51, 0)
+__version_name__ = "Rerank-Fusion"
 __release_date__ = "2026-08-18"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.51.0 (2026-08-18) Rerank-Fusion:
+  • 生产管道集成 bge-reranker 重排（P3a）— 补齐 vs MindMemOS
+    最大差距路径（v5.47 RAG v4 管道含 rerank 时 69.5%）
+  • FUSION 统一出口懒加载 CrossEncoder，sigmoid 归一化覆盖 score，
+    失败静默降级；配置 rerank_enabled/rerank_input_k 可调
+  • 修复生产入口死代码（P0）：/memories/retrieve + A2A/ACP/CLI
+    三条协议路径接入 strategy→level 映射（hybrid→FUSION）
+  • 修复历史欠账：三路融合（vector+BM25+entity）首次在生产 HTTP
+    路径生效；prewarm_reranker 兜冷启动；缓存 key 补 strategy/ns/shared
+  • degraded 信号根治：thread-local 降级标志（熔断 open/重试耗尽置位），
+    替换 level 前缀猜测；_tag_degraded 防御式守卫
+  • 测试: test_query_router_rerank（29+）+ TestP3aR7EntityDegradation +
+    全量回归 1114 passed；Codex 审核链 R1-R8 收敛
 v5.50.1 (2026-08-18) NullTauFix:
   • 修复 GraphLite 真实引擎 NULL 序列化为字符串 'Null' 导致 float()
     崩溃 — BM25/entity 检索通道静默瘫痪（bm25=0 entity=0，400 次）
