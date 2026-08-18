@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.50.0"
-__version_info__ = (5, 50, 0)
-__version_name__ = "Schema-AttrOps"
-__release_date__ = "2026-08-17"
+__version__ = "5.50.1"
+__version_info__ = (5, 50, 1)
+__version_name__ = "NullTauFix"
+__release_date__ = "2026-08-18"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.50.1 (2026-08-18) NullTauFix:
+  • 修复 GraphLite 真实引擎 NULL 序列化为字符串 'Null' 导致 float()
+    崩溃 — BM25/entity 检索通道静默瘫痪（bm25=0 entity=0，400 次）
+  • 新增 _safe_float_tau() 防御解析，替换 query_router.py 5 处
+    （BM25 索引构建 / 实体匹配 / L4 fallback）
+  • 真实引擎 200 问 fusion 56.0%（baseline 54.0%，+2.0pp），
+    三路融合（vector+BM25+entity）恢复
+  • 测试: test_null_tau_fix（13 passed，含真实引擎 'Null' 场景）+ 全量回归
 v5.50.0 (2026-08-17) Schema-AttrOps:
   • P2 Schema 演化深化 — 属性别名合并 + 中文映射学习的零回归最小闭环
     （CC 设计 D1-D6 通过，P0 范围实施）

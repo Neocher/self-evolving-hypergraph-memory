@@ -42,6 +42,26 @@ from observability.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _safe_float_tau(value) -> float:
+    """GraphLite 真实引擎 NULL 序列化为字符串 'Null'（非 None），float('Null') 抛 ValueError。
+
+    防御性解析：None/'Null'/'null'/''/非数字 → 0.0，其余转 float。
+    修复 v5.50 真实引擎评测 bm25/entity 通道静默崩溃（bm25=0 entity=0）。
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "none", "nan"):
+        return 0.0
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 # 【P0-1 实体-属性-时间】属性版本链检索通道常量（append 相对尾分缩放，严格低于种子）
 _PROPERTY_BOOST = 0.6
 _PROPERTY_MAX_RESULTS = 5
@@ -515,12 +535,12 @@ class QueryRouter:
             if isinstance(row, dict):
                 nid = row.get("node_id", "") or ""
                 content = row.get("content", "") or ""
-                tau = float(row.get("tau_value", 0.0) or 0.0)
+                tau = _safe_float_tau(row.get("tau_value", 0.0))
                 fact_track = row.get("fact_track", "active") or "active"
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
                 nid = str(row[0]) if row[0] is not None else ""
                 content = str(row[1]) if row[1] is not None else ""
-                tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+                tau = _safe_float_tau(row[2]) if len(row) > 2 else 0.0
                 fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
             else:
                 continue
@@ -1124,12 +1144,12 @@ class QueryRouter:
             if isinstance(row, dict):
                 nid = row.get("node_id", "") or ""
                 content = row.get("content", "") or ""
-                tau = float(row.get("tau_value", 0.0) or 0.0)
+                tau = _safe_float_tau(row.get("tau_value", 0.0))
                 fact_track = row.get("fact_track", "active") or "active"
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
                 nid = str(row[0]) if row[0] is not None else ""
                 content = str(row[1]) if row[1] is not None else ""
-                tau = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
+                tau = _safe_float_tau(row[2]) if len(row) > 2 else 0.0
                 fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
             else:
                 continue
@@ -2688,7 +2708,7 @@ class QueryRouter:
                             "node_id": str(row[0]),
                             "content": str(row[1]),
                             "score": 0.5,
-                            "tau_value": float(row[2]) if len(row) > 2 else 0.0,
+                            "tau_value": _safe_float_tau(row[2]) if len(row) > 2 else 0.0,
                             "fact_track": str(row[3]) if len(row) > 3 else "active",
                             "level": "graphlite_fallback",
                         }
