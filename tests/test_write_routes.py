@@ -285,14 +285,14 @@ class TestForcePromoteProtectedFlagRoute:
     旁路同构缺陷），本测试证明 force_promote=true 时标记真实落库。
     """
 
-    def test_force_promote_route_persists_protected_flag(self, client, graphlite_store):
+    def test_force_promote_route_persists_protected_flag(self, client, overgraph_store):
         """POST force_promote=true → 落库节点 protected in (True, "true", 1)。
 
         真实 GraphLite 存储读回，兼容 _flatten_row 还原的 Python True
         与 GraphLite 原生 "true"/1 形态。
         """
         svc = Services()
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "重要记忆 force promote 路由级测试",
@@ -302,7 +302,7 @@ class TestForcePromoteProtectedFlagRoute:
 
         assert resp.status_code == 200, resp.text
         episode_id = resp.json()["episode_id"]
-        got = graphlite_store.get_episode(episode_id)
+        got = overgraph_store.get_episode(episode_id)
         assert got is not None
         assert got["content"] == "重要记忆 force promote 路由级测试"
         assert got.get("protected") in (True, "true", 1), (

@@ -477,54 +477,54 @@ class TestAttrAliasChannelConsumption:
         store.create_property_version("Apple", "revenue", "10B", valid_from=_year_ts(2020))
         store.create_property_version("Apple", "income", "9B", valid_from=_year_ts(2020))
 
-    def test_alias_expands_to_canonical_via_retrieve(self, graphlite_store):
+    def test_alias_expands_to_canonical_via_retrieve(self, overgraph_store):
         """注入 attr_aliases 后 "Apple income" 命中 revenue + income 双属性（公共入口）。"""
-        self._seed_two_attrs(graphlite_store)
+        self._seed_two_attrs(overgraph_store)
         router = _make_router(
-            graphlite_store, [_seed_result("ep1", "Apple 的业务情况")],
+            overgraph_store, [_seed_result("ep1", "Apple 的业务情况")],
             attr_aliases={"revenue": ["income"]},
         )
         out = router.retrieve("Apple income")
         props = [r for r in out if r["level"] == "property_temporal"]
         assert {p["attr_name"] for p in props} == {"revenue", "income"}
 
-    def test_no_alias_no_expansion(self, graphlite_store):
+    def test_no_alias_no_expansion(self, overgraph_store):
         """无别名（空表）时 "Apple income" 只命中 income（零回归）。"""
-        self._seed_two_attrs(graphlite_store)
+        self._seed_two_attrs(overgraph_store)
         router = _make_router(
-            graphlite_store, [_seed_result("ep1", "Apple 的业务情况")],
+            overgraph_store, [_seed_result("ep1", "Apple 的业务情况")],
             attr_aliases={},
         )
         out = router.retrieve("Apple income")
         props = [r for r in out if r["level"] == "property_temporal"]
         assert {p["attr_name"] for p in props} == {"income"}
 
-    def test_alias_not_existing_attr_name_via_retrieve(self, graphlite_store):
+    def test_alias_not_existing_attr_name_via_retrieve(self, overgraph_store):
         """【P1-1】alias 不是现存 attr_name：只存 revenue，查 "Apple income" 命中 revenue。
 
         income 不作为真实 attr_name 写入（修复前该缺口使 _extract_property_terms
         收不到 income → 别名学习失效）；别名表提取阶段识别 income → 扩展出
         canonical revenue。
         """
-        graphlite_store.create_property_version("Apple", "revenue", "10B", valid_from=_year_ts(2020))
+        overgraph_store.create_property_version("Apple", "revenue", "10B", valid_from=_year_ts(2020))
         router = _make_router(
-            graphlite_store, [_seed_result("ep1", "Apple 的业务情况")],
+            overgraph_store, [_seed_result("ep1", "Apple 的业务情况")],
             attr_aliases={"revenue": ["income"]},
         )
         out = router.retrieve("Apple income")
         props = [r for r in out if r["level"] == "property_temporal"]
         assert {p["attr_name"] for p in props} == {"revenue"}
 
-    def test_chinese_alias_matches_canonical_via_retrieve(self, graphlite_store):
+    def test_chinese_alias_matches_canonical_via_retrieve(self, overgraph_store):
         """【P1-4】中文 alias "营业额" → 命中 canonical revenue（公共入口）。
 
         只存 revenue + market_cap，查 "Apple 营业额" 应只返回 revenue（market_cap
         被属性词过滤）。修复前中文 alias 收不进 terms → 不过滤 → 双属性都返回。
         """
-        graphlite_store.create_property_version("Apple", "revenue", "10B", valid_from=_year_ts(2020))
-        graphlite_store.create_property_version("Apple", "market_cap", "2T", valid_from=_year_ts(2020))
+        overgraph_store.create_property_version("Apple", "revenue", "10B", valid_from=_year_ts(2020))
+        overgraph_store.create_property_version("Apple", "market_cap", "2T", valid_from=_year_ts(2020))
         router = _make_router(
-            graphlite_store, [_seed_result("ep1", "Apple 的业务情况")],
+            overgraph_store, [_seed_result("ep1", "Apple 的业务情况")],
             attr_aliases={"revenue": ["营业额"]},
         )
         out = router.retrieve("Apple 营业额")

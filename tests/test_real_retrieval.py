@@ -63,7 +63,7 @@ def _enc():
 class TestRealChineseVectorRetrieval:
     """真实 bge + FAISS + GraphLite 全链路中文检索"""
 
-    def test_real_chain_chinese_hits(self, _enc, graphlite_store):
+    def test_real_chain_chinese_hits(self, _enc, overgraph_store):
         from retrieval.vector_store import FaissStore
         from retrieval.query_router import (
             QueryRouter, QueryRouterConfig as QRCfg, RetrievalLevel,
@@ -71,7 +71,7 @@ class TestRealChineseVectorRetrieval:
 
         ids = []
         for i, c in enumerate(DOCS):
-            eid = graphlite_store.create_episode({
+            eid = overgraph_store.create_episode({
                 "content": c, "created_at": i + 1.0, "tau_initial": 1.0,
                 "tau_value": 0.6, "source": "e2e", "trust_score": 0.8,
             })
@@ -83,7 +83,7 @@ class TestRealChineseVectorRetrieval:
         faiss_id_map = {int(faiss_nums[i]): ids[i] for i in range(len(ids))}
 
         qr = QueryRouter(
-            graphlite_store=graphlite_store,
+            graphlite_store=overgraph_store,
             faiss_index=vs,
             tfidf_index=_make_tfidf(DOCS),
             encoder=_enc,

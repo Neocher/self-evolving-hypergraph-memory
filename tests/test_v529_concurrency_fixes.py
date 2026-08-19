@@ -3,7 +3,7 @@ v5.29.0 梦境与写库并发卡死修复测试
 =================================
 覆盖三项修复的关键路径：
 
-· F1 — core/dream_scheduler.py: _run_dream 内两处 graphlite_store.query_cypher
+· F1 — core/dream_scheduler.py: _run_dream 内两处 overgraph_store.query_cypher
         （EpisodeNode 拉取 + HEBBIAN_CONNECTION 拉取）改为 asyncio.to_thread，
         慢查询不再阻塞事件循环。
         · test_dream_fetch_uses_to_thread: 慢查询在工作线程（非事件循环线程）执行
@@ -17,7 +17,7 @@ v5.29.0 梦境与写库并发卡死修复测试
         · test_persist_routed_through_write_queue: 步骤按序入队 + 纯函数不入队
         · test_persist_fallback_to_thread_without_queue: 无队列时回退 to_thread
 
-· F5 — graph/graphlite_store.py: _session_lock = threading.RLock() + 全部
+· F5 — graph/overgraph_store.py: _session_lock = threading.RLock() + 全部
         _session.query/execute 统一经 _locked_query/_locked_execute 串行化。
         · test_session_lock_is_rlock: 锁类型为 RLock（可重入，写线程内嵌套不死锁）
         · test_concurrent_session_access_serialized: 4 线程 × 5 写无异常/无挂起/无丢写
@@ -235,22 +235,22 @@ class TestF2PersistWriteQueue:
 class TestF5SessionLock:
     """F5: GraphLiteStore session 访问锁（RLock 可重入 + 并发写串行化）。"""
 
-    def test_session_lock_is_rlock(self, graphlite_store):
+    def test_session_lock_is_rlock(self, overgraph_store):
         """_session_lock 应为 threading.RLock（写线程内嵌套调用不死锁）。
 
         注意：threading.RLock 在本环境是工厂函数而非类，isinstance 第二参
         用 RLock() 实例的类型。
         """
-        assert isinstance(graphlite_store._session_lock, type(threading.RLock()))
+        assert isinstance(overgraph_store._session_lock, type(threading.RLock()))
 
-    def test_concurrent_session_access_serialized(self, graphlite_store):
+    def test_concurrent_session_access_serialized(self, overgraph_store):
         """4 线程 × 5 次 create_episode：无异常、无挂起、20 条全部落库。"""
         errors: list[str] = []
 
         def write(i: int) -> None:
             try:
                 for j in range(5):
-                    graphlite_store.create_episode({
+                    overgraph_store.create_episode({
                         "id": f"ep-{i}-{j}",
                         "content": f"episode {i}-{j}",
                         "created_at": time.time(),
@@ -270,7 +270,7 @@ class TestF5SessionLock:
         assert errors == [], f"并发写入抛出异常: {errors[:5]}"
         assert all(not t.is_alive() for t in threads), "并发写入线程挂起（>15s 未退出）"
 
-        rows = graphlite_store.query_cypher("MATCH (e:EpisodeNode) RETURN e.id", {})
+        rows = overgraph_store.query_cypher("MATCH (e:EpisodeNode) RETURN e.id", {})
         ids = _extract_ids(rows)
         expected = {f"ep-{i}-{j}" for i in range(4) for j in range(5)}
         assert expected <= ids, f"丢写: 缺失 {sorted(expected - ids)}"

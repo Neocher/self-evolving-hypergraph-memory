@@ -12,6 +12,8 @@ b64 块编码无子串保持性 → 中文 CONTAINS 不保证命中。
 import uuid
 import pytest
 
+pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义测试（默认排除，addopts -m 'not graphlite'）
+
 
 @pytest.fixture
 def gstore(graphlite_store):

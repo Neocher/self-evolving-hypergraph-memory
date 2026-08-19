@@ -54,8 +54,8 @@ def test_distill_min_support_boundary():
 # ─── 存储原语 + run_once（graphlite 真实库）──────────────
 
 
-def test_run_once_graphlite_creates_and_recalls(graphlite_store):
-    store = graphlite_store
+def test_run_once_graphlite_creates_and_recalls(overgraph_store):
+    store = overgraph_store
     for i, content in enumerate(["机器学习 研究 项目", "机器学习 研究 综述",
                                  "机器学习 研究 实验"]):
         store.create_episode({"content": content, "created_at": time.time()})
@@ -101,7 +101,7 @@ def test_run_once_overgraph_idempotent_no_accumulation(overgraph_store):
     assert created2 == created1  # 确定性 id：两轮产出相同 id（覆盖而非累积）
 
 
-def test_run_once_graphlite_idempotent_no_accumulation(graphlite_store):
+def test_run_once_graphlite_idempotent_no_accumulation(overgraph_store):
     """P1 幂等（真实 GraphLiteStore）：重复 run_once（同 episodes）不累积
     重复 :Conceptual 节点。
 
@@ -109,7 +109,7 @@ def test_run_once_graphlite_idempotent_no_accumulation(graphlite_store):
     重复执行产生重复节点（实测 count 1→2）；修复后两段式守卫（MATCH 命中
     SET 更新 / 未命中 INSERT）→ Schema 节点数量不增、产出 id 相同。
     """
-    store = graphlite_store
+    store = overgraph_store
     for content in ["机器学习 研究 项目", "机器学习 研究 综述", "机器学习 研究 实验"]:
         store.create_episode({"content": content, "created_at": time.time()})
 
@@ -123,10 +123,10 @@ def test_run_once_graphlite_idempotent_no_accumulation(graphlite_store):
     assert created2 == created1  # 确定性 id：两轮产出相同 id（覆盖而非累积）
 
 
-def test_create_schema_node_graphlite_upsert_updates_attributes(graphlite_store):
+def test_create_schema_node_graphlite_upsert_updates_attributes(overgraph_store):
     """P1 幂等（直测 create_schema_node）：同 id 重复写入走 SET 更新路径，
     不新增节点且属性更新（created_at/support 覆盖）。"""
-    store = graphlite_store
+    store = overgraph_store
     schema = {
         "id": "schema-1", "schema_name": "模式A",
         "pattern_keywords": ["机器学习"], "support": 2,

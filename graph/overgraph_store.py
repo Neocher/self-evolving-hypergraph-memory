@@ -65,8 +65,9 @@ except ImportError as _e:  # pragma: no cover — 依赖缺失时给出明确指
         "OverGraph SDK 未安装。SHM v6.0.0 overgraph 后端需要: pip install overgraph>=0.17.0"
     ) from _e
 
-# 复用 GraphLiteStore 的熔断器 / 缓存 / GQL 字面量 helpers（铁律：GraphLiteStore 实现不动）
-from graph.graphlite_store import (
+# 复用 graph.common 的熔断器 / 缓存 / GQL 字面量 helpers（跨后端共享符号，
+# v6.0.0 起不再依赖 graphlite_store；OverGraphCircuitBreaker 覆盖 infra 异常集）
+from graph.common import (
     CircuitBreaker,
     CircuitBreakerOpen,
     _backup_corrupt_db,

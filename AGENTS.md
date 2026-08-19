@@ -12,7 +12,7 @@ Do not report code issues without grep/read_file verification — hallucinated f
 
 <!-- banthis:end -->
 
-SHM v5.21.x — 自演化超图记忆系统。Python 3.11+, FastAPI, GraphLite, FAISS, bge-small-zh-v1.5(512d)。
+SHM v6.0.x — 自演化超图记忆系统。Python 3.11+, FastAPI, OverGraph（v6.0.0 起唯一后端，GraphLite 已移除）, FAISS, bge-small-zh-v1.5(512d)。
 
 ## 编码准则（Karpathy 精神）
 
@@ -57,7 +57,7 @@ SHM v5.21.x — 自演化超图记忆系统。Python 3.11+, FastAPI, GraphLite, 
 ```
 api/routes/        FastAPI 路由（write/search/system/...）
 core/              τ 衰减、SSM gate、dual_gate
-graph/             GraphLite store + hyperedge
+graph/             OverGraph store + hyperedge + common（跨后端共享符号）
 retrieval/         query_router + vector_store（FAISS 512d）
 config/            settings.py + defaults.yaml（⚠️ yaml 覆盖代码默认值，改模型必须同步改 yaml）
 shm/               _version.py 版本

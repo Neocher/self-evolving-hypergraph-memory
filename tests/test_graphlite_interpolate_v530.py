@@ -14,6 +14,8 @@ from base64 import b64encode
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义测试（默认排除，addopts -m 'not graphlite'）
+
 from graph.graphlite_store import GraphLiteStore
 
 

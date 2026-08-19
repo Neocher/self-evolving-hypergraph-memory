@@ -33,9 +33,9 @@ def _make_candidate(
     )
 
 
-def _create_episode(graphlite_store, ep_id: str, content: str = "test content") -> None:
+def _create_episode(overgraph_store, ep_id: str, content: str = "test content") -> None:
     """在 GraphLite 中创建一个 EpisodeNode。"""
-    graphlite_store.create_episode({
+    overgraph_store.create_episode({
         "id": ep_id,
         "content": content,
         "created_at": time.time(),
@@ -49,13 +49,13 @@ def _create_episode(graphlite_store, ep_id: str, content: str = "test content") 
 class TestPersistCommunityNodes:
     """_persist_community_nodes 修复验证。"""
 
-    def test_preserves_external_communities(self, graphlite_store):
+    def test_preserves_external_communities(self, overgraph_store):
         """预置外部 CommunityNode → persist 后仍存在（验证不全删）。"""
         store = DreamCandidateStore()
         external_cid = f"ext-comm-{uuid.uuid4().hex[:8]}"
 
         # 预置一个外部 CommunityNode（不是 dream 创建的）
-        graphlite_store.execute_cypher(
+        overgraph_store.execute_cypher(
             "INSERT (c:CommunityNode {id: $id, name: $name, "
             "summary: $summary, leiden_score: $score, "
             "created_at: $created_at})",
@@ -82,16 +82,16 @@ class TestPersistCommunityNodes:
             }],
         )
 
-        store._persist_community_nodes(candidate, graphlite_store)
+        store._persist_community_nodes(candidate, overgraph_store)
 
         # 外部社区仍存在（不会被 DETACH DELETE 全删）
-        result = graphlite_store.execute_cypher(
+        result = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $id}) RETURN c",
             {"id": external_cid},
         )
         assert result, f"External community {external_cid} was deleted"
 
-    def test_creates_member_edges(self, graphlite_store):
+    def test_creates_member_edges(self, overgraph_store):
         """persist 后新社区有 COMMUNITY_MEMBER 边（验证建边 + 两阶段）。"""
         store = DreamCandidateStore()
         comm_id = f"comm-{uuid.uuid4().hex[:8]}"
@@ -99,8 +99,8 @@ class TestPersistCommunityNodes:
         ep2_id = f"ep-{uuid.uuid4().hex[:8]}"
 
         # 先创建 EpisodeNode（否则 MATCH 无行不执行 INSERT 边）
-        _create_episode(graphlite_store, ep1_id, "episode 1")
-        _create_episode(graphlite_store, ep2_id, "episode 2")
+        _create_episode(overgraph_store, ep1_id, "episode 1")
+        _create_episode(overgraph_store, ep2_id, "episode 2")
 
         candidate = _make_candidate(
             community_summaries=[{
@@ -115,10 +115,10 @@ class TestPersistCommunityNodes:
             }],
         )
 
-        store._persist_community_nodes(candidate, graphlite_store)
+        store._persist_community_nodes(candidate, overgraph_store)
 
         # 验证社区节点存在
-        comm_result = graphlite_store.execute_cypher(
+        comm_result = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $id}) RETURN c",
             {"id": comm_id},
         )
@@ -126,7 +126,7 @@ class TestPersistCommunityNodes:
 
         # 验证 COMMUNITY_MEMBER 边存在
         for ep_id in [ep1_id, ep2_id]:
-            edge_result = graphlite_store.execute_cypher(
+            edge_result = overgraph_store.execute_cypher(
                 "MATCH (c:CommunityNode {id: $cid})"
                 "-[:COMMUNITY_MEMBER]->"
                 "(e:EpisodeNode {id: $eid}) RETURN e",
@@ -136,7 +136,7 @@ class TestPersistCommunityNodes:
                 f"COMMUNITY_MEMBER edge missing: {comm_id} -> {ep_id}"
             )
 
-    def test_old_format_candidate_compat(self, graphlite_store):
+    def test_old_format_candidate_compat(self, overgraph_store):
         """无 member_ids 的旧格式候选不崩、只建节点不建边。"""
         store = DreamCandidateStore()
         comm_id = f"old-comm-{uuid.uuid4().hex[:8]}"
@@ -156,11 +156,11 @@ class TestPersistCommunityNodes:
         )
 
         # 不应崩溃
-        created = store._persist_community_nodes(candidate, graphlite_store)
+        created = store._persist_community_nodes(candidate, overgraph_store)
         assert created == 1
 
         # 节点已创建
-        comm_result = graphlite_store.execute_cypher(
+        comm_result = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $id}) RETURN c",
             {"id": comm_id},
         )
@@ -169,7 +169,7 @@ class TestPersistCommunityNodes:
         )
 
         # 无边（member_ids 缺失 → 跳过边创建，仅 logger.warning）
-        edge_result = graphlite_store.execute_cypher(
+        edge_result = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $cid})-[r:COMMUNITY_MEMBER]->() RETURN r",
             {"cid": comm_id},
         )
@@ -177,7 +177,7 @@ class TestPersistCommunityNodes:
             f"Expected no edges for old-format community, got {edge_result}"
         )
 
-    def test_shared_member_keeps_largest_community(self, graphlite_store):
+    def test_shared_member_keeps_largest_community(self, overgraph_store):
         """共享成员 persist 后只保留最大社区的边，验证不湮灭。
 
         构造 C3(member_count=2, [epX, epA]) + C4(member_count=3, [epX, epB, epC])。
@@ -194,7 +194,7 @@ class TestPersistCommunityNodes:
         # 创建所有 EpisodeNode
         for ep_id, label in [(epX, "shared"), (epA, "C3-only"),
                               (epB, "C4-only"), (epC, "C4-only")]:
-            _create_episode(graphlite_store, ep_id, label)
+            _create_episode(overgraph_store, ep_id, label)
 
         candidate = _make_candidate(
             community_summaries=[
@@ -221,16 +221,16 @@ class TestPersistCommunityNodes:
             ],
         )
 
-        store._persist_community_nodes(candidate, graphlite_store)
+        store._persist_community_nodes(candidate, overgraph_store)
 
         # epX 只属于 C4（更大社区）
-        c3_edge = graphlite_store.execute_cypher(
+        c3_edge = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $cid})"
             "-[:COMMUNITY_MEMBER]->"
             "(e:EpisodeNode {id: $eid}) RETURN e",
             {"cid": c3_id, "eid": epX},
         )
-        c4_edge = graphlite_store.execute_cypher(
+        c4_edge = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $cid})"
             "-[:COMMUNITY_MEMBER]->"
             "(e:EpisodeNode {id: $eid}) RETURN e",
@@ -244,7 +244,7 @@ class TestPersistCommunityNodes:
         )
 
         # C3 独有成员 epA 仍属于 C3
-        c3_epA = graphlite_store.execute_cypher(
+        c3_epA = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $cid})"
             "-[:COMMUNITY_MEMBER]->"
             "(e:EpisodeNode {id: $eid}) RETURN e",
@@ -252,7 +252,7 @@ class TestPersistCommunityNodes:
         )
         assert c3_epA, f"C3 exclusive member epA should still belong to C3"
 
-    def test_idempotent_double_apply(self, graphlite_store):
+    def test_idempotent_double_apply(self, overgraph_store):
         """同一候选 persist 两次 → 节点 1 行、边不重复（防回归）。
         """
         store = DreamCandidateStore()
@@ -260,8 +260,8 @@ class TestPersistCommunityNodes:
         ep1_id = f"ep-{uuid.uuid4().hex[:8]}"
         ep2_id = f"ep-{uuid.uuid4().hex[:8]}"
 
-        _create_episode(graphlite_store, ep1_id, "episode 1")
-        _create_episode(graphlite_store, ep2_id, "episode 2")
+        _create_episode(overgraph_store, ep1_id, "episode 1")
+        _create_episode(overgraph_store, ep2_id, "episode 2")
 
         candidate = _make_candidate(
             community_summaries=[{
@@ -277,13 +277,13 @@ class TestPersistCommunityNodes:
         )
 
         # 第一次 persist
-        store._persist_community_nodes(candidate, graphlite_store)
+        store._persist_community_nodes(candidate, overgraph_store)
 
         # 第二次 persist（幂等）
-        store._persist_community_nodes(candidate, graphlite_store)
+        store._persist_community_nodes(candidate, overgraph_store)
 
         # 社区节点只有 1 行
-        comm_rows = graphlite_store.execute_cypher(
+        comm_rows = overgraph_store.execute_cypher(
             "MATCH (c:CommunityNode {id: $id}) RETURN c.id AS id",
             {"id": comm_id},
         )
@@ -294,7 +294,7 @@ class TestPersistCommunityNodes:
 
         # 边不重复：每个成员只有一条 COMMUNITY_MEMBER
         for ep_id in [ep1_id, ep2_id]:
-            edge_rows = graphlite_store.execute_cypher(
+            edge_rows = overgraph_store.execute_cypher(
                 "MATCH (c:CommunityNode {id: $cid})"
                 "-[r:COMMUNITY_MEMBER]->"
                 "(e:EpisodeNode {id: $eid}) RETURN r",

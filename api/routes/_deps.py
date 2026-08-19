@@ -65,7 +65,7 @@ from graph.hyperedge import HyperedgeManager, HyperedgeType as CoreHyperedgeType
 from observability.health import HealthChecker, HealthCheckResult
 from observability.logger import get_logger, set_trace_id
 from core.defense import MemoryDefenseEngine, DefenseConfig, MemoryDefenseVerdict
-from graph.graphlite_store import EpisodeCache
+from graph.common import EpisodeCache
 from core.quarantine_store import QuarantineStore
 from core.write_reconciler import WriteReconciler, ConflictLogger, Strategy
 from core.write_queue import WriteQueueClosedError, WriteQueueFullError

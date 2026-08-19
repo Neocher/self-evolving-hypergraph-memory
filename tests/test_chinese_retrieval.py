@@ -70,7 +70,7 @@ class TestChineseEmbeddingRetrieval:
             pytest.skip("encoder unavailable")
         assert enc.dimension == 512
 
-    def test_query_router_chinese_bm25(self, graphlite_store):
+    def test_query_router_chinese_bm25(self, overgraph_store):
         """QueryRouter BM25 中文检索命中 (bge 模型存在时走真实路径)"""
         docs = [
             "张三喜欢吃苹果和梨",
@@ -79,7 +79,7 @@ class TestChineseEmbeddingRetrieval:
         ]
         ids = []
         for i, c in enumerate(docs):
-            eid = graphlite_store.create_episode({
+            eid = overgraph_store.create_episode({
                 "content": c, "created_at": i + 1.0, "tau_initial": 1.0,
                 "tau_value": 0.6, "source": "test", "trust_score": 0.8,
             })
@@ -97,7 +97,7 @@ class TestChineseEmbeddingRetrieval:
 
         from retrieval.query_router import QueryRouter, QueryRouterConfig as QRCfg, RetrievalLevel
         qr = QueryRouter(
-            graphlite_store=graphlite_store,
+            graphlite_store=overgraph_store,
             faiss_index=FakeFaiss(),
             tfidf_index=tfidf,
             encoder=FakeEncoder(),

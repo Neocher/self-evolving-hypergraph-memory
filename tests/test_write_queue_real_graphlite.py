@@ -20,6 +20,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义测试（默认排除，addopts -m 'not graphlite'）
+
 from core.write_queue import WriteQueue
 from graph.hyperedge import HyperedgeManager
 

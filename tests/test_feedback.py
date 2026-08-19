@@ -12,9 +12,9 @@ import pytest
 from core.feedback import FeedbackEngine
 
 
-def test_threshold_one_no_upgrade_two_upgrade(graphlite_store):
+def test_threshold_one_no_upgrade_two_upgrade(overgraph_store):
     """计数阈值：1 次正确 → 不升；2 次正确 → 升级 fact_track='core'。"""
-    store = graphlite_store
+    store = overgraph_store
     eid = store.create_episode({"content": "事实 A", "created_at": time.time()})
     engine = FeedbackEngine(store)
 
@@ -34,9 +34,9 @@ def test_threshold_one_no_upgrade_two_upgrade(graphlite_store):
     assert out[0]["score"] == pytest.approx(0.88)  # 0.8 × 1.1
 
 
-def test_apply_idempotent_and_upgraded_skipped(graphlite_store):
+def test_apply_idempotent_and_upgraded_skipped(overgraph_store):
     """幂等：已升级节点不再重复升级/计数（upgraded 集合守卫）。"""
-    store = graphlite_store
+    store = overgraph_store
     eid = store.create_episode({"content": "事实 B", "created_at": time.time()})
     engine = FeedbackEngine(store)
 
@@ -52,9 +52,9 @@ def test_apply_idempotent_and_upgraded_skipped(graphlite_store):
     assert engine.counts[eid] == counts_after_upgrade  # 已升级节点停止计数
 
 
-def test_negative_feedback_not_counted(graphlite_store):
+def test_negative_feedback_not_counted(overgraph_store):
     """correct=False → 不计成功计数，永不触发升级。"""
-    store = graphlite_store
+    store = overgraph_store
     eid = store.create_episode({"content": "事实 C", "created_at": time.time()})
     engine = FeedbackEngine(store)
 
@@ -63,9 +63,9 @@ def test_negative_feedback_not_counted(graphlite_store):
     assert store.get_episode(eid)["fact_track"] == "active"
 
 
-def test_multi_node_rewards_and_threshold_per_node(graphlite_store):
+def test_multi_node_rewards_and_threshold_per_node(overgraph_store):
     """多节点奖励：升级判定按节点独立计数（一个达阈值不连带其他）。"""
-    store = graphlite_store
+    store = overgraph_store
     e1 = store.create_episode({"content": "事实 D", "created_at": time.time()})
     e2 = store.create_episode({"content": "事实 E", "created_at": time.time()})
     engine = FeedbackEngine(store)
@@ -76,9 +76,9 @@ def test_multi_node_rewards_and_threshold_per_node(graphlite_store):
     assert store.get_episode(e2)["fact_track"] == "active"
 
 
-def test_upgrade_does_not_touch_edge_or_tau(graphlite_store):
+def test_upgrade_does_not_touch_edge_or_tau(overgraph_store):
     """铁律：升级只改 fact_track，不碰边权重/τ（防答案泄漏）。"""
-    store = graphlite_store
+    store = overgraph_store
     a = store.create_episode({"content": "节点 A", "created_at": time.time()})
     b = store.create_episode({"content": "节点 B", "created_at": time.time()})
     store.link_hyperedge_member(

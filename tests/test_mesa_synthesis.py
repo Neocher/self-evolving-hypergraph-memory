@@ -203,13 +203,13 @@ class TestMesaSynthesis:
 
 
 class TestMesaIntegration:
-    def test_retrieve_default_off_no_mesa_nodes(self, graphlite_store):
+    def test_retrieve_default_off_no_mesa_nodes(self, overgraph_store):
         """默认关零回归：mesa_enabled=False 走生产 retrieve，无 mesa 节点，种子原样。"""
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题", score=0.9),
         ], mesa_enabled=False)
         out = router.retrieve("多会话 K8s 集群 flannel 网络问题")
@@ -217,13 +217,13 @@ class TestMesaIntegration:
         assert out[0]["node_id"] == "ep1"
         assert out[0]["score"] == 0.9  # 种子分未被 mesa 影响
 
-    def test_score_math_mesa_below_member_below_seed(self, graphlite_store):
+    def test_score_math_mesa_below_member_below_seed(self, overgraph_store):
         """score 数学保证：合成节点 < 社区成员 < 种子（mesa_boost 0.4 < community 0.6 < 1）。"""
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题", score=0.9),
         ], mesa_enabled=True)
         out = router.retrieve("多会话 K8s 集群 flannel 网络问题")

@@ -36,7 +36,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from core.user_profile import profile_hit, profile_values
 from config.settings import EntityExpansionConfig, ScopeRecallConfig, get_settings
 from core.schema_distiller import extract_terms
-from graph.graphlite_store import CircuitBreakerOpen
+from graph.common import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
 from retrieval.vector_store import FaissStore
 

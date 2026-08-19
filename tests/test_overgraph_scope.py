@@ -215,6 +215,6 @@ def test_vector_search_scoped_semantics(overgraph_store):
     hits1 = store.vector_search_scoped(A, k=5, query_vec=vec, max_depth=1)
     assert not any(eid == B for eid, _ in hits1), hits1
     assert store.vector_search_scoped("does_not_exist", k=5, query_vec=vec) == []
-    # 返回 (ep_id, score) 契约 + score ∈ [0,1]（cosine）
+    # 返回 (ep_id, score) 契约 + score ∈ [0,1]（cosine；HNSW 近似浮点噪声容忍 1e-6）
     for eid, score in hits2:
-        assert isinstance(eid, str) and -1.0 <= float(score) <= 1.0
+        assert isinstance(eid, str) and -1.0 - 1e-6 <= float(score) <= 1.0 + 1e-6

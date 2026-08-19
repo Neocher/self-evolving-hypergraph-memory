@@ -77,6 +77,7 @@ class DreamConfig:
 
 @dataclass
 class GraphLiteConfig:
+    """【legacy】GraphLite 后端配置——v6.0.0 已由 OverGraph 替代，保留一个发布周期供回滚，下版删除。"""
     database_path: str = "./data/shm_graphlite_db"
     buffer_pool_size_mb: int = 256
     max_threads: int = 4
@@ -95,8 +96,8 @@ class HNSWConfig:
 
 @dataclass
 class GraphConfig:
-    """图后端单开关（v6.0.0 OverGraph 迁移，设计 A8/D11）"""
-    backend: str = "graphlite"      # graphlite|overgraph（默认 graphlite → 存量零感知）
+    """图后端单开关（v6.0.0: OverGraph 唯一后端）"""
+    backend: str = "overgraph"      # overgraph（graphlite 字段保留一个发布周期供回滚）
     hnsw: HNSWConfig = field(default_factory=HNSWConfig)
 
 

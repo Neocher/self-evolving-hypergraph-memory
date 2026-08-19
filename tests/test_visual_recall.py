@@ -147,18 +147,20 @@ def _seed_text_channel(faiss: MockFaissIndex, ep_id: str = "ep_b") -> dict:
 class TestVisualRecallEndToEnd:
     """写 VisualNode + 文本种子 → 图像语义 query → modality=visual 结果（HTTP 公共入口）。"""
 
-    def test_retrieve_route_returns_visual_modality(self, graphlite_store):
+    @pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义/引擎约束（默认排除，addopts -m 'not graphlite'）
+    def test_retrieve_route_returns_visual_modality(self, overgraph_store):
+
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
 
         # 文本种子 episode（与视觉 caption 不同 → 去重键不冲突）
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
         # 视觉节点：embedding = CLIP 图像向量 @ 投影（与 query 向量一致 → 距离 0）
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "海边日落的照片", "image_path": "/tmp/sea.png",
             "embedding": (clip._vec @ proj).tolist(),
             "source": "user", "created_at": 200.0,
@@ -166,7 +168,7 @@ class TestVisualRecallEndToEnd:
 
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None
@@ -175,7 +177,7 @@ class TestVisualRecallEndToEnd:
         svc.faiss_index = faiss
         svc.faiss_id_map = faiss_id_map
         svc.query_router = _make_router(
-            graphlite_store, faiss=faiss, encoder=svc.encoder,
+            overgraph_store, faiss=faiss, encoder=svc.encoder,
             faiss_id_map=faiss_id_map, services=svc,
         )
 
@@ -198,16 +200,16 @@ class TestVisualRecallEndToEnd:
             assert visual[0]["source"] == "visual"  # level → EpisodicResult.source
             assert 0.0 <= visual[0]["score"] <= 1.0
 
-    def test_visual_score_strictly_below_text_seed(self, graphlite_store):
+    def test_visual_score_strictly_below_text_seed(self, overgraph_store):
         """相对尾分缩放：视觉分 = 1/(1+dist) × min(种子分) × boost < 文本种子分。"""
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "海边日落的照片", "image_path": "/tmp/sea.png",
             "embedding": (clip._vec @ proj).tolist(),
             "source": "user", "created_at": 200.0,
@@ -216,7 +218,7 @@ class TestVisualRecallEndToEnd:
         svc._clip_projection = proj
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
             results = qr.retrieve("海边日落")
@@ -232,31 +234,31 @@ class TestVisualRecallEndToEnd:
 class TestTextChannelZeroRegression:
     """视觉通道开启/关闭均不得扰动文本通道结果。"""
 
-    def test_disabled_visual_returns_text_only(self, graphlite_store):
+    def test_disabled_visual_returns_text_only(self, overgraph_store):
         svc = Services()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         with patch("retrieval.query_router.get_settings",
                    side_effect=lambda: _fake_settings(visual_enabled=False)):
             results = qr.retrieve("海边日落")
         assert [r["node_id"] for r in results] == ["ep_b"]
         assert all(r.get("modality") != "visual" for r in results)
 
-    def test_visual_index_present_text_channel_intact(self, graphlite_store):
+    def test_visual_index_present_text_channel_intact(self, overgraph_store):
         """索引已构建但 query 与视觉节点无关 → 文本结果不变（视觉低分追加不顶替）。"""
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "海边日落的照片", "image_path": "",
             "embedding": (clip._vec @ proj).tolist(),
             "source": "user", "created_at": 200.0,
@@ -265,7 +267,7 @@ class TestTextChannelZeroRegression:
         svc._clip_projection = proj
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
             results = qr.retrieve("北京烤鸭")
@@ -325,16 +327,16 @@ class TestEmptyChannelShortCircuit:
 class TestClipDegradation:
     """CLIP 不可用 → 视觉通道静默跳过，文本结果零回归。"""
 
-    def test_clip_unavailable_returns_unchanged(self, graphlite_store):
+    def test_clip_unavailable_returns_unchanged(self, overgraph_store):
         svc = Services()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
         # 索引已构建但 CLIP 不可用（模型加载失败降级）
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         qr._visual_index = FaissStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
@@ -348,10 +350,10 @@ class TestClipDegradation:
         assert [r["node_id"] for r in results] == ["ep_b"]
         assert all(r.get("modality") != "visual" for r in results)
 
-    def test_clip_embed_failure_returns_unchanged(self, graphlite_store):
+    def test_clip_embed_failure_returns_unchanged(self, overgraph_store):
         """embed_text 返回 None（编码失败）→ 静默跳过。"""
         svc = Services()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
@@ -362,7 +364,7 @@ class TestClipDegradation:
 
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         qr._visual_index = FaissStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
@@ -414,15 +416,15 @@ class TestProjectionConsistency:
 class TestEmbeddingJsonParse:
     """prewarm_visual 解析 GraphLite 落库的 JSON 字符串 embedding；非 384d 防御性跳过。"""
 
-    def test_keeps_384_skips_512(self, graphlite_store):
+    def test_keeps_384_skips_512(self, overgraph_store):
         proj = _write_proj()
         clip_vec = np.random.default_rng(7).standard_normal(512).astype(np.float32)
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn384", "caption": "384d 节点", "image_path": "/tmp/a.png",
             "embedding": (clip_vec @ proj).tolist(),
             "source": "user", "created_at": 100.0,
         })
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn512", "caption": "512d 节点（应跳过）", "image_path": "",
             "embedding": np.random.default_rng(3).standard_normal(512).astype(np.float32).tolist(),
             "source": "user", "created_at": 200.0,
@@ -430,7 +432,7 @@ class TestEmbeddingJsonParse:
         svc = Services()
         svc._clip_embedder = FakeClip()
         svc._clip_projection = proj
-        qr = _make_router(graphlite_store, services=svc)
+        qr = _make_router(overgraph_store, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
         assert qr._visual_index is not None
@@ -438,12 +440,12 @@ class TestEmbeddingJsonParse:
         assert qr._visual_id_map == {0: "vn384"}
         assert qr._visual_meta["vn384"]["caption"] == "384d 节点"
 
-    def test_embedding_roundtrip_exact(self, graphlite_store):
+    def test_embedding_roundtrip_exact(self, overgraph_store):
         """embedding 经 JSON 落库/读回后与源向量逐元素相等（float32 无损）。"""
         proj = _write_proj()
         clip_vec = np.random.default_rng(7).standard_normal(512).astype(np.float32)
         stored = (clip_vec @ proj).astype(np.float32)
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "c", "image_path": "",
             "embedding": stored.tolist(),
             "source": "user", "created_at": 100.0,
@@ -451,7 +453,7 @@ class TestEmbeddingJsonParse:
         svc = Services()
         svc._clip_embedder = FakeClip()
         svc._clip_projection = proj
-        qr = _make_router(graphlite_store, services=svc)
+        qr = _make_router(overgraph_store, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
         # 精确命中：query 向量 == 存储向量 → 距离 ≈ 0
@@ -459,10 +461,10 @@ class TestEmbeddingJsonParse:
         assert float(distances[0][0]) < 1e-5
         assert int(indices[0][0]) == 0
 
-    def test_empty_db_no_index(self, graphlite_store):
+    def test_empty_db_no_index(self, overgraph_store):
         """无 VisualNode → prewarm 后 _visual_index 保持 None（短路前提）。"""
         svc = Services()
-        qr = _make_router(graphlite_store, services=svc)
+        qr = _make_router(overgraph_store, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
         assert qr._visual_index is None
@@ -474,11 +476,11 @@ class TestEmbeddingJsonParse:
 class TestIncrementalVisualIndex:
     """【P1-1】prewarm 后写入的 VisualNode 经 add_visual_node 增量入索引，无需重启/prewarm。"""
 
-    def test_add_after_prewarm_immediately_searchable(self, graphlite_store):
+    def test_add_after_prewarm_immediately_searchable(self, overgraph_store):
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "海边日落的照片", "image_path": "/tmp/a.png",
             "embedding": (clip._vec @ proj).tolist(),
             "source": "user", "created_at": 100.0,
@@ -487,7 +489,7 @@ class TestIncrementalVisualIndex:
         svc._clip_projection = proj
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
             assert qr._visual_index.count == 1
@@ -510,7 +512,7 @@ class TestIncrementalVisualIndex:
         assert "vn1" in visual_ids
         assert "vn2" in visual_ids
 
-    def test_lazy_bootstrap_when_index_none(self, graphlite_store):
+    def test_lazy_bootstrap_when_index_none(self, overgraph_store):
         """prewarm 未构建（空库/未跑）→ add_visual_node 惰性引导构建，检索即命中。"""
         svc = Services()
         proj = _write_proj()
@@ -519,7 +521,7 @@ class TestIncrementalVisualIndex:
         svc._clip_projection = proj
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         vn1 = {
             "id": "vn1", "caption": "海边日落的照片", "image_path": "",
             "embedding": (clip._vec @ proj).tolist(),
@@ -533,9 +535,9 @@ class TestIncrementalVisualIndex:
             results = qr.retrieve("海边日落")
         assert [r["node_id"] for r in results if r.get("modality") == "visual"] == ["vn1"]
 
-    def test_rejects_non_384d(self, graphlite_store):
+    def test_rejects_non_384d(self, overgraph_store):
         """维度不符（旧 bge 512d 直落形态）→ 拒绝入索引（索引空间纯净）。"""
-        qr = _make_router(graphlite_store, services=Services())
+        qr = _make_router(overgraph_store, services=Services())
         bad = {
             "id": "vn512", "caption": "旧 512d 节点", "image_path": "",
             "embedding": np.random.default_rng(3).standard_normal(512).astype(np.float32).tolist(),
@@ -552,13 +554,14 @@ class TestIncrementalVisualIndex:
 class TestVisualRouteWritePath:
     """【P1-2】/memories/visual 写路径落 384d CLIP 投影空间 + 增量入索引（修复 512d 缺陷）。"""
 
-    def test_route_writes_384d_and_immediately_searchable(self, graphlite_store):
+    @pytest.mark.graphlite  # 【v6.0.0 legacy】384d CLIP 视觉向量 vs OverGraph 512d 引擎约束（默认排除）
+    def test_route_writes_384d_and_immediately_searchable(self, overgraph_store):
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None
@@ -567,7 +570,7 @@ class TestVisualRouteWritePath:
         svc.faiss_index = faiss
         svc.faiss_id_map = faiss_id_map
         svc.query_router = _make_router(
-            graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc,
+            overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc,
         )
         image_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 128).decode()
         app = FastAPI()
@@ -579,7 +582,7 @@ class TestVisualRouteWritePath:
         assert resp.status_code == 200, resp.text
         vid = resp.json()["visual_id"]
         # 落库形态：384d（CLIP 投影空间），不再是 bge 512d 直落
-        node = graphlite_store.get_visual_node(vid)
+        node = overgraph_store.get_visual_node(vid)
         emb = QueryRouter._parse_visual_embedding(node.get("embedding"))
         assert emb is not None and emb.shape[0] == 384, "写路径必须落 384d（P1-2 修复）"
         # 增量入索引：无需 prewarm，检索即命中（P1-1）
@@ -602,16 +605,16 @@ class TestVisualRouteWritePath:
 class TestClipColdStartIsolation:
     """【P2-1】CLIP 未加载（冷启动）→ 检索跳过视觉通道，不触发模型加载（3s 预算保护）。"""
 
-    def test_real_clip_unloaded_skips_channel(self, graphlite_store):
+    def test_real_clip_unloaded_skips_channel(self, overgraph_store):
         from multimodal.embedders import ClipEmbedder
         svc = Services()
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": "ep_b", "content": "北京烤鸭很好吃",
             "source": "user", "created_at": 100.0,
         })
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
-        qr = _make_router(graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
+        qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
         qr._visual_index = FaissStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
@@ -632,19 +635,19 @@ class TestClipColdStartIsolation:
         assert [r["node_id"] for r in results] == ["ep_b"]
         assert all(r.get("modality") != "visual" for r in results)
 
-    def test_prewarm_warms_clip(self, graphlite_store):
+    def test_prewarm_warms_clip(self, overgraph_store):
         """prewarm 构建索引后预热 CLIP（首次检索不触发模型加载）。"""
         svc = Services()
         proj = _write_proj()
         clip = FakeClip()
-        graphlite_store.create_visual_node({
+        overgraph_store.create_visual_node({
             "id": "vn1", "caption": "海边日落的照片", "image_path": "",
             "embedding": (clip._vec @ proj).tolist(),
             "source": "user", "created_at": 100.0,
         })
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        qr = _make_router(graphlite_store, services=svc)
+        qr = _make_router(overgraph_store, services=svc)
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             asyncio.run(qr.prewarm_visual())
         assert clip.embed_calls >= 1, "prewarm 后必须预热 CLIP（至少一次 embed_text）"
@@ -691,7 +694,7 @@ class TestVisualIndexAtomicSnapshot:
     """【P2-1】add_visual_node 并发增量 + _visual_snapshot 读侧：
     _visual_lock 串行化保证 fid 无碰撞、跨结构（index/map/meta）不暴露中间态。"""
 
-    def test_concurrent_adds_distinct_fids(self, graphlite_store):
+    def test_concurrent_adds_distinct_fids(self, overgraph_store):
         """80 节点 8 线程并发入索引：无 fid 碰撞、count 精确、map/meta 同步。"""
         proj = _write_proj()
         clip = FakeClip()
@@ -714,7 +717,7 @@ class TestVisualIndexAtomicSnapshot:
             for i in range(80):
                 assert f"vn{i}" in qr._visual_meta
 
-    def test_snapshot_never_exposes_partial_swap(self, graphlite_store):
+    def test_snapshot_never_exposes_partial_swap(self, overgraph_store):
         """并发写线程 + 读线程反复 _visual_snapshot：快照永不暴露 id_map/meta 中间态。"""
         proj = _write_proj()
         clip = FakeClip()
@@ -775,13 +778,13 @@ class TestVisualWriteQueueTimeoutPath:
     """【P2-2】qsubmit 超时（已入队迟到完成，DB 将落库）→ 补索引；
     队列满/关闭（未入队，DB 未落库）→ 不补（防幽灵节点）。"""
 
-    def _svc(self, graphlite_store, queue):
+    def _svc(self, overgraph_store, queue):
         proj = _write_proj()
         clip = FakeClip()
         svc = Services()
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None
@@ -791,7 +794,7 @@ class TestVisualWriteQueueTimeoutPath:
         svc.faiss_id_map = faiss_id_map
         svc.write_queue = queue
         svc.query_router = _make_router(
-            graphlite_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc,
+            overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc,
         )
         return svc
 
@@ -804,9 +807,9 @@ class TestVisualWriteQueueTimeoutPath:
             "image_base64": image_b64, "caption": "海边日落的照片", "source": "user",
         })
 
-    def test_timeout_returns_503_but_node_indexed(self, graphlite_store):
+    def test_timeout_returns_503_but_node_indexed(self, overgraph_store):
         """超时 ≠ 失败：任务已入队将迟到完成（DB 仍会落库）→ 必须补索引。"""
-        svc = self._svc(graphlite_store, _RejectingQueue(asyncio.TimeoutError()))
+        svc = self._svc(overgraph_store, _RejectingQueue(asyncio.TimeoutError()))
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             resp = self._post(svc)
         assert resp.status_code == 503, resp.text
@@ -814,17 +817,17 @@ class TestVisualWriteQueueTimeoutPath:
         assert svc.query_router._visual_index.count == 1, "超时路径必须补索引"
         assert len(svc.query_router._visual_id_map) == 1
 
-    def test_queue_full_no_phantom_index(self, graphlite_store):
+    def test_queue_full_no_phantom_index(self, overgraph_store):
         """队列满：任务未入队（DB 未落库）→ 不补索引（防幽灵节点）。"""
-        svc = self._svc(graphlite_store, _RejectingQueue(WriteQueueFullError("full")))
+        svc = self._svc(overgraph_store, _RejectingQueue(WriteQueueFullError("full")))
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             resp = self._post(svc)
         assert resp.status_code == 503, resp.text
         assert svc.query_router._visual_index is None, "未入队不得产生幽灵索引"
 
-    def test_closed_no_phantom_index(self, graphlite_store):
+    def test_closed_no_phantom_index(self, overgraph_store):
         """队列关闭：任务未入队 → 不补索引。"""
-        svc = self._svc(graphlite_store, _RejectingQueue(WriteQueueClosedError("closed")))
+        svc = self._svc(overgraph_store, _RejectingQueue(WriteQueueClosedError("closed")))
         with patch("retrieval.query_router.get_settings", side_effect=_fake_settings):
             resp = self._post(svc)
         assert resp.status_code == 503, resp.text

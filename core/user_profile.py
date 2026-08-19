@@ -163,10 +163,13 @@ def _decode_b64_content(s: str) -> str:
     return s
 
 
-def scan_rows(rows: list) -> list[dict]:
+def scan_rows(rows: list, store=None) -> list[dict]:
     """query_cypher 返回行 → 节点候选（兼容三种返回格式）。
 
-    - 深层嵌套 {"e": {"Node": {...}}} → _flatten_row（含 b64 解码）
+    - 深层嵌套 {"e": {"Node": {...}}} → store 实例 _flatten_row（含 b64 解码）
+      【R2】两后端行格式不同（GraphLite {"e":{"Node":{...}}} vs OverGraph
+      {"e":{"props":{...}}}）→ 必须用实例方法；store=None 回退 GraphLiteStore
+      类（legacy 兼容）。
     - 别名扁平 {"e.content": ...} → 手工解码 {b64}；缺失 source_type 默认
       inferred（防默认 direct 绕过来源门控）
     - 旧格式 [[id, content]] → 仅取 content，source_type 默认 inferred
@@ -175,8 +178,12 @@ def scan_rows(rows: list) -> list[dict]:
     for row in rows or []:
         if isinstance(row, dict) and "e" in row:
             try:
-                from graph.graphlite_store import GraphLiteStore
-                nodes.append(GraphLiteStore._flatten_row(row, "e"))
+                if store is not None:
+                    flat = store._flatten_row(row, "e")
+                else:
+                    from graph.graphlite_store import GraphLiteStore
+                    flat = GraphLiteStore._flatten_row(row, "e")
+                nodes.append(flat)
             except Exception:
                 continue
         elif isinstance(row, dict) and "e.content" in row:

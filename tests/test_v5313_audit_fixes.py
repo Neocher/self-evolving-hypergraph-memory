@@ -26,9 +26,9 @@ from core.ontology_validator import OntologyValidator, OntologyConfig
 
 class TestFlushHebbianWritePathNeutral:
 
-    def _fresh_store(self, graphlite_store):
+    def _fresh_store(self, overgraph_store):
         """隔离探针：验证 query_cypher（读路径）绝不被写调用触碰。"""
-        store = graphlite_store
+        store = overgraph_store
         orig_query = store.query_cypher
 
         def _read_path_guard(*args, **kwargs):
@@ -37,9 +37,9 @@ class TestFlushHebbianWritePathNeutral:
         store.query_cypher = _read_path_guard
         return store, orig_query
 
-    def test_flush_hebbian_uses_execute_cypher(self, graphlite_store):
+    def test_flush_hebbian_uses_execute_cypher(self, overgraph_store):
         """写路径必须走 execute_cypher；成功不 record_success（窗口不变）。"""
-        store, orig = self._fresh_store(graphlite_store)
+        store, orig = self._fresh_store(overgraph_store)
         # 真实建两个节点 → 真实批量建边
         for nid in ("n1", "n2"):
             store.execute_cypher(
@@ -58,11 +58,13 @@ class TestFlushHebbianWritePathNeutral:
         )
         assert rows[0]["c"] == 1  # 边确实建成
 
-    def test_flush_hebbian_failure_raises_and_neutral_to_breaker(self, graphlite_store):
+    @pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义/引擎约束（默认排除，addopts -m 'not graphlite'）
+    def test_flush_hebbian_failure_raises_and_neutral_to_breaker(self, overgraph_store):
+
         """execute_cypher 不吞异常：真实 SDK QueryError 上抛；失败不打点窗口。"""
         from graphlite_sdk.error import QueryError
 
-        store, orig = self._fresh_store(graphlite_store)
+        store, orig = self._fresh_store(overgraph_store)
         store._session = MagicMock()
         store._session.query.side_effect = QueryError("real sdk query error")
 
@@ -73,9 +75,9 @@ class TestFlushHebbianWritePathNeutral:
         assert store.circuit_breaker.state == CircuitBreakerState.CLOSED
         store.query_cypher = orig
 
-    def test_flush_hebbian_empty_pairs_shortcircuits(self, graphlite_store):
+    def test_flush_hebbian_empty_pairs_shortcircuits(self, overgraph_store):
         """空批直接返回 True，不触碰图库。"""
-        store, orig = self._fresh_store(graphlite_store)
+        store, orig = self._fresh_store(overgraph_store)
         assert _flush_hebbian_batch(store, []) is True
         store.query_cypher = orig
 
@@ -91,9 +93,9 @@ class TestFlushHebbianSpecialCharIds:
         ("中文字符 id", "emoji 🚀 id"),
         ("mixed'quote\\slash 中文", "spaces and chars"),
     ])
-    def test_special_char_ids_build_edge(self, graphlite_store, src: str, dst: str):
+    def test_special_char_ids_build_edge(self, overgraph_store, src: str, dst: str):
         """含 ' / \\ / 中文的 id 建边成功且可回读（不坏 GQL）。"""
-        store = graphlite_store
+        store = overgraph_store
         for nid in (src, dst):
             store.execute_cypher(
                 f"INSERT (a:EpisodeNode {{id: {_gql_value(nid)}, content: 'x'}})"
@@ -112,15 +114,15 @@ class TestFlushHebbianSpecialCharIds:
 
 class TestOntologyShortCircuitPrecise:
 
-    def _validator(self, graphlite_store) -> OntologyValidator:
+    def _validator(self, overgraph_store) -> OntologyValidator:
         return OntologyValidator(
-            graphlite_store=graphlite_store,
+            graphlite_store=overgraph_store,
             config=OntologyConfig(enabled=True),
         )
 
-    def test_partial_types_do_not_shortcircuit(self, graphlite_store):
+    def test_partial_types_do_not_shortcircuit(self, overgraph_store):
         """库里只有部分类型（上次同步中断）→ 不得短路，必须全量补齐。"""
-        store = graphlite_store
+        store = overgraph_store
         # 只预置 1 个类型，模拟同步中途中断
         store.execute_cypher("INSERT (t:OntologyType {name: 'ml_model'})")
         v = self._validator(store)
@@ -134,16 +136,16 @@ class TestOntologyShortCircuitPrecise:
         names = {r.get("t.name") or r.get("name") for r in rows}
         assert set(v.ENTITY_TYPE_MAP.values()).issubset(names)
 
-    def test_complete_shortcircuits_to_zero(self, graphlite_store):
+    def test_complete_shortcircuits_to_zero(self, overgraph_store):
         """完整同步后第二次调用 → 短路返回 0（保留 v5.31.2 短路目的）。"""
-        store = graphlite_store
+        store = overgraph_store
         v = self._validator(store)
         assert v.sync_entity_types_to_graphlite() == len(v.ENTITY_TYPE_MAP)
         assert v.sync_entity_types_to_graphlite() == 0
 
-    def test_types_full_but_entities_missing_not_shortcircuit(self, graphlite_store):
+    def test_types_full_but_entities_missing_not_shortcircuit(self, overgraph_store):
         """类型齐全但实体缺失（中断在实体建完前）→ 不得短路。"""
-        store = graphlite_store
+        store = overgraph_store
         v = self._validator(store)
         # 只建全部类型、不建实体
         for etype in set(v.ENTITY_TYPE_MAP.values()):

@@ -16,7 +16,7 @@ from api.routes._deps import (
     qsubmit,
 )
 
-from graph.graphlite_store import CircuitBreakerOpen
+from graph.common import CircuitBreakerOpen
 
 from core.content_guard import scan_content
 

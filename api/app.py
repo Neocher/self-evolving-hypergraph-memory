@@ -30,7 +30,7 @@ from observability.metrics import record_request
 from shm._version import __version__, __version_name__
 from observability.logger import get_logger, configure_logging
 from api.dashboard import dashboard_router
-from graph.graphlite_store import CircuitBreakerOpen, EpisodeCache
+from graph.common import CircuitBreakerOpen, EpisodeCache
 
 logger = get_logger(__name__)
 
@@ -133,28 +133,19 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
 
 
 def make_store(cfg):
-    """图存储后端构造（v6.0.0 OverGraph 迁移，设计 A8）：backend 单开关分支。
+    """图存储后端构造（v6.0.0: OverGraph 唯一后端，GraphLite 已移除）。
 
-    graphlite → GraphLiteStore（现状不变）；overgraph → OverGraphStore
-    （svc.graphlite_store 属性名保留，duck-typing 上层零改动）。
+    svc.graphlite_store 属性名保留，duck-typing 上层零改动。
     """
-    backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
-    if backend == "overgraph":
-        from graph.overgraph_store import OverGraphStore
-        store_cfg = type("cfg", (), {
-            "database_path": str(cfg.overgraph.database_path),
-            "dense_vector_dimension": int(cfg.overgraph.dense_vector_dimension),
-            "dense_vector_metric": str(cfg.overgraph.dense_vector_metric),
-            # graph.hnsw.ef_search → vector_search(ef_search=) 透传（P2#10）
-            "ef_search": int(getattr(cfg.graph.hnsw, "ef_search", 64)),
-        })()
-        return OverGraphStore(config=store_cfg, cb_config=cfg.circuit_breaker)
-    from graph.graphlite_store import GraphLiteStore
-    gcfg = type("cfg", (), {
-        "database_path": str(cfg.graphlite.database_path),
-        "max_threads": cfg.graphlite.max_threads,
+    from graph.overgraph_store import OverGraphStore
+    store_cfg = type("cfg", (), {
+        "database_path": str(cfg.overgraph.database_path),
+        "dense_vector_dimension": int(cfg.overgraph.dense_vector_dimension),
+        "dense_vector_metric": str(cfg.overgraph.dense_vector_metric),
+        # graph.hnsw.ef_search → vector_search(ef_search=) 透传（P2#10）
+        "ef_search": int(getattr(cfg.graph.hnsw, "ef_search", 64)),
     })()
-    return GraphLiteStore(config=gcfg, cb_config=cfg.circuit_breaker)
+    return OverGraphStore(config=store_cfg, cb_config=cfg.circuit_breaker)
 
 
 def _build_router_config(rcfg):
@@ -201,57 +192,26 @@ def _init_services() -> Services:
     svc = Services()
     errors = []
 
-    # 1. 图数据库（v6.0.0 backend 单开关: GraphLiteStore | OverGraphStore）
+    # 1. 图数据库（v6.0.0: OverGraph 唯一后端）
     try:
-        import sys as _sys
-        _bindings = os.environ.get("GRAPHLITE_BINDINGS", os.path.expanduser("~/GraphLite/bindings/python"))
-        _sdk = os.environ.get("GRAPHLITE_SDK", os.path.expanduser("~/GraphLite/sdk-python/src"))
-        for _p in [_bindings, _sdk]:
-            if _p not in _sys.path:
-                _sys.path.insert(0, _p)
         svc.graphlite_store = make_store(cfg)
         svc.graphlite_store.connect()
         logger.info("GraphStore initialized",
-                    backend=getattr(getattr(cfg, "graph", None), "backend", "graphlite"),
+                    backend="overgraph",
                     path=getattr(svc.graphlite_store, "_db_path", ""))
     except Exception as e:
         import traceback
         errors.append(f"GraphStore: {e}")
         logger.warning("GraphStore init failed", error=str(e), traceback=traceback.format_exc())
 
-    # 1b. 【v5.23】写串行化队列（所有 GraphLite 写调用收敛到专用写线程串行执行，
+    # 1b. 【v5.23】写串行化队列（所有图写调用收敛到专用写线程串行执行，
     # 事件循环不再被同步写阻塞；队列不可用时写路径回退同步直调）
+    # v6.0.0: OverGraph 后端不注入 ping 探针（独立连接共享 WAL 风险，写队列超时兜底）
     try:
         from core.write_queue import WriteQueue
-        # 【M1】引擎级死锁探测：注入 ping 探针（独立 daemon 只读连接 + 1 条 trivial
-        # 查询，join(timeout) 兜底）。探针通过 → 看门狗 critical 降级 warning（慢写
-        # 而非死锁）；失败/挂 → 仍 critical。ping 为独立只读连接，不触碰写线程。
-        # v6.0.0: OverGraph 后端跳过探针（独立连接共享 WAL 风险，写队列超时兜底）。
-        ping_fn = None
-        backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
-        if svc.graphlite_store is not None and backend != "overgraph":
-            try:
-                from graph.graphlite_store import GraphLite as _GL
-                ping_path = str(cfg.graphlite.database_path)
-
-                def _ping_graphlite(path: str = ping_path) -> bool:
-                    try:
-                        db = _GL.open(path)
-                        try:
-                            s = db.session("shm")
-                            rows = s.query("RETURN 1 AS ok")
-                            return bool(rows and rows.rows)
-                        finally:
-                            db.close()
-                    except Exception:
-                        return False
-
-                ping_fn = _ping_graphlite
-            except Exception as e:
-                logger.warning("WriteQueue ping probe disabled: %s", e)
-        svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0, ping_fn=ping_fn)
+        svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0, ping_fn=None)
         logger.info("WriteQueue initialized", max_pending=100, wait_timeout=30.0,
-                    ping_probe=ping_fn is not None)
+                    ping_probe=False)
     except Exception as e:
         errors.append(f"WriteQueue: {e}")
         logger.warning("WriteQueue init failed (fallback: sync direct writes)", error=str(e))
@@ -291,7 +251,7 @@ def _init_services() -> Services:
             # v6.0.0: backend 分支 —— overgraph 主通道 = VectorIndexAdapter
             # （OverGraph HNSW，D1）；graphlite 保持 FAISS。视觉 _visual_index
             # 独立 FAISS 空间两后端都保留（D10，只换主通道）。
-            backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
+            backend = str(getattr(getattr(cfg, "graph", None), "backend", "overgraph"))
             dim = getattr(svc.encoder, "dimension", None)
             if not isinstance(dim, int) or dim <= 0:
                 dim = cfg.faiss.dimension
@@ -710,7 +670,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                     "AND (e.quarantine IS NULL OR e.quarantine = false) "
                     "RETURN e LIMIT 10000",
                 )
-                profile = _up.rebuild_or_keep(profile, _up.scan_rows(rows))
+                profile = _up.rebuild_or_keep(profile, _up.scan_rows(rows, store=svc.graphlite_store))
             if profile:
                 _up.save_profile(profile, _up._DEFAULT_PROFILE_PATH)
             set_user_profile(profile)

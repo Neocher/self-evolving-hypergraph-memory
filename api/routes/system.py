@@ -15,7 +15,7 @@ from api.routes._deps import (
     __version__, __version_name__,
     Dict, Any,
 )
-from graph.graphlite_store import _gql_value
+from graph.common import _gql_value
 
 # TTL 缓存：graph_store 相关统计（node_count/hyperedge_count），避免每次 /health 全扫描
 _HEALTH_STATS_CACHE: Dict[str, int] = {"node_count": 0, "hyperedge_count": 0}
@@ -419,8 +419,9 @@ async def rebuild_index(
         #  3. RyuStore 旧格式 [[id, content]]
         if isinstance(row, dict) and "e" in row:
             try:
-                from graph.graphlite_store import GraphLiteStore
-                flat = GraphLiteStore._flatten_row(row, "e")
+                # 【R2】两后端行格式不同（GraphLite {"e":{"Node":{...}}} vs
+                # OverGraph {"e":{"props":{...}}}）→ 用 store 实例方法展平
+                flat = deps.graphlite_store._flatten_row(row, "e")
                 nid, content = str(flat.get("id", "")), str(flat.get("content", ""))
             except Exception:
                 nid, content = str(row.get("id", "")), str(row.get("content", ""))

@@ -100,7 +100,13 @@ def _b64_decode_once(v: Any) -> Any:
 
 
 def _node_props_from_row(row: dict) -> dict:
-    """`RETURN n` 行 → props dict（typed 展开 + b64 decode）。"""
+    """`RETURN n` 行 → props dict（typed 展开 + b64 decode）。
+
+    GraphLite 返回格式 {'n': {'Node': {'id': <elementKey>, 'properties': {...}}}}。
+    elementKey id 不在 properties——无 id 属性的节点（OntologyType/
+    OntologyEntity）必须并入 props["id"]，否则 dump 后丢失（迁移 verify
+    src=23 dst=0 根因，2026-08-20 修复）。
+    """
     nd = row.get("n") or row.get("Node") or row
     if isinstance(nd, dict) and "Node" in nd:
         nd = nd["Node"]
@@ -109,6 +115,8 @@ def _node_props_from_row(row: dict) -> dict:
     props: dict = {}
     for k, v in (nd.get("properties") or {}).items():
         props[k] = _b64_decode_once(_unwrap_typed(v))
+    if "id" not in props and nd.get("id") is not None:
+        props["id"] = str(nd["id"])
     return props
 
 
@@ -394,12 +402,18 @@ class StoreMigration:
 
     @staticmethod
     def _gl_node_props(g, label: str, nid: str) -> dict | None:
-        """源库单节点 props（query_cypher 返回原始行，与 dump 同一解析路径）。"""
-        rows = g.query_cypher(
-            f"MATCH (n:{label} {{id: $id}}) RETURN n", {"id": nid})
-        if not rows:
-            return None
-        return _node_props_from_row(rows[0])
+        """源库单节点 props（与 dump 同一解析路径）。
+
+        GQL `{{id: $id}}` 匹配的是 properties.id——elementKey-id 节点
+        （OntologyType/OntologyEntity，id 不在 properties，AGENTS.md 已知坑）
+        匹配不到 → label 全扫 + Python 侧按 id 过滤（label 节点数少，可接受）。
+        """
+        rows = g.query_cypher(f"MATCH (n:{label}) RETURN n")
+        for r in rows:
+            p = _node_props_from_row(r)
+            if p.get("id") == nid:
+                return p
+        return None
 
 
 def _build_report(snap: dict, load_result: dict, verify: dict,

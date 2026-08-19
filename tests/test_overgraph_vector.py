@@ -20,6 +20,7 @@ pytest.importorskip("overgraph")
 
 from graph.overgraph_store import OverGraphStore  # noqa: E402
 from retrieval.vector_index import VectorIndexAdapter, faiss_id  # noqa: E402
+from config.settings import GraphConfig  # noqa: E402
 
 
 def _make_adapter(overgraph_store, dimension=512):
@@ -183,10 +184,8 @@ def test_remove_ids_noop_semantics(overgraph_store):
 
 
 def test_backend_switch_make_store():
-    """make_store(cfg)：graphlite → GraphLiteStore；overgraph → OverGraphStore。"""
-    from config.settings import GraphConfig
+    """v6.0.0: make_store(cfg) 恒返回 OverGraphStore（GraphLite 分支已移除）。"""
     from api.app import make_store
-    from graph.graphlite_store import GraphLiteStore
 
     class FakeSettings:
         graphlite = type("g", (), {"database_path": "/tmp/gl_db", "max_threads": 4})()
@@ -195,12 +194,12 @@ def test_backend_switch_make_store():
                                    "dense_vector_metric": "cosine"})()
         circuit_breaker = type("cb", (), {})()
 
-    for backend, expected in [("graphlite", GraphLiteStore),
-                              ("overgraph", OverGraphStore)]:
+    # backend 字段保留一个发布周期（回滚保险），但不再影响构造结果
+    for backend in ("graphlite", "overgraph"):
         fs = FakeSettings()
         fs.graph = GraphConfig(backend=backend)
         store = make_store(fs)
-        assert isinstance(store, expected), (backend, type(store))
+        assert isinstance(store, OverGraphStore), (backend, type(store))
 
 
 # ─── 公共检索入口（_vector_retrieve / retrieve VECTOR）──

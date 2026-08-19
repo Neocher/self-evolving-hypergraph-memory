@@ -41,9 +41,9 @@ def client():
     return _build
 
 
-def _svc(graphlite_store, validator=None) -> Services:
+def _svc(overgraph_store, validator=None) -> Services:
     svc = Services()
-    svc.graphlite_store = graphlite_store
+    svc.graphlite_store = overgraph_store
     svc.ontology_validator = validator
     return svc
 
@@ -166,140 +166,140 @@ class TestDecideWinner:
 
 class TestWritePathRevocation:
 
-    def test_new_wins_archives_old_with_supersedes(self, graphlite_store, client):
+    def test_new_wins_archives_old_with_supersedes(self, overgraph_store, client):
         """新值来源级更高 → 自动归档旧记忆，SUPERSEDES 边存在（新节点落库后归档）。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "user",
         })
 
         assert resp.status_code == 200, resp.text
         new_id = resp.json()["episode_id"]
         # 旧记忆被归档、新记忆保持 active
-        assert graphlite_store.get_episode(old_id)["archived"] is True
-        assert graphlite_store.get_episode(new_id)["archived"] is False
+        assert overgraph_store.get_episode(old_id)["archived"] is True
+        assert overgraph_store.get_episode(new_id)["archived"] is False
         # SUPERSEDES 血统边：证明归档发生在新节点落库之后
-        assert _count_supersedes(graphlite_store, old_id, new_id) == 1
+        assert _count_supersedes(overgraph_store, old_id, new_id) == 1
 
-    def test_old_wins_no_archive(self, graphlite_store, client):
+    def test_old_wins_no_archive(self, overgraph_store, client):
         """agent 声明 direct 被防洗白降级 inferred → 新值级更低 → 旧胜不归档。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="direct",
+            overgraph_store, content="张三出生于1990年", source_type="direct",
             entity_name="张三", entity_value="1990")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "hermes", "source_type": "direct",
         })
 
         assert resp.status_code == 200, resp.text
-        assert graphlite_store.get_episode(old_id)["archived"] is False
+        assert overgraph_store.get_episode(old_id)["archived"] is False
 
-    def test_weak_match_contradictory_claim_no_archive(self, graphlite_store, client):
+    def test_weak_match_contradictory_claim_no_archive(self, overgraph_store, client):
         """CONTAINS 弱匹配（contradictory_claim）即使新值来源更高也不自动归档。"""
         old_id = _create_old_episode(
-            graphlite_store, content="2024年实验证明吸烟导致肺癌", source_type="tool",
+            overgraph_store, content="2024年实验证明吸烟导致肺癌", source_type="tool",
             ontology_type="scientific_claim",
             entity_name="吸烟", entity_value="2024")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "2025年证明吸烟导致肺癌死亡率上升", "source": "user",
         })
 
         assert resp.status_code == 200, resp.text
-        assert graphlite_store.get_episode(old_id)["archived"] is False
+        assert overgraph_store.get_episode(old_id)["archived"] is False
 
-    def test_same_level_recency_new_wins_integration(self, graphlite_store, client):
+    def test_same_level_recency_new_wins_integration(self, overgraph_store, client):
         """P1-1 同级 tie-break 走全链路（生产字段形态）：同级 tool/tool 新旧信任
         代理相等（0.7 == 0.7），τ 未衰减（tau_initial=1.0）→ |diff| < ε → recency 新胜归档。
         旧版退化为常量 0.5 的 trust_score 注入已从 helper 移除（防假绿）。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "hermes", "source_type": "tool",
         })
 
         assert resp.status_code == 200, resp.text
         # 同级 tool(0.7) == 旧代理 0.7，τ=1.0 → 有效信任相等 → recency → 新胜归档
-        assert graphlite_store.get_episode(old_id)["archived"] is True
+        assert overgraph_store.get_episode(old_id)["archived"] is True
 
-    def test_protected_old_not_archived_same_level(self, graphlite_store, client):
+    def test_protected_old_not_archived_same_level(self, overgraph_store, client):
         """P1-R2 全链路：旧值 protected=True + 同级 tool/tool（recency 本应新胜）
         → 不自动归档（ConflictNode 仍建，待人工裁决）。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990", protected=True)
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "hermes", "source_type": "tool",
         })
 
         assert resp.status_code == 200, resp.text
-        assert graphlite_store.get_episode(old_id)["archived"] is False
+        assert overgraph_store.get_episode(old_id)["archived"] is False
 
-    def test_core_old_not_archived_same_level(self, graphlite_store, client):
+    def test_core_old_not_archived_same_level(self, overgraph_store, client):
         """P1-R2 全链路：旧值 fact_track=core（稳定事实）+ 同级 tool/tool
         （新源未严格更高）→ 不自动归档。修复前同级恒新胜 → 稳定事实被静默归档。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990", fact_track="core")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "hermes", "source_type": "tool",
         })
 
         assert resp.status_code == 200, resp.text
-        assert graphlite_store.get_episode(old_id)["archived"] is False
+        assert overgraph_store.get_episode(old_id)["archived"] is False
 
-    def test_core_old_archived_by_strictly_higher_source(self, graphlite_store, client):
+    def test_core_old_archived_by_strictly_higher_source(self, overgraph_store, client):
         """P1-R2 全链路：旧值 fact_track=core 但新源严格更高（user→direct 1.0 >
         tool 0.7）→ 允许归档（稳定事实可被更高信任源取代）。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990", fact_track="core")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "user",
         })
 
         assert resp.status_code == 200, resp.text
         new_id = resp.json()["episode_id"]
-        assert graphlite_store.get_episode(old_id)["archived"] is True
-        assert _count_supersedes(graphlite_store, old_id, new_id) == 1
+        assert overgraph_store.get_episode(old_id)["archived"] is True
+        assert _count_supersedes(overgraph_store, old_id, new_id) == 1
 
-    def test_conflict_node_still_created(self, graphlite_store, client):
+    def test_conflict_node_still_created(self, overgraph_store, client):
         """即使自动归档，ConflictNode 审计节点仍落库（冲突可追溯）。"""
         old_id = _create_old_episode(
-            graphlite_store, content="张三出生于1990年", source_type="tool",
+            overgraph_store, content="张三出生于1990年", source_type="tool",
             entity_name="张三", entity_value="1990")
-        validator = OntologyValidator(graphlite_store=graphlite_store,
+        validator = OntologyValidator(graphlite_store=overgraph_store,
                                       config=OntologyConfig(enabled=True))
 
-        resp = client(_svc(graphlite_store, validator)).post("/memories/episodes", json={
+        resp = client(_svc(overgraph_store, validator)).post("/memories/episodes", json={
             "content": "张三出生于2000年", "source": "user",
         })
 
         assert resp.status_code == 200, resp.text
         new_id = resp.json()["episode_id"]
-        rows = graphlite_store.execute_cypher(
+        rows = overgraph_store.execute_cypher(
             "MATCH (c:ConflictNode {id: $cid}) RETURN c",
             {"cid": f"conflict_{new_id}_{old_id}"})
         assert len(rows) == 1
@@ -310,9 +310,9 @@ class TestWritePathRevocation:
 
 class TestRestoreEndpoint:
 
-    def test_restore_flips_archived_keeps_supersedes(self, graphlite_store, client):
+    def test_restore_flips_archived_keeps_supersedes(self, overgraph_store, client):
         """归档 → restore → archived=false，SUPERSEDES 血统边保留（可翻转软删）。"""
-        ep_id = graphlite_store.create_episode({
+        ep_id = overgraph_store.create_episode({
             "id": str(uuid.uuid4()),
             "content": "待恢复的记忆",
             "source": "user",
@@ -320,7 +320,7 @@ class TestRestoreEndpoint:
             "created_at": 1.0,
             "tau_initial": 1.0,
         })
-        replacement_id = graphlite_store.create_episode({
+        replacement_id = overgraph_store.create_episode({
             "id": str(uuid.uuid4()),
             "content": "取代它的新记忆",
             "source": "user",
@@ -328,16 +328,16 @@ class TestRestoreEndpoint:
             "created_at": 1.0,
             "tau_initial": 1.0,
         })
-        assert graphlite_store.archive_node(ep_id, replacement_id=replacement_id) is True
-        assert graphlite_store.get_episode(ep_id)["archived"] is True
+        assert overgraph_store.archive_node(ep_id, replacement_id=replacement_id) is True
+        assert overgraph_store.get_episode(ep_id)["archived"] is True
 
-        resp = client(_svc(graphlite_store)).post(f"/episodes/{ep_id}/restore")
+        resp = client(_svc(overgraph_store)).post(f"/episodes/{ep_id}/restore")
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["archived"] is False
-        assert graphlite_store.get_episode(ep_id)["archived"] is False
-        assert _count_supersedes(graphlite_store, ep_id, replacement_id) == 1
+        assert overgraph_store.get_episode(ep_id)["archived"] is False
+        assert _count_supersedes(overgraph_store, ep_id, replacement_id) == 1
 
-    def test_restore_missing_episode_404(self, graphlite_store, client):
-        resp = client(_svc(graphlite_store)).post("/episodes/nonexistent_id/restore")
+    def test_restore_missing_episode_404(self, overgraph_store, client):
+        resp = client(_svc(overgraph_store)).post("/episodes/nonexistent_id/restore")
         assert resp.status_code == 404

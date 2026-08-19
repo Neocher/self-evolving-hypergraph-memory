@@ -22,12 +22,10 @@ classifiers = [
 
 requires-python = ">=3.10"
 dependencies = [
-    # ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) 不在 PyPI:
-    #   git clone https://github.com/GraphLite-AI/GraphLite ~/GraphLite
-    #   cd ~/GraphLite && cargo build --release -p graphlite-ffi
-    #   export GRAPHLITE_BINDINGS=~/GraphLite/bindings/python
-    #   export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
-    #   详见 README「Installation」章节。
+    # ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) — 【仅迁移需要】：
+    #   v6.0.0 起默认后端为 OverGraph；graphlite_sdk 不在 PyPI，仅
+    #   scripts/migrate_graphlite_to_overgraph.py 读旧库时需要，迁移完成可移除。
+    #   详见 requirements.txt 注释。
     "faiss-cpu>=1.7.4",
     "numpy>=1.24.0",
     "sentence-transformers>=2.2.0",
@@ -63,9 +61,11 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not graphlite'"
 markers = [
     "benchmark: Long-running benchmark tests",
     "slow: Slow tests that take more than 1 second",
     "integration: Tests requiring live DEEPSEEK_API_KEY",
     "overgraph: v6.0.0 OverGraph backend integration tests",
+    "graphlite: v6.0.0 GraphLite legacy backend tests (excluded by default)",
 ]

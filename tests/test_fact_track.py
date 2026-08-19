@@ -71,24 +71,24 @@ class TestClassifyFactTrack:
 # ─── 改动 2/4：落库默认 + 写时分类 ───────────────────────────
 
 class TestFactTrackPersistence:
-    def test_create_episode_defaults_active(self, graphlite_store):
+    def test_create_episode_defaults_active(self, overgraph_store):
         """清单 4：不带 fact_track 的 create_episode → 回读 active。"""
         eid = str(uuid.uuid4())
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": eid,
             "content": "一条普通记忆",
             "created_at": time.time(),
             "tau_initial": 1.0,
             "source": "test",
         })
-        got = graphlite_store.get_episode(eid)
+        got = overgraph_store.get_episode(eid)
         assert got is not None
         assert got.get("fact_track") == "active"
 
-    def test_create_episode_explicit_core_preserved(self, graphlite_store):
+    def test_create_episode_explicit_core_preserved(self, overgraph_store):
         """显式 fact_track="core" 不被 setdefault 覆盖。"""
         eid = str(uuid.uuid4())
-        graphlite_store.create_episode({
+        overgraph_store.create_episode({
             "id": eid,
             "content": "我住在北京",
             "created_at": time.time(),
@@ -96,7 +96,7 @@ class TestFactTrackPersistence:
             "source": "test",
             "fact_track": "core",
         })
-        got = graphlite_store.get_episode(eid)
+        got = overgraph_store.get_episode(eid)
         assert got is not None
         assert got.get("fact_track") == "core"
 
@@ -115,10 +115,10 @@ class TestWriteRouteFactTrack:
 
         return _build
 
-    def test_preference_content_persists_core(self, client, graphlite_store):
+    def test_preference_content_persists_core(self, client, overgraph_store):
         """偏好内容经生产写路径 → 落库 fact_track=="core"。"""
         svc = Services()
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "我喜欢喝茶",
@@ -127,14 +127,14 @@ class TestWriteRouteFactTrack:
 
         assert resp.status_code == 200, resp.text
         episode_id = resp.json()["episode_id"]
-        got = graphlite_store.get_episode(episode_id)
+        got = overgraph_store.get_episode(episode_id)
         assert got is not None
         assert got.get("fact_track") == "core"
 
-    def test_event_content_persists_active(self, client, graphlite_store):
+    def test_event_content_persists_active(self, client, overgraph_store):
         """事件内容经生产写路径 → 落库 fact_track=="active"。"""
         svc = Services()
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "今天下午开会",
@@ -143,7 +143,7 @@ class TestWriteRouteFactTrack:
 
         assert resp.status_code == 200, resp.text
         episode_id = resp.json()["episode_id"]
-        got = graphlite_store.get_episode(episode_id)
+        got = overgraph_store.get_episode(episode_id)
         assert got is not None
         assert got.get("fact_track") == "active"
 

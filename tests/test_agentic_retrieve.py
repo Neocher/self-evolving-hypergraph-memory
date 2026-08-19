@@ -430,15 +430,15 @@ class TestR3RelativeTimeAnchorStableKey:
 class TestR3N1PublicEntryIntegration:
     """R3 P3-3: "apple 收入" 走 retrieve() 公共入口，覆盖实体提取 → 属性时间检索链路。"""
 
-    def test_retrieve_apple_income_triggers_property_temporal(self, graphlite_store):
+    def test_retrieve_apple_income_triggers_property_temporal(self, overgraph_store):
         from core.entity_resolver import EntityResolver
-        resolver = EntityResolver(graphlite_store=graphlite_store)
+        resolver = EntityResolver(graphlite_store=overgraph_store)
         resolver._update_property_version(
             "Apple Inc", "revenue", "10B", valid_from=1_600_000_000.0,
         )
 
         router = _make_fusion_router(fusion_results=[_r("ep1", "Apple 的业务情况", 0.9)])
-        router.graphlite_store = graphlite_store
+        router.graphlite_store = overgraph_store
         router._property_temporal_retrieve = (
             QueryRouter._property_temporal_retrieve.__get__(router, QueryRouter)
         )

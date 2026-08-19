@@ -1,17 +1,13 @@
 # SHM 运行依赖
 #
-# ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) 不在 PyPI：
-#   需要源码构建（Rust）后通过环境变量注入 sys.path：
-#     git clone https://github.com/Neocher/GraphLite ~/GraphLite   # ⚠️ 必须用修复版 fork（含 UTF-8 lexer 修复 4452a96+）
+# ⚠️ 存储引擎 GraphLite SDK (graphlite_sdk, Apache-2.0) — 【仅迁移需要】：
+#   v6.0.0 起默认后端为 OverGraph（graphlite_sdk 不在 PyPI，需源码构建）。
+#   仅 data/migrate_graphlite_to_overgraph.py 读取旧 GraphLite 库时需要；
+#   迁移完成后可整体移除。构建方式（如需）：
+#     git clone https://github.com/Neocher/GraphLite ~/GraphLite   # 修复版 fork（UTF-8 lexer 4452a96+）
 #     cd ~/GraphLite && source ~/.cargo/env && cargo build --release -p graphlite-ffi
 #     export GRAPHLITE_BINDINGS=~/GraphLite/bindings/python
 #     export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
-#   ⚠️⚠️ 勿用上游 https://github.com/GraphLite-AI/GraphLite（main 停滞 2026-01）：
-#   其 lexer 在多字节 UTF-8 字符处 panic（end byte index not a char boundary），
-#   SHM v5.31.4+ 已去除 b64 透明编码（原生中文直写），必须搭配修复版引擎，
-#   否则中文 INSERT/CONTAINS/LIKE 全部 PANIC。fork 修复内容见
-#   https://github.com/Neocher/GraphLite/commit/4452a96
-#   详见 README 「Installation」章节。
 #
 # 以下均为 PyPI 依赖：
 faiss-cpu>=1.7.4

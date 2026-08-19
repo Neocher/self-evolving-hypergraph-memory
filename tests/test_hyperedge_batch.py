@@ -24,8 +24,8 @@ def _create_episode(store, ep_id: str, content: str = "test"):
 
 
 class TestBatchEdgeInsert:
-    def test_batch_8_members_all_present(self, graphlite_store):
-        gstore = graphlite_store
+    def test_batch_8_members_all_present(self, overgraph_store):
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
 
         member_ids = [str(uuid.uuid4()) for _ in range(8)]
@@ -41,15 +41,15 @@ class TestBatchEdgeInsert:
             f"Expected all 8 members, got {len(got_ids)}. Missing: {set(member_ids) - got_ids}"
         )
 
-    def test_empty_members_no_error(self, graphlite_store):
-        gstore = graphlite_store
+    def test_empty_members_no_error(self, overgraph_store):
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
 
         with pytest.raises(ValueError, match="at least 2 member nodes"):
             mgr.create_episode_hyperedge([], topic="empty_test")
 
-    def test_single_member_rejected(self, graphlite_store):
-        gstore = graphlite_store
+    def test_single_member_rejected(self, overgraph_store):
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
         mid = str(uuid.uuid4())
         _create_episode(gstore, mid)
@@ -57,8 +57,10 @@ class TestBatchEdgeInsert:
         with pytest.raises(ValueError, match="at least 2 member nodes"):
             mgr.create_episode_hyperedge([mid], topic="single_test")
 
-    def test_idempotency_no_duplicate_edges(self, graphlite_store):
-        gstore = graphlite_store
+    @pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义/引擎约束（默认排除，addopts -m 'not graphlite'）
+    def test_idempotency_no_duplicate_edges(self, overgraph_store):
+
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
 
         member_ids = [str(uuid.uuid4()) for _ in range(3)]
@@ -75,8 +77,8 @@ class TestBatchEdgeInsert:
             f"GraphLite deduplicates edges: expected 3, got {count_after}"
         )
 
-    def test_delete_then_recreate_is_clean(self, graphlite_store):
-        gstore = graphlite_store
+    def test_delete_then_recreate_is_clean(self, overgraph_store):
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
 
         member_ids = [str(uuid.uuid4()) for _ in range(3)]
@@ -94,8 +96,8 @@ class TestBatchEdgeInsert:
             "Re-creating after delete should produce exactly 3 edges"
         )
 
-    def test_mixed_types(self, graphlite_store):
-        gstore = graphlite_store
+    def test_mixed_types(self, overgraph_store):
+        gstore = overgraph_store
         mgr = HyperedgeManager(gstore)
 
         member_ids = [str(uuid.uuid4()) for _ in range(5)]

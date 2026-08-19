@@ -14,9 +14,9 @@ from core.dream_pipeline import DreamPipeline
 from core.tau_decay import TauDecayEngine
 
 
-def _create_episode(graphlite_store, ep_id: str, content: str = "test content") -> None:
+def _create_episode(overgraph_store, ep_id: str, content: str = "test content") -> None:
     """在 GraphLite 中创建一个 EpisodeNode。"""
-    graphlite_store.create_episode({
+    overgraph_store.create_episode({
         "id": ep_id,
         "content": content,
         "created_at": time.time(),
@@ -38,9 +38,9 @@ def _make_community(
     }
 
 
-def _insert_community(graphlite_store, cid: str, name: str = "test_comm") -> None:
+def _insert_community(overgraph_store, cid: str, name: str = "test_comm") -> None:
     """在 GraphLite 中创建一个 CommunityNode。"""
-    graphlite_store.execute_cypher(
+    overgraph_store.execute_cypher(
         "INSERT (c:CommunityNode {id: $id, name: $name, "
         "summary: $summary, leiden_score: $score, "
         "created_at: $created_at})",
@@ -54,9 +54,9 @@ def _insert_community(graphlite_store, cid: str, name: str = "test_comm") -> Non
     )
 
 
-def _insert_member_edge(graphlite_store, cid: str, eid: str) -> None:
+def _insert_member_edge(overgraph_store, cid: str, eid: str) -> None:
     """在 GraphLite 中创建 COMMUNITY_MEMBER 边。"""
-    graphlite_store.execute_cypher(
+    overgraph_store.execute_cypher(
         "MATCH (c:CommunityNode {id: $cid}), "
         "(e:EpisodeNode {id: $eid}) "
         "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
@@ -64,9 +64,9 @@ def _insert_member_edge(graphlite_store, cid: str, eid: str) -> None:
     )
 
 
-def _edge_exists(graphlite_store, cid: str, eid: str) -> bool:
+def _edge_exists(overgraph_store, cid: str, eid: str) -> bool:
     """检查 COMMUNITY_MEMBER 边是否存在。"""
-    result = graphlite_store.execute_cypher(
+    result = overgraph_store.execute_cypher(
         "MATCH (c:CommunityNode {id: $cid})"
         "-[:COMMUNITY_MEMBER]->"
         "(e:EpisodeNode {id: $eid}) RETURN e",
@@ -78,7 +78,7 @@ def _edge_exists(graphlite_store, cid: str, eid: str) -> bool:
 class TestPipelinePersistSharedMember:
     """_persist_communities Phase 3 同源湮灭修复验证。"""
 
-    def test_shared_member_keeps_largest_community(self, graphlite_store):
+    def test_shared_member_keeps_largest_community(self, overgraph_store):
         """双社区共享成员 → persist 后成员只属最大社区（不湮灭）。
 
         构造 C1(3 members, [epX, epA, epB]) + C2(2 members, [epX, epC])。
@@ -94,7 +94,7 @@ class TestPipelinePersistSharedMember:
         epC = f"epC-{uuid.uuid4().hex[:8]}"
 
         for ep_id in [epX, epA, epB, epC]:
-            _create_episode(graphlite_store, ep_id, f"content of {ep_id}")
+            _create_episode(overgraph_store, ep_id, f"content of {ep_id}")
 
         communities = [
             _make_community(c1_id, [epX, epA, epB], "C1: larger (3 members)"),
@@ -102,30 +102,30 @@ class TestPipelinePersistSharedMember:
         ]
 
         created = pipe._persist_communities(
-            graphlite_store, communities, f"dream-{uuid.uuid4().hex[:8]}"
+            overgraph_store, communities, f"dream-{uuid.uuid4().hex[:8]}"
         )
         assert created == 2
 
         # 回归断言：epX 只属 C1（最大社区），不属 C2
-        assert _edge_exists(graphlite_store, c1_id, epX), (
+        assert _edge_exists(overgraph_store, c1_id, epX), (
             f"epX should belong to larger C1, but edge missing → orphaned"
         )
-        assert not _edge_exists(graphlite_store, c2_id, epX), (
+        assert not _edge_exists(overgraph_store, c2_id, epX), (
             f"epX should NOT belong to smaller C2, but stale edge exists"
         )
 
         # 独有成员边不受影响
-        assert _edge_exists(graphlite_store, c1_id, epA), (
+        assert _edge_exists(overgraph_store, c1_id, epA), (
             f"C1 exclusive member epA edge missing"
         )
-        assert _edge_exists(graphlite_store, c1_id, epB), (
+        assert _edge_exists(overgraph_store, c1_id, epB), (
             f"C1 exclusive member epB edge missing"
         )
-        assert _edge_exists(graphlite_store, c2_id, epC), (
+        assert _edge_exists(overgraph_store, c2_id, epC), (
             f"C2 exclusive member epC edge missing"
         )
 
-    def test_preserves_external_edges(self, graphlite_store):
+    def test_preserves_external_edges(self, overgraph_store):
         """外部社区边不被 Phase 1 波及（共享成员场景）。
 
         构造：
@@ -147,11 +147,11 @@ class TestPipelinePersistSharedMember:
 
         # 创建所有 EpisodeNode
         for ep_id in [epX, epY, epZ]:
-            _create_episode(graphlite_store, ep_id, f"content of {ep_id}")
+            _create_episode(overgraph_store, ep_id, f"content of {ep_id}")
 
         # 预置外部社区 + 边到共享成员 epX（epX 同时属于 EXT + dream C1/C2）
-        _insert_community(graphlite_store, ext_cid, "external_community")
-        _insert_member_edge(graphlite_store, ext_cid, epX)
+        _insert_community(overgraph_store, ext_cid, "external_community")
+        _insert_member_edge(overgraph_store, ext_cid, epX)
 
         # dream 社区：C1 含 epX+epY，C2 含 epX+epZ（epX 共享）
         communities = [
@@ -160,31 +160,31 @@ class TestPipelinePersistSharedMember:
         ]
 
         created = pipe._persist_communities(
-            graphlite_store, communities, f"dream-{uuid.uuid4().hex[:8]}"
+            overgraph_store, communities, f"dream-{uuid.uuid4().hex[:8]}"
         )
         assert created == 2
 
         # F2 核心断言：外部社区到共享成员 epX 的边存活
         # （修复前 Phase 1 MATCH (c:CommunityNode) 无社区过滤 → 必挂）
-        assert _edge_exists(graphlite_store, ext_cid, epX), (
+        assert _edge_exists(overgraph_store, ext_cid, epX), (
             f"F2 FAIL: EXT→epX edge was deleted — "
             f"Phase 1 MATCH lacks community filter ({ext_cid}→{epX})"
         )
 
         # epX 属于先出现的 C1（等大社区取先出现——sorted by member_count，
         # 相同则按 new_member_sets 插入序；C1 先加入 communities 列表）
-        assert _edge_exists(graphlite_store, c1_id, epX), (
+        assert _edge_exists(overgraph_store, c1_id, epX), (
             f"epX should belong to C1 (first in communities list), but edge missing"
         )
-        assert not _edge_exists(graphlite_store, c2_id, epX), (
+        assert not _edge_exists(overgraph_store, c2_id, epX), (
             f"epX should NOT belong to C2, but stale edge exists"
         )
 
         # 独有成员边正常
-        assert _edge_exists(graphlite_store, c1_id, epY), (
+        assert _edge_exists(overgraph_store, c1_id, epY), (
             f"C1 exclusive member epY edge missing"
         )
-        assert _edge_exists(graphlite_store, c2_id, epZ), (
+        assert _edge_exists(overgraph_store, c2_id, epZ), (
             f"C2 exclusive member epZ edge missing"
         )
 

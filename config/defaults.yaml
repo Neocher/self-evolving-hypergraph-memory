@@ -39,12 +39,12 @@ dream:
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
 
 graph:
-  backend: "graphlite"        # v6.0.0 OverGraph 迁移单开关: graphlite|overgraph（默认 graphlite → 存量部署零感知）
+  backend: "overgraph"       # v6.0.0: OverGraph 唯一后端（graphlite 已移除；字段保留一个发布周期供回滚）
   hnsw:                        # OverGraph HNSW 搜索参数（D11；m/ef_construction 无 SDK 设置 API 已移除）
     ef_search: 64             # 搜索时 HNSW 候选集（≥ k 保证召回；vector_search ef_search= 透传）
 
 graphlite:
-  database_path: "./data/shm_graphlite_db"  # GraphLite 数据库文件路径
+  database_path: "./data/shm_graphlite_db"  # 【legacy】GraphLite 后端配置——v6.0.0 已由 OverGraph 替代，保留一个发布周期供回滚，下版删除
   buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
   max_threads: 4                 # 最大工作线程数
 

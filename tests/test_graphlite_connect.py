@@ -6,6 +6,8 @@
 """
 import threading
 import pytest
+
+pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义测试（默认排除，addopts -m 'not graphlite'）
 from unittest.mock import MagicMock, patch
 
 

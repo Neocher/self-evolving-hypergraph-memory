@@ -69,28 +69,28 @@ class TestStorePrimitives:
         assert ce.threshold == 0.5
         assert ce.max_members == 10
 
-    def test_edge_direction_seed_to_community(self, graphlite_store):
+    def test_edge_direction_seed_to_community(self, overgraph_store):
         """边方向：(c:CommunityNode)-[:COMMUNITY_MEMBER]->(e:EpisodeNode)。
 
         种子→社区反查命中（种子属于社区）；非社区成员不命中；成员批量取回。
         """
-        _insert_episode(graphlite_store, "ep1", "K8s 集群搭建 flannel 网络问题")
-        _insert_episode(graphlite_store, "ep2", "用 calico 替换 flannel 解决网络")
-        _insert_episode(graphlite_store, "ep3", "无关买菜清单")
-        _persist_community(graphlite_store, "comm_net", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "K8s 集群搭建 flannel 网络问题")
+        _insert_episode(overgraph_store, "ep2", "用 calico 替换 flannel 解决网络")
+        _insert_episode(overgraph_store, "ep3", "无关买菜清单")
+        _persist_community(overgraph_store, "comm_net", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 排障 多会话")
         # 种子 → 社区反查命中
-        comms = graphlite_store.get_communities_by_seeds(["ep1"])
+        comms = overgraph_store.get_communities_by_seeds(["ep1"])
         assert len(comms) == 1
         assert comms[0]["community_id"] == "comm_net"
         assert set(comms[0]["member_ids"]) == {"ep1"}
         assert "flannel" in comms[0]["summary"]
         # 非成员种子 → 不命中
-        assert graphlite_store.get_communities_by_seeds(["ep3"]) == []
+        assert overgraph_store.get_communities_by_seeds(["ep3"]) == []
         # 空输入 → []
-        assert graphlite_store.get_communities_by_seeds([]) == []
+        assert overgraph_store.get_communities_by_seeds([]) == []
         # 成员批量取回（含 content，供检索复用）
-        members = graphlite_store.get_community_members("comm_net", limit=10)
+        members = overgraph_store.get_community_members("comm_net", limit=10)
         mids = {m["member_id"] for m in members}
         assert mids == {"ep1", "ep2"}
         assert all(m["content"] for m in members)
@@ -99,26 +99,26 @@ class TestStorePrimitives:
 class TestCommunityExpansion:
     """改动 2：检索层社区扩召回（_finish 去重前 append）"""
 
-    def test_irrelevant_community_no_expansion(self, graphlite_store):
+    def test_irrelevant_community_no_expansion(self, overgraph_store):
         """社区不相关（summary 与查询词法无重叠）→ 不加分不召回。"""
-        _insert_episode(graphlite_store, "ep1", "今天讨论 K8s 集群搭建")
-        _insert_episode(graphlite_store, "ep2", "买菜清单 西红柿 鸡蛋")
-        _persist_community(graphlite_store, "comm_unrel", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "今天讨论 K8s 集群搭建")
+        _insert_episode(overgraph_store, "ep2", "买菜清单 西红柿 鸡蛋")
+        _persist_community(overgraph_store, "comm_unrel", ["ep1", "ep2"],
                            "菜谱烹饪 家常菜 西红柿炒蛋")
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "今天讨论 K8s 集群搭建"),
         ])
         out = router.retrieve("K8s 集群网络排障")
         assert all(r["level"] != "community_expansion" for r in out)
         assert [r["node_id"] for r in out] == ["ep1"]
 
-    def test_relevant_community_recalls_members_excluding_seed(self, graphlite_store):
+    def test_relevant_community_recalls_members_excluding_seed(self, overgraph_store):
         """相关社区 → 成员召回（level=community_expansion），种子被排除。"""
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题"),
         ])
         out = router.retrieve("多会话 K8s 集群 flannel 网络问题")
@@ -129,15 +129,15 @@ class TestCommunityExpansion:
         # 种子（已在主检索中）被排除，不重复召回
         assert "ep1" not in {e["node_id"] for e in exp}
 
-    def test_expansion_score_below_min_seed(self, graphlite_store):
+    def test_expansion_score_below_min_seed(self, overgraph_store):
         """假阳性护栏：扩展分 = relevance × min(种子分) × 0.6，严格低于种子分。"""
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _insert_episode(graphlite_store, "ep3", "补充会话里 calico 配置了 BGP 网络")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2", "ep3"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _insert_episode(overgraph_store, "ep3", "补充会话里 calico 配置了 BGP 网络")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2", "ep3"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
         # 种子分 [0.9, 0.6] → min=0.6；ep3 非种子成员 → 被召回
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题", score=0.9),
             _seed_result("ep2", "另一会话用 calico 解决了 flannel 网络问题", score=0.6),
         ])
@@ -157,17 +157,17 @@ class TestCommunityExpansion:
         assert [r["node_id"] for r in out] == ["s1"]
         assert all(r["level"] != "community_expansion" for r in out)
 
-    def test_disabled_bit_identical(self, graphlite_store, monkeypatch):
+    def test_disabled_bit_identical(self, overgraph_store, monkeypatch):
         """开关关闭 → 结果与现状 bit 级一致（无社区扩召回项，种子结果原样）。"""
         from config.settings import Settings, CommunityExpansionConfig
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
         s = Settings()
         s.retrieval.community_expansion = CommunityExpansionConfig(enabled=False)
         monkeypatch.setattr("retrieval.query_router.get_settings", lambda: s)
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题"),
         ])
         out = router.retrieve("多会话 K8s 集群 flannel 网络问题")
@@ -175,17 +175,17 @@ class TestCommunityExpansion:
         assert [r["node_id"] for r in out] == ["ep1"]
         assert out[0]["score"] == 0.9  # 种子分未被扩召回影响
 
-    def test_profile_boost_not_double_applied(self, graphlite_store):
+    def test_profile_boost_not_double_applied(self, overgraph_store):
         """与画像叠加：core ×1.1 + 画像 ×1.2 在 _deduplicate_and_sort 单点各一次，
         扩召回内不加分 → 不双重放大。"""
         from retrieval.query_router import set_user_profile
         set_user_profile({"preferences": {"flannel": {"weight": 1.0, "sources": 1}}})
         try:
-            _insert_episode(graphlite_store, "ep1", "K8s 集群 flannel 问题", fact_track="core")
-            _insert_episode(graphlite_store, "ep2", "flannel 被 calico 替换", fact_track="core")
-            _persist_community(graphlite_store, "comm_f", ["ep1", "ep2"],
+            _insert_episode(overgraph_store, "ep1", "K8s 集群 flannel 问题", fact_track="core")
+            _insert_episode(overgraph_store, "ep2", "flannel 被 calico 替换", fact_track="core")
+            _persist_community(overgraph_store, "comm_f", ["ep1", "ep2"],
                                "K8s 集群 flannel calico 网络 排障")
-            router = _make_router(graphlite_store, [
+            router = _make_router(overgraph_store, [
                 _seed_result("ep1", "K8s 集群 flannel 问题", score=0.8, fact_track="core"),
             ])
             out = router.retrieve("flannel calico 网络")
@@ -219,13 +219,15 @@ class TestCommunityExpansion:
         assert rel[1] > 0.5, f"强匹配社区应高相关: {rel[1]}"
         assert rel[1] > rel[0]
 
-    def test_within_timeout_budget(self, graphlite_store):
+    @pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLite 专属语义/引擎约束（默认排除，addopts -m 'not graphlite'）
+    def test_within_timeout_budget(self, overgraph_store):
+
         """3s 超时预算内：5 次带社区扩召回的检索总耗时 < 3s（单次远低于 _RETRIEVE_TIMEOUT）。"""
-        _insert_episode(graphlite_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
-        _insert_episode(graphlite_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
-        _persist_community(graphlite_store, "comm_k8s", ["ep1", "ep2"],
+        _insert_episode(overgraph_store, "ep1", "多会话记忆里 K8s 集群遇到 flannel 问题")
+        _insert_episode(overgraph_store, "ep2", "另一会话用 calico 解决了 flannel 网络问题")
+        _persist_community(overgraph_store, "comm_k8s", ["ep1", "ep2"],
                            "K8s 集群网络 flannel calico 多会话排障 记忆")
-        router = _make_router(graphlite_store, [
+        router = _make_router(overgraph_store, [
             _seed_result("ep1", "多会话记忆里 K8s 集群遇到 flannel 问题"),
         ])
         t0 = time.monotonic()

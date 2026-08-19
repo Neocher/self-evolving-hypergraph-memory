@@ -326,20 +326,20 @@ class TestWriteMultiSourceBoost:
 
         return _build
 
-    def test_multi_source_write_boosts_tau(self, client, graphlite_store, tmp_path):
+    def test_multi_source_write_boosts_tau(self, client, overgraph_store, tmp_path):
         """清单 5：同内容第二次以不同 source 写入 → tau_initial 提升至 0.85。"""
         svc = Services()
-        svc.graphlite_store = graphlite_store
+        svc.graphlite_store = overgraph_store
         svc.evidence_tracker = EvidenceTracker(data_dir=str(tmp_path))
 
         content = "我喜欢喝茶"
 
         r1 = client(svc).post("/memories/episodes", json={"content": content, "source": "user"})
         assert r1.status_code == 200, r1.text
-        tau1 = float(graphlite_store.get_episode(r1.json()["episode_id"]).get("tau_initial", 1.0))
+        tau1 = float(overgraph_store.get_episode(r1.json()["episode_id"]).get("tau_initial", 1.0))
         assert abs(tau1 - 0.85) > 1e-6  # 单来源：不提升
 
         r2 = client(svc).post("/memories/episodes", json={"content": content, "source": "agent"})
         assert r2.status_code == 200, r2.text
-        tau2 = float(graphlite_store.get_episode(r2.json()["episode_id"]).get("tau_initial", 1.0))
+        tau2 = float(overgraph_store.get_episode(r2.json()["episode_id"]).get("tau_initial", 1.0))
         assert abs(tau2 - 0.85) < 1e-6  # 多来源：提升持久性

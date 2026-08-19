@@ -180,6 +180,9 @@ class TestCircuitBreakerStateMachine:
 
 
 class TestGraphLiteStoreCircuitBreaker:
+    """GraphLiteStore 熔断集成（mock _session.query，GraphLite 专属内部结构）。"""
+
+    pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】依赖 GraphLiteStore 内部 mock 结构
 
     def test_query_success_records_success(self, graphlite_store):
         store = graphlite_store
@@ -505,7 +508,9 @@ class TestWithRetryDualMode:
 
 
 class TestCircuitBreakerConfigInjection:
-    """验证 cb_config 从 GraphLiteStore 构造函数透传到 CircuitBreaker。"""
+    """验证 cb_config 从 GraphLiteStore 构造函数透传到 CircuitBreaker（GraphLite 专属构造）。"""
+
+    pytestmark = pytest.mark.graphlite  # 【v6.0.0 legacy】GraphLiteStore 直构
 
     def test_cb_config_propagates_to_circuit_breaker(self, temp_db_path):
         """注入非默认 cb_config → store.circuit_breaker 属性来自配置而非默认值。"""

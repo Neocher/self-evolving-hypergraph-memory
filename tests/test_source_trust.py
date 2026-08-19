@@ -31,9 +31,9 @@ def client():
     return _build
 
 
-def _svc(graphlite_store) -> Services:
+def _svc(overgraph_store) -> Services:
     svc = Services()
-    svc.graphlite_store = graphlite_store
+    svc.graphlite_store = overgraph_store
     return svc
 
 
@@ -62,13 +62,13 @@ class TestResolveSourceType:
 class TestSourceTypeDefaultDirect:
     """清单 1：create_episode 落库后回读 source_type=="direct" 默认值。"""
 
-    def test_create_episode_defaults_direct(self, graphlite_store):
-        eid = graphlite_store.create_episode({
+    def test_create_episode_defaults_direct(self, overgraph_store):
+        eid = overgraph_store.create_episode({
             "id": "ep_default_direct",
             "content": "默认来源分级测试",
             "source": "user",
         })
-        got = graphlite_store.get_episode(eid)
+        got = overgraph_store.get_episode(eid)
         assert got is not None
         assert got.get("source_type") == "direct", (
             f"未显式传 source_type 时应默认 direct，实际 {got.get('source_type')!r}"
@@ -78,8 +78,8 @@ class TestSourceTypeDefaultDirect:
 class TestAntiLaunderingRoute:
     """清单 2：写 source="hermes" 且 source_type="direct" → 降级 inferred。"""
 
-    def test_agent_declared_direct_downgraded(self, client, graphlite_store):
-        svc = _svc(graphlite_store)
+    def test_agent_declared_direct_downgraded(self, client, overgraph_store):
+        svc = _svc(overgraph_store)
         resp = client(svc).post("/memories/episodes", json={
             "content": "agent 直述防洗白测试",
             "source": "hermes",
@@ -87,35 +87,35 @@ class TestAntiLaunderingRoute:
         })
         assert resp.status_code == 200, resp.text
         episode_id = resp.json()["episode_id"]
-        got = graphlite_store.get_episode(episode_id)
+        got = overgraph_store.get_episode(episode_id)
         assert got is not None
         assert got.get("source_type") == "inferred", (
             f"agent 来源声明 direct 应降级 inferred，实际 {got.get('source_type')!r}"
         )
 
-    def test_user_direct_kept(self, client, graphlite_store):
-        svc = _svc(graphlite_store)
+    def test_user_direct_kept(self, client, overgraph_store):
+        svc = _svc(overgraph_store)
         resp = client(svc).post("/memories/episodes", json={
             "content": "用户直述不降级测试",
             "source": "user",
             "source_type": "direct",
         })
         assert resp.status_code == 200, resp.text
-        got = graphlite_store.get_episode(resp.json()["episode_id"])
+        got = overgraph_store.get_episode(resp.json()["episode_id"])
         assert got.get("source_type") == "direct"
 
 
 class TestPromoteInferred:
     """清单 3：promote_to_episode 落库 source_type=="inferred"。"""
 
-    def test_promote_writes_inferred(self, client, graphlite_store):
-        svc = _svc(graphlite_store)
+    def test_promote_writes_inferred(self, client, overgraph_store):
+        svc = _svc(overgraph_store)
         resp = client(svc).post("/memories/promote", json={
             "sensory_record_id": "nonexistent_record",
         })
         assert resp.status_code == 200, resp.text
         episode_id = resp.json()["episode_id"]
-        got = graphlite_store.get_episode(episode_id)
+        got = overgraph_store.get_episode(episode_id)
         assert got is not None
         assert got.get("source_type") == "inferred", (
             f"promote 落库应写死 inferred，实际 {got.get('source_type')!r}"
@@ -126,17 +126,17 @@ class TestGatewayStoreEpisodeSourceType:
     """gateway_api 直调 create_episode 同步 source_type（堵 A2A 洗白漏洞）。"""
 
     @pytest.mark.asyncio
-    async def test_agent_source_inferred(self, graphlite_store):
+    async def test_agent_source_inferred(self, overgraph_store):
         from gateway.gateway_api import GatewayAPI
-        api = GatewayAPI(_svc(graphlite_store))
+        api = GatewayAPI(_svc(overgraph_store))
         resp = await api.store_episode("A2A agent 写入", source="hermes")
-        got = graphlite_store.get_episode(resp.episode_id)
+        got = overgraph_store.get_episode(resp.episode_id)
         assert got.get("source_type") == "inferred"
 
     @pytest.mark.asyncio
-    async def test_user_source_direct(self, graphlite_store):
+    async def test_user_source_direct(self, overgraph_store):
         from gateway.gateway_api import GatewayAPI
-        api = GatewayAPI(_svc(graphlite_store))
+        api = GatewayAPI(_svc(overgraph_store))
         resp = await api.store_episode("A2A 用户写入", source="user")
-        got = graphlite_store.get_episode(resp.episode_id)
+        got = overgraph_store.get_episode(resp.episode_id)
         assert got.get("source_type") == "direct"
