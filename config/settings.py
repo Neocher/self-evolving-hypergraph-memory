@@ -133,14 +133,14 @@ class MesaConfig:
 class EntityExpansionConfig:
     """实体扩召回配置（v5.53.0 P3c 跨消息多跳增强）"""
     enabled: bool = True        # 开关：关闭时行为 = 现状（bit 级一致）
-    boost: float = 0.5          # 扩展分 = min(种子分) × boost（相对尾分缩放，严格低于种子）
+    boost: float = 0.9          # 扩展分 = max(种子分) × boost（仅低于最高种子）
     max_results: int = 10       # 每实体最大召回数
     max_entities: int = 3       # 每查询最多提取实体数
     time_filter: bool = True    # 时间锚上界过滤（created_at <= session 时间锚）
 
     def __post_init__(self) -> None:
         # 【R1 P2-1】boost/max_results/max_entities 校验（镜像 MesaConfig 做法）：
-        # boost>=1 让扩展分反超种子（违反「严格低于种子」契约）、max<=0 让扩展
+        # boost>=1 让扩展分反超最高种子（违反「仅低于最高种子」契约）、max<=0 让扩展
         # 静默空返回——配置期 fail-fast 拒绝非法值。
         if not 0.0 <= self.boost < 1.0:
             raise ValueError(f"EntityExpansionConfig.boost={self.boost} 必须 ∈ [0, 1)")

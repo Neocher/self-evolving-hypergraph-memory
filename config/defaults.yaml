@@ -76,7 +76,7 @@ retrieval:
     max_nodes: 5                 # 每查询最多合成节点数
   entity_expansion:              # v5.53.0 P3c 实体扩召回（跨消息多跳增强，补充非替代，关闭=现状）
     enabled: true                # 开关
-    boost: 0.5                   # 扩展分 = min(种子分) × boost（相对尾分缩放，严格低于种子）
+    boost: 0.9                   # 扩展分 = max(种子分) × boost（仅低于最高种子）
     max_results: 10              # 每实体最大召回数
     max_entities: 3              # 每查询最多提取实体数
     time_filter: true            # 时间锚上界过滤（created_at <= session 时间锚）

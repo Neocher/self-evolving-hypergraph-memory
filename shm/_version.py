@@ -12,7 +12,12 @@ v5.53.0 (2026-08-19) Cross-Message-Expansion:
     查询专名实体（连续大写序列 + _PROPERTY_CANDIDATE_STOPWORDS 停用词过滤
     + normalize_entity_name 规范化，top-3）→ 单条 OR CONTAINS GQL（避免
     N+1）跨会话召回 EpisodeNode append（每实体 max-10、总 ≤20）；扩展分
-    = min(种子分) × boost(0.5) 相对尾分缩放严格低于种子
+    = max(种子分) × boost(0.9) 仅低于最高种子
+  • 【CC P3c】max 锚 + boost 0.9 同版本修复 — 推翻 R1-P1 的 min 锚契约：
+    cat1 聚合场景要求跨会话证据进 LLM 上下文（评测 docs[:40]→rerank
+    top-12），min 锚使扩展分 ≈0.25 沉底进不了 top-40；max 锚 + boost 0.9
+    使扩展分 ≈0.81 仅低于最高种子，稳进 top-40，由内部/外部 rerank 双兜底
+    收敛语义相关性（2026-08-19）
   • CJK 处理 — 先 _extract_proper_nouns 提取 ASCII 专名，纯中文/无专名
     查询返回原 results（中文零回归）；中英混合（"Apple 最近做了什么"）
     提取 apple 走 CONTAINS（v5.31.4+ 中文原生直写，英文词 CONTAINS 可用；
@@ -22,8 +27,8 @@ v5.53.0 (2026-08-19) Cross-Message-Expansion:
   • 双路径接线 — retrieve() _finish（community → mesa → visual →
     property → entity_expansion）+ _agentic_round（防 MESA 历史教训：
     agentic 缺接线导致通道静默失效）
-  • 配置 — EntityExpansionConfig（settings.py 注册 + defaults.yaml 块，
-    enabled=true/boost=0.5/max_results=10/max_entities=3/time_filter=true）
+  •     配置 — EntityExpansionConfig（settings.py 注册 + defaults.yaml 块，
+    enabled=true/boost=0.9/max_results=10/max_entities=3/time_filter=true）
     + QueryRouterConfig.entity_expansion 嵌套 + api/app.py getattr 条件透传
     （None 不传让默认 factory 生效，旧配置对象零回归）
   • 测试: test_entity_expansion（公共入口 retrieve(level=FUSION)：跨会话

@@ -76,7 +76,7 @@ class _EntityChannelDegraded(Exception):
 # 【P0-1 实体-属性-时间】属性版本链检索通道常量（append 相对尾分缩放，严格低于种子）
 _PROPERTY_BOOST = 0.6
 _PROPERTY_MAX_RESULTS = 5
-# 【P3c 跨消息多跳增强】实体扩召回通道常量（append 相对尾分缩放，严格低于种子）
+# 【P3c 跨消息多跳增强】实体扩召回通道常量（append max 锚 × boost 0.9，仅低于最高种子）
 _ENTITY_EXPANSION_MAX_APPEND = 20  # 总 append 硬上限（实体 top-3 × 每实体 max-10 的钳制）
 # 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
 _RERANK_PREWARM_TIMEOUT = 60.0
@@ -1420,8 +1420,8 @@ class QueryRouter:
             # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
             results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
             # 【P3c 跨消息多跳增强】补充非替代：查询专名实体跨会话召回 append
-            # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = min(种子分)
-            # × boost 相对尾分缩放严格低于种子，经 _deduplicate_and_sort 单点去重不双重放大）
+            # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
+            # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
             results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
             if not include_archived:
                 results = self._filter_archived(results)
@@ -2726,7 +2726,7 @@ class QueryRouter:
              两种存储库（R2 P0）
           3. 时间锚上界过滤：now_ts（session 时间锚）非空且 config.time_filter
              开启 → AND e.created_at <= $at_ts（created_at 为时间戳秒数，int 转换）
-          4. 扩展分 = min(种子分) × boost(0.5)（相对尾分缩放，严格低于种子）
+          4. 扩展分 = max(种子分) × boost(0.9)（仅低于最高种子）
              append {node_id, content, score, level="entity_expansion",
              _source="entity_expansion"}
 
@@ -2736,9 +2736,11 @@ class QueryRouter:
         4452a96 UTF-8 lexer 修复），英文词 CONTAINS 对混合内容可用（对齐
         _entity_match 主通道；仅 v5.31.4 前遗留 {b64} 数据不命中，属历史数据
         迁移边界，非本通道回归）。
-        【R1 P1】min(种子分) 取全部含 score 键的种子：_fuse_results 返回未排序
-        列表，取前 5 会在第 6 个种子分更低时让扩展分反超该种子（违反「扩展分
-        严格低于种子」契约）。
+        【CC P3c】max(种子分) 取全部含 score 键的种子：推翻 R1-P1 的 min 锚契约。
+        R1-P1 原契约（min 锚防扩展分反超低分种子）过度保守：cat1 聚合场景要求
+        跨会话证据进 LLM 上下文（评测 docs[:40]→rerank top-12），min 锚使扩展分
+        ≈0.25 沉底进不了 top-40；max 锚 + boost(0.9) 使扩展分 ≈0.81 仅低于最高
+        种子，稳进 top-40，由内部/外部 rerank 双兜底收敛语义相关性。
         【R1 P2-3】与 FUSION _entity_match 通道存在重复全表 OR CONTAINS 扫描：
         本通道以专名实体词跨会话聚合（P3c 目的），_entity_match 以查询 token
         匹配当前会话——语义互补；单条合并查询 + ORDER BY created_at DESC
@@ -2757,15 +2759,15 @@ class QueryRouter:
             if not entities:
                 return results
             entities = entities[:max(1, int(getattr(ecfg, "max_entities", 3)))]
-            # 【P1】全部种子（score 非 None）的最小分；无有效种子分 → default
-            # 0.0 → 下方 min_seed_score <= 0.0 直接返回原 results（不扩展）。
-            min_seed_score = min(
+            # 【CC P3c】全部种子（score 非 None）的最大分（max 锚）；无有效种子分
+            # → default 0.0 → 下方 max_seed_score <= 0.0 直接返回原 results（不扩展）。
+            max_seed_score = max(
                 (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
                 default=0.0,
             )
-            if min_seed_score <= 0.0:
+            if max_seed_score <= 0.0:
                 return results
-            boost = float(getattr(ecfg, "boost", 0.5))
+            boost = float(getattr(ecfg, "boost", 0.9))
             per_entity = int(getattr(ecfg, "max_results", 10))
             if per_entity <= 0:
                 return results
@@ -2816,7 +2818,7 @@ class QueryRouter:
                     continue
                 if not nid or nid in existing_ids or not content:
                     continue
-                score = round(min_seed_score * boost, 6)
+                score = round(max_seed_score * boost, 6)
                 if score <= 0.0:
                     continue
                 extra.append({
