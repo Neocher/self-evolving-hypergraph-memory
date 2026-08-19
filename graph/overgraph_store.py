@@ -11,6 +11,9 @@ R1 PoC 定标结论（2026-08-19, overgraph 0.17.0）——score 度量决策：
 - vector_search(mode="dense", k, dense_query, label_filter={"labels": [...]})
   恒返回 **cosine 相似度** s∈[-1,1]（实证：相同向量→1.0，正交→0.0，
   相反→-1.0；dense_vector_metric="l2"/"cosine" 选项均接受但 score 输出不变）。
+- 实证补强（R1 P2#9）：l2/cosine 双开库同向量对拍 score 逐位一致 —— 引擎
+  完全忽略 dense_vector_metric 选项（open 时必传参数，纯占位）→ **d=1/s-1
+  映射对两选项均成立**（非仅 cosine）；选项保留仅为引擎 open() 参数兼容。
 - OverGraph 不暴露 L2 距离 → 采纳 design_overgraph_vector.md D5 cosine 分支：
   **distance d = 1/s - 1 (s>0)**，下游 1/(1+d) = s ∈ (0,1] 保持单调 + [0,1] 契约。
 - s ≤ 0（正交/相反）视为非近邻剔除（FAISS 语义：非 top-k 不进结果），不足 k 补 -1。
@@ -26,7 +29,8 @@ OverGraph GQL 语法契约（PoC 8 轮实证，design_overgraph_vector.md D 节�
 - `CREATE (n:Label {props})` 节点带属性 map 不支持（InvalidReturnExpression）
   → 节点创建只能 typed upsert_node。
 - 逗号分隔 MATCH（`MATCH (a),(b)`）不支持 → 重复 MATCH（`MATCH (a) MATCH (b)`）。
-- MERGE 不支持；NOT EXISTS 不支持 → IS NULL。
+- MERGE 不支持；NOT EXISTS 不支持 → OPTIONAL MATCH + count=0 等价改写
+  （_rewrite_not_exists，实测语义；EXISTS 子查询/模式谓词均 parse error）。
 - `RETURN e.*` 不支持 → `RETURN e`（_flatten_row 展开 props）。
 - 裸 `RETURN 1 AS test`（无 MATCH 前缀）不支持 → 合成行。
 - LIKE 不支持（parse error）→ CONTAINS（前缀语义等价，尾部 % 剥离）。
@@ -275,6 +279,44 @@ def _rewrite_offset(query: str) -> str:
     return " ".join(parts)
 
 
+_NOT_EXISTS_RE = re.compile(
+    r"\bWHERE\s+NOT\s+EXISTS\s*\{\s*"
+    r"(\(\s*\w+\s*\))"                         # 源节点 (h)
+    r"(\s*(?:<\[[^\]]*\]-|-\[[^\]]*\]->)\s*)"  # 边 -[:LABEL]->
+    r"(\([^)]*\))"                             # 目标节点 (...)
+    r"\s*\}",
+    re.S,
+)
+
+
+def _rewrite_not_exists(query: str) -> str:
+    """`WHERE NOT EXISTS { (h)-[:L]->() }` → OPTIONAL MATCH + count=0 过滤。
+
+    OverGraph 不支持 EXISTS 子查询 / 模式谓词（PoC 实证：parse error；
+    `NOT (h)-[:L]->()` 同样报 expected expression）——超边孤儿清理
+    （graph/hyperedge.py purge_orphaned_hyperedges）的 NOT EXISTS 若直接透传
+    会 parse error → query_cypher 永不抛契约吞掉 → orphan_count 恒 0 静默 no-op。
+    等价改写（实测语义）：OPTIONAL MATCH 目标 + `WITH count(目标)=0` 过滤，
+    与 NOT EXISTS（无出边）严格等价 —— 有出边 count>0 剔除，无出边 count=0 保留。
+    `RETURN count(h)` 与 `DETACH DELETE h` 后缀均透传（聚合/删除作用域不变）。
+    """
+    m = _NOT_EXISTS_RE.search(query)
+    if not m:
+        return query
+    src, edge, target = m.group(1), m.group(2), m.group(3)
+    t = target.strip()[1:-1].strip()
+    tm = re.match(r"^(\w+)?\s*(?::\s*(\w+))?\s*$", t)
+    count_var = tm.group(1) if (tm and tm.group(1)) else "__m"
+    label = tm.group(2) if tm else None
+    new_target = f"({count_var}" + (f":{label}" if label else "") + ")"
+    prefix = query[: m.start()].rstrip()
+    suffix = query[m.end():]
+    return (
+        f"{prefix} OPTIONAL MATCH {src}{edge}{new_target} "
+        f"WITH {src.strip('()')}, count({count_var}) AS __n WHERE __n = 0{suffix}"
+    )
+
+
 def _eval_bare_return(query: str) -> list[dict]:
     """裸 RETURN 合成（健康检查 `RETURN 1 AS test`；OverGraph 无无前缀 RETURN）。"""
     m = _BARE_RETURN_RE.match(query)
@@ -373,8 +415,10 @@ def _translate_gql(query: str, params: dict | None = None) -> list:
         q2 = _rewrite_like(q)
         q2 = _rewrite_edges(q2)
         return [("gql", (q2, True))]
-    # 4. MATCH 系：逗号拆分 + 边创建重写 + e.* / LIKE / OFFSET 重写
-    q2 = _split_comma_matches(q)
+    # 4. MATCH 系：NOT EXISTS 改写（须先于逗号拆分，OPTIONAL MATCH/WITH 结构
+    #    不能被按逗号切分）+ 逗号拆分 + 边创建重写 + e.* / LIKE / OFFSET 重写
+    q2 = _rewrite_not_exists(q)
+    q2 = _split_comma_matches(q2)
     q2 = _rewrite_edges(q2)
     q2 = _rewrite_like(q2)
     q2 = _rewrite_star(q2)
@@ -1230,9 +1274,14 @@ class OverGraphStore:
         兼容混合形态 —— 同时含 `props`（OverGraphStore._flatten_row）与
         `Node`/`Relationship` 包裹（GraphLiteStore._flatten_row，user_profile/
         dream_scheduler 的零改动消费方）→ 两套 flatten 均返回 props。
+        【P0 契约】`RETURN x.*`（已重写为 `RETURN x`）→ 整节点 props 提升到行
+        顶层 —— communities/hyperedges/system/gateway 消费方直接 row.get("id")
+        零改动（R1 P0#3；GraphLite 原始 `RETURN x.*` 为嵌套 Node 形态，消费方
+        按扁平 props 编写，OverGraph 侧补平该契约）。
         """
         ops = _translate_gql(query, params)
         rows: list = []
+        star_return = re.search(r"\bRETURN\s+\w+\.\*", query) is not None
         for kind, payload in ops:
             if kind == "synth":
                 rows.extend(payload)
@@ -1245,7 +1294,9 @@ class OverGraphStore:
                 gql, allow_full_scan = payload
                 result = self._locked_execute_gql(gql, params)
                 r = list((result or {}).get("rows") or [])
-                rows.extend(self._compat_rows(r))
+                rows.extend(
+                    self._flatten_star_rows(r) if star_return else self._compat_rows(r)
+                )
         if not rows and "RETURN" not in query:
             # 无 RETURN 的 mutation：状态行 truthy 契约（同 GraphLite INSERT/SET）
             return [{"status": "ok"}]
@@ -1270,6 +1321,33 @@ class OverGraphStore:
         return [{k: _wrap(val) for k, val in row.items()} if isinstance(row, dict)
                 else row for row in rows]
 
+    @classmethod
+    def _flatten_star_rows(cls, rows: list) -> list:
+        """`RETURN x.*`（已重写为 `RETURN x`）→ 整节点 props 提升到行顶层。
+
+        消费方契约（communities/hyperedges/system/gateway/hyperedge 直接
+        row.get("id")/row["id"]，按扁平 props 编写）：每个属性为顶层列。
+        多列形态 `RETURN h.*, member_ids` → h 的 props 与 member_ids 等其余
+        列合并进同一行。（注意：GraphLite 原始 `RETURN x.*` 为嵌套 Node
+        形态 —— 本方法补的是消费方契约，非 GraphLite SDK 原始形态。）
+        """
+        out: list = []
+        for row in rows:
+            if not isinstance(row, dict):
+                out.append(row)
+                continue
+            flat: dict = {}
+            merged = False
+            for k, v in row.items():
+                if isinstance(v, dict) and "props" in v:
+                    merged = True
+                    for pk, pv in (v.get("props") or {}).items():
+                        flat.setdefault(pk, pv)
+                else:
+                    flat[k] = v
+            out.append(flat if merged else row)
+        return out
+
     # ─── 向量方法（v6.0.0 HNSW 主通道）────────────────────
 
     def vector_search_dense(
@@ -1288,6 +1366,9 @@ class OverGraphStore:
         """
         labels = list(label_filter) if label_filter else [LABEL_EPISODE]
         kwargs: dict = {}
+        ef_search = getattr(self.config, "ef_search", None)
+        if ef_search is not None:
+            kwargs["ef_search"] = int(ef_search)
         if scope_start_node_id is not None:
             kwargs["scope_start_node_id"] = int(scope_start_node_id)
             kwargs["scope_max_depth"] = int(scope_max_depth or 1)

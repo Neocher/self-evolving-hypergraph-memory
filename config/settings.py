@@ -84,10 +84,13 @@ class GraphLiteConfig:
 
 @dataclass
 class HNSWConfig:
-    """OverGraph HNSW 索引参数（D11 graph.hnsw.*；VectorIndexAdapter 建索引用）"""
+    """OverGraph HNSW 索引参数（D11 graph.hnsw.*）。
+
+    仅 ef_search 生效（vector_search(ef_search=) 透传，见 OverGraphStore.
+    vector_search_dense）。m/ef_construction 无 SDK 设置 API（open() 拒绝
+    未知选项，实证）→ 死配置已移除。
+    """
     ef_search: int = 64
-    m: int = 16
-    ef_construction: int = 200
 
 
 @dataclass
@@ -102,8 +105,8 @@ class OverGraphConfig:
     """OverGraph 引擎配置（design_overgraph_store.md 任务书 8）"""
     database_path: str = "./data/shm_overgraph_db"
     dense_vector_dimension: int = 512
-    # R1 PoC 定标：vector_search score 恒为 cosine（metric 选项不改变输出），
-    # 此字段仅占位（保留 l2 选项以便引擎后续版本暴露 L2 距离时切换）
+    # R1 P2#9 实证：vector_search score 恒为 cosine —— l2/cosine 双开库同向量
+    # 对拍 score 逐位一致（引擎忽略选项）。字段保留仅为引擎 open() 参数兼容。
     dense_vector_metric: str = "cosine"
 
 

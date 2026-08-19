@@ -15,6 +15,9 @@ import pytest
 
 pytestmark = pytest.mark.overgraph
 
+# 依赖缺失 → 整模块 skip（不崩收集；统一顶层导入策略，P2#8）
+pytest.importorskip("overgraph")
+
 
 # ─── Episode CRUD / 中文原生 ────────────────────────────
 
@@ -256,6 +259,11 @@ def test_translation_star_return(overgraph_store):
     rows = store.query_cypher(
         "MATCH (e:EpisodeNode {id: 'ep_s1'}) RETURN e.*")
     assert len(rows) == 1
+    # P0#3 契约：整节点 props 提升到行顶层（communities/hyperedges/system/
+    # gateway 消费方直接 row.get("id")，对齐 GraphLite RETURN e.* 每属性一列）
+    assert rows[0]["id"] == "ep_s1"
+    assert rows[0]["content"] == "星号"
+    assert rows[0]["created_at"] == 100.0
     # OverGraphStore._flatten_row 展开 props
     flat = store._flatten_row(rows[0], "e")
     assert flat["content"] == "星号" and flat["created_at"] == 100.0
@@ -263,6 +271,143 @@ def test_translation_star_return(overgraph_store):
     from graph.graphlite_store import GraphLiteStore
     flat2 = GraphLiteStore._flatten_row(rows[0], "e")
     assert flat2["content"] == "星号"
+
+
+def test_translation_not_exists_purge(overgraph_store):
+    """NOT EXISTS → OPTIONAL MATCH + count=0 改写（P0#1：超边孤儿清理真实生效）。
+
+    OverGraph 不支持 EXISTS 子查询/模式谓词 —— 旧实现透传 parse error →
+    query_cypher 永不抛契约吞掉 → orphan_count 恒 0 清理 no-op。改写后
+    count 与 DETACH DELETE 均按真实无出边语义执行（实测对拍）。
+    """
+    store = overgraph_store
+    store.create_hyperedge_node({"id": "he_has", "type": "episode"})
+    store.create_hyperedge_node({"id": "he_orphan", "type": "episode"})
+    e1 = store.create_episode({"content": "成员"})
+    store.link_hyperedge_member("he_has", e1)
+    # 翻译层改写验证（白盒：确认 NOT EXISTS 未原样透传）
+    from graph.overgraph_store import _rewrite_not_exists
+    q = ("MATCH (h:HyperedgeNode) "
+         "WHERE NOT EXISTS { (h)-[:HYPEREDGE_MEMBER]->() } "
+         "RETURN count(h) AS cnt")
+    rewritten = _rewrite_not_exists(q)
+    assert "NOT EXISTS" not in rewritten
+    assert "OPTIONAL MATCH" in rewritten and "count(__m)" in rewritten
+    # 公共入口：孤儿计数（只 he_orphan 无出边）
+    rows = store.query_cypher(q)
+    assert rows == [{"cnt": 1}]
+    # 公共入口：孤儿清理 DETACH DELETE（he_has 保留，he_orphan 删除）
+    store.query_cypher(
+        "MATCH (h:HyperedgeNode) "
+        "WHERE NOT EXISTS { (h)-[:HYPEREDGE_MEMBER]->() } "
+        "DETACH DELETE h")
+    assert store.get_node_internal_id("he_has", "HyperedgeNode") is not None
+    assert store.get_node_internal_id("he_orphan", "HyperedgeNode") is None
+    assert store.query_cypher(q) == [{"cnt": 0}]
+
+
+def test_hyperedges_list_query_shape(overgraph_store):
+    """/hyperedges 路由查询形态（OPTIONAL MATCH + WITH collect + RETURN h.*）。
+
+    P0#2/#3：OverGraph 原生支持 OPTIONAL MATCH/WITH/collect（PoC 实证），
+    真实断点是行形态 —— RETURN h.*, member_ids 须把 h props 提升顶层并与
+    member_ids 合并（路由消费方 row["id"] 零改动）。
+    """
+    store = overgraph_store
+    store.create_hyperedge_node({"id": "he_a", "type": "episode", "created_at": 1.0})
+    store.create_hyperedge_node({"id": "he_b", "type": "episode", "created_at": 2.0})
+    e1 = store.create_episode({"content": "成员一"})
+    store.link_hyperedge_member("he_a", e1)
+    rows = store.query_cypher(
+        "MATCH (h:HyperedgeNode) "
+        "OPTIONAL MATCH (h)-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) "
+        "WITH h, collect(e.id) AS member_ids "
+        "RETURN h.*, member_ids ORDER BY h.created_at DESC LIMIT $limit",
+        {"limit": 50})
+    by_id = {r["id"]: r for r in rows}
+    assert set(by_id) == {"he_a", "he_b"}
+    assert by_id["he_a"]["member_ids"] == [e1]
+    assert by_id["he_b"]["member_ids"] == []
+    assert by_id["he_a"]["type"] == "episode"
+
+
+def test_translation_no_as_bare_columns(overgraph_store):
+    """无 AS 裸属性列 key 形态对拍（P1#4）：`RETURN c.id, c.episode_a` → 键为
+    `c.id`/`c.episode_a`（communities.py 冲突列表消费方 r.get("c.episode_a")）。"""
+    store = overgraph_store
+    store.execute_cypher(
+        "INSERT (:ConflictNode {id: 'c1', episode_a: 'A', episode_b: 'B', "
+        "rule_id: 'r1', detected_at: 1.0, resolved: false})")
+    rows = store.execute_cypher(
+        "MATCH (c:ConflictNode) WHERE 1=1 "
+        "RETURN c.id, c.episode_a, c.episode_b, c.rule_id, "
+        "c.detected_at, c.resolved")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["c.id"] == "c1"
+    assert r["c.episode_a"] == "A"
+    assert r["c.episode_b"] == "B"
+    assert r["c.resolved"] is False
+    # 消费方访问形态（与 communities.py L117-146 一致）
+    assert r.get("c.episode_a") == "A"
+    assert r.get("c.id") == "c1"
+
+
+def test_translation_var_length_path(overgraph_store):
+    """变长路径 RELATES_TO*1..3（P1#5）：ontology_validator 拓扑分真实计算。
+
+    OverGraph 原生支持变长路径（PoC 实证：`*1..3` 有界路径 parse 通过）——
+    补公共入口回归，锁死 2 跳命中 / 断连零命中的语义。
+    """
+    store = overgraph_store
+    for name in ("Alpha", "Beta", "Gamma", "Isolated"):
+        store.execute_cypher("INSERT (:OntologyEntity {name: $n})", {"n": name})
+    store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: 'Alpha'}), (b:OntologyEntity {name: 'Beta'}) "
+        "INSERT (a)-[:RELATES_TO]->(b)")
+    store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: 'Beta'}), (b:OntologyEntity {name: 'Gamma'}) "
+        "INSERT (a)-[:RELATES_TO]->(b)")
+    # 2 跳在 1..3 界内（ontology_validator L992 主循环形态，plain MATCH）
+    rows = store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $a_name}) "
+        "MATCH (b:OntologyEntity {name: $b_name}) "
+        "MATCH (a)-[:RELATES_TO*1..3]-(b) RETURN count(*) AS cnt LIMIT 1",
+        {"a_name": "Alpha", "b_name": "Gamma"})
+    assert rows == [{"cnt": 1}]
+    # 断连实体 → 0 行（plain MATCH 无路径不产出）
+    rows = store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $a_name}) "
+        "MATCH (b:OntologyEntity {name: $b_name}) "
+        "MATCH (a)-[:RELATES_TO*1..3]-(b) RETURN count(*) AS cnt LIMIT 1",
+        {"a_name": "Alpha", "b_name": "Isolated"})
+    assert rows == [{"cnt": 0}]
+    # OPTIONAL MATCH 形态（ontology_validator L1013 共享实体对）不抛错
+    rows = store.execute_cypher(
+        "MATCH (a:OntologyEntity {name: $a_name}) "
+        "MATCH (b:OntologyEntity {name: $b_name}) "
+        "OPTIONAL MATCH (a)-[:RELATES_TO*1..3]-(b) RETURN count(*) AS cnt",
+        {"a_name": "Alpha", "b_name": "Isolated"})
+    assert rows == [{"cnt": 1}]  # OPTIONAL MATCH 无路径 → 1 行 count(*) 计数（同 GraphLite）
+
+
+def test_translation_remove(overgraph_store):
+    """REMOVE 属性（P2#11）：transaction_manager rollback 的 tx_tag 清理语义。
+
+    OverGraph 原生支持 REMOVE（PoC 实证：SET→REMOVE→属性回 None）——
+    补公共入口回归，锁死该语义（R1 疑 REMOVE 未翻译，实测已支持）。
+    """
+    store = overgraph_store
+    store.create_episode({"id": "ep_rm", "content": "事务节点"})
+    store.query_cypher("MATCH (n {id: 'ep_rm'}) SET n.tx_tag = 'tx_abc'")
+    assert store.query_cypher(
+        "MATCH (n {id: 'ep_rm'}) RETURN n.tx_tag AS t") == [{"t": "tx_abc"}]
+    # transaction_manager.L156-164 同款语句
+    store.query_cypher(
+        "MATCH (n {id: $id}) WHERE n.tx_tag = $tag REMOVE n.tx_tag",
+        {"id": "ep_rm", "tag": "tx_abc"})
+    assert store.query_cypher(
+        "MATCH (n {id: 'ep_rm'}) RETURN n.tx_tag AS t") == [{"t": None}]
 
 
 def test_translation_bare_return_and_sentinel(overgraph_store):
@@ -360,18 +505,25 @@ def test_delete_namespace(overgraph_store):
 # ─── 熔断器（OverGraphError 计为基础设施失败）────────────
 
 
-def test_circuit_breaker_counts_overgraph_error(overgraph_store):
-    """OverGraphError → 熔断窗口计数（设计 A7：唯一 SDK 成员）。"""
+def test_circuit_breaker_counts_overgraph_error(overgraph_store, monkeypatch):
+    """OverGraphError → 熔断窗口计数（设计 A7：唯一 SDK 成员）。
+
+    P1#6：不直调 cb.record_failure —— mock 注入抛 OverGraphError 的底层执行
+    单元，走 query_cypher 公共入口验证失败计数与 is_open()（熔断真实接线）。
+    """
     store = overgraph_store
     from graph.overgraph_store import _INFRA_EXCEPTIONS, OverGraphError
     assert OverGraphError in _INFRA_EXCEPTIONS
     cb = store.circuit_breaker
-    # 触发 10 次失败（窗口满 + 超阈值）→ 跳闸
+
+    def _boom(gql, params=None):
+        raise OverGraphError("模拟 infra 失败")
+
+    monkeypatch.setattr(store, "_locked_execute_gql", _boom)
+    assert not cb.is_open()
+    # 窗口满（window_size 次失败）→ 跳闸（query_cypher 静默返回 [] 保持永不抛）
     for _ in range(cb.window_size):
-        try:
-            cb.record_failure(OverGraphError("模拟 infra 失败"))
-        except Exception:
-            break
+        assert store.query_cypher("MATCH (e:EpisodeNode) RETURN e.id AS id") == []
     assert cb.is_open()
     # 跳闸后 query_cypher 静默返回 []（永不抛契约）
     assert store.query_cypher("MATCH (e:EpisodeNode) RETURN e.id AS id") == []
@@ -408,3 +560,236 @@ def test_vector_search_and_internal_id(overgraph_store):
     # batch 不破坏 props（读-合并-upsert）
     ep = store.get_episode(e1)
     assert ep["content"] == "向量一" and ep["version"] == 1
+
+
+# ─── GraphLite/OverGraph 行为对拍（P1#7 真实 diff fixture）────────────
+
+
+def _same_dataset(graphlite_store, overgraph_store):
+    """同一数据集落两库（显式 id 对齐，使对拍可按 key 强比对）。"""
+    gl, og = graphlite_store, overgraph_store
+    for i in range(3):
+        gl.create_episode({"id": f"p{i}", "content": f"对拍内容{i}",
+                           "created_at": float(i)})
+        og.create_episode({"id": f"p{i}", "content": f"对拍内容{i}",
+                           "created_at": float(i)})
+    gl.create_hyperedge_node({"id": "he_x", "type": "episode"})
+    og.create_hyperedge_node({"id": "he_x", "type": "episode"})
+    gl.link_hyperedge_member("he_x", "p0")
+    og.link_hyperedge_member("he_x", "p0")
+    return gl, og
+
+
+def test_behavior_parity_read_shapes(graphlite_store, overgraph_store):
+    """同一数据集上 GraphLite/OverGraph 关键读形态输出 diff（P1#7）。
+
+    对拍面：别名列 RETURN、整节点 RETURN e.*（顶层 props 契约）、
+    超边成员反查、CAS 乐观锁 —— 显式 id 对齐后按 key 强比对。
+    """
+    gl, og = _same_dataset(graphlite_store, overgraph_store)
+
+    # 1) 别名列 RETURN（e.id AS id, e.content AS content）→ 逐行强等
+    gl_rows = gl.query_cypher(
+        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content ORDER BY e.id")
+    og_rows = og.query_cypher(
+        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content ORDER BY e.id")
+    assert og_rows == gl_rows == [
+        {"id": "p0", "content": "对拍内容0"},
+        {"id": "p1", "content": "对拍内容1"},
+        {"id": "p2", "content": "对拍内容2"},
+    ]
+
+    # 2) 整节点 RETURN e.* → 顶层 props 契约（P0#3）
+    #    GraphLite 原始形态为嵌套 {'e': {'Node': {'properties': {...}}}}（SDK
+    #    原样返回，消费方 row.get("id") 拿不到）；OverGraph 按 P0#3 契约把
+    #    props 提升到行顶层 —— 对拍语义 = 两引擎 props 集合逐键等价
+    gl_star = gl.query_cypher(
+        "MATCH (e:EpisodeNode {id: 'p1'}) RETURN e.*")
+    og_star = og.query_cypher(
+        "MATCH (e:EpisodeNode {id: 'p1'}) RETURN e.*")
+    assert len(gl_star) == len(og_star) == 1
+    gl_node = gl_star[0]["e"]["Node"]
+    gl_props = {k: (next(iter(v.values())) if isinstance(v, dict) else v)
+                for k, v in gl_node["properties"].items()}
+    og_row = og_star[0]
+    assert og_row["id"] == "p1"  # P0#3 消费方契约：row.get("id") 直接可用
+    assert set(og_row) == set(gl_props)
+    for k in gl_props:
+        assert og_row[k] == gl_props[k], k
+
+    # 3) 超边成员反查（RETURN e.id，无 AS 裸列）
+    gl_m = gl.query_cypher(
+        "MATCH (h:HyperedgeNode {id: 'he_x'})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id")
+    og_m = og.query_cypher(
+        "MATCH (h:HyperedgeNode {id: 'he_x'})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id")
+    assert og_m == gl_m == [{"e.id": "p0"}]
+
+    # 4) CAS 乐观锁对拍（成功 / 旧版本冲突 / force）
+    assert gl.update_with_version("p2", {"content": "v1"}, 1) is True
+    assert og.update_with_version("p2", {"content": "v1"}, 1) is True
+    assert gl.update_with_version("p2", {"content": "v2"}, 1) is False
+    assert og.update_with_version("p2", {"content": "v2"}, 1) is False
+    assert gl.update_with_version("p2", {"content": "f"}, None) is True
+    assert og.update_with_version("p2", {"content": "f"}, None) is True
+    assert gl.get_episode("p2")["content"] == og.get_episode("p2")["content"] == "f"
+
+
+# ─── 向量度量实证（P2#9）/ HNSW ef_search（P2#10）────────────────────
+
+
+def _build_metric_store(metric: str, tmp_path):
+    from graph.overgraph_store import OverGraphStore
+    cfg = type("cfg", (), {"database_path": str(tmp_path) + f"_{metric}",
+                           "dense_vector_dimension": 512,
+                           "dense_vector_metric": metric})()
+    s = OverGraphStore(config=cfg)
+    s.connect()
+    return s
+
+
+def test_metric_l2_cosine_identical_scores(tmp_path):
+    """R1 metric 结论实证补跑（P2#9）：l2/cosine 双开库同向量对拍 score 逐位一致。
+
+    实证：引擎忽略 dense_vector_metric 选项，输出恒为 cosine —— d=1/s-1
+    映射对两选项均成立（固化设计文档结论，防误删/误切换）。
+    """
+    rng = np.random.default_rng(42)
+    v1 = rng.standard_normal(512).astype(np.float32)
+    v1 /= np.linalg.norm(v1)
+    v2 = rng.standard_normal(512).astype(np.float32)
+    v2 += 0.3 * v1
+    v2 /= np.linalg.norm(v2)
+
+    scores: dict[str, list[tuple[str, float]]] = {}
+    for metric in ("l2", "cosine"):
+        store = _build_metric_store(metric, tmp_path)
+        e1 = store.create_episode({"content": "v1"})
+        e2 = store.create_episode({"content": "v2"})
+        store.batch_upsert_embeddings([
+            {"node_id": e1, "embedding": v1},
+            {"node_id": e2, "embedding": v2},
+        ])
+        hits = store.vector_search_dense(5, v1)
+        scores[metric] = [(eid, round(float(s), 6)) for eid, s in hits]
+        store.close()
+    assert [s for _, s in scores["l2"]] == [s for _, s in scores["cosine"]]
+    assert abs(scores["l2"][0][1] - 1.0) < 1e-4
+    assert len(scores["l2"]) == 2
+
+
+def test_hnsw_ef_search_wired(overgraph_store, monkeypatch):
+    """HNSW ef_search 配置真实透传（P2#10）：config.ef_search → vector_search(ef_search=)。
+
+    m/ef_construction 无 SDK 设置 API（open() 拒绝未知选项，实证）→ 已从
+    HNSWConfig/defaults.yaml 移除；仅 ef_search 走 vector_search 生效。
+    """
+    from graph.overgraph_store import OverGraphStore
+
+    cfg = type("cfg", (), {"database_path": "/tmp/nonexist_ef",
+                           "dense_vector_dimension": 512,
+                           "dense_vector_metric": "cosine",
+                           "ef_search": 96})()
+    store = OverGraphStore(config=cfg)
+    # 属性须预声明（monkeypatch.setattr 拒绝给实例新增不存在的属性）
+    store._db = type("fake_db", (), {"vector_search": None})()
+    captured: dict = {}
+
+    def _fake_vector_search(mode, k, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(store._db, "vector_search", _fake_vector_search)
+    store.vector_search_dense(5, np.zeros(512, dtype=np.float32))
+    assert captured.get("ef_search") == 96
+    assert captured.get("label_filter") == {"labels": ["EpisodeNode"]}
+    # 未配置 ef_search → 不传参（保持引擎默认）
+    store2 = OverGraphStore(config=type("c", (), {
+        "database_path": "/tmp/x", "dense_vector_dimension": 512,
+        "dense_vector_metric": "cosine"})())
+    store2._db = store._db
+    captured.clear()
+    monkeypatch.setattr(store2._db, "vector_search", _fake_vector_search)
+    store2.vector_search_dense(5, np.zeros(512, dtype=np.float32))
+    assert "ef_search" not in captured
+
+
+# ─── 端点级回归（P0#2/#3：/communities /hyperedges /conceptual/analyze）────
+
+
+def _make_route_app(store):
+    """FastAPI 路由装配：dependency_overrides 注入 overgraph store。
+
+    与 tests/test_conflict_revocation.py 同构（真实路由 + 真实 store）。
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.routes import router, Services, get_services
+    from graph.hyperedge import HyperedgeManager
+
+    svc = Services()
+    svc.graphlite_store = store
+    svc.hyperedge_manager = HyperedgeManager(store)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_services] = lambda: svc
+    return TestClient(app)
+
+
+def test_communities_endpoints_overgraph(overgraph_store):
+    """GET /communities + /communities/{id}（OverGraph 后端，P0#3 顶层 props）。"""
+    store = overgraph_store
+    store.execute_cypher(
+        "INSERT (:CommunityNode {id: 'com_1', name: '社区一', summary: '摘要一', "
+        "member_count: 3, created_at: 1.0})")
+    client = _make_route_app(store)
+    r = client.get("/communities")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    assert body["communities"][0]["id"] == "com_1"
+    assert body["communities"][0]["name"] == "社区一"
+    assert body["communities"][0]["summary"] == "摘要一"
+    assert body["communities"][0]["member_count"] == 3
+    assert body["communities"][0]["keywords"] == []  # 生产不落 keywords → 默认 []
+    r = client.get("/communities/com_1")
+    assert r.status_code == 200
+    assert r.json()["id"] == "com_1"
+
+
+def test_hyperedges_list_endpoint_overgraph(overgraph_store):
+    """GET /hyperedges（OverGraph 后端，OPTIONAL MATCH/WITH/collect 形态）。
+
+    R1 P0#2 报 500：行未扁平化 → row["id"] KeyError。修复后返回
+    HyperedgeResponse（id/member_ids/type）。
+    """
+    store = overgraph_store
+    store.create_hyperedge_node({"id": "he_1", "type": "episode", "created_at": 1.0})
+    e1 = store.create_episode({"content": "成员"})
+    store.link_hyperedge_member("he_1", e1)
+    client = _make_route_app(store)
+    r = client.get("/hyperedges")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 1
+    item = body["hyperedges"][0]
+    assert item["id"] == "he_1"
+    assert item["member_ids"] == [e1]
+    assert item["type"] == "episode"
+
+
+def test_system_conceptual_analyze_endpoint(overgraph_store):
+    """POST /conceptual/analyze（OverGraph 后端，system.py L588-604 消费 c.*）。
+
+    概念聚合为确定性本地逻辑（无 LLM）：2 社区共享 keyword → 发现 1 概念。
+    """
+    store = overgraph_store
+    for i in (1, 2):
+        store.execute_cypher(
+            f"INSERT (:CommunityNode {{id: 'cc_{i}', name: '社区{i}', "
+            f"summary: '摘要{i}', keywords: '[\"共享概念\"]', created_at: {i}.0}})")
+    client = _make_route_app(store)
+    r = client.post("/conceptual/analyze")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["concepts_found"] >= 1
+    assert any(c["concept_name"] == "共享概念" for c in body["concepts"])

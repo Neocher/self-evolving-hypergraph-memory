@@ -145,6 +145,8 @@ def make_store(cfg):
             "database_path": str(cfg.overgraph.database_path),
             "dense_vector_dimension": int(cfg.overgraph.dense_vector_dimension),
             "dense_vector_metric": str(cfg.overgraph.dense_vector_metric),
+            # graph.hnsw.ef_search → vector_search(ef_search=) 透传（P2#10）
+            "ef_search": int(getattr(cfg.graph.hnsw, "ef_search", 64)),
         })()
         return OverGraphStore(config=store_cfg, cb_config=cfg.circuit_breaker)
     from graph.graphlite_store import GraphLiteStore

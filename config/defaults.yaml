@@ -40,10 +40,8 @@ dream:
 
 graph:
   backend: "graphlite"        # v6.0.0 OverGraph 迁移单开关: graphlite|overgraph（默认 graphlite → 存量部署零感知）
-  hnsw:                        # OverGraph HNSW 索引参数（D11）
-    ef_search: 64             # 搜索时 HNSW 候选集（≥ k 保证召回）
-    m: 16                     # 每节点最大连接数
-    ef_construction: 200      # 构建时候选集
+  hnsw:                        # OverGraph HNSW 搜索参数（D11；m/ef_construction 无 SDK 设置 API 已移除）
+    ef_search: 64             # 搜索时 HNSW 候选集（≥ k 保证召回；vector_search ef_search= 透传）
 
 graphlite:
   database_path: "./data/shm_graphlite_db"  # GraphLite 数据库文件路径
@@ -53,7 +51,7 @@ graphlite:
 overgraph:
   database_path: "./data/shm_overgraph_db"  # OverGraph 数据库路径（backend=overgraph 时使用）
   dense_vector_dimension: 512     # dense 向量维度（bge-small-zh-v1.5 512d；HNSW 建索引用）
-  dense_vector_metric: "cosine"   # R1 PoC 定标: vector_search score 恒为 cosine（选项不改变输出，占位）
+  dense_vector_metric: "cosine"   # R1 P2#9 实证: score 恒为 cosine（l2/cosine 双开库对拍逐位一致，引擎忽略选项）
 
 faiss:
   dimension: 512                 # 向量维度（bge-small-zh-v1.5, 512维中文专用, CPU 快 28 倍）

@@ -15,6 +15,9 @@ import pytest
 
 pytestmark = pytest.mark.overgraph
 
+# 依赖缺失 → 整模块 skip（不崩收集；统一顶层导入策略，P2#8）
+pytest.importorskip("overgraph")
+
 from graph.overgraph_store import OverGraphStore  # noqa: E402
 from retrieval.vector_index import VectorIndexAdapter, faiss_id  # noqa: E402
 
