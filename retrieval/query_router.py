@@ -2673,14 +2673,21 @@ class QueryRouter:
         复用 _extract_query_entities 的英文大写序列正则；句首 What/How/Where 等
         经 _PROPERTY_CANDIDATE_STOPWORDS 过滤（非实体）。上限 3 个实体。返回已
         规范化（小写 + 去尾词后缀）的实体名，直接作 GQL CONTAINS 词。
+        【R1 P2-2】token 级首词停用词剥离：句首 The/In 等混入多词序列时
+        （"The Apple Store" 整段不在单词停用词集合 → 旧逻辑漏滤出 "the apple
+        store"），逐 token 剥离首词停用词；"The" 单独成段剥离后为空 → 跳过。
+        中间大写词与后置实体名保留（"The Apple Store" → "Apple Store"）。
         """
         from core.entity_resolver import normalize_entity_name
         seen: set[str] = set()
         out: list[str] = []
         for m in re.finditer(r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b', query):
-            if m.group(1).lower() in _PROPERTY_CANDIDATE_STOPWORDS:
+            tokens = m.group(1).split()
+            while tokens and tokens[0].lower() in _PROPERTY_CANDIDATE_STOPWORDS:
+                tokens.pop(0)
+            if not tokens:
                 continue
-            norm = normalize_entity_name(m.group(1))
+            norm = normalize_entity_name(" ".join(tokens))
             if not norm or norm in seen:
                 continue
             seen.add(norm)
@@ -2708,17 +2715,25 @@ class QueryRouter:
              append {node_id, content, score, level="entity_expansion",
              _source="entity_expansion"}
 
-        CJK 查询跳过（CONTAINS 对中文无子串保持性，恒空）；异常/无实体/无种子分
-        → 静默返回原 results（主检索零回归，永不抛异常）。候选经
-        _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大。
+        【R1 P0】不再用全查询 CJK 判定短路：纯中文查询自然提取不到大写 ASCII
+        专名 → 空实体跳过（原 CJK 早退语义保留）；中英混合查询（"Apple 最近做了
+        什么"）先提取实体（apple）再走 CONTAINS——v5.31.4+ 中文原生直写（fork
+        4452a96 UTF-8 lexer 修复），英文词 CONTAINS 对混合内容可用（对齐
+        _entity_match 主通道；仅 v5.31.4 前遗留 {b64} 数据不命中，属历史数据
+        迁移边界，非本通道回归）。
+        【R1 P1】min(种子分) 取全部含 score 键的种子：_fuse_results 返回未排序
+        列表，取前 5 会在第 6 个种子分更低时让扩展分反超该种子（违反「扩展分
+        严格低于种子」契约）。
+        【R1 P2-3】与 FUSION _entity_match 通道存在重复全表 OR CONTAINS 扫描：
+        本通道以专名实体词跨会话聚合（P3c 目的），_entity_match 以查询 token
+        匹配当前会话——语义互补；单条合并查询 + ORDER BY created_at DESC
+        LIMIT 下推（LIMIT 经 _interpolate 直插 GQL，引擎侧截断非 Python 全量
+        拉取）控制成本，扩展候选经 _deduplicate_and_sort 单点去重不重复输出。
+        异常/无实体/无种子分 → 静默返回原 results（主检索零回归，永不抛异常）。
         """
         try:
             ecfg = getattr(getattr(self, "config", None), "entity_expansion", None)
             if ecfg is None or not getattr(ecfg, "enabled", True) or not results:
-                return results
-            # CJK 跳过：对齐 _fusion_retrieve 的 skip_entity 判定（CONTAINS 对
-            # 中文无子串保持性，纯省一次全表扫描，中文查询零回归）
-            if any("一" <= ch <= "鿿" for ch in (raw_query or query)):
                 return results
             store = getattr(self, "graphlite_store", None)
             if store is None or not hasattr(store, "query_cypher"):
@@ -2727,8 +2742,10 @@ class QueryRouter:
             if not entities:
                 return results
             entities = entities[:max(1, int(getattr(ecfg, "max_entities", 3)))]
+            # 【P1】全部种子（score 非 None）的最小分；无有效种子分 → default
+            # 0.0 → 下方 min_seed_score <= 0.0 直接返回原 results（不扩展）。
             min_seed_score = min(
-                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
                 default=0.0,
             )
             if min_seed_score <= 0.0:

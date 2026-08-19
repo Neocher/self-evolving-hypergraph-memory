@@ -4,9 +4,12 @@ v5.53.0 P3c 实体扩召回（Entity-Expansion）测试
 覆盖（任务书 5 类用例，全部走公共入口 retrieve(level=FUSION)）：
   1. 跨会话聚合召回：mock GraphLite 返回含实体多会话消息 → append + level="entity_expansion"
   2. 时间锚过滤：session_ts 传入 → GQL 含 created_at 上界过滤（spy）；不传 → 无过滤
-  3. CJK 跳过：中文查询 → 不触发实体提取（_entity_expansion 直接返回，query_cypher 不被调用）
-  4. enabled=false 零回归：关闭时与现状完全一致（无 entity_expansion 节点）
-  5. boost 钳制：expanded score = min(种子分) × 0.5，严格低于种子分
+  3. 纯中文查询 → 提取不到 ASCII 专名 → 直接返回（query_cypher 不被调用）；
+     【R1 P0】中英混合查询（"Apple 最近做了什么"）→ 先提取专名再走 CONTAINS
+  4. enabled=false 零回归：关闭时与现状完全一致（无 entity_expansion 节点，
+     其余补充通道调用与基线一致）
+  5. boost 钳制：expanded score = min(全部种子分) × 0.5，严格低于种子分
+     【R1 P1】6 种子 [0.9×5, 0.1] → 扩展分 0.05 不排在 0.1 前
 
 运行: .venv/bin/python -m pytest tests/test_entity_expansion.py -v
 """
@@ -98,6 +101,23 @@ class TestEntityExpansionConfig:
         assert qcfg.entity_expansion.boost == 0.5
         assert qcfg.entity_expansion.time_filter is True
 
+    def test_config_validation_invalid_values(self):
+        """【R1 P2-1】boost>=1 / boost<0 / max_results=0 / max_entities=0 → ValueError。"""
+        with pytest.raises(ValueError):
+            EntityExpansionConfig(boost=1.2)
+        with pytest.raises(ValueError):
+            EntityExpansionConfig(boost=-0.1)
+        with pytest.raises(ValueError):
+            EntityExpansionConfig(max_results=0)
+        with pytest.raises(ValueError):
+            EntityExpansionConfig(max_entities=0)
+
+    def test_config_validation_boundaries_ok(self):
+        """【R1 P2-1】边界合法值不抛：boost=0 / 0.99，max_results/max_entities=1。"""
+        ecfg = EntityExpansionConfig(boost=0.0, max_results=1, max_entities=1)
+        assert ecfg.boost == 0.0 and ecfg.max_results == 1 and ecfg.max_entities == 1
+        assert EntityExpansionConfig(boost=0.99).boost == 0.99
+
 
 class TestExtractProperNouns:
     def test_extracts_capital_sequences_normalized(self):
@@ -117,6 +137,14 @@ class TestExtractProperNouns:
         )
         assert "tesla" in ents
         assert all(e not in ("how", "the", "battery") for e in ents)
+
+    def test_sentence_start_the_stripped_from_sequence(self):
+        """【R1 P2-2】句首 The 混入大写序列 → token 级首词剥离（不再提出 the apple）。"""
+        ents = QueryRouter._extract_proper_nouns(
+            "The Apple Store opened a new flagship."
+        )
+        assert "apple store" in ents  # 中间大写词 Store 保留
+        assert all(e != "the" and not e.startswith("the ") for e in ents)
 
 
 class TestEntityExpansion:
@@ -139,6 +167,8 @@ class TestEntityExpansion:
         cypher, params = store.query_cypher.call_args[0]
         assert "e.content CONTAINS $t0" in cypher
         assert params["t0"] == "apple"
+        # 【R1 P2-3】单条合并查询 LIMIT 下推：每实体 max_results × 实体数（1 实体 → 10）
+        assert params["limit"] == 10
 
     def test_time_anchor_adds_created_at_filter(self):
         """now_ts（session_ts）传入 → GQL 含 created_at 上界过滤，参数 int 秒。"""
@@ -162,7 +192,7 @@ class TestEntityExpansion:
         assert "at_ts" not in params
 
     def test_cjk_query_skipped(self):
-        """中文查询 → 直接返回（不提取实体、不查 GraphLite），零回归。"""
+        """纯中文查询 → 提取不到大写 ASCII 专名 → 不查 GraphLite，零回归。"""
         store = MagicMock()
         store.query_cypher.return_value = [_row("ep2", "Apple 发布新芯片")]
         router = _make_router(store, [_seed("ep1", "苹果 公司 最近 发布 了 什么", score=0.9)])
@@ -170,8 +200,25 @@ class TestEntityExpansion:
         assert all(r.get("level") != "entity_expansion" for r in out)
         store.query_cypher.assert_not_called()
 
+    def test_mixed_cjk_english_query_runs_expansion(self):
+        """【R1 P0】中英混合查询：先提取 ASCII 专名再走 CONTAINS（不再被全查询
+        CJK 判定短路）——"Apple 最近做了什么" 提取 apple 并调用 query_cypher。"""
+        store = MagicMock()
+        store.query_cypher.return_value = [_row("ep2", "Apple 发布新芯片 M4")]
+        router = _make_router(store, [_seed("ep1", "Apple 最近做了什么", score=0.9)])
+        out = router.retrieve("Apple 最近做了什么", level=RetrievalLevel.FUSION)
+        exp = [r for r in out if r.get("level") == "entity_expansion"]
+        assert len(exp) == 1
+        assert exp[0]["node_id"] == "ep2"
+        assert exp[0]["_source"] == "entity_expansion"
+        cypher, params = store.query_cypher.call_args[0]
+        assert "e.content CONTAINS $t0" in cypher
+        assert params["t0"] == "apple"
+
     def test_disabled_zero_regression(self):
-        """enabled=false → 不查 GraphLite、无 entity_expansion 节点，种子原样返回。"""
+        """enabled=false → 不查 GraphLite、无 entity_expansion 节点，种子原样返回；
+        其余补充通道调用与基线一致（各恰好 1 次 identity 透传）——关闭扩展不影响
+        生产链路（不 stub 全部补充通道，验证完整链路等价）。"""
         store = MagicMock()
         store.query_cypher.return_value = [_row("ep2", "Apple 发布新芯片")]
         router = _make_router(
@@ -185,6 +232,10 @@ class TestEntityExpansion:
         assert out[0]["score"] == 0.9
         assert all(r.get("level") != "entity_expansion" for r in out)
         store.query_cypher.assert_not_called()
+        assert router._community_expansion.call_count == 1
+        assert router._mesa_synthesis.call_count == 1
+        assert router._visual_recall.call_count == 1
+        assert router._property_temporal_retrieve.call_count == 1
 
     def test_boost_clamped_below_seed(self):
         """boost 钳制：expanded score = min(种子分) × 0.5，严格低于全部种子分。"""
@@ -202,6 +253,24 @@ class TestEntityExpansion:
         assert len(exp) == 1
         assert exp[0]["score"] == pytest.approx(round(0.4 * 0.5, 6))  # min 种子 0.4
         assert all(e["score"] < min(seed_scores) for e in exp)
+
+    def test_p1_seed_score_min_over_all_seeds(self):
+        """【R1 P1】6 种子 [0.9×5, 0.1]：扩展分 = min(全部种子 0.1)×0.5 = 0.05，
+        严格低于 0.1 且排在 0.1 种子之后（旧逻辑取前 5 → 0.45 反超 0.1）。"""
+        store = MagicMock()
+        store.query_cypher.return_value = [
+            _row("ep9", "Apple announced the M4 chip at WWDC."),
+        ]
+        seeds = [_seed(f"ep{i}", f"Apple session {i}", score=0.9) for i in range(1, 6)]
+        seeds.append(_seed("ep6", "Apple low score node", score=0.1))
+        router = _make_router(store, seeds)
+        out = router.retrieve("Apple revenue", level=RetrievalLevel.FUSION)
+        exp = [r for r in out if r.get("level") == "entity_expansion"]
+        assert len(exp) == 1
+        assert exp[0]["score"] == pytest.approx(round(0.1 * 0.5, 6))  # min(全部种子)=0.1
+        seed6_pos = next(i for i, r in enumerate(out) if r.get("node_id") == "ep6")
+        exp_pos = next(i for i, r in enumerate(out) if r.get("level") == "entity_expansion")
+        assert exp_pos > seed6_pos  # 扩展分 0.05 严格低于种子 0.1 → 排序在 0.1 之后
 
     def test_total_append_capped_at_20(self):
         """总 append 硬上限 20：25 条命中 → 只追加 20 条。"""

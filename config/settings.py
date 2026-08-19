@@ -138,6 +138,17 @@ class EntityExpansionConfig:
     max_entities: int = 3       # 每查询最多提取实体数
     time_filter: bool = True    # 时间锚上界过滤（created_at <= session 时间锚）
 
+    def __post_init__(self) -> None:
+        # 【R1 P2-1】boost/max_results/max_entities 校验（镜像 MesaConfig 做法）：
+        # boost>=1 让扩展分反超种子（违反「严格低于种子」契约）、max<=0 让扩展
+        # 静默空返回——配置期 fail-fast 拒绝非法值。
+        if not 0.0 <= self.boost < 1.0:
+            raise ValueError(f"EntityExpansionConfig.boost={self.boost} 必须 ∈ [0, 1)")
+        if self.max_results < 1:
+            raise ValueError(f"EntityExpansionConfig.max_results={self.max_results} 必须 >= 1")
+        if self.max_entities < 1:
+            raise ValueError(f"EntityExpansionConfig.max_entities={self.max_entities} 必须 >= 1")
+
 
 @dataclass
 class RetrievalConfig:
