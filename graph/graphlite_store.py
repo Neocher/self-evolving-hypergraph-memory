@@ -106,8 +106,8 @@ def _dict_to_gql_values(d: dict, skip_keys: set = None) -> str:
     return ", ".join(parts)
 
 
-def _dict_to_gql_set_values(d: dict, skip_keys: set = None) -> str:
-    """Convert Python dict to GQL SET clause (e.key = value, ...).
+def _dict_to_gql_set_values(d: dict, skip_keys: set = None, alias: str = "e") -> str:
+    """Convert Python dict to GQL SET clause (alias.key = value, ...).
 
     逐字段直接构建 (不复用 split), 值含 ', ' (如 content="a, b") 不会拆坏 SQL。
     """
@@ -118,7 +118,7 @@ def _dict_to_gql_set_values(d: dict, skip_keys: set = None) -> str:
             continue
         lit = _gql_value(v)
         if lit is not None:
-            parts.append(f"e.{k} = {lit}")
+            parts.append(f"{alias}.{k} = {lit}")
     return ", ".join(parts)
 
 
@@ -1207,18 +1207,41 @@ class GraphLiteStore:
         return vid
 
     def create_schema_node(self, schema: dict) -> str:
-        """INSERT Schema 节点（:Conceptual 标签，阶段4-1 模式蒸馏产物）。
+        """幂等 upsert Schema 节点（:Conceptual 标签，阶段4-1 模式蒸馏产物）。
 
         pattern_keywords 为 list → 存空格连接串（CONTAINS 友好）；source_ids 为
-        JSON 串。幂等：同 id 重复 INSERT 覆盖（GraphLite INSERT 语义）。
+        JSON 串。幂等：GraphLite INSERT 无覆盖语义（同 id 重复 INSERT 产生重复
+        节点，实测 count 1→2），采用 查询-写入 两段式守卫（参照 ensure_session）
+        ——MATCH (s:Conceptual {id}) 命中则 SET 更新属性（updated 路径），未命中
+        再 INSERT（created 路径）；查询异常（如表不存在）走创建路径。返回 id
+        （与 overgraph 后端一致，run_once 收集 id 列表契约）。
         """
         sid = str(schema.get("id", str(uuid.uuid4())))
         props = dict(schema)
         props["id"] = sid
         props["pattern_keywords"] = " ".join(schema.get("pattern_keywords") or [])
+        # 【H1】id 经 _gql_value 转义（外部可达 schema dict 的 id 字段）
+        id_lit = _gql_value(sid)
+        try:
+            result = self._locked_query(
+                f"MATCH (s:Conceptual {{id: {id_lit}}}) RETURN s.id"
+            )
+            if result.rows:
+                # updated 路径：命中 → SET 更新属性
+                set_clause = _dict_to_gql_set_values(
+                    props, skip_keys={"id"}, alias="s"
+                )
+                if set_clause:
+                    self._locked_execute(
+                        f"MATCH (s:Conceptual {{id: {id_lit}}}) SET {set_clause}"
+                    )
+                return sid
+        except Exception:
+            pass  # 查询失败（如表不存在）走创建路径，与 ensure_session 一致
+        # created 路径：未命中 → INSERT
         vals = _dict_to_gql_values(props, skip_keys={"id"})
         self._locked_execute(
-            f"INSERT (s:Conceptual {{id: {_gql_value(sid)}, {vals}}})"
+            f"INSERT (s:Conceptual {{id: {id_lit}, {vals}}})"
         )
         return sid
 

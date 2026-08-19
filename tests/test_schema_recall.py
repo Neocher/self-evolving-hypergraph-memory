@@ -101,6 +101,49 @@ def test_run_once_overgraph_idempotent_no_accumulation(overgraph_store):
     assert created2 == created1  # 确定性 id：两轮产出相同 id（覆盖而非累积）
 
 
+def test_run_once_graphlite_idempotent_no_accumulation(graphlite_store):
+    """P1 幂等（真实 GraphLiteStore）：重复 run_once（同 episodes）不累积
+    重复 :Conceptual 节点。
+
+    修复前 graphlite create_schema_node 是裸 INSERT（无覆盖语义），同 id
+    重复执行产生重复节点（实测 count 1→2）；修复后两段式守卫（MATCH 命中
+    SET 更新 / 未命中 INSERT）→ Schema 节点数量不增、产出 id 相同。
+    """
+    store = graphlite_store
+    for content in ["机器学习 研究 项目", "机器学习 研究 综述", "机器学习 研究 实验"]:
+        store.create_episode({"content": content, "created_at": time.time()})
+
+    created1 = run_once(store, limit=100, min_support=2)
+    assert created1
+    count1 = len(store.query_schema_nodes(["机器学习"], limit=100))
+    created2 = run_once(store, limit=100, min_support=2)
+    assert created2
+    count2 = len(store.query_schema_nodes(["机器学习"], limit=100))
+    assert count2 == count1, (count1, count2)
+    assert created2 == created1  # 确定性 id：两轮产出相同 id（覆盖而非累积）
+
+
+def test_create_schema_node_graphlite_upsert_updates_attributes(graphlite_store):
+    """P1 幂等（直测 create_schema_node）：同 id 重复写入走 SET 更新路径，
+    不新增节点且属性更新（created_at/support 覆盖）。"""
+    store = graphlite_store
+    schema = {
+        "id": "schema-1", "schema_name": "模式A",
+        "pattern_keywords": ["机器学习"], "support": 2,
+        "source_ids": "[]", "summary": "旧摘要", "created_at": 1.0,
+    }
+    assert store.create_schema_node(schema) == "schema-1"
+
+    updated = dict(schema)
+    updated["support"] = 5
+    updated["summary"] = "新摘要"
+    assert store.create_schema_node(updated) == "schema-1"
+
+    nodes = store.query_schema_nodes(["机器学习"], limit=100)
+    assert len(nodes) == 1, nodes  # 同 id 覆盖，不新增节点
+    assert nodes[0]["support"] == 5 and nodes[0]["summary"] == "新摘要", nodes
+
+
 # ─── 检索通道（公共入口 FUSION）─────────────────────────
 
 
