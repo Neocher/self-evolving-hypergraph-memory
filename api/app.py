@@ -132,6 +132,29 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
         logger.warning("Dream scheduler state persist failed (non-fatal)")
 
 
+def make_store(cfg):
+    """图存储后端构造（v6.0.0 OverGraph 迁移，设计 A8）：backend 单开关分支。
+
+    graphlite → GraphLiteStore（现状不变）；overgraph → OverGraphStore
+    （svc.graphlite_store 属性名保留，duck-typing 上层零改动）。
+    """
+    backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
+    if backend == "overgraph":
+        from graph.overgraph_store import OverGraphStore
+        store_cfg = type("cfg", (), {
+            "database_path": str(cfg.overgraph.database_path),
+            "dense_vector_dimension": int(cfg.overgraph.dense_vector_dimension),
+            "dense_vector_metric": str(cfg.overgraph.dense_vector_metric),
+        })()
+        return OverGraphStore(config=store_cfg, cb_config=cfg.circuit_breaker)
+    from graph.graphlite_store import GraphLiteStore
+    gcfg = type("cfg", (), {
+        "database_path": str(cfg.graphlite.database_path),
+        "max_threads": cfg.graphlite.max_threads,
+    })()
+    return GraphLiteStore(config=gcfg, cb_config=cfg.circuit_breaker)
+
+
 def _build_router_config(rcfg):
     """从 RetrievalConfig 构建 QueryRouterConfig。
 
@@ -172,7 +195,7 @@ def _init_services() -> Services:
     svc = Services()
     errors = []
 
-    # 1. GraphLite 图数据库 (替换RyuGraph)
+    # 1. 图数据库（v6.0.0 backend 单开关: GraphLiteStore | OverGraphStore）
     try:
         import sys as _sys
         _bindings = os.environ.get("GRAPHLITE_BINDINGS", os.path.expanduser("~/GraphLite/bindings/python"))
@@ -180,18 +203,15 @@ def _init_services() -> Services:
         for _p in [_bindings, _sdk]:
             if _p not in _sys.path:
                 _sys.path.insert(0, _p)
-        from graph.graphlite_store import GraphLiteStore
-        graphlite_cfg = type("cfg", (), {
-            "database_path": str(cfg.graphlite.database_path),
-            "max_threads": cfg.graphlite.max_threads,
-        })()
-        svc.graphlite_store = GraphLiteStore(config=graphlite_cfg, cb_config=cfg.circuit_breaker)
+        svc.graphlite_store = make_store(cfg)
         svc.graphlite_store.connect()
-        logger.info("GraphLiteStore initialized", path=graphlite_cfg.database_path)
+        logger.info("GraphStore initialized",
+                    backend=getattr(getattr(cfg, "graph", None), "backend", "graphlite"),
+                    path=getattr(svc.graphlite_store, "_db_path", ""))
     except Exception as e:
         import traceback
-        errors.append(f"GraphLiteStore: {e}")
-        logger.warning("GraphLiteStore init failed", error=str(e), traceback=traceback.format_exc())
+        errors.append(f"GraphStore: {e}")
+        logger.warning("GraphStore init failed", error=str(e), traceback=traceback.format_exc())
 
     # 1b. 【v5.23】写串行化队列（所有 GraphLite 写调用收敛到专用写线程串行执行，
     # 事件循环不再被同步写阻塞；队列不可用时写路径回退同步直调）
@@ -200,8 +220,10 @@ def _init_services() -> Services:
         # 【M1】引擎级死锁探测：注入 ping 探针（独立 daemon 只读连接 + 1 条 trivial
         # 查询，join(timeout) 兜底）。探针通过 → 看门狗 critical 降级 warning（慢写
         # 而非死锁）；失败/挂 → 仍 critical。ping 为独立只读连接，不触碰写线程。
+        # v6.0.0: OverGraph 后端跳过探针（独立连接共享 WAL 风险，写队列超时兜底）。
         ping_fn = None
-        if svc.graphlite_store is not None:
+        backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
+        if svc.graphlite_store is not None and backend != "overgraph":
             try:
                 from graph.graphlite_store import GraphLite as _GL
                 ping_path = str(cfg.graphlite.database_path)
@@ -260,24 +282,40 @@ def _init_services() -> Services:
             logger.warning("TextEncoder init failed (fallback: embedding disabled)", error=str(e))
 
         try:
-            from retrieval.vector_store import VectorStoreFactory
-            # FAISS 维度从 encoder 动态获取（bge=512 / MiniLM-ONNX=384 / TF-IDF=384），
-            # 避免 dim 不匹配报错；encoder 不可用时回退到配置默认值
+            # v6.0.0: backend 分支 —— overgraph 主通道 = VectorIndexAdapter
+            # （OverGraph HNSW，D1）；graphlite 保持 FAISS。视觉 _visual_index
+            # 独立 FAISS 空间两后端都保留（D10，只换主通道）。
+            backend = str(getattr(getattr(cfg, "graph", None), "backend", "graphlite"))
             dim = getattr(svc.encoder, "dimension", None)
             if not isinstance(dim, int) or dim <= 0:
                 dim = cfg.faiss.dimension
-            store = VectorStoreFactory.create(
-                dimension=dim,
-                index_type=cfg.faiss.index_type,
-                nlist=cfg.faiss.nlist,
-            )
-            svc.vector_store = store
-            svc.faiss_index = store.index      # 保持向后兼容
-            svc.faiss_dim = dim
-            svc.faiss_index_type = store.index_type
-            svc.faiss_nlist = store.nlist
-            svc.faiss_id_map = store.id_map
-            logger.info("VectorStore initialized", engine="faiss", dim=dim)
+            if backend == "overgraph":
+                from retrieval.vector_index import VectorIndexAdapter
+                svc.faiss_id_map = {}
+                adapter = VectorIndexAdapter(
+                    store=svc.graphlite_store, dimension=dim,
+                    faiss_id_map=svc.faiss_id_map,
+                )
+                svc.vector_store = adapter
+                svc.faiss_index = adapter      # 保持向后兼容（faiss.Index 鸭子类型）
+                svc.faiss_dim = dim
+                svc.faiss_index_type = "HNSW"
+                svc.faiss_nlist = 0
+                logger.info("VectorStore initialized", engine="overgraph-hnsw", dim=dim)
+            else:
+                from retrieval.vector_store import VectorStoreFactory
+                store = VectorStoreFactory.create(
+                    dimension=dim,
+                    index_type=cfg.faiss.index_type,
+                    nlist=cfg.faiss.nlist,
+                )
+                svc.vector_store = store
+                svc.faiss_index = store.index      # 保持向后兼容
+                svc.faiss_dim = dim
+                svc.faiss_index_type = store.index_type
+                svc.faiss_nlist = store.nlist
+                svc.faiss_id_map = store.id_map
+                logger.info("VectorStore initialized", engine="faiss", dim=dim)
         except Exception as e:
             errors.append(f"FAISS: {e}")
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))

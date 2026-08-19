@@ -64,6 +64,31 @@ def graphlite_store(temp_db_path: Path, request):
 
 
 @pytest.fixture
+def overgraph_store(temp_db_path: Path, request):
+    """真实 OverGraphStore 临时库（v6.0.0 overgraph 后端集成测试用）。
+
+    与 graphlite_store fixture 同构：temp_db_path 子目录建库，
+    connect/close 生命周期托管。支持 indirect parametrize 注入维度：
+        @pytest.mark.parametrize('overgraph_store', [{"dimension": 384}], indirect=True)
+    """
+    from graph.overgraph_store import OverGraphStore
+
+    params = getattr(request, "param", None) or {}
+    dim = int(params.get("dimension", 512))
+    config = type("cfg", (), {
+        "database_path": str(temp_db_path) + "_og",
+        "dense_vector_dimension": dim,
+        "dense_vector_metric": "cosine",
+    })()
+    cb_config = getattr(request, "param", None) or {}
+    cb_config = params.get("cb_config") if isinstance(params, dict) else None
+    store = OverGraphStore(config=config, cb_config=cb_config)
+    store.connect()
+    yield store
+    store.close()
+
+
+@pytest.fixture
 def mock_faiss_index() -> Any:
     """模拟 FAISS 索引（用 numpy 模拟 search/add_with_ids/remove_ids）。"""
     import types

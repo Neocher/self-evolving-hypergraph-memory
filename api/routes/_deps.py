@@ -266,6 +266,9 @@ def flush_faiss_buffer(deps: Services) -> int:
     """
     将 FAISS 缓冲区中的待写入项批量写入索引。
 
+    v6.0.0: backend=overgraph（faiss_index 为 VectorIndexAdapter）→ 写
+    EpisodeNode.dense_vector（D6）；graphlite → 原 FAISS add_with_ids 路径。
+
     Returns:
         实际写入的数量
     """
@@ -277,13 +280,26 @@ def flush_faiss_buffer(deps: Services) -> int:
     if not batch:
         return 0
     try:
-        ids = np.array([item[0] for item in batch], dtype=np.int64)
-        vecs = np.array([item[1] for item in batch], dtype=np.float32)
-        deps.faiss_index.add_with_ids(vecs, ids)
-        # 更新 id_map
-        if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
-            for faiss_id, _emb, ep_id in batch:
-                deps.faiss_id_map[int(faiss_id)] = ep_id
+        # v6.0.0 OverGraph 分支：ep_id 已在 buffer → 直写 dense_vector
+        from retrieval.vector_index import VectorIndexAdapter
+        if isinstance(deps.faiss_index, VectorIndexAdapter):
+            store = getattr(deps, "graphlite_store", None)
+            if store is None or not hasattr(store, "batch_upsert_embeddings"):
+                raise RuntimeError("overgraph backend without vector-capable store")
+            store.batch_upsert_embeddings([
+                {"node_id": ep_id, "embedding": emb} for _fid, emb, ep_id in batch
+            ])
+            if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                for faiss_id, _emb, ep_id in batch:
+                    deps.faiss_id_map[int(faiss_id)] = ep_id
+        else:
+            ids = np.array([item[0] for item in batch], dtype=np.int64)
+            vecs = np.array([item[1] for item in batch], dtype=np.float32)
+            deps.faiss_index.add_with_ids(vecs, ids)
+            # 更新 id_map
+            if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                for faiss_id, _emb, ep_id in batch:
+                    deps.faiss_id_map[int(faiss_id)] = ep_id
         # 【M5】episode 内容缓存填充：faiss_id_map 与 _episode_cache 均为
         # query_router 共享引用，本批写入的节点内容在此预填，检索零回查。
         # 【Core-Boost】填充时带上 fact_track（一次性批量回查），否则 L1 缓存
@@ -324,6 +340,9 @@ def incremental_faiss_update(deps: Services, removed_node_ids: list[str]) -> int
     """
     梦境后增量更新 FAISS 索引：删除被 PRUNE/RESOLVE 移除的节点向量。
 
+    v6.0.0: overgraph no-op（D7：节点删即向量删，dense_vector 随节点生命周期）；
+    仅 in-place 清理 faiss_id_map 残留。
+
     Args:
         deps: 服务容器
         removed_node_ids: 从 GraphLite 删除的 EpisodeNode ID 列表
@@ -334,9 +353,16 @@ def incremental_faiss_update(deps: Services, removed_node_ids: list[str]) -> int
     if not removed_node_ids or deps.faiss_index is None:
         return 0
     try:
-
         removed = [int(uuid.uuid5(uuid.NAMESPACE_OID, str(nid)).int & ((1 << 63) - 1))
                    for nid in removed_node_ids]
+        from retrieval.vector_index import VectorIndexAdapter
+        if isinstance(deps.faiss_index, VectorIndexAdapter):
+            # D7 no-op：向量已随节点删除；仅清 map 残留
+            if hasattr(deps, "faiss_id_map") and deps.faiss_id_map is not None:
+                remove_set = set(removed)
+                for fid in remove_set:
+                    deps.faiss_id_map.pop(fid, None)
+            return len(removed_node_ids)
         id_selector = np.array(removed, dtype=np.int64)
         removed_count = deps.faiss_index.remove_ids(id_selector)
 

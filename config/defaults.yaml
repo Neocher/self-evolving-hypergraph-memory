@@ -38,10 +38,22 @@ dream:
   cpu_affinity_low_priority: true  # 低优先级 CPU 亲和性
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
 
+graph:
+  backend: "graphlite"        # v6.0.0 OverGraph 迁移单开关: graphlite|overgraph（默认 graphlite → 存量部署零感知）
+  hnsw:                        # OverGraph HNSW 索引参数（D11）
+    ef_search: 64             # 搜索时 HNSW 候选集（≥ k 保证召回）
+    m: 16                     # 每节点最大连接数
+    ef_construction: 200      # 构建时候选集
+
 graphlite:
   database_path: "./data/shm_graphlite_db"  # GraphLite 数据库文件路径
   buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
   max_threads: 4                 # 最大工作线程数
+
+overgraph:
+  database_path: "./data/shm_overgraph_db"  # OverGraph 数据库路径（backend=overgraph 时使用）
+  dense_vector_dimension: 512     # dense 向量维度（bge-small-zh-v1.5 512d；HNSW 建索引用）
+  dense_vector_metric: "cosine"   # R1 PoC 定标: vector_search score 恒为 cosine（选项不改变输出，占位）
 
 faiss:
   dimension: 512                 # 向量维度（bge-small-zh-v1.5, 512维中文专用, CPU 快 28 倍）

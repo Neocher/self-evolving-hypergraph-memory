@@ -280,6 +280,103 @@ async def evidence_stats(
     return deps.evidence_tracker.stats()
 
 
+def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
+    """v6.0.0 OverGraph 后端索引重建（D8）：dense_vector 批量写 + Hebbian 近邻。
+
+    - 向量写入 EpisodeNode.dense_vector（adapter.rebuild 覆盖式）
+    - Hebbian 边经 store.vector_search_dense（802×1 次，替代 FAISS search）：
+      similarity = cosine s 直接用作边权重（R1 定标 d=1/s-1 的原始得分），
+      s < 0.3 丢弃（与原 1-dist/2 阈值的保守对齐）
+    - adapter 为共享引用，无需替换 deps.faiss_index / query_router 引用
+    """
+    store = deps.graphlite_store
+    start = _now()
+    rows = store.query_cypher(
+        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content LIMIT 10000"
+    )
+    if not rows:
+        return {"status": "ok", "indexed_count": 0, "message": "No episodes found"}
+
+    node_ids = []
+    contents = []
+    for row in rows:
+        if isinstance(row, dict):
+            nid = str(row.get("id", "") or "")
+            content = str(row.get("content", "") or "")
+        else:
+            nid, content = "", ""
+        if nid and content.strip():
+            node_ids.append(nid)
+            contents.append(content)
+
+    if not contents:
+        return {"status": "ok", "indexed_count": 0, "message": "No episodes with content"}
+
+    logger.info("Rebuilding OverGraph vectors: encoding %d episodes", len(contents))
+    embeddings = deps.encoder.embed_batch(contents)
+    nodes = [{"node_id": nid, "embedding": vec}
+             for nid, vec in zip(node_ids, embeddings)]
+    indexed = adapter.rebuild(nodes)
+
+    # Hebbian 批量建边（HEBBIAN_BATCH 上限与 graphlite 路径一致）
+    hebbian_count = 0
+    try:
+        store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
+    except Exception:
+        logger.exception("Failed to clear Hebbian connections")
+    pending: list[tuple[str, str, float]] = []
+    for i, qv in enumerate(embeddings):
+        try:
+            hits = store.vector_search_dense(6, qv)
+            for ep_id, s in hits:
+                if ep_id == node_ids[i] or s < 0.3:
+                    continue
+                pending.append((node_ids[i], ep_id, round(float(s), 4)))
+                hebbian_count += 1
+                if len(pending) >= HEBBIAN_BATCH:
+                    try:
+                        ok = _flush_hebbian_batch(store, pending)
+                    except Exception as e:
+                        logger.warning("Hebbian batch creation failed (%d pairs): %s",
+                                       len(pending), e)
+                        ok = False
+                    if not ok:
+                        logger.warning("Hebbian batch creation failed (%d pairs)",
+                                       len(pending))
+                    pending = []
+        except Exception:
+            logger.exception("OverGraph vector search failed for Hebbian at index %d", i)
+    if pending:
+        try:
+            ok = _flush_hebbian_batch(store, pending)
+        except Exception as e:
+            logger.warning("Hebbian batch creation failed (%d pairs): %s",
+                           len(pending), e)
+            ok = False
+        if not ok:
+            logger.warning("Hebbian batch creation failed (%d pairs)", len(pending))
+
+    record_request("POST", "/index/rebuild", "200", _now() - start)
+    logger.info("OverGraph index rebuilt: %d vectors, %d Hebbian connections",
+                indexed, hebbian_count)
+
+    try:
+        tfidf = getattr(deps, "tfidf_index", None)
+        if tfidf is not None and hasattr(tfidf, "fit") and contents:
+            tfidf.fit(contents)
+            logger.info("TF-IDF index fitted with %d texts", len(contents))
+    except Exception:
+        logger.exception("TF-IDF fit failed (non-fatal)")
+
+    return {
+        "status": "ok",
+        "indexed_count": indexed,
+        "total_nodes": len(node_ids),
+        "dimension": getattr(adapter, "dimension", 0),
+        "hebbian_connections": hebbian_count,
+    }
+
+
 @router.post("/index/rebuild", summary="重建 FAISS 索引")
 async def rebuild_index(
     deps: Services = Depends(get_services),
@@ -298,6 +395,11 @@ async def rebuild_index(
         raise HTTPException(status_code=503, detail="GraphLite store not available")
     if deps.encoder is None:
         raise HTTPException(status_code=503, detail="Text encoder not available")
+
+    # v6.0.0 OverGraph 分支（D8）：batch_upsert dense_vector + Hebbian 改 vector_search
+    from retrieval.vector_index import VectorIndexAdapter
+    if isinstance(getattr(deps, "faiss_index", None), VectorIndexAdapter):
+        return _rebuild_index_overgraph(deps, deps.faiss_index)
 
     import numpy as np
     import faiss

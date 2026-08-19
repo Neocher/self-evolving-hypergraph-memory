@@ -83,6 +83,31 @@ class GraphLiteConfig:
 
 
 @dataclass
+class HNSWConfig:
+    """OverGraph HNSW 索引参数（D11 graph.hnsw.*；VectorIndexAdapter 建索引用）"""
+    ef_search: int = 64
+    m: int = 16
+    ef_construction: int = 200
+
+
+@dataclass
+class GraphConfig:
+    """图后端单开关（v6.0.0 OverGraph 迁移，设计 A8/D11）"""
+    backend: str = "graphlite"      # graphlite|overgraph（默认 graphlite → 存量零感知）
+    hnsw: HNSWConfig = field(default_factory=HNSWConfig)
+
+
+@dataclass
+class OverGraphConfig:
+    """OverGraph 引擎配置（design_overgraph_store.md 任务书 8）"""
+    database_path: str = "./data/shm_overgraph_db"
+    dense_vector_dimension: int = 512
+    # R1 PoC 定标：vector_search score 恒为 cosine（metric 选项不改变输出），
+    # 此字段仅占位（保留 l2 选项以便引擎后续版本暴露 L2 距离时切换）
+    dense_vector_metric: str = "cosine"
+
+
+@dataclass
 class FAISSConfig:
     dimension: int = 512
     index_type: str = "IVFFlat"
@@ -273,7 +298,9 @@ class Settings:
     hebbian: HebbianConfig = field(default_factory=HebbianConfig)
     ssm: SSMConfig = field(default_factory=SSMConfig)
     dream: DreamConfig = field(default_factory=DreamConfig)
+    graph: GraphConfig = field(default_factory=GraphConfig)
     graphlite: GraphLiteConfig = field(default_factory=GraphLiteConfig)
+    overgraph: OverGraphConfig = field(default_factory=OverGraphConfig)
     faiss: FAISSConfig = field(default_factory=FAISSConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -337,7 +364,9 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         "hebbian": HebbianConfig,
         "ssm": SSMConfig,
         "dream": DreamConfig,
+        "graph": GraphConfig,
         "graphlite": GraphLiteConfig,
+        "overgraph": OverGraphConfig,
         "faiss": FAISSConfig,
         "retrieval": RetrievalConfig,
         "embedding": EmbeddingConfig,

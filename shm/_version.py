@@ -1,12 +1,35 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.53.0"
-__version_info__ = (5, 53, 0)
-__version_name__ = "Cross-Message-Expansion"
+__version__ = "6.0.0"
+__version_info__ = (6, 0, 0)
+__version_name__ = "OverGraph-Engine"
 __release_date__ = "2026-08-19"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.0.0 (2026-08-19) OverGraph-Engine:
+  • 图引擎迁移阶段1 — 新增 graph/overgraph_store.py OverGraphStore
+    （OverGraph Rust/PyO3 0.17.0，Apache-2.0）与 GraphLiteStore 同接口契约
+    （39 公开方法 + 4 向量方法），config graph.backend 单开关切换，
+    svc.graphlite_store 属性名保留（duck-typing 上层零改动）
+  • 零 b64 — OverGraph 中文原生直写直查（CONTAINS 中文子串直用），
+    GraphLite 的 {{b64}} 透明编解码整体移除（读侧 helper 保留兼容遗留库）
+  • GQL 白名单翻译层 — SHM 101 处裸 GQL 收敛：INSERT 节点→typed
+    upsert_node、INSERT 边→CREATE、逗号 MATCH→重复 MATCH、weight 移入
+    SET、RETURN e.*→e、裸 RETURN→合成、LIKE→CONTAINS（PoC 8 轮实证）
+  • CAS/超边/时间锚 — 版本号乐观锁（WHERE version SET + mutation_stats）、
+    HyperedgeNode+HYPEREDGE_MEMBER 边+weight 属性、created_at 业务 float
+    秒属性保真、begin_write_txn 补偿链原子化
+  • FAISS 同期替换为 OverGraph HNSW — retrieval/vector_index.py
+    VectorIndexAdapter（faiss.Index 鸭子类型）：vector_search(mode=dense)
+    + EpisodeNode.dense_vector；uuid5 映射契约保留；R1 PoC 定标 score 恒为
+    cosine → d=1/s-1 映射保 1/(1+d) [0,1] 下游；视觉 _visual_index 保留
+    FAISS 独立空间（384d，只换主通道）
+  • 配置 — GraphConfig.backend/hnsw + OverGraphConfig(database_path) +
+    defaults.yaml graph/overgraph 块；backend: graphlite 默认 → 存量零感知
+  • 测试: test_overgraph_store（与 GraphLiteStore 行为对拍：create/get/
+    query/超边/CAS/中文/翻译层）+ test_overgraph_vector（公共入口 retrieve/
+    search/vector；score 方向；faiss_id_map 回填）+ 全量回归
 v5.53.0 (2026-08-19) Cross-Message-Expansion:
   • P3c 跨消息多跳增强（cat1）— 实体扩召回补充通道 _entity_expansion：
     查询专名实体（连续大写序列 + _PROPERTY_CANDIDATE_STOPWORDS 停用词过滤
