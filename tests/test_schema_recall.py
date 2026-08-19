@@ -80,6 +80,27 @@ def test_run_once_overgraph_creates_and_recalls(overgraph_store):
     assert hits and any(h.get("id") in created for h in hits)
 
 
+def test_run_once_overgraph_idempotent_no_accumulation(overgraph_store):
+    """P1-2 幂等：重复 run_once（同 episodes）不累积重复 :Conceptual 节点。
+
+    修复前 distill 每轮生成新 uuid4 → 同 pattern 重复 run_once 累积多份节点；
+    修复后 uuid5 确定性 id（uuid5 over 完整 pattern）→ 同 id 覆盖（overgraph
+    upsert / graphlite INSERT 覆盖），Schema 节点数量不增、产出 id 相同。
+    """
+    store = overgraph_store
+    for content in ["机器学习 研究 项目", "机器学习 研究 综述", "机器学习 研究 实验"]:
+        store.create_episode({"content": content, "created_at": time.time()})
+
+    created1 = run_once(store, limit=100, min_support=2)
+    assert created1
+    count1 = len(store.query_schema_nodes(["机器学习"], limit=100))
+    created2 = run_once(store, limit=100, min_support=2)
+    assert created2
+    count2 = len(store.query_schema_nodes(["机器学习"], limit=100))
+    assert count2 == count1, (count1, count2)
+    assert created2 == created1  # 确定性 id：两轮产出相同 id（覆盖而非累积）
+
+
 # ─── 检索通道（公共入口 FUSION）─────────────────────────
 
 

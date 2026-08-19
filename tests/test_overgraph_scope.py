@@ -114,6 +114,35 @@ def test_scope_recall_fusion_shared_hyperedge(overgraph_store):
 
 
 @_VEC_FIXTURE
+def test_scope_recall_production_entry_no_embedding(overgraph_store):
+    """P1-1 生产路径：公共入口不传 query_embedding → scope 必须真触发。
+
+    生产（self_evolving.py:608 / api/routes/search.py:129）调 retrieve() 均不传
+    query_embedding → 修复前 _scope_retrieve 见 None 恒 return，scope 永不 append；
+    修复后内部先 _encode_query(query)（归一化 query）再继续。D 主通道零召回
+    （中文 vs 英文 char_wb gram 不相交），仅经共享超边两跳 scope 可达。
+    """
+    store, A, B, C, D = _make_scope_graph(overgraph_store)
+    encoder = _HashEncoder()
+    adapter = VectorIndexAdapter(store=store, dimension=_DIM, faiss_id_map={})
+    adapter.rebuild([{"node_id": A, "embedding": encoder.embed("Alan Turing was born in London")},
+                     {"node_id": B, "embedding": encoder.embed("He later moved to Princeton")},
+                     {"node_id": D, "embedding": encoder.embed("数据模型研究")},
+                     {"node_id": C, "embedding": encoder.embed("The weather in Tokyo is rainy today")}])
+    qr = _build_router(store, adapter, {}, encoder)
+
+    from retrieval.query_router import RetrievalLevel
+    results = qr.retrieve(
+        "Alan Turing was born in London",
+        level=RetrievalLevel.FUSION,  # 不传 query_embedding（生产形态）
+    )
+    assert results, results
+    scope = [r for r in results if r.get("_source") == "scope"]
+    assert scope, results  # 修复前：query_embedding=None 恒 return → scope 恒空
+    assert any(r["node_id"] == D for r in scope), results
+
+
+@_VEC_FIXTURE
 def test_scope_recall_disabled_bit_identical(overgraph_store):
     """scope_recall.enabled=False → 关闭时行为 = 现状（零 scope 条目）。"""
     from config.settings import ScopeRecallConfig

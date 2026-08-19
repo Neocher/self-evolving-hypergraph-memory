@@ -1,0 +1,6 @@
+{
+  "_comment": "跨语言实体别名映射占位（阶段4-3，v6.0.0 设计定稿：本期仅接口占位，不接线）。",
+  "_rationale": "根本问题 = embedding 语种不匹配（bge-small-zh 中文查询 vs 英文库语义空间偏移），非实体映射；LoCoMo 纯英文库 + 无中文查询测试集 → 收益≈0，待 ①scope_retrieve 落地 ②真实跨语种生产数据 再做。",
+  "alias_mode": "placeholder",
+  "aliases": {}
+}

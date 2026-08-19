@@ -2894,10 +2894,35 @@ class QueryRouter:
             if store is None or not hasattr(store, "vector_search_scoped"):
                 return results
             if query_embedding is None:
-                return results
+                # 【P1-1】生产入口（self_evolving.py:608 / api/routes/search.py:129）
+                # 调 retrieve() 均不传 query_embedding → 外层恒 None → scope 通道
+                # 生产永不生效（恒 no-op）。与 _vector_retrieve 同构：None 时先
+                # 编码（query 已是归一化 query），编码失败才静默降级。
+                query_embedding = self._encode_query(query)
+                if query_embedding is None:
+                    return results
+            # 【P1-1】scope 引擎 dense_query 需 1D 向量；_encode_query 产出 2D
+            # (1, dim)（FAISS 检索契约），reshape 为 1D 再传入（显式 1D 直通）。
+            query_vec = (
+                query_embedding.reshape(-1)
+                if getattr(query_embedding, "ndim", 0) == 2
+                else query_embedding
+            )
+            # 【P2-1】skip 集与实际合成 level 对齐（原 "community"/"mesa"/"property"
+            # 是死名字，实际 level 为 community_expansion/mesa_synthesis/…）：
+            #   合成节点（node_id 非真实 EpisodeNode elementKey，不可作种子）：
+            #     - mesa_synthesis: node_id=community_id（CommunityNode，非 EpisodeNode）
+            #     - visual: node_id=VisualNode id
+            #     - property_temporal: node_id=PropertyVerNode id
+            #     - schema: node_id=Conceptual id（阶段4-1 节点）
+            #     - scope: 自身 level（防自递归种子）
+            #   node_id 实为真实 EpisodeNode elementKey 的扩召回（community_expansion
+            #   社区成员 / entity_expansion 实体召回均为 EpisodeNode）本可作种子，但
+            #   阶段3 契约「种子取首个基础通道真实 EpisodeNode」统一跳过——基础通道
+            #   （vector/bm25/entity）恒有真实 EpisodeNode，零种子损失。
             skip_levels = {
-                "community", "mesa", "visual", "property", "entity_expansion",
-                "scope", "property_temporal",
+                "community_expansion", "mesa_synthesis", "visual",
+                "property_temporal", "schema", "scope", "entity_expansion",
             }
             seed_id: Optional[str] = None
             for r in results:
@@ -2923,7 +2948,7 @@ class QueryRouter:
             hits = store.vector_search_scoped(
                 seed_id,
                 k=max_results,
-                query_vec=query_embedding,
+                query_vec=query_vec,
                 max_depth=max_depth,
                 at_ts=now_ts,
             )

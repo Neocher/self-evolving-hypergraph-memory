@@ -1,7 +1,8 @@
 
 build/
 .cache/
-data/
+data/*
+!data/entity_aliases.json
 data.bak.*/
 # Data & Cache
 dist/

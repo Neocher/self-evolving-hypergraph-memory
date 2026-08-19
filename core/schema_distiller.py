@@ -96,7 +96,10 @@ def distill(episodes: list[dict], min_support: int = 2,
             continue
         now = time.time()
         schemas.append({
-            "id": str(uuid.uuid4()),
+            # 【P1-2】确定性 id（uuid5 over 完整 pattern）：同 pattern 跨 run 稳定 →
+            # run_once 重复执行 create_schema_node 同 id 覆盖（graphlite INSERT 覆盖 /
+            # overgraph upsert），不累积重复 :Conceptual 节点
+            "id": str(uuid.uuid5(uuid.NAMESPACE_OID, "schema:" + "|".join(pattern))),
             "schema_name": "_".join(pattern[:3]),
             "pattern_keywords": list(pattern),
             "support": len(src_ids),
