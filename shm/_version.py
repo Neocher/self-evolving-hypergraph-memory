@@ -13,8 +13,10 @@ v5.53.0 (2026-08-19) Cross-Message-Expansion:
     + normalize_entity_name 规范化，top-3）→ 单条 OR CONTAINS GQL（避免
     N+1）跨会话召回 EpisodeNode append（每实体 max-10、总 ≤20）；扩展分
     = min(种子分) × boost(0.5) 相对尾分缩放严格低于种子
-  • CJK 跳过 — 对齐 _fusion_retrieve skip_entity 判定（"一".."鿿" 区间），
-    中文查询直接返回（CONTAINS 对中文无子串保持性，零回归）
+  • CJK 处理 — 先 _extract_proper_nouns 提取 ASCII 专名，纯中文/无专名
+    查询返回原 results（中文零回归）；中英混合（"Apple 最近做了什么"）
+    提取 apple 走 CONTAINS（v5.31.4+ 中文原生直写，英文词 CONTAINS 可用；
+    R1 P0 修复，2026-08-19）
   • 时间锚上界过滤 — now_ts（session 时间锚）非空且 time_filter 开启时
     AND e.created_at <= $at_ts（created_at 为时间戳秒数，int 转换）
   • 双路径接线 — retrieve() _finish（community → mesa → visual →
