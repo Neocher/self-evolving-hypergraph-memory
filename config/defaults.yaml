@@ -74,6 +74,12 @@ retrieval:
     boost: 0.4                   # 合成分 = relevance × min(种子分) × boost（严格 < community boost 0.6）
     threshold: 0.5               # BM25-on-summary 相关度阈值（对齐 community_expansion）
     max_nodes: 5                 # 每查询最多合成节点数
+  entity_expansion:              # v5.53.0 P3c 实体扩召回（跨消息多跳增强，补充非替代，关闭=现状）
+    enabled: true                # 开关
+    boost: 0.5                   # 扩展分 = min(种子分) × boost（相对尾分缩放，严格低于种子）
+    max_results: 10              # 每实体最大召回数
+    max_entities: 3              # 每查询最多提取实体数
+    time_filter: true            # 时间锚上界过滤（created_at <= session 时间锚）
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
   rerank_enabled: true           # bge-reranker 重排开关（默认开，仅 FUSION 生效）
   rerank_input_k: 40             # 送入 reranker 的头部候选数（尾部保持原序 append）

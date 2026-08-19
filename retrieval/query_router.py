@@ -34,7 +34,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from core.user_profile import profile_hit, profile_values
-from config.settings import get_settings
+from config.settings import EntityExpansionConfig, get_settings
 from graph.graphlite_store import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
 from retrieval.vector_store import FaissStore
@@ -76,6 +76,8 @@ class _EntityChannelDegraded(Exception):
 # 【P0-1 实体-属性-时间】属性版本链检索通道常量（append 相对尾分缩放，严格低于种子）
 _PROPERTY_BOOST = 0.6
 _PROPERTY_MAX_RESULTS = 5
+# 【P3c 跨消息多跳增强】实体扩召回通道常量（append 相对尾分缩放，严格低于种子）
+_ENTITY_EXPANSION_MAX_APPEND = 20  # 总 append 硬上限（实体 top-3 × 每实体 max-10 的钳制）
 # 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
 _RERANK_PREWARM_TIMEOUT = 60.0
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
@@ -240,6 +242,8 @@ class QueryRouterConfig:
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
     hyde_timeout: float = 1.5  # LLM 生成超时（秒）【P3b R1 P0-2】2.0→1.5：3s 检索预算内
     # 预留 1.5s LLM + 融合检索，失败静默降级单路
+    # 实体扩召回配置（P3c v5.53.0 跨消息多跳增强，默认开；关闭/异常静默回落现状）
+    entity_expansion: EntityExpansionConfig = field(default_factory=EntityExpansionConfig)
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -1415,6 +1419,10 @@ class QueryRouter:
             # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
             # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
             results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
+            # 【P3c 跨消息多跳增强】补充非替代：查询专名实体跨会话召回 append
+            # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = min(种子分)
+            # × boost 相对尾分缩放严格低于种子，经 _deduplicate_and_sort 单点去重不双重放大）
+            results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
             if not include_archived:
                 results = self._filter_archived(results)
             sorted_results = self._deduplicate_and_sort(results)
@@ -1832,6 +1840,9 @@ class QueryRouter:
         # 修复前 agentic 路径缺此步 → MESA 静默跳过 + 自演化统计 mesa_hit_count=0 误判。
         results = self._mesa_synthesis(results, query, raw_query)
         results = self._visual_recall(results, query, raw_query)
+        # 【P3c】实体扩召回补充：与 retrieve() _finish 顺序一致（property → entity_expansion）。
+        # 防 MESA 历史教训：agentic 路径缺接线会导致通道静默失效。
+        results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
         if not include_archived:
             results = self._filter_archived(results)
         return results
@@ -2652,6 +2663,145 @@ class QueryRouter:
             logger.debug(
                 "Property temporal retrieve degraded, returning original results",
                 exc_info=True,
+            )
+            return results
+
+    @staticmethod
+    def _extract_proper_nouns(query: str) -> list[str]:
+        """P3c：提取大写专名实体（连续大写词序列）→ normalize_entity_name 规范化。
+
+        复用 _extract_query_entities 的英文大写序列正则；句首 What/How/Where 等
+        经 _PROPERTY_CANDIDATE_STOPWORDS 过滤（非实体）。上限 3 个实体。返回已
+        规范化（小写 + 去尾词后缀）的实体名，直接作 GQL CONTAINS 词。
+        """
+        from core.entity_resolver import normalize_entity_name
+        seen: set[str] = set()
+        out: list[str] = []
+        for m in re.finditer(r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b', query):
+            if m.group(1).lower() in _PROPERTY_CANDIDATE_STOPWORDS:
+                continue
+            norm = normalize_entity_name(m.group(1))
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(norm)
+            if len(out) >= 3:
+                break
+        return out
+
+    def _entity_expansion(
+        self,
+        results: list[dict],
+        query: str,
+        raw_query: Optional[str],
+        now_ts: Optional[float] = None,
+    ) -> list[dict]:
+        """【P3c 跨消息多跳增强】补充非替代：查询专名实体 → EpisodeNode 跨会话 append。
+
+        链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
+          1. _extract_proper_nouns 提取大写专名实体（停用词过滤 + 规范化，top-3）
+          2. 单条 OR CONTAINS GQL 合并查询（避免 N+1）：content 含任一实体的
+             未归档 EpisodeNode，ORDER BY created_at DESC LIMIT 每实体×实体数
+          3. 时间锚上界过滤：now_ts（session 时间锚）非空且 config.time_filter
+             开启 → AND e.created_at <= $at_ts（created_at 为时间戳秒数，int 转换）
+          4. 扩展分 = min(种子分) × boost(0.5)（相对尾分缩放，严格低于种子）
+             append {node_id, content, score, level="entity_expansion",
+             _source="entity_expansion"}
+
+        CJK 查询跳过（CONTAINS 对中文无子串保持性，恒空）；异常/无实体/无种子分
+        → 静默返回原 results（主检索零回归，永不抛异常）。候选经
+        _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大。
+        """
+        try:
+            ecfg = getattr(getattr(self, "config", None), "entity_expansion", None)
+            if ecfg is None or not getattr(ecfg, "enabled", True) or not results:
+                return results
+            # CJK 跳过：对齐 _fusion_retrieve 的 skip_entity 判定（CONTAINS 对
+            # 中文无子串保持性，纯省一次全表扫描，中文查询零回归）
+            if any("一" <= ch <= "鿿" for ch in (raw_query or query)):
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "query_cypher"):
+                return results
+            entities = self._extract_proper_nouns(raw_query or query)
+            if not entities:
+                return results
+            entities = entities[:max(1, int(getattr(ecfg, "max_entities", 3)))]
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results[:5] if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            boost = float(getattr(ecfg, "boost", 0.5))
+            per_entity = int(getattr(ecfg, "max_results", 10))
+            if per_entity <= 0:
+                return results
+            # 单条 OR CONTAINS GQL（避免 N+1）：实体词已小写化 + 去尾词后缀，
+            # CONTAINS 大小写不敏感子串匹配（对齐 _entity_match 的 lowercase 参数）
+            params: dict = {}
+            conditions: list[str] = []
+            for i, ent in enumerate(entities):
+                pkey = f"t{i}"
+                params[pkey] = ent
+                conditions.append(f"e.content CONTAINS ${pkey}")
+            where_clause = " OR ".join(conditions)
+            at_clause = ""
+            if now_ts is not None and bool(getattr(ecfg, "time_filter", True)):
+                at_clause = " AND e.created_at <= $at_ts"
+                params["at_ts"] = int(now_ts)
+            cypher = (
+                f"MATCH (e:EpisodeNode) WHERE ({where_clause}) "
+                f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
+                f"RETURN e.id AS node_id, e.content AS content, "
+                f"e.tau_initial AS tau_value, e.fact_track AS fact_track "
+                f"ORDER BY e.created_at DESC LIMIT $limit"
+            )
+            params["limit"] = per_entity * len(entities)
+            rows = store.query_cypher(cypher, params)
+            if not isinstance(rows, (list, tuple)) or not rows:
+                return results
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    nid = row.get("node_id", "") or ""
+                    content = row.get("content", "") or ""
+                    tau = _safe_float_tau(row.get("tau_value", 0.0))
+                    fact_track = row.get("fact_track", "active") or "active"
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    nid = str(row[0]) if row[0] is not None else ""
+                    content = str(row[1]) if row[1] is not None else ""
+                    tau = _safe_float_tau(row[2]) if len(row) > 2 else 0.0
+                    fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
+                else:
+                    continue
+                if not nid or nid in existing_ids or not content:
+                    continue
+                score = round(min_seed_score * boost, 6)
+                if score <= 0.0:
+                    continue
+                extra.append({
+                    "node_id": nid,
+                    "content": content,
+                    "score": score,
+                    "tau_value": tau,
+                    "fact_track": fact_track,
+                    "level": "entity_expansion",
+                    "_source": "entity_expansion",
+                })
+            if extra:
+                # 总 append 硬上限 20（实体 top-3 × 每实体 max-10 的钳制）
+                extra = extra[:_ENTITY_EXPANSION_MAX_APPEND]
+                logger.info(
+                    "Entity expansion appended",
+                    entities=len(entities), candidates=len(extra), boost=boost,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Entity expansion degraded, returning original results", exc_info=True
             )
             return results
 

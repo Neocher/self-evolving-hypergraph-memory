@@ -1,12 +1,32 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "5.52.0"
-__version_info__ = (5, 52, 0)
-__version_name__ = "HyDE-Query-Enhance"
+__version__ = "5.53.0"
+__version_info__ = (5, 53, 0)
+__version_name__ = "Cross-Message-Expansion"
 __release_date__ = "2026-08-19"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5.53.0 (2026-08-19) Cross-Message-Expansion:
+  • P3c 跨消息多跳增强（cat1）— 实体扩召回补充通道 _entity_expansion：
+    查询专名实体（连续大写序列 + _PROPERTY_CANDIDATE_STOPWORDS 停用词过滤
+    + normalize_entity_name 规范化，top-3）→ 单条 OR CONTAINS GQL（避免
+    N+1）跨会话召回 EpisodeNode append（每实体 max-10、总 ≤20）；扩展分
+    = min(种子分) × boost(0.5) 相对尾分缩放严格低于种子
+  • CJK 跳过 — 对齐 _fusion_retrieve skip_entity 判定（"一".."鿿" 区间），
+    中文查询直接返回（CONTAINS 对中文无子串保持性，零回归）
+  • 时间锚上界过滤 — now_ts（session 时间锚）非空且 time_filter 开启时
+    AND e.created_at <= $at_ts（created_at 为时间戳秒数，int 转换）
+  • 双路径接线 — retrieve() _finish（community → mesa → visual →
+    property → entity_expansion）+ _agentic_round（防 MESA 历史教训：
+    agentic 缺接线导致通道静默失效）
+  • 配置 — EntityExpansionConfig（settings.py 注册 + defaults.yaml 块，
+    enabled=true/boost=0.5/max_results=10/max_entities=3/time_filter=true）
+    + QueryRouterConfig.entity_expansion 嵌套 + api/app.py getattr 条件透传
+    （None 不传让默认 factory 生效，旧配置对象零回归）
+  • 测试: test_entity_expansion（公共入口 retrieve(level=FUSION)：跨会话
+    聚合召回 / 时间锚 GQL spy / CJK 跳过 / enabled=false 零回归 / boost
+    钳制）+ 全量回归
 v5.52.0 (2026-08-19) HyDE-Query-Enhance:
   • 生产管道集成 HyDE 假设文档增强检索（P3b）— LLM 生成假设段落与原始
     查询一起参与融合检索（评测 recall 7.5%→11.7% +49%，补齐 P3a 排序

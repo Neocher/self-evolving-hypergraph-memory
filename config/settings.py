@@ -130,6 +130,16 @@ class MesaConfig:
 
 
 @dataclass
+class EntityExpansionConfig:
+    """实体扩召回配置（v5.53.0 P3c 跨消息多跳增强）"""
+    enabled: bool = True        # 开关：关闭时行为 = 现状（bit 级一致）
+    boost: float = 0.5          # 扩展分 = min(种子分) × boost（相对尾分缩放，严格低于种子）
+    max_results: int = 10       # 每实体最大召回数
+    max_entities: int = 3       # 每查询最多提取实体数
+    time_filter: bool = True    # 时间锚上界过滤（created_at <= session 时间锚）
+
+
+@dataclass
 class RetrievalConfig:
     top_k_l1: int = 5              # L1 FAISS 检索 top-K
     top_k_vector: int = 20         # L2 向量检索 top-K
@@ -143,6 +153,7 @@ class RetrievalConfig:
     community_expansion: CommunityExpansionConfig = field(default_factory=CommunityExpansionConfig)
     visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
     mesa: MesaConfig = field(default_factory=MesaConfig)
+    entity_expansion: EntityExpansionConfig = field(default_factory=EntityExpansionConfig)
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
     rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
     rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）

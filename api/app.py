@@ -140,7 +140,8 @@ def _build_router_config(rcfg):
     """
     from retrieval.query_router import QueryRouterConfig as QRCfg
     mesa = getattr(rcfg, "mesa", None)
-    return QRCfg(
+    entity_expansion = getattr(rcfg, "entity_expansion", None)
+    kwargs = dict(
         tau_weight=rcfg.tau_weight,
         vector_weight=rcfg.vector_weight,
         top_k_l1=rcfg.top_k_l1,
@@ -157,6 +158,11 @@ def _build_router_config(rcfg):
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
     )
+    # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
+    # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）
+    if entity_expansion is not None:
+        kwargs["entity_expansion"] = entity_expansion
+    return QRCfg(**kwargs)
 
 
 def _init_services() -> Services:
