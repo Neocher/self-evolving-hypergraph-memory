@@ -2668,17 +2668,23 @@ class QueryRouter:
 
     @staticmethod
     def _extract_proper_nouns(query: str) -> list[str]:
-        """P3c：提取大写专名实体（连续大写词序列）→ normalize_entity_name 规范化。
+        """P3c：提取大写专名实体（连续大写词序列），保留原始大小写。
 
         复用 _extract_query_entities 的英文大写序列正则；句首 What/How/Where 等
-        经 _PROPERTY_CANDIDATE_STOPWORDS 过滤（非实体）。上限 3 个实体。返回已
-        规范化（小写 + 去尾词后缀）的实体名，直接作 GQL CONTAINS 词。
+        经 _PROPERTY_CANDIDATE_STOPWORDS 过滤（非实体）。上限 3 个实体。返回
+        保留原始大小写（仅去首词停用词 + 去尾词后缀，不再小写化）的实体名，
+        直接作 GQL CONTAINS 词——GraphLite CONTAINS 大小写敏感，小写化后打
+        不进大写专名存储（"Melanie"→"melanie" 恒 0 命中），必须保留原始形式
+        供 _entity_expansion 生成 orig/lower 双变体条件覆盖两种存储库。
         【R1 P2-2】token 级首词停用词剥离：句首 The/In 等混入多词序列时
         （"The Apple Store" 整段不在单词停用词集合 → 旧逻辑漏滤出 "the apple
         store"），逐 token 剥离首词停用词；"The" 单独成段剥离后为空 → 跳过。
         中间大写词与后置实体名保留（"The Apple Store" → "Apple Store"）。
         """
-        from core.entity_resolver import normalize_entity_name
+        from core.entity_resolver import (
+            _ENTITY_NORMALIZE_SUFFIX_RE,
+            normalize_entity_name,
+        )
         seen: set[str] = set()
         out: list[str] = []
         for m in re.finditer(r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b', query):
@@ -2687,11 +2693,15 @@ class QueryRouter:
                 tokens.pop(0)
             if not tokens:
                 continue
-            norm = normalize_entity_name(" ".join(tokens))
+            raw = " ".join(tokens)
+            # 去重键用规范化（小写 + 去尾词后缀）结果（"Apple Inc" 与 "APPLE Inc"
+            # 视为同一实体）；输出保留原始大小写 + 去尾词后缀（"Apple Inc"→"Apple"，
+            # 与 lower 变体同源同后缀剥离，仅大小写不同）
+            norm = normalize_entity_name(raw)
             if not norm or norm in seen:
                 continue
             seen.add(norm)
-            out.append(norm)
+            out.append(_ENTITY_NORMALIZE_SUFFIX_RE.sub('', raw).strip())
             if len(out) >= 3:
                 break
         return out
@@ -2705,10 +2715,15 @@ class QueryRouter:
     ) -> list[dict]:
         """【P3c 跨消息多跳增强】补充非替代：查询专名实体 → EpisodeNode 跨会话 append。
 
-        链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
-          1. _extract_proper_nouns 提取大写专名实体（停用词过滤 + 规范化，top-3）
+         链路（对齐 _community_expansion 的 try/except + append + 相对尾分缩放）：
+          1. _extract_proper_nouns 提取大写专名实体（停用词过滤，保留原始大小写，
+             top-3）
           2. 单条 OR CONTAINS GQL 合并查询（避免 N+1）：content 含任一实体的
-             未归档 EpisodeNode，ORDER BY created_at DESC LIMIT 每实体×实体数
+             未归档 EpisodeNode，ORDER BY created_at DESC LIMIT 每实体×实体数；
+             每实体生成 orig（原始大小写）/lower（小写）双变体条件——GraphLite
+             CONTAINS 大小写敏感（实测 'Melanie' 3 rows / 'melanie' 0 rows），
+             仅小写条件打不进大写专名存储 → P3c 恒空转，双变体覆盖大写/小写
+             两种存储库（R2 P0）
           3. 时间锚上界过滤：now_ts（session 时间锚）非空且 config.time_filter
              开启 → AND e.created_at <= $at_ts（created_at 为时间戳秒数，int 转换）
           4. 扩展分 = min(种子分) × boost(0.5)（相对尾分缩放，严格低于种子）
@@ -2754,14 +2769,20 @@ class QueryRouter:
             per_entity = int(getattr(ecfg, "max_results", 10))
             if per_entity <= 0:
                 return results
-            # 单条 OR CONTAINS GQL（避免 N+1）：实体词已小写化 + 去尾词后缀，
-            # CONTAINS 大小写不敏感子串匹配（对齐 _entity_match 的 lowercase 参数）
+            # 单条 OR CONTAINS GQL（避免 N+1）：每实体生成 orig（原始大小写）+
+            # lower（小写）双变体条件——GraphLite CONTAINS 大小写敏感，仅小写
+            # 条件打不进大写专名存储（"Melanie"→"melanie" 恒 0 命中），双变体
+            # 覆盖大写存储（Melanie）与小写存储（melanie）两种库
             params: dict = {}
             conditions: list[str] = []
             for i, ent in enumerate(entities):
-                pkey = f"t{i}"
-                params[pkey] = ent
-                conditions.append(f"e.content CONTAINS ${pkey}")
+                pkey_orig = f"t{i}_orig"
+                pkey_lower = f"t{i}_lower"
+                params[pkey_orig] = ent
+                params[pkey_lower] = ent.lower()
+                conditions.append(
+                    f"(e.content CONTAINS ${pkey_orig} OR e.content CONTAINS ${pkey_lower})"
+                )
             where_clause = " OR ".join(conditions)
             at_clause = ""
             if now_ts is not None and bool(getattr(ecfg, "time_filter", True)):

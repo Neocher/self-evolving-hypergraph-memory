@@ -10,6 +10,8 @@ v5.53.0 P3c 实体扩召回（Entity-Expansion）测试
      其余补充通道调用与基线一致）
   5. boost 钳制：expanded score = min(全部种子分) × 0.5，严格低于种子分
      【R1 P1】6 种子 [0.9×5, 0.1] → 扩展分 0.05 不排在 0.1 前
+  6. 【R2 P0】大小写敏感回归：CONTAINS 大小写敏感，实体保留原始大小写 +
+     小写双变体条件（"Melanie"/"melanie"）覆盖大写/小写两种存储
 
 运行: .venv/bin/python -m pytest tests/test_entity_expansion.py -v
 """
@@ -120,14 +122,15 @@ class TestEntityExpansionConfig:
 
 
 class TestExtractProperNouns:
-    def test_extracts_capital_sequences_normalized(self):
-        """大写专名序列提取 + normalize_entity_name 规范化 + 停用词过滤。"""
+    def test_extracts_capital_sequences_preserves_case(self):
+        """大写专名序列提取保留原始大小写（不再小写化）+ 去尾词后缀 + 停用词过滤。"""
         ents = QueryRouter._extract_proper_nouns(
             "What did Apple Inc announce about Tesla Motors?"
         )
-        assert "apple" in ents  # "Apple Inc" → "apple"（去尾词后缀）
-        assert "tesla motors" in ents
+        assert "Apple" in ents  # "Apple Inc" → "Apple"（去尾词后缀，保留大小写）
+        assert "Tesla Motors" in ents
         assert all(e != "what" for e in ents)  # 句首 What 被停用词过滤
+        assert all(e[0].isupper() for e in ents)  # 全部保留原始首字母大写
         assert len(ents) <= 3
 
     def test_sentence_start_stopwords_filtered(self):
@@ -135,7 +138,7 @@ class TestExtractProperNouns:
         ents = QueryRouter._extract_proper_nouns(
             "How did Tesla solve the battery problem?"
         )
-        assert "tesla" in ents
+        assert "Tesla" in ents
         assert all(e not in ("how", "the", "battery") for e in ents)
 
     def test_sentence_start_the_stripped_from_sequence(self):
@@ -143,7 +146,7 @@ class TestExtractProperNouns:
         ents = QueryRouter._extract_proper_nouns(
             "The Apple Store opened a new flagship."
         )
-        assert "apple store" in ents  # 中间大写词 Store 保留
+        assert "Apple Store" in ents  # 中间大写词 Store 保留（原始大小写）
         assert all(e != "the" and not e.startswith("the ") for e in ents)
 
 
@@ -163,10 +166,13 @@ class TestEntityExpansion:
         assert {r["node_id"] for r in exp} == {"ep2", "ep3"}
         assert all(r["_source"] == "entity_expansion" for r in exp)
         assert all(r["score"] == pytest.approx(round(0.9 * 0.5, 6)) for r in exp)
-        # 实体词经 normalize_entity_name 小写化作 CONTAINS 参数（对齐 _entity_match）
+        # 双变体条件：原始大小写（Apple）+ 小写（apple）——CONTAINS 大小写敏感，
+        # 覆盖大写/小写两种存储（R2 P0）
         cypher, params = store.query_cypher.call_args[0]
-        assert "e.content CONTAINS $t0" in cypher
-        assert params["t0"] == "apple"
+        assert "e.content CONTAINS $t0_orig" in cypher
+        assert "e.content CONTAINS $t0_lower" in cypher
+        assert params["t0_orig"] == "Apple"
+        assert params["t0_lower"] == "apple"
         # 【R1 P2-3】单条合并查询 LIMIT 下推：每实体 max_results × 实体数（1 实体 → 10）
         assert params["limit"] == 10
 
@@ -212,8 +218,35 @@ class TestEntityExpansion:
         assert exp[0]["node_id"] == "ep2"
         assert exp[0]["_source"] == "entity_expansion"
         cypher, params = store.query_cypher.call_args[0]
-        assert "e.content CONTAINS $t0" in cypher
-        assert params["t0"] == "apple"
+        assert "e.content CONTAINS $t0_orig" in cypher
+        assert "e.content CONTAINS $t0_lower" in cypher
+        assert params["t0_orig"] == "Apple"
+        assert params["t0_lower"] == "apple"
+
+    def test_case_sensitive_storage_matches_original_case(self):
+        """【R2 P0】大小写回归：GraphLite CONTAINS 大小写敏感（实测 'Melanie' 3 rows /
+        'melanie' 0 rows）——mock 返回大写专名存储内容，旧逻辑实体小写化后 CONTAINS
+        打不进（扩展恒空）；修复后生成 orig（"Melanie"）+ lower（"melanie"）双条件，
+        大写内容被命中 append。（修复前本测试必 FAIL：params 无 t0_orig 键 /
+        cypher 无 orig 条件）"""
+        store = MagicMock()
+        store.query_cypher.return_value = [
+            _row("ep2", "Melanie asked about the quarterly budget yesterday."),
+        ]
+        router = _make_router(
+            store, [_seed("ep1", "What did Melanie say?", score=0.9)]
+        )
+        out = router.retrieve("What did Melanie say?", level=RetrievalLevel.FUSION)
+        exp = [r for r in out if r.get("level") == "entity_expansion"]
+        assert len(exp) == 1
+        assert exp[0]["node_id"] == "ep2"
+        assert exp[0]["_source"] == "entity_expansion"
+        cypher, params = store.query_cypher.call_args[0]
+        assert "e.content CONTAINS $t0_orig" in cypher
+        assert "e.content CONTAINS $t0_lower" in cypher
+        assert params["t0_orig"] == "Melanie"
+        assert params["t0_lower"] == "melanie"
+        assert params["limit"] == 10
 
     def test_disabled_zero_regression(self):
         """enabled=false → 不查 GraphLite、无 entity_expansion 节点，种子原样返回；
