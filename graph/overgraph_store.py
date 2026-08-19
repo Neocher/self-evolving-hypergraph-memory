@@ -950,6 +950,38 @@ class OverGraphStore:
         except Exception:
             return []
 
+    def create_schema_node(self, schema: dict) -> str:
+        """INSERT Schema 节点（:Conceptual 标签，阶段4-1 模式蒸馏产物）。
+
+        pattern_keywords list → 空格连接串（CONTAINS 友好）；source_ids JSON 串。
+        """
+        sid = str(schema.get("id", str(uuid.uuid4())))
+        props = dict(schema)
+        props["id"] = sid
+        props["pattern_keywords"] = " ".join(schema.get("pattern_keywords") or [])
+        self._locked_upsert_node("Conceptual", sid, props)
+        return sid
+
+    def query_schema_nodes(self, terms: list[str], limit: int = 5) -> list[dict]:
+        """按术语 OR CONTAINS 检索 Schema 节点（pattern_keywords/schema_name）。"""
+        terms = [str(t) for t in (terms or []) if t]
+        if not terms:
+            return []
+        try:
+            conditions = " OR ".join(
+                f"(s.pattern_keywords CONTAINS $t{i} OR s.schema_name CONTAINS $t{i})"
+                for i in range(len(terms))
+            )
+            params = {f"t{i}": t for i, t in enumerate(terms)}
+            result = self._locked_execute_gql(
+                f"MATCH (s:Conceptual) WHERE {conditions} "
+                f"RETURN s ORDER BY s.support DESC LIMIT {int(limit)}",
+                params,
+            )
+            return [self._flatten_row(r, "s") for r in (result or {}).get("rows", [])]
+        except Exception:
+            return []
+
     def get_hyperedges_by_node(self, node_id: str) -> list[dict]:
         try:
             result = self._locked_execute_gql(
@@ -1357,12 +1389,16 @@ class OverGraphStore:
         label_filter: list[str] | None = None,
         scope_start_node_id: int | None = None,
         scope_max_depth: int | None = None,
+        scope_direction: str | None = None,
+        scope_at_epoch: int | None = None,
     ) -> list[tuple[str, float]]:
         """OverGraph HNSW dense 检索 → [(ep_id, cosine_score)]。
 
         R1 定标：score 为 cosine s∈[-1,1]（无 L2 可用）——由调用方（adapter）按
         D5 映射 d=1/s-1。scope 强化（D9）Phase 1 透传：scope_start_node_id 需
-        引擎内部 ID(int)，经 get_node_internal_id 转换。
+        引擎内部 ID(int)，经 get_node_internal_id 转换。阶段3（v6.0.0 图作用域
+        检索）补 scope_direction/scope_at_epoch 透传（D7/D8/D9；direction 语义
+        见 vector_search_scoped PoC 定标注释）。
         """
         labels = list(label_filter) if label_filter else [LABEL_EPISODE]
         kwargs: dict = {}
@@ -1372,12 +1408,68 @@ class OverGraphStore:
         if scope_start_node_id is not None:
             kwargs["scope_start_node_id"] = int(scope_start_node_id)
             kwargs["scope_max_depth"] = int(scope_max_depth or 1)
+            if scope_direction is not None:
+                kwargs["scope_direction"] = scope_direction
+            if scope_at_epoch is not None:
+                kwargs["scope_at_epoch"] = int(scope_at_epoch)
         with self._session_lock:
             assert self._db is not None
             hits = self._db.vector_search(
                 "dense", int(k),
                 dense_query=_as_float32(query_vec),
                 label_filter={"labels": labels},
+                **kwargs,
+            )
+            if not hits:
+                return []
+            views = self._db.get_nodes([int(h.node_id) for h in hits])
+        keys = {int(v.id): str(v.key) for v in views if v is not None}
+        return [(keys.get(int(h.node_id), str(h.node_id)), float(h.score))
+                for h in hits]
+
+    # ─── 图作用域检索（阶段3 D5-D10）──────────────────────
+
+    def vector_search_scoped(
+        self,
+        seed_episode_id: str,
+        k: int,
+        query_vec,
+        max_depth: int = 2,
+        at_ts: float | None = None,
+    ) -> list[tuple[str, float]]:
+        """以种子 Episode 为作用域起点的 HNSW 检索 → [(ep_id, cosine_score)]。
+
+        【R1 PoC 定标（2026-08-19, overgraph 0.17.0）】——scope 语义实证：
+        - direction 每跳独立：outgoing=沿离开节点的边，incoming=沿进入节点的边，
+          both=每跳可入可出（非法值引擎抛 ValueError）。
+        - HYPEREDGE_MEMBER 为 hyperedge→episode 单向边：co-member（ep2 经共享
+          超边 h：ep1←h 入跳 + h→ep2 出跳）**必须 scope_direction="both"**，
+          "outgoing" 恒不命中（D7 实证成立）→ 本方法硬编码 both。
+        - scope_max_depth 计跳数：depth=1(both) 仅直达邻居，depth=2 才含
+          共享超边 co-member（实测 ep2 在 depth=2 命中、depth=1 不命中）。
+        - scope_at_epoch=int(at_ts*1000)（D8/D9：SHM 秒 → 引擎毫秒）接受且无
+          副作用（SHM 边无时序）→ 仅作时间锚透传，created_at<=at_ts 节点过滤
+          由上层负责，不替代。
+        - 降级安全：种子不存在 → 返回 []（不抛）；孤立种子 → 仅自身。
+        """
+        iid = self.get_node_internal_id(str(seed_episode_id))
+        if iid is None:
+            return []
+        kwargs: dict = {}
+        ef_search = getattr(self.config, "ef_search", None)
+        if ef_search is not None:
+            kwargs["ef_search"] = int(ef_search)
+        if at_ts is not None:
+            kwargs["scope_at_epoch"] = int(float(at_ts) * 1000)
+        with self._session_lock:
+            assert self._db is not None
+            hits = self._db.vector_search(
+                "dense", int(k),
+                dense_query=_as_float32(query_vec),
+                label_filter={"labels": [LABEL_EPISODE]},
+                scope_start_node_id=iid,
+                scope_max_depth=int(max_depth),
+                scope_direction="both",
                 **kwargs,
             )
             if not hits:

@@ -60,6 +60,10 @@ faiss:
   nprobe: 3                      # 搜索时探测的聚类数（降低=更快）
 
 retrieval:
+  # 阶段4-3 跨语言实体扩召回：本期仅接口占位（data/entity_aliases.json 已建，
+  # 不接线、0 生产代码）。根本问题 = embedding 语种不匹配，非实体映射；待
+  # scope_retrieve 落地 + 真实跨语种生产数据后再实现完整映射。此段为占位声明，
+  # 不参与配置装载（未知 section 被 _build_settings 忽略）。
   top_k_l1: 5                    # L1 FAISS 检索 top-K (直接查 EpisodeNode)
   top_k_vector: 20               # L2 向量检索 top-K
   top_k_keyword: 20              # L3 关键词检索 top-K
@@ -90,6 +94,11 @@ retrieval:
     max_results: 10              # 每实体最大召回数
     max_entities: 3              # 每查询最多提取实体数
     time_filter: true            # 时间锚上界过滤（created_at <= session 时间锚）
+  scope_recall:                  # v6.0.0 阶段3 图作用域召回（仅 overgraph 后端生效；graphlite hasattr no-op）
+    enabled: true                # 开关
+    boost: 0.9                   # 扩展分 = max(种子分) × boost（仅低于最高种子）
+    max_depth: 2                 # 作用域遍历跳数（D7 PoC：共享超边 co-member 需入+出 2 跳）
+    max_results: 10              # 每查询最多追加的图作用域结果数（硬上限）
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
   rerank_enabled: true           # bge-reranker 重排开关（默认开，仅 FUSION 生效）
   rerank_input_k: 40             # 送入 reranker 的头部候选数（尾部保持原序 append）

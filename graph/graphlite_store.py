@@ -1206,6 +1206,42 @@ class GraphLiteStore:
         self._locked_execute(f"INSERT (v:VisualNode {{id: {id_lit}, {vals}}})")
         return vid
 
+    def create_schema_node(self, schema: dict) -> str:
+        """INSERT Schema 节点（:Conceptual 标签，阶段4-1 模式蒸馏产物）。
+
+        pattern_keywords 为 list → 存空格连接串（CONTAINS 友好）；source_ids 为
+        JSON 串。幂等：同 id 重复 INSERT 覆盖（GraphLite INSERT 语义）。
+        """
+        sid = str(schema.get("id", str(uuid.uuid4())))
+        props = dict(schema)
+        props["id"] = sid
+        props["pattern_keywords"] = " ".join(schema.get("pattern_keywords") or [])
+        vals = _dict_to_gql_values(props, skip_keys={"id"})
+        self._locked_execute(
+            f"INSERT (s:Conceptual {{id: {_gql_value(sid)}, {vals}}})"
+        )
+        return sid
+
+    def query_schema_nodes(self, terms: list[str], limit: int = 5) -> list[dict]:
+        """按术语 OR CONTAINS 检索 Schema 节点（pattern_keywords/schema_name）。"""
+        terms = [str(t) for t in (terms or []) if t]
+        if not terms:
+            return []
+        try:
+            conditions = " OR ".join(
+                f"(s.pattern_keywords CONTAINS {_gql_value(t)} "
+                f"OR s.schema_name CONTAINS {_gql_value(t)})"
+                for t in terms
+            )
+            gql = (
+                f"MATCH (s:Conceptual) WHERE {conditions} "
+                f"RETURN s ORDER BY s.support DESC LIMIT {int(limit)}"
+            )
+            result = self._locked_query(gql)
+            return [self._flatten_row(r, "s") for r in result.rows]
+        except Exception:
+            return []
+
     def get_visual_node(self, visual_id: str) -> Optional[dict]:
         """MATCH VisualNode by id（参照 get_episode）。"""
         gql = f"MATCH (v:VisualNode {{id: {_gql_value(str(visual_id))}}}) RETURN v"

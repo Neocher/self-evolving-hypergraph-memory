@@ -179,6 +179,26 @@ class EntityExpansionConfig:
 
 
 @dataclass
+class ScopeRecallConfig:
+    """图作用域召回配置（阶段3 D5-D10；仅 overgraph 后端生效，graphlite hasattr no-op）"""
+    enabled: bool = True        # 开关：关闭时行为 = 现状（bit 级一致）
+    boost: float = 0.9          # 扩展分 = max(种子分) × boost（仅低于最高种子）
+    max_depth: int = 2          # 作用域遍历跳数（D7 PoC：共享超边 co-member 需 2 跳）
+    max_results: int = 10       # 每查询最多追加的图作用域结果数（硬上限）
+
+    def __post_init__(self) -> None:
+        # 镜像 EntityExpansionConfig 校验：boost>=1 让扩展分反超最高种子（违反
+        # 「仅低于最高种子」契约）、max_depth<1 空转、max_results<1 静默空返回——
+        # 配置期 fail-fast 拒绝非法值。
+        if not 0.0 <= self.boost < 1.0:
+            raise ValueError(f"ScopeRecallConfig.boost={self.boost} 必须 ∈ [0, 1)")
+        if self.max_depth < 1:
+            raise ValueError(f"ScopeRecallConfig.max_depth={self.max_depth} 必须 >= 1")
+        if self.max_results < 1:
+            raise ValueError(f"ScopeRecallConfig.max_results={self.max_results} 必须 >= 1")
+
+
+@dataclass
 class RetrievalConfig:
     top_k_l1: int = 5              # L1 FAISS 检索 top-K
     top_k_vector: int = 20         # L2 向量检索 top-K
@@ -193,6 +213,7 @@ class RetrievalConfig:
     visual_recall: VisualRecallConfig = field(default_factory=VisualRecallConfig)
     mesa: MesaConfig = field(default_factory=MesaConfig)
     entity_expansion: EntityExpansionConfig = field(default_factory=EntityExpansionConfig)
+    scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
     rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
     rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）

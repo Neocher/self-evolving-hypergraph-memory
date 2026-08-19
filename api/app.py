@@ -166,6 +166,7 @@ def _build_router_config(rcfg):
     from retrieval.query_router import QueryRouterConfig as QRCfg
     mesa = getattr(rcfg, "mesa", None)
     entity_expansion = getattr(rcfg, "entity_expansion", None)
+    scope_recall = getattr(rcfg, "scope_recall", None)
     kwargs = dict(
         tau_weight=rcfg.tau_weight,
         vector_weight=rcfg.vector_weight,
@@ -187,6 +188,9 @@ def _build_router_config(rcfg):
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）
     if entity_expansion is not None:
         kwargs["entity_expansion"] = entity_expansion
+    # 【阶段3】scope_recall 嵌套配置透传（同上：缺省不传，默认 factory 生效）
+    if scope_recall is not None:
+        kwargs["scope_recall"] = scope_recall
     return QRCfg(**kwargs)
 
 

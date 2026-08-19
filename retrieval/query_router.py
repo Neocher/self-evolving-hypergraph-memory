@@ -34,7 +34,8 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from core.user_profile import profile_hit, profile_values
-from config.settings import EntityExpansionConfig, get_settings
+from config.settings import EntityExpansionConfig, ScopeRecallConfig, get_settings
+from core.schema_distiller import extract_terms
 from graph.graphlite_store import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
 from retrieval.vector_store import FaissStore
@@ -78,6 +79,9 @@ _PROPERTY_BOOST = 0.6
 _PROPERTY_MAX_RESULTS = 5
 # 【P3c 跨消息多跳增强】实体扩召回通道常量（append max 锚 × boost 0.9，仅低于最高种子）
 _ENTITY_EXPANSION_MAX_APPEND = 20  # 总 append 硬上限（实体 top-3 × 每实体 max-10 的钳制）
+# 【阶段4-1 Schema 蒸馏】Schema 节点召回通道常量（append 相对尾分缩放，严格低于种子）
+_SCHEMA_BOOST = 0.5
+_SCHEMA_MAX_RESULTS = 3
 # 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
 _RERANK_PREWARM_TIMEOUT = 60.0
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
@@ -244,6 +248,8 @@ class QueryRouterConfig:
     # 预留 1.5s LLM + 融合检索，失败静默降级单路
     # 实体扩召回配置（P3c v5.53.0 跨消息多跳增强，默认开；关闭/异常静默回落现状）
     entity_expansion: EntityExpansionConfig = field(default_factory=EntityExpansionConfig)
+    # 图作用域召回配置（阶段3 v6.0.0；仅 overgraph 后端生效，graphlite hasattr 假 no-op）
+    scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -1423,6 +1429,14 @@ class QueryRouter:
             # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
             # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
             results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
+            # 【阶段3 图作用域检索】补充非替代：种子 EpisodeNode → 邻域向量检索
+            # append（仅 overgraph 后端；EpisodeNode 带 archived 字段，
+            # _filter_archived 正常过滤；score = max(种子分) × boost(0.9) 仅低于
+            # 最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
+            results = self._scope_retrieve(results, query, query_embedding, now_ts=session_ts)
+            # 【阶段4-1 Schema 模式蒸馏】补充非替代：Schema 节点（:Conceptual 标签）
+            # 命中 → append 聚合线索上下文（尾分缩放；无 archived 字段恒保留）
+            results = self._schema_recall(results, raw_query or query)
             if not include_archived:
                 results = self._filter_archived(results)
             sorted_results = self._deduplicate_and_sort(results)
@@ -2842,6 +2856,189 @@ class QueryRouter:
         except Exception:
             logger.debug(
                 "Entity expansion degraded, returning original results", exc_info=True
+            )
+            return results
+
+    def _scope_retrieve(
+        self,
+        results: list[dict],
+        query: str,
+        query_embedding: Optional[np.ndarray],
+        now_ts: Optional[float] = None,
+    ) -> list[dict]:
+        """【阶段3 图作用域检索】补充非替代：种子 EpisodeNode 邻域向量检索 append。
+
+         链路（对齐 _entity_expansion 的 try/except + append + max 锚 × boost）：
+          1. 仅 overgraph 后端：hasattr(store, "vector_search_scoped") 守卫
+             （graphlite 后端假 no-op）
+          2. 种子 = 首个 get_node_internal_id 成功的检索结果（跳过
+             community/mesa/visual/property/entity_expansion 合成节点——其
+             node_id 非真实 EpisodeNode elementKey）
+          3. vector_search_scoped(seed, k=max_results, query_vec=query_embedding,
+             max_depth=cfg.max_depth, at_ts=now_ts) → [(ep_id, score)]（引擎内
+             direction 硬编码 both + depth 两跳，共享超边 co-member 可达，D7）
+          4. get_episodes_batch 富化（content/archived/fact_track/tau 一次取回，
+             免 N+1 回查）；扩展分 = max(种子分) × boost(0.9)（仅低于最高种子）
+             append {node_id, content, score, level="scope", _source="scope"}
+          5. 硬上限 cfg.max_results；无种子/无向量/异常 → 静默返回原 results
+             （主检索零回归，永不抛异常）
+
+        【D8】scope_at_epoch=int(at_ts×1000) 仅时间锚透传（SHM 边无时序）；
+        已归档候选经 _finish _filter_archived 正常过滤（EpisodeNode 带 archived）。
+        """
+        try:
+            scfg = getattr(getattr(self, "config", None), "scope_recall", None)
+            if scfg is None or not getattr(scfg, "enabled", True) or not results:
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "vector_search_scoped"):
+                return results
+            if query_embedding is None:
+                return results
+            skip_levels = {
+                "community", "mesa", "visual", "property", "entity_expansion",
+                "scope", "property_temporal",
+            }
+            seed_id: Optional[str] = None
+            for r in results:
+                nid = r.get("node_id", "")
+                if not nid or r.get("level") in skip_levels:
+                    continue
+                if store.get_node_internal_id(str(nid)) is not None:
+                    seed_id = str(nid)
+                    break
+            if seed_id is None:
+                return results
+            max_seed_score = max(
+                (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
+                default=0.0,
+            )
+            if max_seed_score <= 0.0:
+                return results
+            boost = float(getattr(scfg, "boost", 0.9))
+            max_depth = int(getattr(scfg, "max_depth", 2))
+            max_results = int(getattr(scfg, "max_results", 10))
+            if max_results <= 0:
+                return results
+            hits = store.vector_search_scoped(
+                seed_id,
+                k=max_results,
+                query_vec=query_embedding,
+                max_depth=max_depth,
+                at_ts=now_ts,
+            )
+            if not isinstance(hits, (list, tuple)) or not hits:
+                return results
+            hit_ids = [h[0] for h in hits if h and h[0]]
+            if not hit_ids:
+                return results
+            episodes = store.get_episodes_batch(list(dict.fromkeys(hit_ids)))
+            by_id = {
+                str(ep.get("id", "")): ep
+                for ep in episodes if isinstance(ep, dict) and ep.get("id")
+            }
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for ep_id, hit_score in hits:
+                if not ep_id or ep_id in existing_ids:
+                    continue
+                ep = by_id.get(str(ep_id))
+                if ep is None:
+                    continue
+                content = ep.get("content", "") or ""
+                if not content:
+                    continue
+                score = round(max_seed_score * boost, 6)
+                if score <= 0.0:
+                    continue
+                extra.append({
+                    "node_id": str(ep_id),
+                    "content": content,
+                    "score": score,
+                    "tau_value": _safe_float_tau(ep.get("tau_initial", 0.0)),
+                    "fact_track": ep.get("fact_track", "active") or "active",
+                    "archived": ep.get("archived"),
+                    "level": "scope",
+                    "_source": "scope",
+                    "_scope_sim": round(float(hit_score), 4),
+                })
+            if extra:
+                extra = extra[:max_results]
+                logger.info(
+                    "Scope recall appended",
+                    seed=seed_id[:12], candidates=len(extra), boost=boost,
+                    max_depth=max_depth,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Scope recall degraded, returning original results", exc_info=True
+            )
+            return results
+
+    def _schema_recall(self, results: list[dict], query: str) -> list[dict]:
+        """【阶段4-1 Schema 模式蒸馏】补充非替代：查询术语 → Schema 节点 append。
+
+        链路（对齐 MESA 合成节点通道的补充非替代语义）：
+          1. 查询术语 = extract_terms(query)（拉丁词 + CJK 双字 gram）
+          2. store.query_schema_nodes(terms)（两后端均有；缺失 → hasattr 守卫 no-op）
+          3. 扩展分 = min(种子分) × _SCHEMA_BOOST(0.5)（相对尾分缩放，严格低于种子）
+             append {node_id=schema_id 可回溯, content=description, level="schema",
+             _source="schema"}
+          4. 硬上限 _SCHEMA_MAX_RESULTS；无种子分/无 Schema/异常 → 静默返回原
+             results（主检索零回归，永不抛异常）
+        """
+        try:
+            if not results:
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "query_schema_nodes"):
+                return results
+            terms = [t for t in extract_terms(query) if t]
+            if not terms:
+                return results
+            min_seed_score = min(
+                (float(r.get("score") or 0.0) for r in results if r.get("score")),
+                default=0.0,
+            )
+            if min_seed_score <= 0.0:
+                return results
+            nodes = store.query_schema_nodes(terms, limit=_SCHEMA_MAX_RESULTS * 2)
+            if not isinstance(nodes, (list, tuple)) or not nodes:
+                return results
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for node in nodes:
+                nid = node.get("id", "")
+                if not nid or nid in existing_ids:
+                    continue
+                content = node.get("summary", "") or ""
+                if not content:
+                    continue
+                score = round(min_seed_score * _SCHEMA_BOOST, 6)
+                if score <= 0.0:
+                    continue
+                extra.append({
+                    "node_id": str(nid),
+                    "content": content,
+                    "score": score,
+                    "level": "schema",
+                    "_source": "schema",
+                    "schema_name": node.get("schema_name", ""),
+                    "schema_support": node.get("support", 0),
+                })
+            if extra:
+                extra = extra[:_SCHEMA_MAX_RESULTS]
+                logger.info(
+                    "Schema recall appended",
+                    schemas=len(extra), boost=_SCHEMA_BOOST,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Schema recall degraded, returning original results", exc_info=True
             )
             return results
 
