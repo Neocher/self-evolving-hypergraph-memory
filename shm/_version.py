@@ -1,9 +1,9 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.0.0"
-__version_info__ = (6, 0, 0)
-__version_name__ = "OverGraph-Engine"
-__release_date__ = "2026-08-19"
+__version__ = "6.1.0"
+__version_info__ = (6, 1, 0)
+__version_name__ = "BGE-M3-Embedding"
+__release_date__ = "2026-08-23"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -235,7 +235,7 @@ class RetrievalConfig:
 
 @dataclass
 class EmbeddingConfig:
-    model_name: str = "BAAI/bge-small-zh-v1.5"
+    model_name: str = "BAAI/bge-m3"
     device: str = "auto"
 
 

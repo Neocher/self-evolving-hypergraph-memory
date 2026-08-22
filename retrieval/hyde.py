@@ -43,9 +43,9 @@ _PROMPT_TEMPLATE = (
     "Based on the question below, write a short factual paragraph "
     "(3-5 sentences) that would contain the answer. "
     "Make it concrete and specific. "
-    # 【P3b R1 P2】语言一致性约束：中文查询生成中文假设段落（bge-small-zh 对英文
-    # 失效，语种不匹配 → 向量相似度噪声）；追加在指令段末尾，Question:/Hypothetical
-    # passage: 结构不变（评测脚本子串断言与等效性不变）。
+    # 【P3b R1 P2】语言一致性约束：中文查询生成中文假设段落（语种匹配提升向量相似度；
+    # v6.1 bge-m3 多语言可跨语种，但同语言假设仍是最佳实践）；追加在指令段末尾，
+    # Question:/Hypothetical passage: 结构不变（评测脚本子串断言与等效性不变）。
     "Write in the same language as the question.\n\n"
     "Question: {query}\n\n"
     "Hypothetical passage:"

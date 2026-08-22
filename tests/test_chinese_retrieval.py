@@ -1,6 +1,6 @@
-"""中文 embedding 检索集成测试 — 真实 bge 模型 + 隔离 GraphLite + 生产 QueryRouter
+"""中文 embedding 检索集成测试 — 真实 bge-m3 模型 + 隔离 OverGraph + 生产 QueryRouter
 
-验证: bge-small-zh-v1.5 切换后, 中文语义检索真实可用 (同类命中 > 异类)。
+验证: bge-m3（多语言，MRL 截断 512）切换后, 中文语义检索真实可用 (同类命中 > 异类)。
 """
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")

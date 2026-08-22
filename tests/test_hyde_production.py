@@ -341,7 +341,7 @@ class TestHydeGenerateFailureDegradation:
         assert body["model"] == "deepseek-chat-v3"
 
     def test_chinese_query_prompt_has_language_constraint(self, monkeypatch):
-        """【P3b R1 P2】中文查询 → prompt 含语言一致性约束（bge-small-zh 语种匹配）。"""
+        """【P3b R1 P2】中文查询 → prompt 含语言一致性约束（语种匹配提升检索）。"""
         from retrieval import hyde
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         opener = _make_ok_opener()

@@ -50,11 +50,11 @@ graphlite:
 
 overgraph:
   database_path: "./data/shm_overgraph_db"  # OverGraph 数据库路径（backend=overgraph 时使用）
-  dense_vector_dimension: 512     # dense 向量维度（bge-small-zh-v1.5 512d；HNSW 建索引用）
+  dense_vector_dimension: 512     # dense 向量维度（bge-m3 MRL 截断 512；HNSW 建索引用）
   dense_vector_metric: "cosine"   # R1 P2#9 实证: score 恒为 cosine（l2/cosine 双开库对拍逐位一致，引擎忽略选项）
 
 faiss:
-  dimension: 512                 # 向量维度（bge-small-zh-v1.5, 512维中文专用, CPU 快 28 倍）
+  dimension: 512                 # 向量维度（bge-m3 MRL 截断 512 匹配 HNSW 契约）
   index_type: "FlatL2"           # FAISS 索引类型（<10K向量用FlatL2最快）
   nlist: 100                     # IVF 聚类中心数（IVFFlat 专用）
   nprobe: 3                      # 搜索时探测的聚类数（降低=更快）
@@ -107,7 +107,7 @@ retrieval:
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
 
 embedding:
-  model_name: "BAAI/bge-small-zh-v1.5"  # 中文 embedding 模型（512维，中文专用，CPU 0.05s/条）
+  model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）
   device: "auto"                # 推理设备: auto=自动检测(CUDA可用且显存充足→cuda,否则cpu) / cpu / cuda 强制
 
 api:

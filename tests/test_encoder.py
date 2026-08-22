@@ -1,18 +1,18 @@
 """
-TextEncoder bge 加载路径测试（全部 mock，不实际加载模型）。
+TextEncoder 加载路径测试（全部 mock，不实际加载模型）。
 =========================================================
-覆盖 Codex 审核必改 2:
-- _find_bge_snapshot: HF 缓存目录缺失返回 None，按 mtime 取最新
-- load() 优先加载 bge-small-zh-v1.5 (snapshot)
-- 完整 fallback 链: bge 失败 → ONNX 失败 → model_name
-- dimension: bge 加载后返回 512
+覆盖:
+- load() 默认加载 bge-m3（多语言，MRL 截断 512）
+- bge-m3 链路: ONNX（EmbeddedLLM O2）→ ST snapshot → model_name 通用
+- 非 bge-m3 模型名走通用 sentence-transformers 加载
+- dimension: bge-m3 截断后返回 512
 """
 from __future__ import annotations
 
 import sys
 from unittest import mock
 
-from embedding.encoder import TextEncoder, _find_bge_snapshot, _resolve_device
+from embedding.encoder import TextEncoder, _resolve_device
 
 
 def _fake_st_module(side_effect):
@@ -33,80 +33,73 @@ def _fake_onnx_modules(onnx_side_effect):
     return {"optimum.onnxruntime": opt, "transformers": tf}
 
 
-class TestFindBgeSnapshot:
-    def test_missing_cache_dir_returns_none(self):
-        with mock.patch("glob.glob", return_value=[]):
-            assert _find_bge_snapshot() is None
-
-    def test_returns_most_recent_by_mtime(self):
-        # 字典序与 mtime 序相反，验证按 mtime 取最新
-        snaps = ["/snap/b", "/snap/a"]
-        mtimes = {"/snap/b": 100, "/snap/a": 200}
-        with mock.patch("glob.glob", return_value=snaps), mock.patch(
-            "os.path.getmtime", side_effect=lambda p: mtimes[p]
-        ):
-            assert _find_bge_snapshot() == "/snap/a"
-
-
 class TestLoadPriority:
-    def test_load_prefers_bge_snapshot(self):
-        """【v5.42】ONNX 目录缺失时，load() 优先加载 bge snapshot。
-
-        必须把 _ONNX_DIR 指向缺失目录跳过 ONNX 分支：真实 embedding/onnx/
-        存在会触发 import 真实 optimum.onnxruntime，同进程后续 TestDeviceResolution
-        import torch → segfault（exit 139，Codex 终审定位）。
-        """
-        fake_model = mock.MagicMock()
-        fake_model.get_sentence_embedding_dimension.return_value = 512
-        st = _fake_st_module([fake_model])
+    def test_load_prefers_bge_m3_onnx(self):
+        """【v6.1】bge-m3 ONNX 快照存在 → ONNX 路径，MRL 截断 512。"""
+        fake_onnx = mock.MagicMock()
+        onnx_mods = _fake_onnx_modules(lambda *a, **k: fake_onnx)
 
         encoder = TextEncoder()
-        with mock.patch.object(
-            TextEncoder, "_ONNX_DIR", "onnx_missing_dir_xyz"
-        ), mock.patch(
-            "embedding.encoder._find_bge_snapshot", return_value="/fake/snapshot"
-        ), mock.patch.dict(sys.modules, {"sentence_transformers": st}):
-            encoder.load()
-
-        assert encoder._model is fake_model
-        assert encoder.model_name == "BAAI/bge-small-zh-v1.5"
-        assert encoder.dimension == 512
-
-    def test_fallback_chain_onnx_bge_model_name(self):
-        """【v5.42】完整 fallback 链（ONNX 优先）：ONNX 失败 → bge 失败 → model_name。"""
-        fake_model = mock.MagicMock()
-        fake_model.get_sentence_embedding_dimension.return_value = 384
-        # ONNX 分支（isdir=True 强制进入）抛异常 → 回退 bge：
-        # 第一次 (cuda) 抛异常 → CPU 重试也抛异常 → 落到 model_name 分支
-        st = _fake_st_module([RuntimeError("bge cuda fail"), RuntimeError("bge cpu fail"), fake_model])
-        onnx_mods = _fake_onnx_modules(RuntimeError("onnx fail"))
-
-        encoder = TextEncoder(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-        )
         with mock.patch(
-            "embedding.encoder._find_bge_snapshot", return_value="/fake/snapshot"
-        ), mock.patch("os.path.isdir", return_value=True), mock.patch(
-            "os.path.exists", return_value=True
+            "embedding.encoder._find_model_snapshot", return_value="/fake/onnx_snap"
+        ), mock.patch("os.path.exists", return_value=True), mock.patch.object(
+            TextEncoder, "_infer_onnx_dimension", return_value=1024
         ), mock.patch.dict(
             sys.modules,
             {
-                "sentence_transformers": st,
                 "optimum.onnxruntime": onnx_mods["optimum.onnxruntime"],
                 "transformers": onnx_mods["transformers"],
             },
         ):
             encoder.load()
 
+        assert encoder._onnx_model is fake_onnx
+        assert encoder.model_name == "BAAI/bge-m3"
+        assert encoder._truncate_dim == 512
+        assert encoder.dimension == 512  # MRL 截断
+
+    def test_load_prefers_bge_m3_st(self):
+        """【v6.1】ONNX 快照缺失时走 ST snapshot，MRL 截断 512。"""
+        fake_model = mock.MagicMock()
+        fake_model.get_sentence_embedding_dimension.return_value = 1024
+        st = _fake_st_module([fake_model])
+
+        def fake_snapshot(repo):
+            return None if "onnx" in repo else "/fake/snapshot"
+
+        encoder = TextEncoder()
+        with mock.patch(
+            "embedding.encoder._find_model_snapshot", side_effect=fake_snapshot
+        ), mock.patch.dict(sys.modules, {"sentence_transformers": st}):
+            encoder.load()
+
+        assert encoder._model is fake_model
+        assert encoder.model_name == "BAAI/bge-m3"
+        assert encoder._truncate_dim == 512
+        assert encoder.dimension == 512  # MRL 截断
+
+    def test_fallback_chain_generic_model(self):
+        """【v6.1】非 bge-m3 模型名 → 通用 sentence-transformers 加载。"""
+        fake_model = mock.MagicMock()
+        fake_model.get_sentence_embedding_dimension.return_value = 384
+        st = _fake_st_module([fake_model])
+
+        encoder = TextEncoder(
+            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
+        with mock.patch.dict(sys.modules, {"sentence_transformers": st}):
+            encoder.load()
+
         assert encoder._model is fake_model
         assert encoder.model_name == "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        assert encoder._truncate_dim is None
         assert encoder.dimension == 384
 
 
 class TestDeviceResolution:
     """embedding/encoder._resolve_device 五分支测试（全 mock torch，不加载真实模型）。"""
 
-    def _resolve(self, requested, model_name="BAAI/bge-small-zh-v1.5",
+    def _resolve(self, requested, model_name="BAAI/bge-m3",
                  cuda_ok=True, free_gb=16.0):
         with mock.patch("torch.cuda.is_available", return_value=cuda_ok), \
                 mock.patch("torch.cuda.mem_get_info",
@@ -120,7 +113,7 @@ class TestDeviceResolution:
         assert self._resolve("auto", cuda_ok=False) == "cpu"
 
     def test_auto_insufficient_memory_uses_cpu(self):
-        # bge-small 估算 0.6GB + 0.5GB 上下文 = 1.1GB，空闲 1.0GB → cpu（防 OOM）
+        # bge-m3 估算 2.6GB + 0.5GB 上下文 = 3.1GB，空闲 1.0GB → cpu（防 OOM）
         assert self._resolve("auto", free_gb=1.0) == "cpu"
 
     def test_forced_cuda_unavailable_uses_cpu(self):
@@ -135,21 +128,22 @@ class TestDeviceResolution:
             assert _resolve_device("cuda", "BAAI/bge-m3") == "cpu"
 
     def test_load_uses_resolved_device(self):
-        """load() 解析一次后，SentenceTransformer 收到解析后的 device。"""
+        """load() 解析一次后，SentenceTransformer 收到解析后的 device（bge-m3 默认路径）。"""
         fake_model = mock.MagicMock()
-        fake_model.get_sentence_embedding_dimension.return_value = 512
+        fake_model.get_sentence_embedding_dimension.return_value = 1024
         st = _fake_st_module([fake_model])
 
+        def fake_snapshot(repo):
+            return None if "onnx" in repo else "/fake/snapshot"
+
         encoder = TextEncoder(device="auto")
-        with mock.patch.object(
-            TextEncoder, "_ONNX_DIR", "onnx_missing_dir_xyz"
-        ), mock.patch(
-            "embedding.encoder._find_model_snapshot", return_value="/fake/snapshot"
+        with mock.patch(
+            "embedding.encoder._find_model_snapshot", side_effect=fake_snapshot
         ), mock.patch("embedding.encoder._resolve_device", return_value="cuda"), \
                 mock.patch.dict(sys.modules, {"sentence_transformers": st}):
             encoder.load()
 
         assert encoder._model is fake_model
         assert encoder.device == "cuda"
-        # 三处构造均以解析后的 device 调用
+        # ST 路径以解析后的 device 调用
         st.SentenceTransformer.assert_called_with("/fake/snapshot", device="cuda")

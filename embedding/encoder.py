@@ -6,8 +6,8 @@
   Tier 2 — Local sentence-transformers（CPU，本地缓存模型）
   Tier 3 — TF-IDF 本地编码器（零依赖，最后兜底）
 
-默认使用 Tier 2（本地 BAAI/bge-small-zh-v1.5，512维，中文专用，CPU 0.05s/条）。
-配置 DEEPSEEK_API_KEY + DEEPSEEK_EMBED_MODEL 可启用 Tier 1。
+默认使用 Tier 2（本地 BAAI/bge-m3，1024d 多语言，MRL 截断 512 匹配 HNSW 契约；
+ONNX O2 CPU 优化版约数十 ms/条）。配置 DEEPSEEK_API_KEY + DEEPSEEK_EMBED_MODEL 可启用 Tier 1。
 
 FAISS 索引过期策略：
 - 跟踪索引中的节点 ID 集合
@@ -25,6 +25,11 @@ from typing import Any, List, Optional, Set
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# ─── bge-m3 常量（v6.1 embedding 升级）────────────────────
+_BGE_M3_MODEL = "BAAI/bge-m3"
+_BGE_M3_ONNX_REPO = "EmbeddedLLM/bge-m3-onnx-o2-cpu"  # ORT O2 CPU 优化 ONNX（HF 缓存加载，不进 git）
+_TRUNCATE_DIM = 512  # bge-m3 MRL 截断目标维度：匹配 overgraph.dense_vector_dimension=512（HNSW 契约）
 
 # ─── Tier 1: Cloud Embedding API ──────────────────────────
 
@@ -116,17 +121,11 @@ def _find_model_snapshot(model_name: str) -> Optional[str]:
     return snapshots[-1] if snapshots else None
 
 
-def _find_bge_snapshot() -> Optional[str]:
-    """兼容旧接口：定位 bge-small-zh-v1.5 的 HF 缓存 snapshot 路径（离线，不访问网络）。"""
-    return _find_model_snapshot("BAAI/bge-small-zh-v1.5")
-
-
 # ─── 推理设备解析（auto/cpu/cuda 自适应）────────────────────
 
 # 模型名子串 → 估算显存占用 (GB)；不含 PyTorch 运行时上下文 (~0.5GB)
 _ESTIMATED_MEMORY_GB = {
     "bge-m3": 2.6,
-    "bge-small": 0.6,
 }
 _DEFAULT_ESTIMATED_MEMORY_GB = 1.5
 _CUDA_CONTEXT_OVERHEAD_GB = 0.5
@@ -177,29 +176,21 @@ def _resolve_device(requested: str, model_name: str) -> str:
 
 
 class TextEncoder:
-    """
-    文本嵌入编码器（Tier 2）。
+    """文本嵌入编码器（Tier 2）。
 
-    封装 sentence-transformers，提供文本到向量的转换，
+    封装 sentence-transformers/ORT，提供文本到向量的转换，
     集成 FAISS 索引过期管理。
-    支持 CPU (device='cpu') 和 GPU (device='cuda')。
-    加载优先级: bge-small-zh-v1.5（中文，512维，HF缓存snapshot）→
-    ONNX INT8（./data/all-MiniLM-L6-v2-int8，384维）→ model_name 通用模型。
-
-    【安全】API keys 在初始化时从环境变量读取一次并存储在私有实例变量中，
-    不依赖 os.environ 运行时读取，防止子进程继承。
     """
-
-    _ONNX_DIR = "onnx"  # 【v5.42】ONNX 产物目录（bge-small-zh-v1.5 导出，512d，CLS+normalize）
 
     def __init__(
-        self, model_name: str = "BAAI/bge-small-zh-v1.5", device: str = "cpu"
+        self, model_name: str = "BAAI/bge-m3", device: str = "cpu"
     ) -> None:
         self.model_name = model_name
         self.device = device
         self._model = None
         self._onnx_model = None
         self._onnx_dim: Optional[int] = None  # 【v5.42】ONNX 输出维度缓存（防 384 硬编码崩 FAISS）
+        self._truncate_dim: Optional[int] = None  # 【v6.1】bge-m3 MRL 截断目标维度（512=HNSW 契约）
         self._indexed_node_ids: Set[str] = set()
         self._dream_cycle_count: int = 0
         self._needs_rebuild: bool = False
@@ -238,12 +229,11 @@ class TextEncoder:
         return vec
 
     def load(self) -> None:
-        """加载模型。优先 embedding/onnx/（bge-small-zh-v1.5 导出 ONNX，512d，
-        CLS pooling + L2 归一化，与 ST 路径一致），fallback bge-small-zh-v1.5
-        （PyTorch，HF 缓存 snapshot 离线加载），最后 fallback sentence-transformers。
+        """加载模型。bge-m3（默认）走专用链路（ONNX O2 → ST snapshot →
+        通用 fallback）；其他模型名走 sentence-transformers 通用加载。
 
-        【v5.42】ONNX 提到最高优先级：同步 defense R2 embed 走 ONNX 加速
-        （~2ms/条 vs PyTorch ~7ms/条）；ONNX 缺失/加载失败静默回退 PyTorch 零回归。
+        【v6.1】bge-m3 ONNX（EmbeddedLLM/bge-m3-onnx-o2-cpu）最高优先级，
+        CPU ~68ms/条（单条）/~4ms/条（批量）；缺失/失败静默回退 ST 兜底。
         """
         import os as _os
 
@@ -259,51 +249,78 @@ class TextEncoder:
             logger.info("Embedding device resolved: requested=%s → %s", self.device, resolved)
         self.device = resolved
 
-        # ── 优先: ONNX（embedding/onnx/，bge-small-zh-v1.5 导出，512d）──
-        onnx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), self._ONNX_DIR)
-        if _os.path.isdir(onnx_path) and _os.path.exists(_os.path.join(onnx_path, "model.onnx")):
-            try:
-                from optimum.onnxruntime import ORTModelForFeatureExtraction
-                from transformers import AutoTokenizer
+        # 【v6.1】模型感知加载：bge-m3（多语言 1024d + MRL 截断）走专用链路
+        if "bge-m3" in self.model_name.lower():
+            self._load_bge_m3()
+            return
 
-                self._tokenizer = AutoTokenizer.from_pretrained(onnx_path, local_files_only=True)
-                self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
-                    onnx_path, provider="CPUExecutionProvider", local_files_only=True
-                )
-                self._onnx_dim = self._infer_onnx_dimension()
-                self.model_name = "BAAI/bge-small-zh-v1.5"  # ONNX 即 bge 导出，语义维度对齐
-                logger.info("ONNX model loaded from %s (dim=%d)", onnx_path, self.dimension)
-                return
-            except Exception as e:
-                logger.warning("ONNX model load failed, fallback to sentence-transformers: %s", e)
-                self._onnx_model = None
-                self._tokenizer = None
-                self._onnx_dim = None
-
-        # ── 次优先: bge-small-zh-v1.5（中文专用，512维，本地缓存 snapshot）──
-        bge_snapshot = _find_bge_snapshot()
-        if bge_snapshot is not None:
-            try:
-                from sentence_transformers import SentenceTransformer
-                logger.info("Loading Chinese embedding model (bge-small-zh-v1.5): %s", bge_snapshot)
-                try:
-                    self._model = SentenceTransformer(bge_snapshot, device=self.device)
-                except Exception:
-                    # CUDA 不可用时自动降级 CPU（如 "Torch not compiled with CUDA enabled"）
-                    logger.warning("bge device=%s failed, retry on cpu", self.device)
-                    self._model = SentenceTransformer(bge_snapshot, device="cpu")
-                    self.device = "cpu"
-                self.model_name = "BAAI/bge-small-zh-v1.5"
-                logger.info("Local embedding model loaded: dim=%d", self.dimension)
-                return
-            except Exception as e:
-                logger.warning("bge-small-zh-v1.5 load failed, fallback to sentence-transformers: %s", e)
-                self._model = None
-
+        # 非 bge-m3 模型（显式指定时）：通用 sentence-transformers 加载
         from sentence_transformers import SentenceTransformer
         logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
         self._model = SentenceTransformer(self.model_name, device=self.device)
         logger.info("Local embedding model loaded: dim=%d", self.dimension)
+
+    def _load_bge_m3(self) -> None:
+        """加载 bge-m3（多语言，1024d，MRL 截断 512 保持 HNSW 契约）。
+
+        优先级: ① EmbeddedLLM/bge-m3-onnx-o2-cpu（ORT O2 CPU 优化 ONNX，
+        HF 缓存 snapshot 离线加载，不进 git）→ ② BAAI/bge-m3 ST snapshot
+        （PyTorch 兜底）→ ③ model_name 通用加载（离线下通常失败，由调用方兜底）。
+        """
+        import os as _os
+
+        # ① ONNX（EmbeddedLLM/bge-m3-onnx-o2-cpu，外置权重 model.onnx.data）
+        onnx_snap = _find_model_snapshot(_BGE_M3_ONNX_REPO)
+        if onnx_snap and _os.path.exists(_os.path.join(onnx_snap, "model.onnx")):
+            try:
+                from optimum.onnxruntime import ORTModelForFeatureExtraction
+                from transformers import AutoTokenizer
+
+                self._tokenizer = AutoTokenizer.from_pretrained(onnx_snap, local_files_only=True)
+                self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
+                    onnx_snap, provider="CPUExecutionProvider", local_files_only=True
+                )
+                self._onnx_dim = self._infer_onnx_dimension()
+                self._truncate_dim = _TRUNCATE_DIM
+                self.model_name = _BGE_M3_MODEL
+                logger.info("BGE-M3 ONNX loaded from %s (dim=%d, truncate=%d)",
+                            onnx_snap, self._onnx_dim, self._truncate_dim)
+                return
+            except Exception as e:
+                logger.warning("BGE-M3 ONNX load failed, fallback to ST: %s", e)
+                self._onnx_model = None
+                self._tokenizer = None
+                self._onnx_dim = None
+
+        # ② ST bge-m3 snapshot（PyTorch 兜底）
+        m3_snapshot = _find_model_snapshot(_BGE_M3_MODEL)
+        if m3_snapshot is not None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(m3_snapshot, device=self.device)
+                self._truncate_dim = _TRUNCATE_DIM
+                self.model_name = _BGE_M3_MODEL
+                logger.info("BGE-M3 ST loaded: dim=%d (truncate=%d)", self.dimension, self._truncate_dim)
+                return
+            except Exception as e:
+                logger.warning("BGE-M3 ST load failed: %s", e)
+                self._model = None
+
+        # ③ 通用 fallback（离线下通常失败，异常由调用方兜底）
+        from sentence_transformers import SentenceTransformer
+        logger.info("Loading local embedding model: %s on %s", self.model_name, self.device)
+        self._model = SentenceTransformer(self.model_name, device=self.device)
+        logger.info("Local embedding model loaded: dim=%d", self.dimension)
+
+    def _maybe_truncate(self, vecs: np.ndarray) -> np.ndarray:
+        """bge-m3 MRL 截断（1024d → _TRUNCATE_DIM=512）后重归一化，保持 HNSW 单位范数契约。"""
+        truncate_dim = getattr(self, "_truncate_dim", None)  # 容忍 __new__ 构造（测试）
+        if not truncate_dim or vecs.shape[-1] <= truncate_dim:
+            return vecs
+        out = vecs[..., : truncate_dim]
+        norms = np.linalg.norm(out, axis=-1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return out / norms
 
     def embed(self, text: str) -> np.ndarray:
         """单条文本 → embedding 向量 (dim,) float32（带LRU缓存）。"""
@@ -332,9 +349,11 @@ class TextEncoder:
             # 与 ST encode 输出一致（FAISS L2 = cosine）
             vec = outputs.last_hidden_state[:, 0].squeeze().detach().numpy().astype(np.float32)
             norm = np.linalg.norm(vec)
-            return vec / norm if norm > 0 else vec
+            vec = vec / norm if norm > 0 else vec
+            return self._maybe_truncate(vec.reshape(1, -1))[0]
 
-        return self._model.encode(text)
+        vec = np.asarray(self._model.encode(text), dtype=np.float32).reshape(1, -1)
+        return self._maybe_truncate(vec)[0]
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
         """批量 → embedding 矩阵 (N, dim) float32。
@@ -401,6 +420,7 @@ class TextEncoder:
         else:
             # Tier 3: Local sentence-transformers
             encoded = np.asarray(self._model.encode(unique_texts), dtype=np.float32)
+        encoded = self._maybe_truncate(encoded)  # 【v6.1】bge-m3 MRL 截断 512
 
         # 组装原序矩阵 + populate 缓存（LRU 512）
         out = np.zeros((len(texts), encoded.shape[1]), dtype=np.float32)
@@ -439,7 +459,10 @@ class TextEncoder:
 
     @property
     def dimension(self) -> int:
-        """实际加载模型的向量维度（bge-small-zh-v1.5=512，ONNX MiniLM=384）。"""
+        """实际加载模型的向量维度（bge-m3=1024 MRL 截断 512）。"""
+        truncate_dim = getattr(self, "_truncate_dim", None)
+        if truncate_dim:
+            return truncate_dim
         if self._onnx_model is not None:
             if self._onnx_dim is not None:
                 return self._onnx_dim
@@ -568,7 +591,7 @@ class TfidfEncoder:
 
 
 def create_encoder(
-    model_name: str = "BAAI/bge-small-zh-v1.5",
+    model_name: str = "BAAI/bge-m3",
     device: str = "cpu",
     prefer_cloud: bool = True,
 ) -> TextEncoder:

@@ -1,7 +1,7 @@
-"""端到端: 真实 bge + 真实 FAISS + 真实 GraphLite 中文向量检索闭环
+"""端到端: 真实 bge-m3 + 真实 OverGraph HNSW + 生产检索链 中文向量检索闭环
 
-验证: bge-small-zh-v1.5 切换后, 中文语义检索真实命中 (非噪声)。
-标记 slow: 需要加载 bge 模型 (~5s)。
+验证: bge-m3（MRL 截断 512）切换后, 中文语义检索真实命中 (非噪声)。
+标记 slow: 需要加载 bge-m3 模型 (~10s)。
 """
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
