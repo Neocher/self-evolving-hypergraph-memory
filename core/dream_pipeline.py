@@ -1465,12 +1465,19 @@ Text:
                 if not ent or ent in seen:
                     continue
                 seen.add(ent)
+                # 【Codex 批1 P2-3】异常打 WARNING（此前裸 except 吞没难排查）；
+                # 仅在全部 occurrences 链接成功后计数（防计数虚高）。
+                ok = True
                 for occ in (link.get("occurrences") or []):
                     try:
                         graphlite_store.link_entity_to_episode(ent, str(occ))
-                    except Exception:
-                        pass
-                created += 1
+                    except Exception as e:
+                        ok = False
+                        logger.warning(
+                            "Dream PERSIST: link_entity_to_episode failed "
+                            "entity=%s occ=%s: %s", ent, occ, e)
+                if ok:
+                    created += 1
         if created:
             logger.info("Dream PERSIST: %d entities persisted (schema self-evolution)", created)
         return created

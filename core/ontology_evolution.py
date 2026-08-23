@@ -383,7 +383,9 @@ async def evolve_once(summaries: list, llm_client, extended_path: str,
     elif action == "skip":
         mutation, result = None, {"action": "skip", "reason": "llm_decided"}
     else:
-        return {"action": "skip", "reason": f"unknown_action:{action}"}
+        result = {"action": "skip", "reason": f"unknown_action:{action}"}
+        _log_drift_if_skip(result)
+        return result
 
     # 【v5.50.0 P2】attr_ops 与类型决策正交（可同轮发生）；类型 skip 但 attr_op
     # 通过守卫时仍落盘（base 回落 current）。类型决策成功优先返回，仅类型 skip
@@ -408,7 +410,28 @@ async def evolve_once(summaries: list, llm_client, extended_path: str,
         elif result["action"] == "attr_op":
             logger.info("Ontology evolution: attr_op → %s (%d aliases)",
                         result.get("canonical"), len(result.get("aliases", [])))
+    _log_drift_if_skip(result)
     return result
+
+
+# 【2026-08-23 漂移检测】借鉴《本体论增强问数》持续运营：新 SQL/模式无法被本体
+# 覆盖时告警触发增补。SHM 语义 = new_type 被守卫拒绝（无法覆盖新模式）→ 打
+# WARNING 提示检查 extended_types.yaml 治理（防本体静默腐烂/与数据脱节）。
+_DRIFT_REASONS = ("not_enough_specific_keys", "key_clash", "guard_rejected",
+                  "type_reserved", "bad_type_name", "no_type_proposal",
+                  "unknown_action")
+
+
+def _log_drift_if_skip(result: Optional[dict]) -> None:
+    if not isinstance(result, dict):
+        return
+    if result.get("action") != "skip":
+        return
+    reason = str(result.get("reason", ""))
+    if any(reason.startswith(r) for r in _DRIFT_REASONS):
+        logger.warning(
+            "Ontology drift: 新模式无法被本体覆盖 (reason=%s) — "
+            "建议检查 ontology_extended.json 治理或增补", reason)
 
 
 def classify_with_extended(text: str, entities: list, extended: Optional[dict] = None) -> str:

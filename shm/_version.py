@@ -1,12 +1,21 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.3.1"
-__version_info__ = (6, 3, 1)
-__version_name__ = "Schema-Entity-Persist-Fix"
+__version__ = "6.3.2"
+__version_info__ = (6, 3, 2)
+__version_name__ = "Ontology-Governance"
 __release_date__ = "2026-08-23"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.3.2 (2026-08-23) Ontology-Governance:
+  • 借鉴《本体论增强智能问数》P0：PropertyVerNode 补口径治理字段
+    (formula/filter_/owner，可选 None 跳过，向后兼容零迁移)
+  • 漂移检测：新模式被本体守卫拒绝 → WARNING 告警触发治理
+    (防本体静默腐烂/与数据脱节)
+  • Codex 批1审核闭环：P1 unknown_action 漂移日志死代码修复 +
+    P2 日志路径文案 + _persist_entities 异常 WARNING/计数修正
+  • 评测口径对齐 v6.1.0（关 entity/attr 扩展，LoCoMo 主角恒定噪音）
+  • 测试: 全量 1150 passed 全绿
 v6.3.1 (2026-08-23) Schema-Entity-Persist-Fix:
   • 修复 v6.2.0 P0-① 生产缺陷：候选模式（candidate_store 非 None）下
     PERSIST 直接模式（PRUNE/MERGE）不跑 → _persist_entities 永不落库 →

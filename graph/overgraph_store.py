@@ -992,6 +992,9 @@ class OverGraphStore:
         valid_from: float | None = None,
         supersedes_id: str | None = None,
         superseded_by: str | None = None,
+        formula: str | None = None,
+        filter_: str | None = None,
+        owner: str | None = None,
     ) -> str:
         """INSERT PropertyVerNode + SUPERSEDES 血统边（begin_write_txn 多语句原子）。
 
@@ -1002,6 +1005,9 @@ class OverGraphStore:
         - supersedes_id 非空 → 旧版本打 expired_at + (old)-[:SUPERSEDES]->(new)
         - superseded_by 非空（乱序中段插入 R4/R6）→ 新版本打 expired_at=后继
           valid_from + (new)-[:SUPERSEDES]->(succ)；中段时先删旧 P→S 边防分支图
+        - 【2026-08-23 口径治理】formula/filter_/owner 可选口径字段（借鉴
+          《本体论增强问数》指标构件：公式/过滤/owner 为治理资产）；None 不写
+          字段（向后兼容，旧节点零迁移）
         """
         pid = str(uuid.uuid4())
         now = valid_from if valid_from is not None else time.time()
@@ -1027,6 +1033,13 @@ class OverGraphStore:
             "id": pid, "entity_id": str(entity_id), "attr_name": attr_name,
             "value": str(value), "valid_from": now,
         }
+        # 【2026-08-23 口径治理】可选口径字段（None 不写，向后兼容）
+        if formula is not None:
+            new_props["formula"] = str(formula)
+        if filter_ is not None:
+            new_props["filter"] = str(filter_)
+        if owner is not None:
+            new_props["owner"] = str(owner)
         if superseded_by:
             new_props["expired_at"] = succ_ts
         try:
