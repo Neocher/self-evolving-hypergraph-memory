@@ -12,7 +12,7 @@ Do not report code issues without grep/read_file verification — hallucinated f
 
 <!-- banthis:end -->
 
-SHM v6.0.x — 自演化超图记忆系统。Python 3.11+, FastAPI, OverGraph（v6.0.0 起唯一后端，GraphLite 已移除）, FAISS, bge-small-zh-v1.5(512d)。
+SHM v6.2.x — 自演化超图记忆系统。Python 3.11+, FastAPI, OverGraph（v6.0.0 起唯一后端，GraphLite 已移除）, FAISS, bge-m3 ONNX O2 (EmbeddedLLM/bge-m3-onnx-o2-cpu, 1024d MRL 截断 512)。
 
 ## 编码准则（Karpathy 精神）
 
