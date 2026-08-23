@@ -207,6 +207,35 @@ class TestF2PersistWriteQueue:
         )
         assert report is not None and report.degraded is False
 
+    def test_persist_entities_runs_in_candidate_mode(self):
+        """【v6.3.1】候选模式下实体落库 + Schema 演化也执行（幂等只增写）。
+
+        v6.2.0 P0-① 生产缺陷：生产用候选模式（candidate_store 非 None），
+        PERSIST 直接模式（PRUNE/MERGE/HYPEREDGES）不跑 → _persist_entities
+        永不落库 → EntityNode=0 → Schema 自演化（P0-②）无消费对象。
+        修复：候选分支同样经 write_queue 提交幂等的实体落库步骤。
+        """
+        q = _RecordingQueue()
+        pipe = DreamPipeline(write_queue=q)
+        store = self._make_store()
+        candidate_store = MagicMock()
+
+        report = run(pipe.run(
+            nodes=[],
+            connections={},
+            trigger_mode="explicit",
+            graphlite_store=store,
+            candidate_store=candidate_store,
+        ))
+
+        assert "_persist_entities" in q.calls, q.calls
+        assert "_persist_schema_evolution" in q.calls, q.calls
+        # 破坏性操作不因候选模式提前执行（仍经 apply 人工放行）
+        assert "_persist_prune" not in q.calls, q.calls
+        assert "_persist_merge" not in q.calls, q.calls
+        candidate_store.save_candidate.assert_called_once()
+        assert report is not None
+
     def test_persist_fallback_to_thread_without_queue(self):
         """无 write_queue 时 _persist_async 回退 asyncio.to_thread（run 正常完成）。"""
         pipe = DreamPipeline()

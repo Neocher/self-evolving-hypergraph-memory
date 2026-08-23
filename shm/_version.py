@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.3.0"
-__version_info__ = (6, 3, 0)
-__version_name__ = "Schema-Self-Evolution"
+__version__ = "6.3.1"
+__version_info__ = (6, 3, 1)
+__version_name__ = "Schema-Entity-Persist-Fix"
 __release_date__ = "2026-08-23"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.3.1 (2026-08-23) Schema-Entity-Persist-Fix:
+  • 修复 v6.2.0 P0-① 生产缺陷：候选模式（candidate_store 非 None）下
+    PERSIST 直接模式（PRUNE/MERGE）不跑 → _persist_entities 永不落库 →
+    EntityNode=0 → Schema 自演化（P0-②）生产无消费对象（dry_run 恒 0）
+  • 修复：dream run() Step 7 候选分支同样经 write_queue 提交幂等的
+    _persist_entities + _persist_schema_evolution（sha1 elementKey /
+    blake3 证据键幂等只增写）；PRUNE/MERGE 破坏性操作仍经 apply 人工放行
+  • 测试: +1（候选模式实体落库断言，全量 1149 passed 全绿）
 v6.3.0 (2026-08-23) Schema-Self-Evolution:
   • Schema 自演化 P0-② 实体属性/关系自我进化闭环（CC 设计 → OC/Hermes 实现
     → Codex 两轮审核）— 属性/关系演化态存 EntityNode.props 的 attrs_json/

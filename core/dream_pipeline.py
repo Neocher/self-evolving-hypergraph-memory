@@ -426,6 +426,23 @@ class DreamPipeline:
                 },
             )
             logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
+            # 【v6.3.1】候选模式下也落库实体（幂等，只增不删）：
+            # PERSIST 直接模式的 PRUNE/MERGE 破坏性操作仍经 apply 人工放行，
+            # 但实体落库（_persist_entities）与 Schema 演化（_persist_schema_
+            # evolution）本质是 sha1 elementKey / blake3 证据键幂等的只增写——
+            # 候选模式下不执行则 EntityNode 永不落库（v6.2.0 P0-① 生产缺陷）。
+            # 这里经写队列串行（_persist_async），候选保存不受影响。
+            if graphlite_store is not None:
+                try:
+                    await self._persist_async(
+                        self._persist_entities, graphlite_store, communities)
+                    await self._persist_async(
+                        self._persist_schema_evolution, graphlite_store, communities)
+                except Exception as persist_exc:
+                    persist_degraded = True
+                    logger.error(
+                        "Dream %s: candidate-mode entity persist partial failure "
+                        "(degraded, next dream repairs): %s", dream_id, persist_exc)
         elif graphlite_store is not None:
             # 直接模式（原行为）：直接修改生产数据
             # 【H5】GraphLite 无跨语句事务（TransactionManager 的 rollback 仅做
