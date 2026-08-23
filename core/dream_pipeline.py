@@ -1406,11 +1406,40 @@ Text:
                     graphlite_store, member_sets)
             await self._persist_async(
                 self._persist_hyperedges, graphlite_store, communities, dream_id)
+            await self._persist_async(
+                self._persist_entities, graphlite_store, communities)
         except Exception as persist_exc:
             persist_degraded = True
             logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
                          dream_id, persist_exc)
         return persist_created, persist_deleted, all_removed_ids, persist_degraded
+
+    def _persist_entities(self, graphlite_store, communities: list[dict]) -> int:
+        """Schema 自演化（P0-①）：community.entity_links → EntityNode + MENTIONS 边落库。
+
+        消费 _entity_linking_step 产出的实体链接（entity → occurrences 节点 id），
+        逐实体幂等创建 EntityNode 并连 MENTIONS 边（store 侧幂等去重）。
+        失败不阻塞（沿用 PERSIST degraded 语义，下次梦境自愈）。
+        """
+        created = 0
+        if graphlite_store is None or not hasattr(graphlite_store, "link_entity_to_episode"):
+            return 0
+        seen: set[str] = set()
+        for comm in communities:
+            for link in comm.get("entity_links") or []:
+                ent = (link.get("entity") or "").strip()
+                if not ent or ent in seen:
+                    continue
+                seen.add(ent)
+                for occ in (link.get("occurrences") or []):
+                    try:
+                        graphlite_store.link_entity_to_episode(ent, str(occ))
+                    except Exception:
+                        pass
+                created += 1
+        if created:
+            logger.info("Dream PERSIST: %d entities persisted (schema self-evolution)", created)
+        return created
 
     # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
 

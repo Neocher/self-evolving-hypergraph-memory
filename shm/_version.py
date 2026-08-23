@@ -1,12 +1,28 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.1.1"
-__version_info__ = (6, 1, 1)
-__version_name__ = "BGE-M3-Embedding"
+__version__ = "6.2.0"
+__version_info__ = (6, 2, 0)
+__version_name__ = "Schema-Entity-Persistence"
 __release_date__ = "2026-08-23"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.2.0 (2026-08-23) Schema-Entity-Persistence:
+  • Schema 自演化 P0-① 实体落库闭环 — 梦境 _entity_linking_step 产出的
+    entity_links 经 _persist_entities 幂等落库 EntityNode + MENTIONS 边
+  • overgraph_store 新增 5 方法：create_entity（sha1 确定性 key 幂等）/
+    get_entity / get_entity_by_id / link_entity_to_episode / get_entity_episodes
+    （检索候选定位）；失败降级不阻塞（PERSIST degraded 自愈语义）
+  • 门禁 1128 passed 全绿（含 write_queue 顺序断言更新）
+v6.1.1 (2026-08-23) BGE-M3-Embedding:
+  • ONNX SessionOptions 线程优化 — intra=8/inter=1（16 核机器实测
+    最优点，单条 embed -28%、批量16 -22%；默认会话 16 线程多进程
+    超订风险显式消除），读回 options 验证生效 + 门禁全绿
+v6.1.0 (2026-08-23) BGE-M3-Embedding:
+  • Embedding 升级 bge-small-zh-v1.5(512d) → BAAI/bge-m3 ONNX O2 CPU
+    （EmbeddedLLM/bge-m3-onnx-o2-cpu，MRL 截断 512 保 HNSW 契约）
+  • LoCoMo 200 问决定性验证 84.0% → 88.5%（+4.5pp，历史最高）；
+    bge-small 全面移除（encoder/测试/embedding/onnx git rm）
 v6.0.0 (2026-08-19) OverGraph-Engine:
   • 图引擎迁移阶段1 — 新增 graph/overgraph_store.py OverGraphStore
     （OverGraph Rust/PyO3 0.17.0，Apache-2.0）与 GraphLiteStore 同接口契约

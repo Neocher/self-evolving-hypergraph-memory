@@ -196,6 +196,7 @@ class TestF2PersistWriteQueue:
             "_persist_one_community",
             "_persist_merge",
             "_persist_hyperedges",
+            "_persist_entities",
         ], f"write_queue 提交顺序/集合不符: {q.calls}"
         assert "_persist_communities_prune_edges" not in q.calls, (
             "空社区（members=[]）不应触发阶段 3 湮灭"

@@ -54,6 +54,7 @@ import re
 import threading
 import time
 import uuid
+import hashlib
 
 import numpy as np
 
@@ -96,6 +97,8 @@ LABEL_PROPERTY_VER = "PropertyVerNode"
 LABEL_COMMUNITY = "CommunityNode"
 LABEL_SYSTEM = "SystemNode"
 LABEL_CONFLICT = "ConflictNode"
+LABEL_ENTITY = "EntityNode"
+LABEL_MENTIONS = "MENTIONS"
 LABEL_ONTOLOGY_TYPE = "OntologyType"
 LABEL_ONTOLOGY_ENTITY = "OntologyEntity"
 
@@ -643,6 +646,90 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (e:{LABEL_EPISODE}) WHERE e.created_at >= {cutoff} RETURN e"
+            )
+            return [self._flatten_row(r, "e") for r in (result or {}).get("rows", [])]
+        except Exception:
+            return []
+
+    # ── EntityNode（Schema 自演化持久化，v6.1.0 P0-①）──
+    def create_entity(self, entity_name: str, entity_type: str = "Person",
+                      props: dict | None = None) -> str:
+        """创建/复用 EntityNode（规范化 name 确定性 key 幂等）。Returns entity id.
+
+        Schema 自演化持久化闭环（P0-①）：梦境实体链接产出的实体落库，
+        key = ent_<sha1(norm_name)> 保证同名复用不重复建节点。
+        """
+        name = (entity_name or "").strip()
+        if not name:
+            raise OverGraphError("entity name required")
+        norm = name.lower().strip()
+        eid = f"ent_{hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]}"
+        p = dict(props or {})
+        p["id"] = eid
+        p["name"] = name
+        p["norm_name"] = norm
+        p["entity_type"] = entity_type
+        p.setdefault("archived", False)
+        p.setdefault("created_at", _now())
+        self._locked_upsert_node(LABEL_ENTITY, eid, p)
+        return eid
+
+    def get_entity(self, entity_name: str) -> dict | None:
+        """按规范化 name 查 EntityNode（确定性 key O(1)）。"""
+        norm = (entity_name or "").strip().lower()
+        if not norm:
+            return None
+        eid = f"ent_{hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]}"
+        try:
+            view = self._db.get_node_by_key(LABEL_ENTITY, eid)
+        except Exception:
+            return None
+        return self._flatten_view(view) if view is not None else None
+
+    def get_entity_by_id(self, entity_id: str) -> dict | None:
+        try:
+            view = self._db.get_node_by_key(LABEL_ENTITY, str(entity_id))
+        except Exception:
+            return None
+        return self._flatten_view(view) if view is not None else None
+
+    def link_entity_to_episode(self, entity_name: str, episode_id: str,
+                               entity_type: str = "Person") -> str:
+        """实体 → EpisodeNode MENTIONS 边（幂等）。Returns entity id."""
+        eid = self.create_entity(entity_name, entity_type=entity_type)
+        try:
+            frm = self._require_internal_id(eid, LABEL_ENTITY)
+            to = self._require_internal_id(str(episode_id), LABEL_EPISODE)
+            self._ensure_edge(frm, to, LABEL_MENTIONS)
+        except Exception:
+            pass  # 边失败不阻塞（节点已落库）
+        return eid
+
+    def get_entity_episodes(self, entity_name: str, limit: int = 50) -> list[str]:
+        """EntityNode → MENTIONS → EpisodeNode ids（检索候选定位）。"""
+        eid = self.get_entity(entity_name)
+        if not eid:
+            return []
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (e:{LABEL_ENTITY})-[r:{LABEL_MENTIONS}]->(ep:{LABEL_EPISODE}) "
+                f"WHERE e.id = '{eid.get('id')}' RETURN ep.id AS ep_id LIMIT {int(limit)}"
+            )
+            rows = (result or {}).get("rows", [])
+            out = []
+            for r in rows:
+                ep = r.get("ep_id") if isinstance(r, dict) else None
+                if ep:
+                    out.append(str(ep))
+            return out
+        except Exception:
+            return []
+
+    def get_entities(self, limit: int = 200) -> list[dict]:
+        """列出实体（调试/评测/梦境消费）。"""
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (e:{LABEL_ENTITY}) RETURN e LIMIT {int(limit)}"
             )
             return [self._flatten_row(r, "e") for r in (result or {}).get("rows", [])]
         except Exception:
