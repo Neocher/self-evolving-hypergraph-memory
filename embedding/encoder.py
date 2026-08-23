@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _BGE_M3_MODEL = "BAAI/bge-m3"
 _BGE_M3_ONNX_REPO = "EmbeddedLLM/bge-m3-onnx-o2-cpu"  # ORT O2 CPU 优化 ONNX（HF 缓存加载，不进 git）
 _TRUNCATE_DIM = 512  # bge-m3 MRL 截断目标维度：匹配 overgraph.dense_vector_dimension=512（HNSW 契约）
+_INTRA_OP_THREADS = 8  # ORT SessionOptions intra 线程：16 核实测最优点（单条 -28% 批量 -22%）；16 与生产多进程超订
 
 # ─── Tier 1: Cloud Embedding API ──────────────────────────
 
@@ -277,8 +278,15 @@ class TextEncoder:
                 from transformers import AutoTokenizer
 
                 self._tokenizer = AutoTokenizer.from_pretrained(onnx_snap, local_files_only=True)
+                # SessionOptions：intra=8 为 16 核机器实测最优点（单条 -28%、批量16 -22%），
+                # inter=1 单模型推理无并行收益；避免默认 16 线程与生产多进程超订（2026-08-23 实测）
+                import onnxruntime as _ort
+                _so = _ort.SessionOptions()
+                _so.intra_op_num_threads = _INTRA_OP_THREADS
+                _so.inter_op_num_threads = 1
                 self._onnx_model = ORTModelForFeatureExtraction.from_pretrained(
-                    onnx_snap, provider="CPUExecutionProvider", local_files_only=True
+                    onnx_snap, provider="CPUExecutionProvider", local_files_only=True,
+                    session_options=_so,
                 )
                 self._onnx_dim = self._infer_onnx_dimension()
                 self._truncate_dim = _TRUNCATE_DIM
