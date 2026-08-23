@@ -50,3 +50,4 @@ design_herdr*.md
 design_p0_fix*.md
 tests/test_acp_bridge_herdr.py
 *.docx
+api/data

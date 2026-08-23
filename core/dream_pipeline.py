@@ -31,6 +31,21 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+
+class _EntityView:
+    """EntityNode props dict → duck-typing 视图（供 extract_attributes 消费）。
+
+    属性对齐 attribute_extractor 期望的接口：name / entity_type / entity_id / aliases。
+    """
+
+    __slots__ = ("name", "entity_type", "entity_id", "aliases")
+
+    def __init__(self, props: dict):
+        self.name = str(props.get("name") or props.get("norm_name") or "")
+        self.entity_type = str(props.get("entity_type") or "Person")
+        self.entity_id = str(props.get("id") or "")
+        self.aliases = list(props.get("aliases") or [])
+
 # LLM-NER 每社区节点数上限：超出的节点跳过 LLM 由调用方正则降级
 # 防单社区节点多时串行 await（每节点 ~2.5s）→ SYNTHESIZE 阶段超时死循环
 _NER_MAX_NODES_PER_COMMUNITY = 5
@@ -1408,6 +1423,8 @@ Text:
                 self._persist_hyperedges, graphlite_store, communities, dream_id)
             await self._persist_async(
                 self._persist_entities, graphlite_store, communities)
+            await self._persist_async(
+                self._persist_schema_evolution, graphlite_store, communities)
         except Exception as persist_exc:
             persist_degraded = True
             logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
@@ -1440,6 +1457,173 @@ Text:
         if created:
             logger.info("Dream PERSIST: %d entities persisted (schema self-evolution)", created)
         return created
+
+    # ─── Schema 自进化 P0-②：实体属性/关系演化 ────────────────
+
+    def _persist_schema_evolution(self, graphlite_store, communities: list[dict]) -> int:
+        """Schema 自演化（P0-②）：community 内容 → 实体属性/关系演化落库。
+
+        消费已落库 EntityNode（P0-① _persist_entities 之后），对 community
+        content 做纯规则属性提取 + 关系抽取 → 分区计票 → sidecar 演化 →
+        跨阈值固化（PropertyVerNode / REL_ 边）。失败不阻塞（degraded 自愈）。
+        """
+        evolved = 0
+        failures = 0
+        if graphlite_store is None or not hasattr(graphlite_store, "locked_update_entity_props"):
+            return 0
+        for comm in communities:
+            content = comm.get("content") or ""
+            ep_id = str(comm.get("episode_id") or comm.get("id") or "")
+            links = comm.get("entity_links") or []
+            if not content or not links:
+                continue
+            entities = []
+            for link in links:
+                ent_name = (link.get("entity") or "").strip()
+                if not ent_name:
+                    continue
+                ent = graphlite_store.get_entity(ent_name)
+                if ent:
+                    entities.append(_EntityView(ent))
+            if not entities:
+                continue
+            try:
+                from core.attribute_extractor import extract_attributes
+                attrs = extract_attributes(ep_id, content, entities)
+                if attrs:
+                    evolved += self._evolve_attrs(graphlite_store, attrs)
+                rels = self._extract_entity_relations(graphlite_store, content, entities)
+                if rels:
+                    evolved += self._evolve_rels(graphlite_store, rels)
+            except Exception as exc:  # 单 community 失败 → 聚合，外层标记 degraded 自愈
+                failures += 1
+                logger.warning("Dream PERSIST schema-evolution failed (%s): %s",
+                               str(ep_id)[:12], exc)
+        if failures:
+            # 抛聚合异常 → _persist_direct 捕获 → persist_degraded=True → 下轮梦境重放
+            # （blake3 证据键 + sha1 elementKey 幂等，重放不重复）
+            raise RuntimeError(f"schema-evolution failed for {failures}/{len(communities)} communities")
+        if evolved:
+            logger.info("Dream PERSIST: %d attr/rel evolutions (schema self-evolution P0-②)", evolved)
+        return evolved
+
+    def _evolve_attrs(self, store, attrs: list) -> int:
+        """属性演化：sidecar 累票 → 固化（PropertyVerNode / sidecar solidified）。"""
+        from core.schema_evolver import accumulate_votes, decide, Action, AttrStat, T_SOLIDIFY
+        by_ent: dict[str, list] = {}
+        for a in attrs:
+            by_ent.setdefault(a.entity_id, []).append(a)
+        count = 0
+        for eid, ex_list in by_ent.items():
+            new_props = store.locked_update_entity_props(eid, lambda props, exs=ex_list: self._merge_attrs_sidecar(props, exs))
+            sidecar = store._decode_sidecar(new_props, "attrs_json")
+            # decide + 固化
+            for attr_name, attr_block in sidecar.items():
+                solidified = attr_block.get("solidified") or {}
+                for vkey, cand in (attr_block.get("candidates") or {}).items():
+                    stat = AttrStat(attr_name, cand.get("value", ""), vkey,
+                                    cand.get("votes", {}), cand.get("evidence", []),
+                                    cand.get("conf", 0.0))
+                    action = decide(stat, solidified)
+                    if action in (Action.SOLIDIFY, Action.CORRECT):
+                        supersedes_id = solidified.get("pvn_key") if action == Action.CORRECT else None
+                        try:
+                            pvn_key = store.create_property_version(
+                                eid, attr_name, stat.value,
+                                supersedes_id=supersedes_id)
+                        except Exception:
+                            pvn_key = ""
+                        solidified = {
+                            "value": stat.value, "value_blake3": vkey,
+                            "version": int(solidified.get("version", 0)) + 1,
+                            "conf": stat.confidence,
+                            "pvn_key": pvn_key, "active": True,
+                        }
+                        attr_block["solidified"] = solidified
+                        count += 1
+                    elif action == Action.STRENGTHEN and solidified:
+                        solidified["conf"] = max(float(solidified.get("conf", 0)), stat.confidence)
+                        attr_block["solidified"] = solidified
+            # 写回（固化后 sidecar 变化）
+            store.locked_update_entity_props(eid, lambda props, sc=sidecar: self._write_attrs_sidecar(props, sc))
+        return count
+
+    @staticmethod
+    def _merge_attrs_sidecar(props: dict, ex_list: list) -> dict:
+        from core.schema_evolver import accumulate_votes
+        sidecar = dict(props.get("attrs_json") or {}) if isinstance(props.get("attrs_json"), dict) else {}
+        new_sc = accumulate_votes(sidecar, ex_list)
+        props["attrs_json"] = new_sc
+        return props
+
+    @staticmethod
+    def _write_attrs_sidecar(props: dict, sidecar: dict) -> dict:
+        props["attrs_json"] = sidecar
+        return props
+
+    def _extract_entity_relations(self, store, content: str, entities: list) -> list:
+        """抽取实体间谓词关系（仅保留两端都是已落库实体的三元组）。"""
+        from core.relation_extractor import RelationExtractor
+        names = {e.name.lower() for e in entities}
+        out = []
+        try:
+            triples = RelationExtractor().extract(content)
+        except Exception:
+            return out
+        for t in triples:
+            subj = (t.subject or "").strip()
+            obj = (t.obj or "").strip()
+            if not subj or not obj:
+                continue
+            src = next((e for e in entities if e.name.lower() == subj.lower()), None)
+            dst = next((e for e in entities if e.name.lower() == obj.lower()), None)
+            if src and dst and src.entity_id != dst.entity_id:
+                out.append((src.entity_id, dst.entity_id, t.relation, t.confidence))
+        return out
+
+    def _evolve_rels(self, store, rels: list) -> int:
+        """关系演化：rels_json 侧车分区计票 → 固化（REL_ 边）。"""
+        from core.schema_evolver import confidence as rel_confidence, T_SOLIDIFY
+        by_ent: dict[str, list] = {}
+        for src_id, dst_id, pred, conf in rels:
+            by_ent.setdefault(src_id, []).append((dst_id, pred, conf))
+        count = 0
+        for src_id, rel_list in by_ent.items():
+            new_props = store.locked_update_entity_props(src_id, lambda props, rl=rel_list: self._merge_rels_sidecar(props, rl))
+            sidecar = store._decode_sidecar(new_props, "rels_json")
+            for dst_id, pred, conf in rel_list:
+                slot = sidecar.setdefault(pred, {}).setdefault(dst_id, {})
+                slot["target_name"] = slot.get("target_name", "")
+                slot["votes"] = slot.get("votes", {})
+                slot["evidence"] = slot.get("evidence", [])
+                # conf 已由 _merge_rels_sidecar 分区计票计算，不覆盖
+                if float(slot.get("conf", 0)) >= T_SOLIDIFY and not slot.get("solidified"):
+                    try:
+                        store.create_rel_edge(src_id, dst_id, pred, confidence=float(slot["conf"]))
+                        slot["solidified"] = True
+                        count += 1
+                    except Exception:
+                        pass
+            store.locked_update_entity_props(src_id, lambda props, sc=sidecar: self._write_rels_sidecar(props, sc))
+        return count
+
+    @staticmethod
+    def _merge_rels_sidecar(props: dict, rel_list: list) -> dict:
+        from core.schema_evolver import confidence as rel_confidence
+        sidecar = dict(props.get("rels_json") or {}) if isinstance(props.get("rels_json"), dict) else {}
+        for dst_id, pred, conf in rel_list:
+            slot = sidecar.setdefault(pred, {}).setdefault(dst_id, {})
+            slot["votes"] = slot.get("votes", {})
+            # 分区计票（与属性侧一致：单分区封顶 CAP=5，≥2 独立分区才高分）
+            slot["votes"]["rel_extract"] = int(slot["votes"].get("rel_extract", 0)) + 1
+            slot["conf"] = rel_confidence(slot["votes"])
+        props["rels_json"] = sidecar
+        return props
+
+    @staticmethod
+    def _write_rels_sidecar(props: dict, sidecar: dict) -> dict:
+        props["rels_json"] = sidecar
+        return props
 
     # ─── 【FIX】GraphLite持久化方法 ──────────────────────────────
 

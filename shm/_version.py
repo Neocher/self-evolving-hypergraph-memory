@@ -1,12 +1,39 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.2.0"
-__version_info__ = (6, 2, 0)
-__version_name__ = "Schema-Entity-Persistence"
+__version__ = "6.3.0"
+__version_info__ = (6, 3, 0)
+__version_name__ = "Schema-Self-Evolution"
 __release_date__ = "2026-08-23"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.3.0 (2026-08-23) Schema-Self-Evolution:
+  • Schema 自演化 P0-② 实体属性/关系自我进化闭环（CC 设计 → OC/Hermes 实现
+    → Codex 两轮审核）— 属性/关系演化态存 EntityNode.props 的 attrs_json/
+    rels_json 侧车，跨置信阈值（T_SOLIDIFY=0.60 + 0.15 迟滞带）固化
+    PropertyVerNode 版本链 + REL_<谓词> 边
+  • 新增 core/attribute_extractor.py — 纯规则属性提取（5 属性 × 中英模式，
+    实体锚点 ±80 窗口定位，blake3 证据键幂等）
+  • 新增 core/schema_evolver.py — 分区计票置信度（0.6*diversity+0.4*strength，
+    单分区封顶 CAP=5，≥2 独立分区高分）+ 五态状态机（EMERGE/SOLIDIFY/
+    STRENGTHEN/CORRECT/IGNORE）；证据键含 partition 防单规则刷票
+  • relation_extractor +4 谓词（PARTNER_WITH/SUBSIDIARY_OF/MEMBER_OF/
+    COMPETES_WITH，中英双列 8 例精确命中，旧谓词零回归）
+  • overgraph_store +6 方法 — locked_update_entity_props（锁内 read-modify-
+    write 防并发写丢失）、create_rel_edge（predicate label 校验 + 三元组
+    幂等）、get_rel_neighbors、get_entity_attributes/relations（出边+入边
+    direction=in 镜像）、get_entity_episodes_by_episode
+  • 梦境 PERSIST 接入 _persist_schema_evolution（write_queue 顺序：entities
+    → schema-evolution；失败聚合异常 → degraded 自愈重放）
+  • 检索通道 P1 — _attribute_expansion 属性匹配扩召回（固化值 token 匹配，
+    score = max(种子) × 0.85 降权，双路径接线）
+  • API — POST /ontology/evolve（dry_run 支持）+ 3 个 GET（attributes /
+    relations / neighbors）
+  • Codex 审核闭环：批1 2×P1+8×P2+3×P3 全部修复（聚合异常→degraded、
+    关系侧车改分区计票、label 校验、入边镜像、负权重回退等）
+  • 测试: +20（test_attribute_extractor 4 / test_schema_evolver 6 /
+    test_schema_store_ops 6 真实 OverGraph 集成 / test_schema_attribute_
+    expansion 5），全量 1142 passed 全绿
 v6.2.0 (2026-08-23) Schema-Entity-Persistence:
   • Schema 自演化 P0-① 实体落库闭环 — 梦境 _entity_linking_step 产出的
     entity_links 经 _persist_entities 幂等落库 EntityNode + MENTIONS 边

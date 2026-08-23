@@ -452,7 +452,6 @@ async def ontology_match(
 # 全局单例关系抽取器（注入 LLM 客户端，跨请求复用动态关系缓存）
 _relation_extractor: Optional[Any] = None
 
-
 def _get_relation_extractor() -> Any:
     """懒加载全局关系抽取器：注入全局单例 LLM 客户端，复用动态关系缓存。
 
@@ -492,3 +491,200 @@ async def ontology_relations_extract(
             for t in triples
         ],
     }
+
+
+# ─── Schema 自进化 P0-②：属性/关系演化端点（v6.2.0）───────────
+
+
+class EvolveRequest(BaseModel):
+    episode_ids: Optional[List[str]] = None   # null = 全量重放（梦境候选）
+    entity_ids: Optional[List[str]] = None
+    dry_run: bool = False
+
+
+@router.post("/ontology/evolve", summary="触发实体属性/关系演化（Schema 自进化 P0-②）")
+async def ontology_evolve(
+    req: EvolveRequest,
+    deps: Services = Depends(get_services),
+) -> dict:
+    """对 EpisodeNode 内容执行纯规则属性提取 + 关系抽取 → sidecar 演化 → 固化。
+
+    dry_run=True 只返回统计不落库。失败降级返回 partial 标记（degraded 自愈语义）。
+    """
+    store = deps.graphlite_store
+    if store is None or not hasattr(store, "locked_update_entity_props"):
+        raise HTTPException(status_code=503, detail="Schema evolution not supported by backend")
+    from core.attribute_extractor import extract_attributes
+    from core.schema_evolver import accumulate_votes, decide, Action, AttrStat
+    from core.relation_extractor import RelationExtractor
+
+    # 1. 选取 episodes（显式 ids 或梦境候选全量）
+    episodes: list[dict] = []
+    if req.episode_ids:
+        for eid in req.episode_ids:
+            ep = store.get_episode(str(eid))
+            if ep:
+                episodes.append(ep)
+    else:
+        # 全量重放：梦境候选 = 有 entity_links 的社区数据（简化：取全部 EpisodeNode）
+        try:
+            result = store._locked_execute_gql(
+                "MATCH (e:EpisodeNode) RETURN e LIMIT 500")
+            episodes = [store._flatten_row(r, "e") for r in (result or {}).get("rows", [])]
+        except Exception:
+            episodes = []
+
+    stats = {"entities_scanned": 0, "attrs_extracted": 0, "rels_extracted": 0,
+             "solidified_attrs": 0, "solidified_rels": 0, "corrected": 0}
+    for ep in episodes:
+        content = str(ep.get("content") or "")
+        ep_id = str(ep.get("id") or "")
+        if not content or not ep_id:
+            continue
+        # 载入该 episode 关联实体
+        entities = []
+        try:
+            linked = store.get_entity_episodes_by_episode(ep_id) if hasattr(store, "get_entity_episodes_by_episode") else []
+        except Exception:
+            linked = []
+        for ent_name in linked:
+            ent = store.get_entity(str(ent_name))
+            if ent:
+                entities.append(ent)
+        if not entities:
+            continue
+        stats["entities_scanned"] += len(entities)
+        # 属性
+        from core.dream_pipeline import _EntityView
+        views = [_EntityView(e) for e in entities]
+        attrs = extract_attributes(ep_id, content, views)
+        stats["attrs_extracted"] += len(attrs)
+        # 关系
+        try:
+            triples = RelationExtractor().extract(content)
+        except Exception:
+            triples = []
+        rels = []
+        for t in triples:
+            src = next((v for v in views if v.name.lower() == (t.subject or "").lower()), None)
+            dst = next((v for v in views if v.name.lower() == (t.obj or "").lower()), None)
+            if src and dst and src.entity_id != dst.entity_id:
+                rels.append((src.entity_id, dst.entity_id, t.relation, t.confidence))
+        stats["rels_extracted"] += len(rels)
+        if req.dry_run:
+            continue
+        # 落库：属性演化
+        by_ent: dict[str, list] = {}
+        for a in attrs:
+            by_ent.setdefault(a.entity_id, []).append(a)
+        for eid, ex_list in by_ent.items():
+            new_props = store.locked_update_entity_props(
+                eid, lambda props, exs=ex_list: _merge_attrs_sidecar(props, exs))
+            sidecar = store._decode_sidecar(new_props, "attrs_json")
+            for attr_name, attr_block in sidecar.items():
+                solidified = attr_block.get("solidified") or {}
+                for vkey, cand in (attr_block.get("candidates") or {}).items():
+                    stat = AttrStat(attr_name, cand.get("value", ""), vkey,
+                                    cand.get("votes", {}), cand.get("evidence", []),
+                                    cand.get("conf", 0.0))
+                    action = decide(stat, solidified)
+                    if action in (Action.SOLIDIFY, Action.CORRECT):
+                        supersedes_id = solidified.get("pvn_key") if action == Action.CORRECT else None
+                        try:
+                            pvn_key = store.create_property_version(
+                                eid, attr_name, stat.value, supersedes_id=supersedes_id)
+                        except Exception:
+                            pvn_key = ""
+                        solidified = {"value": stat.value, "value_blake3": vkey,
+                                      "version": int(solidified.get("version", 0)) + 1,
+                                      "conf": stat.confidence, "pvn_key": pvn_key, "active": True}
+                        attr_block["solidified"] = solidified
+                        if action == Action.CORRECT:
+                            stats["corrected"] += 1
+                        else:
+                            stats["solidified_attrs"] += 1
+            store.locked_update_entity_props(
+                eid, lambda props, sc=sidecar: _write_sidecar(props, "attrs_json", sc))
+        # 落库：关系演化
+        from core.schema_evolver import T_SOLIDIFY
+        by_src: dict[str, list] = {}
+        for src_id, dst_id, pred, conf in rels:
+            by_src.setdefault(src_id, []).append((dst_id, pred, conf))
+        for src_id, rel_list in by_src.items():
+            new_props = store.locked_update_entity_props(
+                src_id, lambda props, rl=rel_list: _merge_rels_sidecar(props, rl))
+            sidecar = store._decode_sidecar(new_props, "rels_json")
+            for dst_id, pred, conf in rel_list:
+                slot = sidecar.setdefault(pred, {}).setdefault(dst_id, {})
+                slot["conf"] = max(float(slot.get("conf", 0)), float(conf))
+                if float(slot.get("conf", 0)) >= T_SOLIDIFY and not slot.get("solidified"):
+                    try:
+                        store.create_rel_edge(src_id, dst_id, pred, confidence=float(slot["conf"]))
+                        slot["solidified"] = True
+                        stats["solidified_rels"] += 1
+                    except Exception:
+                        pass
+            store.locked_update_entity_props(
+                src_id, lambda props, sc=sidecar: _write_sidecar(props, "rels_json", sc))
+    return stats
+
+
+def _merge_attrs_sidecar(props: dict, ex_list: list) -> dict:
+    from core.schema_evolver import accumulate_votes
+    sidecar = dict(props.get("attrs_json") or {}) if isinstance(props.get("attrs_json"), dict) else {}
+    props["attrs_json"] = accumulate_votes(sidecar, ex_list)
+    return props
+
+
+def _merge_rels_sidecar(props: dict, rel_list: list) -> dict:
+    sidecar = dict(props.get("rels_json") or {}) if isinstance(props.get("rels_json"), dict) else {}
+    for dst_id, pred, conf in rel_list:
+        slot = sidecar.setdefault(pred, {}).setdefault(dst_id, {})
+        slot["votes"] = slot.get("votes", {})
+        slot["votes"]["rel_extract"] = int(slot["votes"].get("rel_extract", 0)) + 1
+        slot["conf"] = max(float(slot.get("conf", 0)), float(conf))
+    props["rels_json"] = sidecar
+    return props
+
+
+def _write_sidecar(props: dict, key: str, sidecar: dict) -> dict:
+    props[key] = sidecar
+    return props
+
+
+@router.get("/ontology/entity/{entity_id}/attributes",
+            summary="读实体属性侧车（候选 + 固化 + 证据）")
+async def entity_attributes(
+    entity_id: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    store = deps.graphlite_store
+    if store is None or not hasattr(store, "get_entity_attributes"):
+        raise HTTPException(status_code=503, detail="Not supported by backend")
+    return store.get_entity_attributes(entity_id)
+
+
+@router.get("/ontology/entity/{entity_id}/relations",
+            summary="读实体关系侧车 + 已固化 REL 边")
+async def entity_relations(
+    entity_id: str,
+    deps: Services = Depends(get_services),
+) -> dict:
+    store = deps.graphlite_store
+    if store is None or not hasattr(store, "get_entity_relations"):
+        raise HTTPException(status_code=503, detail="Not supported by backend")
+    return store.get_entity_relations(entity_id)
+
+
+@router.get("/ontology/entity/{entity_id}/relations/neighbors",
+            summary="1 跳谓词邻居（P2 检索通道）")
+async def entity_relations_neighbors(
+    entity_id: str,
+    predicates: Optional[str] = None,
+    deps: Services = Depends(get_services),
+) -> dict:
+    store = deps.graphlite_store
+    if store is None or not hasattr(store, "get_rel_neighbors"):
+        raise HTTPException(status_code=503, detail="Not supported by backend")
+    pred_list = [p.strip() for p in predicates.split(",")] if predicates else None
+    return {"entity_id": entity_id, "neighbors": store.get_rel_neighbors(entity_id, pred_list)}

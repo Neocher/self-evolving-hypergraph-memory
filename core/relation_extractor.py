@@ -173,6 +173,61 @@ RELATION_PATTERNS: List[RelationPattern] = [
      r'(?:位于|地处|坐落于)'
      r'([\u4e00-\u9fff]{2,8}(?:省|市|区|县|路|街道|大厦|广场)?)',
      None),
+
+    # ── 新谓词（Schema 自进化 P0-②，v6.2.0）────────────────
+
+    # X partners with Y / X 与 Y 达成合作（英文）
+    ("PARTNER_WITH",
+     r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\s+'
+     r'(?:partners? with|has partnered with)\s+'
+     r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b',
+     None),
+
+    # X is a subsidiary of Y（英文）
+    ("SUBSIDIARY_OF",
+     r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\s+is\s+a\s+subsidiary\s+of\s+'
+     r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b',
+     None),
+
+    # X is a member of Y（英文）
+    ("MEMBER_OF",
+     r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\s+is\s+a\s+member\s+of\s+'
+     r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b',
+     None),
+
+    # X competes with Y（英文）
+    ("COMPETES_WITH",
+     r'\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\s+'
+     r'(?:competes? with|is competing with)\s+'
+     r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)\b',
+     None),
+
+    # X 与 Y 达成合作（中文）
+    ("PARTNER_WITH",
+     r'([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)'
+     r'(?:与|和)([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)'
+     r'(?:达成|建立|开展)(?:战略)?合作',
+     None),
+
+    # X 是 Y 的子公司 / X 旗下有 Y（中文）
+    ("SUBSIDIARY_OF",
+     r'([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)'
+     r'(?:旗下|全资子公司|控股子公司)(?:有|拥有)?'
+     r'([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)',
+     None),
+
+    # X 加入 Y / X 是 Y 的成员（中文）
+    ("MEMBER_OF",
+     r'([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)'
+     r'(?:加入|是)([\u4e00-\u9fff]{2,10}?(?:公司|集团|科技|有限|协会|联盟)?)'
+     r'(?:的成员|成员)',
+     None),
+
+    # X 与 Y 竞争（中文）
+    ("COMPETES_WITH",
+     r'([\u4e00-\u9fff]{2,10}(?:公司|集团|科技|有限)?)'
+     r'(?:与|和)([\u4e00-\u9fff]{2,10}?)(?:展开)?(?:竞争|抗衡)',
+     None),
 ]
 
 

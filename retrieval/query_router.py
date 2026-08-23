@@ -1429,6 +1429,9 @@ class QueryRouter:
             # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
             # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
             results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
+            # 【Schema 自进化 P0-② 检索通道 P1】属性匹配：查询词命中实体固化属性
+            # → MENTIONS episodes 补充召回（score = max(种子) × 0.85 降权）
+            results = self._attribute_expansion(results, query, raw_query, now_ts=session_ts)
             # 【阶段3 图作用域检索】补充非替代：种子 EpisodeNode → 邻域向量检索
             # append（仅 overgraph 后端；EpisodeNode 带 archived 字段，
             # _filter_archived 正常过滤；score = max(种子分) × boost(0.9) 仅低于
@@ -1857,6 +1860,8 @@ class QueryRouter:
         # 【P3c】实体扩召回补充：与 retrieve() _finish 顺序一致（property → entity_expansion）。
         # 防 MESA 历史教训：agentic 路径缺接线会导致通道静默失效。
         results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
+        # 【Schema 自进化 P0-② P1】属性匹配扩召回（agentic 路径同接线）
+        results = self._attribute_expansion(results, query, raw_query, now_ts=session_ts)
         if not include_archived:
             results = self._filter_archived(results)
         return results
@@ -2856,6 +2861,89 @@ class QueryRouter:
         except Exception:
             logger.debug(
                 "Entity expansion degraded, returning original results", exc_info=True
+            )
+            return results
+
+    def _attribute_expansion(
+        self,
+        results: list[dict],
+        query: str,
+        raw_query: Optional[str],
+        now_ts: Optional[float] = None,
+    ) -> list[dict]:
+        """【Schema 自进化 P0-② 检索通道 P1】查询词命中实体固化属性 → 扩展候选。
+
+        对已落库 EntityNode 的 attrs_json 侧车固化值（active=true）做 token 级
+        匹配：查询词命中某实体属性值 → 该实体 MENTIONS 的 EpisodeNode 补充召回，
+        得分 = max(种子分) × attr_boost(0.85)。只读固化值（候选未固化不进检索，
+        保精度）。异常/无属性/无种子 → 静默返回原 results（零回归）。
+        """
+        try:
+            ecfg = getattr(getattr(self, "config", None), "entity_expansion", None)
+            if ecfg is None or not getattr(ecfg, "enabled", True) or not results:
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_entities"):
+                return results
+            max_seed_score = max(
+                (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
+                default=0.0,
+            )
+            if max_seed_score <= 0.0:
+                return results
+            boost = float(getattr(ecfg, "attr_boost", 0.85))
+            per_entity = int(getattr(ecfg, "max_results", 10))
+            if per_entity <= 0:
+                return results
+            q_text = (raw_query or query or "").lower()
+            q_tokens = set(re.findall(r"[a-z][a-z0-9]{1,}|[\u4e00-\u9fff]{2,6}", q_text))
+            if not q_tokens:
+                return results
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            for ent in store.get_entities(limit=500):
+                sidecar = store._decode_sidecar(ent, "attrs_json")
+                if not sidecar:
+                    continue
+                hit_val: str = ""
+                for attr_name, attr_block in sidecar.items():
+                    solid = attr_block.get("solidified") or {}
+                    if not solid.get("active", True):
+                        continue
+                    val = str(solid.get("value") or "").lower()
+                    if val and any(t in val for t in q_tokens):
+                        hit_val = val
+                        break
+                if not hit_val:
+                    continue
+                ent_name = ent.get("name") or ent.get("norm_name") or ""
+                for ep_id in store.get_entity_episodes(ent_name, limit=per_entity):
+                    if not ep_id or ep_id in existing_ids:
+                        continue
+                    score = round(max_seed_score * boost, 6)
+                    if score <= 0.0:
+                        continue
+                    extra.append({
+                        "node_id": ep_id,
+                        "content": "",
+                        "score": score,
+                        "tau_value": 0.0,
+                        "fact_track": "active",
+                        "level": "attribute_expansion",
+                        "_source": "attribute_expansion",
+                    })
+                    existing_ids.add(ep_id)
+            if extra:
+                extra = extra[:_ENTITY_EXPANSION_MAX_APPEND]
+                logger.info(
+                    "Attribute expansion appended",
+                    tokens=len(q_tokens), candidates=len(extra), boost=boost,
+                )
+                results = results + extra
+            return results
+        except Exception:
+            logger.debug(
+                "Attribute expansion degraded, returning original results", exc_info=True
             )
             return results
 

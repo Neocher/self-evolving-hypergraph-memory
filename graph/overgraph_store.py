@@ -55,6 +55,7 @@ import threading
 import time
 import uuid
 import hashlib
+import json
 
 import numpy as np
 
@@ -725,6 +726,22 @@ class OverGraphStore:
         except Exception:
             return []
 
+    def get_entity_episodes_by_episode(self, episode_id: str, limit: int = 100) -> list[str]:
+        """反查：EpisodeNode → MENTIONS → EntityNode names（Schema 演化全量重放用）。"""
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (e:{LABEL_ENTITY})-[r:{LABEL_MENTIONS}]->(ep:{LABEL_EPISODE}) "
+                f"WHERE ep.id = '{episode_id}' RETURN e.name AS ent_name LIMIT {int(limit)}"
+            )
+            out = []
+            for row in (result or {}).get("rows", []):
+                nm = row.get("ent_name") if isinstance(row, dict) else None
+                if nm:
+                    out.append(str(nm))
+            return out
+        except Exception:
+            return []
+
     def get_entities(self, limit: int = 200) -> list[dict]:
         """列出实体（调试/评测/梦境消费）。"""
         try:
@@ -734,6 +751,151 @@ class OverGraphStore:
             return [self._flatten_row(r, "e") for r in (result or {}).get("rows", [])]
         except Exception:
             return []
+
+    # ── Schema 自进化 P0-②（实体属性/关系演化，v6.2.0）───────────────
+
+    def locked_update_entity_props(self, entity_id: str, mutator) -> dict:
+        """锁内读-改-写 EntityNode.props（sidecar 演化安全）。
+
+        _locked_upsert_node 是整包替换（非字段合并）→ 属性/关系侧车累积必须
+        在 session_lock 内 read-modify-write，避免并发写丢失。Returns 新 props。
+        """
+        with self._session_lock:
+            assert self._db is not None
+            try:
+                view = self._db.get_node_by_key(LABEL_ENTITY, str(entity_id))
+            except Exception:
+                view = None
+            props = self._flatten_view(view) if view is not None else {"id": str(entity_id)}
+            new_props = mutator(props)
+            if new_props is None:
+                new_props = props
+            clean = {k: v for k, v in new_props.items() if v is not None}
+            self._db.upsert_node(LABEL_ENTITY, str(entity_id), props=clean)
+            return dict(new_props)
+
+    def create_rel_edge(self, src_entity_id: str, dst_entity_id: str,
+                        predicate: str, confidence: float = 0.6,
+                        evidence_episode_ids: list[str] | None = None) -> str:
+        """EntityNode → EntityNode 谓词边（REL_<PRED>，三元组幂等）。
+
+        边创建后不原地更新（_ensure_edge 语义）：confidence 是固化时快照，
+        后续演化只写 rels_json 侧车。
+        """
+        label = f"REL_{predicate}"
+        if not re.match(r"^[A-Z][A-Z0-9_]{0,63}$", str(predicate)):
+            raise OverGraphError(f"invalid predicate label: {str(predicate)[:40]}")
+        rel_key = f"rel:{predicate}:{src_entity_id}:{dst_entity_id}"
+        key_hash = hashlib.sha1(rel_key.encode("utf-8")).hexdigest()[:16]
+        try:
+            frm = self._require_internal_id(str(src_entity_id), LABEL_ENTITY)
+            to = self._require_internal_id(str(dst_entity_id), LABEL_ENTITY)
+        except Exception:
+            raise OverGraphError(
+                f"rel edge endpoints missing: {str(src_entity_id)[:12]} -> {str(dst_entity_id)[:12]}"
+            )
+        self._ensure_edge(
+            frm, to, label,
+            props={"predicate": predicate, "confidence": float(confidence),
+                   "evidence_episode_ids": list(evidence_episode_ids or []),
+                   "rel_key": key_hash},
+            weight=float(confidence),
+        )
+        return key_hash
+
+    def get_rel_neighbors(self, entity_id: str,
+                          predicates: list[str] | None = None) -> list[dict]:
+        """1 跳谓词邻居（P2 检索通道用）。返回 [{dst_id, predicate, confidence}]。
+
+        边 props 含 predicate → 不需要枚举 label，GQL 全出边后按 props 过滤。
+        """
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (e:{LABEL_ENTITY})-[r]->(n:{LABEL_ENTITY}) "
+                f"WHERE e.id = '{entity_id}' "
+                f"RETURN n.id AS dst_id, r.predicate AS predicate, "
+                f"r.confidence AS confidence LIMIT 200"
+            )
+            out = []
+            for row in (result or {}).get("rows", []):
+                pred = row.get("predicate") if isinstance(row, dict) else None
+                if not pred:
+                    continue
+                if predicates and pred not in predicates:
+                    continue
+                out.append({
+                    "dst_id": str(row.get("dst_id") or ""),
+                    "predicate": str(pred),
+                    "confidence": float(row.get("confidence") or 0.0),
+                })
+            return out
+        except Exception:
+            return []
+
+    @staticmethod
+    def _decode_sidecar(props: dict, key: str) -> dict:
+        """读取 attrs_json / rels_json 侧车（兼容 dict 或 JSON 字符串存储）。"""
+        raw = props.get(key)
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+        return {}
+
+    def get_entity_attributes(self, entity_id: str) -> dict:
+        """读 EntityNode attrs_json 侧车（候选 + 固化 + 证据）。"""
+        ent = self.get_entity_by_id(str(entity_id))
+        if not ent:
+            return {}
+        return self._decode_sidecar(ent, "attrs_json")
+
+    def get_entity_relations(self, entity_id: str) -> dict:
+        """读 EntityNode rels_json 侧车 + 已固化 REL 边（出边 + 入边）。
+
+        出边存 src 视角（sidecar 内），入边以 direction=in 标记补全（消费方
+        dst 视角可读）。已固化边只更新 confidence/solidified，不覆盖侧车候选
+        字段（target_name/votes/evidence）。
+        """
+        ent = self.get_entity_by_id(str(entity_id))
+        sidecar: dict = {}
+        if ent:
+            sidecar = self._decode_sidecar(ent, "rels_json")
+        # 合并已固化 REL 边（GQL 侧，出边 + 入边）
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (e:{LABEL_ENTITY})-[r]->(n:{LABEL_ENTITY}) "
+                f"WHERE e.id = '{entity_id}' AND r.predicate IS NOT NULL "
+                f"RETURN n.id AS dst_id, r.predicate AS predicate, "
+                f"r.confidence AS confidence, 'out' AS direction LIMIT 200"
+            )
+            result_in = self._locked_execute_gql(
+                f"MATCH (n:{LABEL_ENTITY})-[r]->(e:{LABEL_ENTITY}) "
+                f"WHERE e.id = '{entity_id}' AND r.predicate IS NOT NULL "
+                f"RETURN n.id AS dst_id, r.predicate AS predicate, "
+                f"r.confidence AS confidence, 'in' AS direction LIMIT 200"
+            )
+            rows = ((result or {}).get("rows", []) + (result_in or {}).get("rows", []))
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                pred = row.get("predicate")
+                if not pred:
+                    continue
+                dst = str(row.get("dst_id") or "")
+                slot = sidecar.setdefault(str(pred), {}).setdefault(dst, {})
+                # 只更新固化信息，保留候选证据字段
+                slot["confidence"] = float(row.get("confidence") or 0.0)
+                slot["solidified"] = True
+                if row.get("direction") == "in":
+                    slot["direction"] = "in"
+        except Exception:
+            pass
+        return sidecar
 
     def get_episodes_by_tau_range(self, min_tau: float, max_tau: float,
                                   limit: int = 100) -> list[dict]:
