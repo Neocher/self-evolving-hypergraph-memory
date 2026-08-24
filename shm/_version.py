@@ -1,12 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.3.3"
-__version_info__ = (6, 3, 3)
-__version_name__ = "P0-Audit-Fix"
+__version__ = "6.4.0"
+__version_info__ = (6, 4, 0)
+__version_name__ = "Fact-Gated-Retrieval"
 __release_date__ = "2026-08-24"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.4.0 (2026-08-24) Fact-Gated-Retrieval:
+  • AtomicFact 事实级中间层（P0-③，EverOS 93.05 参考）：AtomicFactNode
+    (subject/predicate/object/valid_time/source_episode) + 梦境规则抽取
+    (_persist_atomic_facts) + _fact_retrieve 检索通道（实体命中事实文本进
+    上下文，独立段 0.85，默认关）；Phase A2 注入纪律（相关性过滤 + 同
+    subject+predicate valid_time 最新仲裁）
+  • sufficiency 门控（P0 ①）：证据充分跳过实体扩展，不足才全量——修复
+    自适应频率门控 -2pp（84.5→86.5）
+  • D-MEM RPE 写入门控（多巴胺奖励预测误差借鉴）：surprise=1-max_sim +
+    utility 三分流（深度/缓存/忽略），默认关零回归
+  • 评测：LoCoMo 200 问 87.0%（174/200，cat1 76.7/cat2 93.7/cat3 84.6/
+    cat4 87.7）— v6.1.0 后新高；含 v6.3.3 审计 P0 批量修复
+  • health 字段改名 faiss_index_size → vector_index_size（OverGraph HNSW）
+  • 测试: 全量门禁 + test_atomic_fact(8) + test_write_gate_rpe(8)
 v6.3.3 (2026-08-24) P0-Audit-Fix:
   • P0-1 命名空间隔离 fail-closed + visibility 过滤真实现 (search.py)
   • P0-2 空串哨兵收缩到 new_value 比较点，mutation 不再污染 (overgraph_store.py)
