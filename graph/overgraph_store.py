@@ -100,6 +100,8 @@ LABEL_SYSTEM = "SystemNode"
 LABEL_CONFLICT = "ConflictNode"
 LABEL_ENTITY = "EntityNode"
 LABEL_MENTIONS = "MENTIONS"
+LABEL_FACT = "AtomicFactNode"
+LABEL_FACT_MENTIONS = "FACT_MENTIONS"
 LABEL_ONTOLOGY_TYPE = "OntologyType"
 LABEL_ONTOLOGY_ENTITY = "OntologyEntity"
 
@@ -676,6 +678,97 @@ class OverGraphStore:
         p.setdefault("created_at", _now())
         self._locked_upsert_node(LABEL_ENTITY, eid, p)
         return eid
+
+    def create_atomic_fact(self, subject: str, predicate: str, object_: str,
+                           valid_time: str = "", source_episode: str = "",
+                           confidence: float = 1.0,
+                           props: dict | None = None) -> str:
+        """创建/复用 AtomicFactNode（sha1 确定性 key 幂等）。Returns fact id.
+
+        P0-③ AtomicFact 事实级中间层：Episode 拆 subject-predicate-object/time
+        原子事实单元，key = fact_<sha1(subject|predicate|object|valid_time)> 保证
+        同事实同版本不重复建节点；source_episode 记证据链 + FACT_MENTIONS 边。
+        """
+        subj = (subject or "").strip()
+        pred = (predicate or "").strip()
+        obj = (object_ or "").strip()
+        if not subj or not pred or not obj:
+            raise OverGraphError("atomic fact requires subject/predicate/object")
+        vt = (valid_time or "").strip()
+        raw = "|".join([subj.lower(), pred.lower(), obj.lower(), vt.lower()])
+        fid = f"fact_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+        p = dict(props or {})
+        p["id"] = fid
+        p["subject"] = subj
+        p["predicate"] = pred
+        p["object"] = obj
+        p["valid_time"] = vt
+        p["source_episode"] = str(source_episode or "")
+        p["confidence"] = float(confidence)
+        p.setdefault("archived", False)
+        p.setdefault("created_at", _now())
+        self._locked_upsert_node(LABEL_FACT, fid, p)
+        if source_episode:
+            try:
+                frm = self._require_internal_id(fid, LABEL_FACT)
+                to = self._require_internal_id(str(source_episode), LABEL_EPISODE)
+                self._ensure_edge(frm, to, LABEL_FACT_MENTIONS)
+            except Exception:
+                pass  # 边失败不阻塞（节点已落库）
+        return fid
+
+    def get_atomic_facts_by_episode(self, episode_id: str, limit: int = 50) -> list[dict]:
+        """EpisodeNode → FACT_MENTIONS → AtomicFactNode（梦境反查/审计）。"""
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (f:{LABEL_FACT})-[r:{LABEL_FACT_MENTIONS}]->(ep:{LABEL_EPISODE}) "
+                f"WHERE ep.id = '{episode_id}' RETURN f.id AS id, f.subject AS subject, "
+                f"f.predicate AS predicate, f.object AS object, f.valid_time AS valid_time "
+                f"LIMIT {int(limit)}"
+            )
+            rows = (result or {}).get("rows", [])
+            out = []
+            for r in rows:
+                if isinstance(r, dict):
+                    out.append({
+                        "id": str(r.get("id", "")),
+                        "subject": str(r.get("subject", "")),
+                        "predicate": str(r.get("predicate", "")),
+                        "object": str(r.get("object", "")),
+                        "valid_time": str(r.get("valid_time", "")),
+                    })
+            return out
+        except Exception:
+            return []
+
+    def get_atomic_facts_by_subject(self, subject: str, limit: int = 50) -> list[dict]:
+        """按 subject 查 AtomicFactNode（检索候选定位）。"""
+        subj = (subject or "").strip()
+        if not subj:
+            return []
+        try:
+            result = self._locked_execute_gql(
+                f"MATCH (f:{LABEL_FACT}) WHERE f.subject CONTAINS '{subj}' "
+                f"OR f.subject CONTAINS '{subj.lower()}' "
+                f"AND (f.archived IS NULL OR f.archived = false) "
+                f"RETURN f.id AS id, f.subject AS subject, f.predicate AS predicate, "
+                f"f.object AS object, f.valid_time AS valid_time "
+                f"LIMIT {int(limit)}"
+            )
+            rows = (result or {}).get("rows", [])
+            out = []
+            for r in rows:
+                if isinstance(r, dict):
+                    out.append({
+                        "id": str(r.get("id", "")),
+                        "subject": str(r.get("subject", "")),
+                        "predicate": str(r.get("predicate", "")),
+                        "object": str(r.get("object", "")),
+                        "valid_time": str(r.get("valid_time", "")),
+                    })
+            return out
+        except Exception:
+            return []
 
     def get_entity(self, entity_name: str) -> dict | None:
         """按规范化 name 查 EntityNode（确定性 key O(1)）。"""

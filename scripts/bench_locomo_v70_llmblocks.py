@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""v69 agentic 两轮（EverOS 参数 + v63 教训修正）——200 问对比 v66 82.5%
+"""v70 LLM 压缩记忆块（MindMemOS 核心机制）——200 问对比 v66 82.5%
 
-round1: FUSION + multi-query → rerank top-50（保留）
-sufficiency check: LLM 判断证据是否足够
-round2（不足时）: LLM 生成 follow-up 查询 → FUSION 追加（cap 40，去重）→ 合并 rerank
+每 15 条消息 → LLM 压缩为结构化块（保留实体/事实/时间戳，聚拢分散事实）
+→ 块向量化 + 块级检索（top-10）→ 命中块 → 展开块内消息 + 块摘要进 rerank 池
+→ 与消息级 FUSION 合并 → top-50 → LLM 生成
 """
 import json, os, re, sys, time
 sys.path.insert(0, "/home/admin/shm")
@@ -12,14 +12,14 @@ import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 
 DATA = "/home/admin/shm/data/bench/locomo10.json"
-DB_PATH = "/tmp/locomo_og_eval_v69"
+DB_PATH = "/tmp/locomo_og_eval_v70"
 SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
 RERANK_TOP = int(os.environ.get("RERANK_TOP", "50"))
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "20000"))
-ROUND2_CAP = int(os.environ.get("ROUND2_CAP", "40"))   # EverOS round2 追加上限
-SUFF_IF_EMPTY = os.environ.get("SUFF_IF_EMPTY", "1")   # 空检索直接 round2
-print(f"v69 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} round2_cap={ROUND2_CAP}", flush=True)
+BLOCK_SIZE = int(os.environ.get("BLOCK_SIZE", "15"))    # 每块消息数（MindMemOS）
+BLOCK_TOP = int(os.environ.get("BLOCK_TOP", "10"))      # 块检索 top-k
+print(f"v70 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} block_top={BLOCK_TOP}", flush=True)
 
 from graph.overgraph_store import OverGraphStore
 from retrieval.vector_index import VectorIndexAdapter
@@ -97,25 +97,6 @@ if vec_buf:
     faiss_index.add_with_ids(np.vstack(vec_buf), np.array(id_buf, dtype=np.int64))
 print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s", flush=True)
 
-# ── AtomicFact 灌库（P0-③ Phase A）──
-try:
-    from core.dream_pipeline import DreamPipeline
-    _dp = DreamPipeline.__new__(DreamPipeline)
-    _fact_count = 0
-    for mid, m in msg_by_id.items():
-        for fact in _dp._extract_facts_rules(m):
-            try:
-                gstore.create_atomic_fact(
-                    subject=fact["subject"], predicate=fact["predicate"],
-                    object_=fact["object"], valid_time=fact["valid_time"],
-                    confidence=0.6)
-                _fact_count += 1
-            except Exception:
-                pass
-    print(f"AtomicFact 灌入: {_fact_count} 条, {time.time()-t0:.0f}s", flush=True)
-except Exception as _fe:
-    print(f"AtomicFact 灌入跳过: {_fe}", flush=True)
-
 # ── TF-IDF ──
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -149,49 +130,113 @@ config.mesa_enabled = True
 config.mesa_boost = 0.4
 config.mesa_threshold = 0.5
 config.mesa_max_nodes = 5
-# 【2026-08-23 P0 sufficiency 门控评测】v6.3.4：静态频率门控实测 -2pp
-# （84.5 vs 86.5）→ 用 sufficiency 门控替代（证据充分跳过扩展，不足才全量）。
-config.entity_expansion.enabled = True
-config.entity_expansion.sufficiency_gate = True
-# 【2026-08-24 P0-③ AtomicFact Phase A】事实级通道开启（评测观察单变量增益）
-config.fact_channel.enabled = True
-config.fact_channel.max_facts = 5
 qr = QueryRouter(graphlite_store=gstore, faiss_index=faiss_index, tfidf_index=tfidf_index,
                  encoder=enc, config=config, faiss_id_map=faiss_id_map, episode_cache=episode_cache)
 
-def multi_query_expand(question, n=3):
-    prompt = f"""Generate {n} alternative search queries for finding the answer to this question in a conversation log.
+# ── LLM 压缩记忆块（MindMemOS）──
+_BLOCK_PROMPT = """Compress the following conversation messages into a memory block that preserves ALL key facts for later retrieval.
+Keep: entities (names, places), events, activities, preferences, dates/times, relationships, objects, amounts.
+Structure the block as:
+FACTS:
+- [entity] [verb phrase] [detail with dates/places/names]
+- ... (exhaustive, 1 per fact, include speaker and rough date when present)
+ENTITIES: comma-separated list
+
+Conversation messages:
+{messages}
+
+Output only the FACTS/ENTITIES block. No preamble."""
+
+def _compress_block(msgs):
+    msgs_text = "\n".join(f"[{i+1}] {m[:250]}" for i, m in enumerate(msgs))
+    try:
+        raw = llm_generate(_BLOCK_PROMPT.replace("{messages}", msgs_text), max_tokens=1200, temperature=0.0)
+        return raw.strip()
+    except Exception:
+        return "\n".join(msgs)
+
+# 块构建：连续 BLOCK_SIZE 条消息 → LLM 压缩
+print(f"LLM 压缩记忆块（{BLOCK_SIZE} 条/块）...", flush=True)
+blocks = []  # (block_id, start_idx, end_idx, summary)
+LIMIT_BLOCKS = int(os.environ.get("LIMIT_BLOCKS", "0"))  # 冒烟用：只压缩前 N 块
+t0 = time.time()
+_n_total = (len(all_msgs) + BLOCK_SIZE - 1) // BLOCK_SIZE
+for b_start in range(0, len(all_msgs), BLOCK_SIZE):
+    if LIMIT_BLOCKS > 0 and len(blocks) >= LIMIT_BLOCKS:
+        break
+    b_end = min(b_start + BLOCK_SIZE, len(all_msgs))
+    seg = all_msgs[b_start:b_end]
+    summary = _compress_block(seg)
+    blocks.append((f"blk_{len(blocks)}", b_start, b_end, summary))
+    if len(blocks) % 25 == 0:
+        print(f"  块 {len(blocks)}/{_n_total} ({time.time()-t0:.0f}s)", flush=True)
+print(f"记忆块完成: {len(blocks)} 块 ({time.time()-t0:.0f}s)", flush=True)
+json.dump([{"id": b[0], "start": b[1], "end": b[2], "summary": b[3]} for b in blocks],
+          open("/tmp/v70_blocks.json", "w"), ensure_ascii=False)
+
+# 块向量化 + FAISS
+import faiss
+block_vecs = np.asarray(enc.embed_batch([b[3][:1500] for b in blocks]), dtype=np.float32)
+block_vecs = block_vecs / np.linalg.norm(block_vecs, axis=1, keepdims=True)
+idx_blk = faiss.IndexFlatIP(512)
+idx_blk.add(block_vecs)
+print(f"块索引: {idx_blk.ntotal} 向量", flush=True)
+
+def block_recall(question):
+    """块级检索：query → 块 top-k → 块摘要 + 块内消息展开"""
+    qv = np.asarray(enc.embed(question), dtype=np.float32).reshape(1, -1)
+    qv = qv / np.linalg.norm(qv, axis=1, keepdims=True)
+    scores, bidx = idx_blk.search(qv, BLOCK_TOP)
+    out, seen = [], set()
+    for bi in bidx[0]:
+        blk = blocks[bi]
+        # 块摘要先进（语义聚拢）
+        if blk[3][:300] not in seen:
+            seen.add(blk[3][:300])
+            out.append(blk[3])
+        # 块内消息展开（证据保留）
+        for j in range(blk[1], blk[2]):
+            c = msg_by_id.get(f"ep_{j}", "")
+            if c and c[:200] not in seen:
+                seen.add(c[:200])
+                out.append(c)
+    return out
+
+def multi_query_expand(question):
+    prompt = f"""Generate 2 alternative search queries for finding the answer to this question in a conversation log.
 Question: {question}
-Output a JSON list of {n} query strings, e.g. ["query1", "query2", "query3"]. One should target the entity/people involved, one should target the specific fact/attribute, one should use different wording.
+Output a JSON list of 2 query strings, e.g. ["query1", "query2"]. One should target the entity/people involved, one should target the specific fact/attribute.
 No other text."""
     try:
-        raw = llm_generate(prompt, max_tokens=150, temperature=0.0)
+        raw = llm_generate(prompt, max_tokens=120, temperature=0.0)
         start, end = raw.find("["), raw.rfind("]")
         if start >= 0 and end > start:
             arr = json.loads(raw[start:end + 1])
-            return [str(x) for x in arr if isinstance(x, str) and x.strip()][:n]
+            return [str(x) for x in arr if isinstance(x, str) and x.strip()][:2]
     except Exception:
         pass
     return []
 
-def _fuse(q, seen, docs):
-    try:
-        raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=None, hyde=True)
-    except Exception:
-        return
-    for r in raw:
-        if isinstance(r, dict):
-            c = r.get("content") or msg_by_id.get(r.get("node_id", ""), "")
-            if c and c[:200] not in seen:
-                seen.add(c[:200])
-                docs.append(c)
-        else:
-            s = str(r)
-            if s[:200] not in seen:
-                seen.add(s[:200])
-                docs.append(s)
-
-def _adjacent(docs, seen):
+def retrieve_docs(question):
+    queries = [question] + multi_query_expand(question)
+    seen, docs = set(), []
+    for q in queries:
+        try:
+            raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=None, hyde=True)
+        except Exception:
+            continue
+        for r in raw:
+            if isinstance(r, dict):
+                c = r.get("content") or msg_by_id.get(r.get("node_id", ""), "")
+                if c and c[:200] not in seen:
+                    seen.add(c[:200])
+                    docs.append(c)
+            else:
+                s = str(r)
+                if s[:200] not in seen:
+                    seen.add(s[:200])
+                    docs.append(s)
+    # 相邻拉取
     doc_ids = []
     for c in docs:
         for mid, content in msg_by_id.items():
@@ -211,48 +256,15 @@ def _adjacent(docs, seen):
                     seen.add(msg_by_id[nb_mid][:200])
                     extra.append(msg_by_id[nb_mid])
     docs.extend(extra)
-
-def retrieve_round1(question):
-    queries = [question] + multi_query_expand(question, n=3)
-    seen, docs = set(), []
-    for q in queries:
-        _fuse(q, seen, docs)
-    _adjacent(docs, seen)
+    # LLM 压缩块通道（MindMemOS）——块摘要 + 块内消息进池
+    try:
+        for c in block_recall(question):
+            if c[:200] not in seen:
+                seen.add(c[:200])
+                docs.append(c)
+    except Exception:
+        pass
     return docs
-
-def suff_check(question, docs_top):
-    """sufficiency：LLM 判断 top 文档能否回答问题。返回 (enough, followup_query)"""
-    ctx = "\n".join(f"[{j+1}] {d[:120]}" for j, d in enumerate(docs_top[:10]))
-    prompt = f"""You are searching a conversation log. Given the retrieved snippets below, decide whether they are SUFFICIENT to answer the question.
-
-Question: {question}
-
-Retrieved snippets:
-{ctx}
-
-Output STRICT JSON: {{"sufficient": true/false, "missing_info": "what specific info is missing, or empty string"}}
-No other text."""
-    try:
-        raw = llm_generate(prompt, max_tokens=200, temperature=0.0)
-        s, e = raw.find("{"), raw.rfind("}")
-        d = json.loads(raw[s:e + 1]) if s >= 0 and e > s else {}
-        enough = bool(d.get("sufficient"))
-        missing = str(d.get("missing_info", ""))
-        return enough, missing
-    except Exception:
-        return True, ""
-
-def followup_query(question, missing):
-    prompt = f"""Generate a search query to find the missing information in a conversation log.
-
-Question: {question}
-Missing information needed: {missing}
-
-Output a single search query string. No other text."""
-    try:
-        return llm_generate(prompt, max_tokens=80, temperature=0.0).strip()[:200]
-    except Exception:
-        return question
 
 conv_ts = {}
 for item in data:
@@ -276,16 +288,14 @@ if SAMPLE_N > 0:
     qa_all = qa_all[:SAMPLE_N]
 print(f"评测规模: {len(qa_all)} 问", flush=True)
 
-results = {"total": 0, "correct": 0, "errors": 0, "by_cat": {}, "round2_used": 0}
+results = {"total": 0, "correct": 0, "errors": 0, "by_cat": {}}
 t0 = time.time()
 for i, q in enumerate(qa_all):
     qid = id(q)
     ci = qa_conv.get(qid, 0)
     question, gold, cat = q["question"], q["answer"], q.get("category", 0)
     session_ts = parse_session_ts(conv_ts.get(ci))
-
-    # round1 检索 + rerank top-50（保留）
-    docs = retrieve_round1(question)
+    docs = retrieve_docs(question)
     try:
         get_reranker()
         reranked = rerank(question, docs[:RERANK_POOL], top_n=RERANK_TOP)
@@ -293,29 +303,6 @@ for i, q in enumerate(qa_all):
     except Exception as e:
         print(f"  [rerank err] {e}", flush=True)
         docs = docs[:RERANK_TOP]
-
-    # sufficiency check + round2 追加（EverOS 修正版：保留 round1）
-    enough = True
-    if docs:
-        try:
-            enough, missing = suff_check(question, docs)
-        except Exception:
-            enough, missing = True, ""
-    else:
-        enough, missing = False, "general information about the question"
-    if not enough:
-        results["round2_used"] += 1
-        fq = followup_query(question, missing) if missing and missing != "general information about the question" else question
-        seen2 = {c[:200] for c in docs}
-        _fuse(fq, seen2, docs)
-        _adjacent(docs, seen2)
-        # round2 结果合并（cap 40 追加——已在 docs 中，rerank 池 200 内）
-        try:
-            reranked2 = rerank(question, docs[:RERANK_POOL], top_n=RERANK_TOP)
-            docs = [d for d, s in reranked2]
-        except Exception:
-            docs = docs[:RERANK_TOP]
-
     ctx = "\n".join(f"[{j+1}] {d}" for j, d in enumerate(docs[:RERANK_TOP]))
     ctx = ctx[:CTX_TOKENS]
     prompt = f"""Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
@@ -345,19 +332,19 @@ Answer:"""
         results["by_cat"][cat]["c"] += 1
     if (i + 1) % 10 == 0 or i == len(qa_all) - 1:
         acc = results["correct"] / max(1, results["total"]) * 100
-        print(f"  {i+1}/{len(qa_all)} acc={acc:.1f}% ({results['correct']}/{results['total']}) round2={results['round2_used']} elapsed={time.time()-t0:.0f}s", flush=True)
+        print(f"  {i+1}/{len(qa_all)} acc={acc:.1f}% ({results['correct']}/{results['total']}) elapsed={time.time()-t0:.0f}s", flush=True)
 
 acc = results["correct"] / max(1, results["total"]) * 100
-print(f"\n=== v69 agentic 两轮评测 {SAMPLE_N}问 ===", flush=True)
+print(f"\n=== v70 LLM 压缩记忆块评测 {SAMPLE_N}问 ===", flush=True)
 print(f"准确率: {acc:.1f}% ({results['correct']}/{results['total']})", flush=True)
-print(f"round2 使用: {results['round2_used']} 问 | 错误: {results['errors']} | 耗时: {time.time()-t0:.0f}s", flush=True)
+print(f"错误: {results['errors']} | 耗时: {time.time()-t0:.0f}s", flush=True)
 for cat in sorted(results["by_cat"]):
     d = results["by_cat"][cat]
     print(f"  cat={cat}: {d['c']}/{d['t']} = {d['c']/max(1,d['t'])*100:.1f}%", flush=True)
 
-out = "/tmp/locomo_v69_results.json"
+out = "/tmp/locomo_v70_results.json"
 json.dump({"acc": acc, "correct": results["correct"], "total": results["total"],
-           "by_cat": results["by_cat"], "errors": results["errors"], "round2_used": results["round2_used"],
-           "version": "6.4.0-agentic2"},
+           "by_cat": results["by_cat"], "errors": results["errors"], "blocks": len(blocks),
+           "version": "6.4.0-llmblocks"},
           open(out, "w"), ensure_ascii=False, indent=2)
 print(f"结果已存: {out}", flush=True)

@@ -438,6 +438,8 @@ class DreamPipeline:
                         self._persist_entities, graphlite_store, communities)
                     await self._persist_async(
                         self._persist_schema_evolution, graphlite_store, communities)
+                    await self._persist_async(
+                        self._persist_atomic_facts, graphlite_store, communities)
                 except Exception as persist_exc:
                     persist_degraded = True
                     logger.error(
@@ -1442,6 +1444,8 @@ Text:
                 self._persist_entities, graphlite_store, communities)
             await self._persist_async(
                 self._persist_schema_evolution, graphlite_store, communities)
+            await self._persist_async(
+                self._persist_atomic_facts, graphlite_store, communities)
         except Exception as persist_exc:
             persist_degraded = True
             logger.error("Dream %s: PERSIST partial failure (degraded, next dream repairs): %s",
@@ -1480,6 +1484,87 @@ Text:
                     created += 1
         if created:
             logger.info("Dream PERSIST: %d entities persisted (schema self-evolution)", created)
+        return created
+
+    # ─── AtomicFact 事实级中间层（P0-③）─────────────
+
+    _FACT_VERB_PAT = re.compile(
+        r"([A-Z][A-Za-z]+)\s+"
+        r"((?:is|was|has|had|works\s+as|works\s+at|graduated\s+from|enrolled\s+in|"
+        r"started|finished|likes|prefers|attends|attended|moved\s+to|born\s+in))\s+"
+        r"([^.,;!?]{1,80})",
+        re.IGNORECASE,
+    )
+    _FACT_TIME_PAT = re.compile(
+        r"(?:in|on|since|until)\s+((?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|"
+        r"Sep|Oct|Nov|Dec)?\.?\s*\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}|\d{4})",
+        re.IGNORECASE,
+    )
+
+    def _extract_facts_rules(self, content: str) -> list[dict]:
+        """规则抽取 SPO 三元组（英文为主，LoCoMo 评测场景；中文后续扩展）。"""
+        if not content:
+            return []
+        out: list[dict] = []
+        for m in self._FACT_VERB_PAT.finditer(content):
+            subj = m.group(1).strip()
+            pred = m.group(2).strip()
+            obj = m.group(3).strip()
+            if not subj or not pred or not obj:
+                continue
+            vt = ""
+            tm = self._FACT_TIME_PAT.search(content)
+            if tm:
+                vt = tm.group(1).strip()
+            out.append({
+                "subject": subj, "predicate": pred,
+                "object": obj, "valid_time": vt,
+            })
+            if len(out) >= 10:
+                break
+        return out
+
+    async def _persist_atomic_facts(self, graphlite_store, communities: list[dict]) -> int:
+        """AtomicFact 落库（P0-③）：社区 episode 内容 → SPO 事实节点（幂等）。
+
+        独立于实体落库（_persist_entities）——事实级中间层（EverOS 93.05 核心）。
+        抽取失败/落库失败不阻塞（PERSIST degraded 语义）。
+        """
+        created = 0
+        if graphlite_store is None or not hasattr(graphlite_store, "create_atomic_fact"):
+            return 0
+        seen: set[str] = set()
+        for comm in communities:
+            for node in (comm.get("episodes") or comm.get("nodes") or []):
+                content = ""
+                if isinstance(node, dict):
+                    content = node.get("content") or node.get("summary") or ""
+                elif isinstance(node, str):
+                    content = node
+                if not content:
+                    continue
+                for fact in self._extract_facts_rules(content):
+                    key = "|".join([
+                        fact["subject"].lower(), fact["predicate"].lower(),
+                        fact["object"].lower(), fact["valid_time"].lower(),
+                    ])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        graphlite_store.create_atomic_fact(
+                            subject=fact["subject"], predicate=fact["predicate"],
+                            object_=fact["object"], valid_time=fact["valid_time"],
+                            confidence=0.6,
+                        )
+                        created += 1
+                    except Exception as e:
+                        logger.warning(
+                            "Dream PERSIST: create_atomic_fact failed %s|%s: %s",
+                            fact["subject"], fact["predicate"], e)
+        if created:
+            logger.info("Dream PERSIST: %d atomic facts persisted (P0-③)", created)
         return created
 
     # ─── Schema 自进化 P0-②：实体属性/关系演化 ────────────────

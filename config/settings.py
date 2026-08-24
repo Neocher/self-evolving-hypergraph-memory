@@ -70,6 +70,30 @@ class SSMConfig:
 
 
 @dataclass
+class WriteGateConfig:
+    """【D-MEM RPE 写入门控】多巴胺奖励预测误差批判路由（默认关零回归）
+
+    生物原型：多巴胺神经元编码奖励预测误差（RPE）——新信息与已有记忆的
+    预测差距（惊奇度）决定记忆深度。批判路由器按惊奇度 + 长期效用三分流：
+    深度写入（EpisodeNode 梦境候选）/ 快速缓存（τ 降低加速衰减）/ 忽略。
+    """
+    enabled: bool = False       # 开关：产品端实验，默认关
+    surprise_deep: float = 0.45  # 惊奇度 ≥ 此值 → 深度写入（新信息）
+    surprise_cache: float = 0.25  # 惊奇度 ≥ 此值 → 快速缓存（τ 降低）
+    utility_min: float = 0.5     # 效用下限（低于 → 忽略，即使高惊奇）
+    cache_tau: float = 0.5       # 快速缓存 τ_initial（默认 1.0 的降级）
+    top_k: int = 3              # 相似检索候选数
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.surprise_cache <= self.surprise_deep <= 1.0:
+            raise ValueError(
+                f"WriteGateConfig 阈值须满足 0 <= cache({self.surprise_cache}) "
+                f"<= deep({self.surprise_deep}) <= 1")
+        if not 0.0 < self.cache_tau <= 1.0:
+            raise ValueError(f"WriteGateConfig.cache_tau={self.cache_tau} 必须 ∈ (0, 1]")
+
+
+@dataclass
 class DreamConfig:
     idle_timeout_seconds: int = 300
     accum_threshold: int = 100
@@ -170,6 +194,17 @@ class EntityExpansionConfig:
     max_results: int = 10       # 每实体最大召回数
     max_entities: int = 3       # 每查询最多提取实体数
     time_filter: bool = True    # 时间锚上界过滤（created_at <= session 时间锚）
+    # 【2026-08-23 自适应扩展】频率门控实验：LoCoMo 200 问实测 84.5%（含扩展
+    # 86.5%）→ 静态频率门控 -2pp（cat2 时间类 -4.8pp，高频主角时间题需扩展帮助）。
+    # 方向错误 → 默认关闭（freq_adaptive=False 保持含扩展最优行为）；如需重试
+    # sufficiency 驱动方案，显式开启并先 A/B。
+    freq_adaptive: bool = False
+    freq_threshold: int = 50    # 实体消息数超过该值判高频（配置化，可按库分位调）
+    freq_boost: float = 0.5     # 高频实体降级扩展分系数
+    freq_max_results: int = 3   # 高频实体降级最大召回数
+    # 【2026-08-23 P0 sufficiency 门控】首轮证据充分（分差+distinct 达标）→
+    # 跳过实体扩展；证据不足才全量扩展（替代失败的静态频率门控）。
+    sufficiency_gate: bool = True
 
     def __post_init__(self) -> None:
         # 【R1 P2-1】boost/max_results/max_entities 校验（镜像 MesaConfig 做法）：
@@ -181,6 +216,26 @@ class EntityExpansionConfig:
             raise ValueError(f"EntityExpansionConfig.max_results={self.max_results} 必须 >= 1")
         if self.max_entities < 1:
             raise ValueError(f"EntityExpansionConfig.max_entities={self.max_entities} 必须 >= 1")
+        if not 0.0 <= self.freq_boost < 1.0:
+            raise ValueError(f"EntityExpansionConfig.freq_boost={self.freq_boost} 必须 ∈ [0, 1)")
+        if self.freq_threshold < 1:
+            raise ValueError(f"EntityExpansionConfig.freq_threshold={self.freq_threshold} 必须 >= 1")
+        if self.freq_max_results < 1:
+            raise ValueError(f"EntityExpansionConfig.freq_max_results={self.freq_max_results} 必须 >= 1")
+
+
+@dataclass
+class FactChannelConfig:
+    """【P0-③ AtomicFact 事实级中间层】检索通道配置（默认关零回归）"""
+    enabled: bool = False       # 开关：评测 Phase A 显式开启
+    boost: float = 0.85         # 事实分 = max(种子分) × boost（独立段降权）
+    max_facts: int = 5          # 每查询最大事实候选数
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.boost < 1.0:
+            raise ValueError(f"FactChannelConfig.boost={self.boost} 必须 ∈ [0, 1)")
+        if self.max_facts < 1:
+            raise ValueError(f"FactChannelConfig.max_facts={self.max_facts} 必须 >= 1")
 
 
 @dataclass
@@ -342,6 +397,8 @@ class Settings:
     defense: DefenseConfig = field(default_factory=DefenseConfig)
     shm_client: SHMClientConfig = field(default_factory=SHMClientConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    # 【D-MEM RPE 写入门控】（v6.4.0 实验，默认关）
+    write_gate: WriteGateConfig = field(default_factory=WriteGateConfig)
 
 
 def _env_override(raw: dict[str, Any], prefix: str = "SHM") -> dict[str, Any]:

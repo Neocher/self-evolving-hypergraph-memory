@@ -96,6 +96,11 @@ retrieval:
     max_results: 10              # 每实体最大召回数
     max_entities: 3              # 每查询最多提取实体数
     time_filter: true            # 时间锚上界过滤（created_at <= session 时间锚）
+    freq_adaptive: false         # 2026-08-23 实测：静态频率门控 -2pp（LoCoMo 84.5 vs 86.5）→ 默认关
+    freq_threshold: 50           # 高频判定阈值（freq_adaptive=true 时生效）
+    freq_boost: 0.5              # 高频降级扩展分系数
+    freq_max_results: 3          # 高频降级最大召回数
+    sufficiency_gate: true       # 2026-08-23 P0：证据充分跳过扩展，不足才全量（替代频率门控）
   scope_recall:                  # v6.0.0 阶段3 图作用域召回（仅 overgraph 后端生效；graphlite hasattr no-op）
     enabled: true                # 开关
     boost: 0.9                   # 扩展分 = max(种子分) × boost（仅低于最高种子）

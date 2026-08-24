@@ -218,7 +218,11 @@ async def health_check(
         "version": __version__,
         "version_name": __version_name__,
         "uptime_seconds": health.uptime_seconds,
-        "faiss_index_size": health.faiss_index_size,
+        # 【2026-08-23】命名修正：向量索引已由 OverGraph HNSW 承担（v6.0.0 起
+        # GraphLite/FAISS 均弃用），faiss_index_size 为历史字段名——新增
+        # vector_index_size 主字段，旧字段保留兼容（监控脚本迁移后移除）。
+        "vector_index_size": health.faiss_index_size,
+        "faiss_index_size": health.faiss_index_size,  # deprecated: 兼容旧监控
         "chain_verified": health.chain_verified,
         "node_count": health.node_count,
         "hyperedge_count": health.hyperedge_count,

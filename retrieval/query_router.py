@@ -34,7 +34,9 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from core.user_profile import profile_hit, profile_values
-from config.settings import EntityExpansionConfig, ScopeRecallConfig, get_settings
+from config.settings import (
+    EntityExpansionConfig, FactChannelConfig, ScopeRecallConfig, get_settings,
+)
 from core.schema_distiller import extract_terms
 from graph.common import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
@@ -248,6 +250,8 @@ class QueryRouterConfig:
     # 预留 1.5s LLM + 融合检索，失败静默降级单路
     # 实体扩召回配置（P3c v5.53.0 跨消息多跳增强，默认开；关闭/异常静默回落现状）
     entity_expansion: EntityExpansionConfig = field(default_factory=EntityExpansionConfig)
+    # 【P0-③ AtomicFact 事实级中间层】检索通道（默认关零回归；评测 Phase A 开启）
+    fact_channel: FactChannelConfig = field(default_factory=FactChannelConfig)
     # 图作用域召回配置（阶段3 v6.0.0；仅 overgraph 后端生效，graphlite hasattr 假 no-op）
     scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
 
@@ -1440,6 +1444,10 @@ class QueryRouter:
             # 【阶段4-1 Schema 模式蒸馏】补充非替代：Schema 节点（:Conceptual 标签）
             # 命中 → append 聚合线索上下文（尾分缩放；无 archived 字段恒保留）
             results = self._schema_recall(results, raw_query or query)
+            # 【P0-③ AtomicFact 事实级中间层】补充非替代：查询实体命中
+            # AtomicFactNode → 事实文本（subject/predicate/object/time）直接进
+            # 上下文（事实级证据，EverOS 93.05 核心）；默认关（fact_channel_enabled）
+            results = self._fact_retrieve(results, query, raw_query, now_ts=session_ts)
             if not include_archived:
                 results = self._filter_archived(results)
             sorted_results = self._deduplicate_and_sort(results)
@@ -2778,6 +2786,25 @@ class QueryRouter:
             if not entities:
                 return results
             entities = entities[:max(1, int(getattr(ecfg, "max_entities", 3)))]
+            # 【P0 sufficiency 驱动】首轮证据已充分（top-k 分差 + distinct 节点数
+            # 达标）→ 跳过实体扩展；仅证据不足时补充跨会话证据。2026-08-23 实测
+            # 静态频率门控 -2pp（LoCoMo 84.5 vs 86.5）→ 用 sufficiency 门控替代
+            # （扩展在证据不足时是全量正贡献，不该按频率降级）。
+            if bool(getattr(ecfg, "sufficiency_gate", True)):
+                try:
+                    top = results[: self.config.agentic_top_k]
+                    scores = [float(r.get("score") or 0.0) for r in top]
+                    if top and max(scores) > 0.0:
+                        gap = (max(scores) - min(scores)) / max(scores)
+                        distinct = len({r.get("node_id") for r in top if r.get("node_id")})
+                        if (gap >= self.config.agentic_score_gap
+                                and distinct >= self.config.agentic_min_new):
+                            logger.info(
+                                "Entity expansion skipped (sufficiency)",
+                                gap=round(gap, 3), distinct=distinct)
+                            return results
+                except Exception:
+                    pass  # 判定失败 → 不拦扩展（零回归）
             # 【CC P3c】全部种子（score 非 None）的最大分（max 锚）；无有效种子分
             # → default 0.0 → 下方 max_seed_score <= 0.0 直接返回原 results（不扩展）。
             max_seed_score = max(
@@ -2794,61 +2821,79 @@ class QueryRouter:
             # lower（小写）双变体条件——GraphLite CONTAINS 大小写敏感，仅小写
             # 条件打不进大写专名存储（"Melanie"→"melanie" 恒 0 命中），双变体
             # 覆盖大写存储（Melanie）与小写存储（melanie）两种库
-            params: dict = {}
-            conditions: list[str] = []
-            for i, ent in enumerate(entities):
-                pkey_orig = f"t{i}_orig"
-                pkey_lower = f"t{i}_lower"
-                params[pkey_orig] = ent
-                params[pkey_lower] = ent.lower()
-                conditions.append(
-                    f"(e.content CONTAINS ${pkey_orig} OR e.content CONTAINS ${pkey_lower})"
-                )
-            where_clause = " OR ".join(conditions)
             at_clause = ""
             if now_ts is not None and bool(getattr(ecfg, "time_filter", True)):
                 at_clause = " AND e.created_at <= $at_ts"
-                params["at_ts"] = int(now_ts)
-            cypher = (
-                f"MATCH (e:EpisodeNode) WHERE ({where_clause}) "
-                f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
-                f"RETURN e.id AS node_id, e.content AS content, "
-                f"e.tau_initial AS tau_value, e.fact_track AS fact_track "
-                f"ORDER BY e.created_at DESC LIMIT $limit"
-            )
-            params["limit"] = per_entity * len(entities)
-            rows = store.query_cypher(cypher, params)
-            if not isinstance(rows, (list, tuple)) or not rows:
-                return results
+            # 【2026-08-23 自适应扩展】频率门控：每实体单独查询（N≤3 次小查询），
+            # 先 COUNT 该实体在库消息数——高频实体（> freq_threshold）扩展 = 噪音
+            # 洪流（LoCoMo 主角恒定教训）→ 降级召回量（freq_max_results）；低频
+            # 实体照常全量扩展（跨会话聚合证据有价值）。COUNT/查询失败 → 默认参数
+            # （零回归）。
+            freq_adaptive = bool(getattr(ecfg, "freq_adaptive", True))
+            freq_threshold = int(getattr(ecfg, "freq_threshold", 50))
+            freq_max = int(getattr(ecfg, "freq_max_results", 3))
             existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
             extra: list[dict] = []
-            for row in rows:
-                if isinstance(row, dict):
-                    nid = row.get("node_id", "") or ""
-                    content = row.get("content", "") or ""
-                    tau = _safe_float_tau(row.get("tau_value", 0.0))
-                    fact_track = row.get("fact_track", "active") or "active"
-                elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                    nid = str(row[0]) if row[0] is not None else ""
-                    content = str(row[1]) if row[1] is not None else ""
-                    tau = _safe_float_tau(row[2]) if len(row) > 2 else 0.0
-                    fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
-                else:
+            for i, ent in enumerate(entities):
+                pkey_orig = f"t{i}_orig"
+                pkey_lower = f"t{i}_lower"
+                pparams: dict[str, object] = {
+                    pkey_orig: ent, pkey_lower: ent.lower(),
+                }
+                if now_ts is not None and bool(getattr(ecfg, "time_filter", True)):
+                    pparams["at_ts"] = int(now_ts)
+                ent_cond = (
+                    f"(e.content CONTAINS ${pkey_orig} OR e.content CONTAINS ${pkey_lower})"
+                )
+                ent_limit = per_entity
+                if freq_adaptive:
+                    try:
+                        cnt_rows = store.query_cypher(
+                            f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
+                            f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
+                            f"RETURN count(e) AS c", pparams)
+                        freq = int(cnt_rows[0]["c"]) if cnt_rows else 0
+                        if freq > freq_threshold:
+                            ent_limit = freq_max
+                    except Exception:
+                        pass  # 频率检测失败 → 默认参数（零回归）
+                pparams["limit"] = ent_limit
+                ent_rows = store.query_cypher(
+                    f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
+                    f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
+                    f"RETURN e.id AS node_id, e.content AS content, "
+                    f"e.tau_initial AS tau_value, e.fact_track AS fact_track "
+                    f"ORDER BY e.created_at DESC LIMIT $limit", pparams)
+                if not isinstance(ent_rows, (list, tuple)):
                     continue
-                if not nid or nid in existing_ids or not content:
-                    continue
-                score = round(max_seed_score * boost, 6)
-                if score <= 0.0:
-                    continue
-                extra.append({
-                    "node_id": nid,
-                    "content": content,
-                    "score": score,
-                    "tau_value": tau,
-                    "fact_track": fact_track,
-                    "level": "entity_expansion",
-                    "_source": "entity_expansion",
-                })
+                for row in ent_rows:
+                    if isinstance(row, dict):
+                        nid = row.get("node_id", "") or ""
+                        content = row.get("content", "") or ""
+                        tau = _safe_float_tau(row.get("tau_value", 0.0))
+                        fact_track = row.get("fact_track", "active") or "active"
+                    elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                        nid = str(row[0]) if row[0] is not None else ""
+                        content = str(row[1]) if row[1] is not None else ""
+                        tau = _safe_float_tau(row[2]) if len(row) > 2 else 0.0
+                        fact_track = str(row[3]) if len(row) > 3 and row[3] is not None else "active"
+                    else:
+                        continue
+                    if not nid or nid in existing_ids or not content:
+                        continue
+                    score = round(max_seed_score * boost, 6)
+                    if score <= 0.0:
+                        continue
+                    existing_ids.add(nid)
+                    extra.append({
+                        "node_id": nid,
+                        "content": content,
+                        "score": score,
+                        "tau_value": tau,
+                        "fact_track": fact_track,
+                        "level": "entity_expansion",
+                        "_source": "entity_expansion",
+                    })
             if extra:
                 # 总 append 硬上限 20（实体 top-3 × 每实体 max-10 的钳制）
                 extra = extra[:_ENTITY_EXPANSION_MAX_APPEND]
@@ -3088,6 +3133,105 @@ class QueryRouter:
             logger.debug(
                 "Scope recall degraded, returning original results", exc_info=True
             )
+            return results
+
+    def _fact_retrieve(self, results: list[dict], query: str,
+                       raw_query: Optional[str] = None,
+                       now_ts: Optional[float] = None) -> list[dict]:
+        """【P0-③ AtomicFact 事实级中间层】查询实体命中 AtomicFactNode → 事实文本
+        直接进上下文（事实级证据，EverOS 93.05 核心；Phase A 评测观察）。
+
+        独立通道不塞池：事实候选 score = max(种子) × 0.85 独立段（对齐属性扩展
+        降权）；query_router config.fact_channel_enabled=False 默认关零回归。
+        """
+        try:
+            ecfg = getattr(getattr(self, "config", None), "fact_channel", None)
+            if ecfg is None or not getattr(ecfg, "enabled", False):
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_atomic_facts_by_subject"):
+                return results
+            q_text = (raw_query or query or "").strip()
+            if not q_text:
+                return results
+            entities = self._extract_query_entities(q_text)
+            if not entities:
+                return results
+            max_seed_score = max(
+                (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
+                default=0.0,
+            )
+            if max_seed_score <= 0.0:
+                return results
+            boost = float(getattr(ecfg, "boost", 0.85))
+            max_facts = int(getattr(ecfg, "max_facts", 5))
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            # 【P0-③ Phase A2 注入纪律】D-MEM 批判路由器借鉴：事实注入前按
+            # 「相关性 + 时间冲突」批判——只注入与查询实体/谓词/时间匹配的事实；
+            # 同 subject+predicate 多版本取 valid_time 最新（最新事实优先，防旧
+            # 事实与最新状态冲突稀释 judge 注意力——CC 塞池风险 + v68 教训）。
+            q_lower = q_text.lower()
+            extra: list[dict] = []
+            seen_facts: set[str] = set()
+            # subject → 候选事实（同 subject+predicate 保留最新 valid_time）
+            best_by_sp: dict[tuple[str, str], dict] = {}
+            for ent in entities[:3]:
+                try:
+                    facts = store.get_atomic_facts_by_subject(ent, limit=12)
+                except Exception:
+                    continue
+                for f in facts or []:
+                    fid = str(f.get("id", ""))
+                    if not fid or fid in seen_facts:
+                        continue
+                    seen_facts.add(fid)
+                    subj = f.get("subject", "")
+                    pred = f.get("predicate", "")
+                    obj = f.get("object", "")
+                    vt = f.get("valid_time", "")
+                    if not subj or not obj:
+                        continue
+                    # 相关性批判：谓词/客体须与查询词有词面重叠（否则低相关不注入）
+                    fact_text = f"{subj} {pred} {obj}".lower()
+                    pred_obj = f"{pred} {obj}".lower()
+                    if not any(
+                        tok in q_lower for tok in
+                        [pred.lower(), obj.lower(), pred_obj] if len(tok) >= 3
+                    ):
+                        continue
+                    # 时间冲突仲裁：同 subject+predicate → 保留最新 valid_time
+                    key = (subj.lower(), pred.lower())
+                    cur = best_by_sp.get(key)
+                    if cur is None or (vt and (not cur.get("valid_time") or vt > cur["valid_time"])):
+                        best_by_sp[key] = {
+                            "id": fid, "subject": subj, "predicate": pred,
+                            "object": obj, "valid_time": vt,
+                        }
+            for f in best_by_sp.values():
+                fid = f["id"]
+                text = f"{f['subject']} {f['predicate']} {f['object']}"
+                if f["valid_time"]:
+                    text += f" ({f['valid_time']})"
+                if text.lower() in existing_ids:
+                    continue
+                extra.append({
+                    "node_id": fid,
+                    "content": text,
+                    "score": round(max_seed_score * boost, 6),
+                    "tau_value": 0.0,
+                    "fact_track": "active",
+                    "level": "atomic_fact",
+                    "_source": "atomic_fact",
+                })
+                existing_ids.add(text.lower())
+                if len(extra) >= max_facts:
+                    break
+            if extra:
+                logger.info(
+                    "AtomicFact retrieved", entities=len(entities), candidates=len(extra))
+                results = results + extra
+            return results
+        except Exception:
             return results
 
     def _schema_recall(self, results: list[dict], query: str) -> list[dict]:

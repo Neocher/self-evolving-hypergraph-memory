@@ -301,6 +301,24 @@ class TestEntityExpansion:
         seeds.append(_seed("ep6", "Apple low score node", score=0.1))
         router = _make_router(store, seeds)
         out = router.retrieve("Apple revenue", level=RetrievalLevel.FUSION)
+        # 【2026-08-23 P0 sufficiency 门控】6 高分种子（gap=0.889 ≥ 0.25,
+        # distinct=6 ≥ 3）= 证据充分 → 跳过实体扩展（扩展仅在证据不足时补充）。
+        exp = [r for r in out if r.get("level") == "entity_expansion"]
+        assert len(exp) == 0, "证据充分时应跳过实体扩展（sufficiency 门控）"
+
+    def test_p1_sufficiency_gate_disabled_still_expands(self):
+        """sufficiency_gate=False 时保留 max 锚扩展逻辑（原行为）：6 种子
+        [0.9×5, 0.1] → 扩展分 = max(0.9)×0.9 = 0.81，仅低于最高种子 0.9。"""
+        store = MagicMock()
+        store.query_cypher.return_value = [
+            _row("ep9", "Apple announced the M4 chip at WWDC."),
+        ]
+        seeds = [_seed(f"ep{i}", f"Apple session {i}", score=0.9) for i in range(1, 6)]
+        seeds.append(_seed("ep6", "Apple low score node", score=0.1))
+        router = _make_router(
+            store, seeds,
+            entity_expansion=EntityExpansionConfig(sufficiency_gate=False))
+        out = router.retrieve("Apple revenue", level=RetrievalLevel.FUSION)
         exp = [r for r in out if r.get("level") == "entity_expansion"]
         assert len(exp) == 1
         assert exp[0]["score"] == pytest.approx(round(0.9 * 0.9, 6))  # max(全部种子)=0.9

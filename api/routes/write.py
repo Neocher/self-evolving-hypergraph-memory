@@ -562,6 +562,44 @@ async def create_episode(
     # [Defense] 记忆投毒预检（在 GraphLite 写入前执行）
     defense_verdict = None
     defense_reason = ""
+
+    # 【D-MEM RPE 写入门控】多巴胺奖励预测误差批判路由（默认关零回归）
+    # 生物原型：RPE = 新信息 vs 已有记忆的预测差距（惊奇度）→ 决定记忆深度。
+    # 三分流：深度写入 / 快速缓存（τ 降低）/ 忽略（重复信息仅强化已有记忆）。
+    # 在 SSM gate 之后、defense 之前执行；force_promote 绕过（强制语义无条件写入）。
+    rpe_route = None  # deep / cache / ignore
+    if (not req.force_promote and deps.encoder is not None
+            and deps.graphlite_store is not None):
+        try:
+            from config.settings import get_settings
+            _wgc = getattr(get_settings(), "write_gate", None)
+            if _wgc is not None and _wgc.enabled:
+                _emb = deps.encoder.embed(req.content)
+                if _emb is not None:
+                    _hits = deps.graphlite_store.vector_search_dense(_wgc.top_k, _emb)
+                    _max_sim = 0.0
+                    for _ep, _s in (_hits or []):
+                        if float(_s) > _max_sim:
+                            _max_sim = float(_s)
+                    _surprise = 1.0 - _max_sim  # 相似度高 → 惊奇度低（重复信息）
+                    # 长期效用：实体丰富度代理（内容长度 + 数字/专名密度）
+                    _alpha = sum(ch.isalpha() for ch in req.content) if req.content else 0
+                    _len_u = min(len(req.content) / 200.0, 1.0)
+                    _name_u = 1.0 if any(ch.isupper() for ch in req.content) else 0.3
+                    _utility = 0.5 * _len_u + 0.3 * _name_u + 0.2 * min(_alpha / 100.0, 1.0)
+                    if _surprise >= _wgc.surprise_deep and _utility >= _wgc.utility_min:
+                        rpe_route = "deep"
+                    elif _surprise >= _wgc.surprise_cache and _utility >= _wgc.utility_min * 0.7:
+                        rpe_route = "cache"
+                    else:
+                        rpe_route = "ignore"
+                    logger.info(
+                        "RPE critique", surprise=round(_surprise, 3),
+                        utility=round(_utility, 3), route=rpe_route)
+        except Exception as _rpe_exc:
+            logger.warning("RPE critique failed (non-fatal): %s", _rpe_exc)
+            rpe_route = None  # 批判失败 → 不拦截（零回归）
+
     if deps.defense_engine and deps.defense_engine.config.enabled:
         # 【FIX】pre_check 是 async 函数，缺 await 导致 TypeError: cannot unpack coroutine
         try:
@@ -590,6 +628,29 @@ async def create_episode(
             )
         elif verdict.value == "quarantine":
             logger.warning("Defense QUARANTINE write", source=req.source, reason=reason)
+
+    # 【D-MEM RPE 路由决策消费】ignore → 过滤（不落库，仅强化）；cache → τ 降低
+    if rpe_route == "ignore":
+        logger.info("RPE route ignore (duplicate/low-value), skipping persist",
+                    episode_id=episode_id, content_len=len(req.content))
+        try:
+            if deps.tau_engine is not None:
+                deps.tau_engine.reinforce(req.content, 1.0)  # 重复信息强化已有记忆
+        except Exception:
+            pass
+        record_request("POST", "/memories/episodes", "202", _now() - start)
+        return EpisodeResponse(episode_id=episode_id, status="rpe_filtered", tau_initial=0.0,
+                               created_at=created_at, content=req.content, source=req.source)
+    if rpe_route == "cache":
+        try:
+            from config.settings import get_settings
+            _wgc = getattr(get_settings(), "write_gate", None)
+            if _wgc is not None:
+                tau_initial = _wgc.cache_tau
+                logger.info("RPE route cache (tau degraded)", episode_id=episode_id,
+                            tau=tau_initial)
+        except Exception:
+            pass
 
     # [Ontology] 写时验证（v1 — 冲突检测）
     ontology_note = None
