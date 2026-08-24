@@ -434,8 +434,10 @@ def _translate_gql(query: str, params: dict | None = None) -> list:
 def _prepare_params(params: dict | None) -> dict | None:
     """OverGraph 原生参数适配（与 GraphLite _interpolate 语义对齐）：
 
-    - 空串 → '__SHM_NO_VALUE__' 哨兵（CONTAINS '' 恒真 → NOT CONTAINS '' 恒假，
-      read_validate 的 $new_value 空值矛盾漏检防护 —— 与 GraphLite 完全一致）
+    【P0-2 哨兵收缩】空串 → '__SHM_NO_VALUE__' 哨兵仅作用于 read_validate 的
+    $new_value 比较点（CONTAINS '' 恒真 → 空值矛盾漏检防护，与 GraphLite 一致）。
+    不再替换通用 mutation 路径的全部字符串参数——合法空串属性（用户写入的空字段）
+    不会被字面存储为哨兵（update_with_version 与通用路径同语义，一套行为）。
     - numpy 标量 → Python 标量；numpy 数组 → list（execute_gql 不支持 ndarray）
     """
     if not params:
@@ -443,7 +445,7 @@ def _prepare_params(params: dict | None) -> dict | None:
     out: dict = {}
     for k, v in params.items():
         if isinstance(v, str):
-            out[k] = "__SHM_NO_VALUE__" if not v else v
+            out[k] = "__SHM_NO_VALUE__" if (not v and k == "new_value") else v
         elif isinstance(v, (np.integer, np.floating)):
             out[k] = v.item()
         elif isinstance(v, np.ndarray):

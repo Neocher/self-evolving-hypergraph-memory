@@ -162,13 +162,17 @@ class GatewayAPI:
         tau_initial = 1.0
 
         # τ 值计算
+        # 【P0-3】移除恒真门卫（与 write.py 同病）：created_at=_now() 后 dt≈0
+        # → τ≡1.0 恒 > decay_threshold，"filtered" 分支是死代码（审计 P0-3）。
+        # 【P0-4a】写路径接线：先注册节点再计算 τ，初始值反映重要性调制。
         if self._svc.tau_engine:
-            tau_initial = self._svc.tau_engine.compute_tau(created_at)
-            if tau_initial < self._svc.tau_engine.config.decay_threshold and not force_promote:
-                return EpisodeResponse(
-                    episode_id=episode_id, status="filtered", tau_initial=0.0,
-                    content=content, source=source,
-                )
+            self._svc.tau_engine.register_node(
+                episode_id, created_at,
+                importance=min(1.0, len(content) / 1000.0),
+            )
+            tau_initial = self._svc.tau_engine.compute_tau(
+                node_id=episode_id, created_at=created_at
+            )
 
         # SSM 门控过滤
         if self._svc.ssm_gate is not None and self._svc.tau_engine is not None:

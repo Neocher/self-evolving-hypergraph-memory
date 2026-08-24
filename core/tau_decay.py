@@ -326,17 +326,23 @@ class TauDecayEngine:
 
     def refresh_tau(self, node_id: str, created_at: Optional[float] = None) -> float:
         """再巩固：访问节点时提升 τ 值（v2.0 渐进增强）
-        
+
         每次访问不仅重置 τ，还累积 refresh_boost。
         多次访问形成渐进式强化——模拟记忆的"间隔重复"效应。
+
+        【P0-4】重置衰减基准时间：原实现只返回 τ₀、不动 created_at，
+        后续 compute_tau 仍按旧 created_at 衰减（"refresh 无效"死代码，审计 P2-12）。
+        现同步前移 info.created_at=now，使再巩固真正延长记忆寿命。
         """
         if not self.config.refresh_on_access:
             return self.compute_tau(node_id, created_at)
-        
+
         info = self._node_info.get(node_id)
         if info:
             info.access_count += 1
-        
+            # 再巩固：衰减基准归零（compute_tau 的 dt≈0 → τ 回到初始强度）
+            info.created_at = time.time()
+
         return self.config.tau_initial
 
     def batch_compute(self, nodes: list[tuple[str, float, Optional[float], float]]) -> dict[str, float]:

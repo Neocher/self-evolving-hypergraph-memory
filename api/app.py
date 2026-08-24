@@ -315,7 +315,10 @@ def _init_services() -> Services:
     # 5. Hebbian 更新器
     try:
         from core.hebbian import SparseHebbianUpdater
-        svc.hebbian_updater = SparseHebbianUpdater(config=cfg.hebbian)
+        # 【H1】注入 graphlite_store：_persist_batch 由"永不执行"变为真正落库
+        # （原实现未注入 store → 重启丢权重；注入后 config.persist_to_graph 生效）
+        svc.hebbian_updater = SparseHebbianUpdater(config=cfg.hebbian,
+                                                   graphlite_store=svc.graphlite_store)
         logger.info("HebbianUpdater initialized", k_sparsity=cfg.hebbian.k_sparsity)
     except Exception as e:
         errors.append(f"HebbianUpdater: {e}")

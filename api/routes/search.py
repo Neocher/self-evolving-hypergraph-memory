@@ -262,20 +262,26 @@ async def retrieve(
                     if isinstance(r, dict) or (isinstance(r, (list, tuple)) and r)
                 } if ns_rows else set()
             except asyncio.TimeoutError:
-                logger.warning("Namespace prefetch timed out after %.1fs, skipping filter",
+                logger.warning("Namespace prefetch timed out after %.1fs, fail-closed (empty results)",
                                _DEGRADE_TIMEOUT)
+                # 【P0-1】fail-closed：命名空间预取失败 → 置空 ns_set，下方过滤将
+                # 全量结果过滤为空，不放行跨命名空间泄露（原跳过过滤为 fail-open 缺陷）
+                ns_set = set()
             except Exception:
-                logger.warning("Namespace query failed, skipping namespace filter")
+                logger.warning("Namespace query failed, fail-closed (empty results)")
+                # 【P0-1】fail-closed：异常路径同上，也不放行全量结果
+                ns_set = set()
         for r in results_raw:
             key = r.get("content", "")[:100]
             if key and key not in seen:
                 # 命名空间过滤
                 if ns_set is not None and r.get("node_id", "") not in ns_set:
                     continue
-                # visibility=shared 的记忆可被所有Agent检索
+                # visibility=shared 的记忆可被所有Agent检索；include_shared=False 时
+                # 显式排除 shared 结果（原 pass 占位未过滤，P0-1 补全）
                 if not req.include_shared:
-                    # 仅在命名空间内搜索时跳过 shared 记忆
-                    pass  # 当前实现：shared 记忆不会被索引到命名空间中，所以自动跳过
+                    if str(r.get("visibility", "private")).lower() == "shared":
+                        continue
                 seen.add(key)
                 deduped.append(r)
         if len(deduped) < len(results_raw):
@@ -325,6 +331,24 @@ async def retrieve(
                 r["risk_level"] = scan_content(r.get("content", "")).risk_level
             except Exception:
                 r["risk_level"] = None
+
+    # 【P0-4b】检索命中接线：update_importance（分数→重要性平滑调制）+ refresh_tau
+    # （再巩固重置衰减基准，访问频次增强记忆持久性——v2.0 自适应衰减引擎接线，
+    # 原实现零调用导致 _node_info 恒空、检索增强无效）。失败非致命，不引入静默丢结果。
+    if deps.tau_engine is not None:
+        for r in results_raw[:req.top_k]:
+            if not isinstance(r, dict):
+                continue
+            nid = r.get("node_id", "")
+            if not nid:
+                continue
+            try:
+                deps.tau_engine.update_importance(
+                    nid, min(1.0, float(r.get("score", 0.0) or 0.0))
+                )
+                deps.tau_engine.refresh_tau(nid)
+            except Exception:
+                logger.debug("tau refresh failed for %s (non-fatal)", nid)
 
     results: list[EpisodicResult] = []
     for r in results_raw[:req.top_k]:

@@ -46,6 +46,10 @@ class HebbianConfig:
     decay_constant: float = 0.01
     activation_threshold: float = 0.3
     max_connections_per_node: int = 64
+    # v2.0: 持久化配置（与 core.hebbian.HebbianConfig 对齐——注入 graphlite_store
+    # 后 _persist_batch 生效；缺字段会在注入时踩 AttributeError 雷，审计 H1）
+    persist_to_graph: bool = True
+    persist_every_n_updates: int = 1
 
 
 @dataclass

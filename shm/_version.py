@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.3.2"
-__version_info__ = (6, 3, 2)
-__version_name__ = "Ontology-Governance"
-__release_date__ = "2026-08-23"
+__version__ = "6.3.3"
+__version_info__ = (6, 3, 3)
+__version_name__ = "P0-Audit-Fix"
+__release_date__ = "2026-08-24"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.3.3 (2026-08-24) P0-Audit-Fix:
+  • P0-1 命名空间隔离 fail-closed + visibility 过滤真实现 (search.py)
+  • P0-2 空串哨兵收缩到 new_value 比较点，mutation 不再污染 (overgraph_store.py)
+  • P0-3 移除 τ 恒真门卫死代码 (write.py + gateway_api.py)
+  • P0-4 自适应衰减接线: register/update_importance/refresh(重置created_at)
+  • H1 Hebbian 持久化注入 store + HebbianConfig 补 persist 字段
+  • 回归测试 ×4 (namespace_failclosed/sentinel_no_value/tau_wiring/timeout_flag)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v6.3.2 (2026-08-23) Ontology-Governance:
   • 借鉴《本体论增强智能问数》P0：PropertyVerNode 补口径治理字段
     (formula/filter_/owner，可选 None 跳过，向后兼容零迁移)

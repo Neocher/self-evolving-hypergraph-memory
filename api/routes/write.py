@@ -514,10 +514,16 @@ async def create_episode(
     tau_initial = 1.0
 
     # τ 值计算
+    # 【P0-3】移除恒真门卫：created_at=_now() 后 compute_strength dt≈0 → τ≡1.0
+    # 恒 > decay_threshold，拒绝分支与 force_promote 全是死代码（审计 P0-3）。
+    # 【P0-4a】写路径接线：先注册节点再计算强度——compute_strength(node_id) 的
+    # 自适应衰减基于注册的 importance（内容长度启发式），初始 τ 反映重要性调制。
     if deps.tau_engine:
-        tau_initial = deps.tau_engine.compute_strength(created_at)
-        if tau_initial < deps.tau_engine.config.decay_threshold and not req.force_promote:
-            raise HTTPException(status_code=400, detail="τ below threshold; use force_promote=true")
+        deps.tau_engine.register_node(
+            episode_id, created_at,
+            importance=min(1.0, len(req.content) / 1000.0),
+        )
+        tau_initial = deps.tau_engine.compute_strength(created_at, node_id=episode_id)
 
     # SSM门控过滤：低价值内容跳过持久化
     # 【FIX 2026-08-06】force_promote=true 应绕过 gate — "强制提升"语义即无条件持久化。

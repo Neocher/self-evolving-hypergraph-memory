@@ -14,6 +14,8 @@ hebbian:
   decay_constant: 0.01           # 权重衰减常数
   activation_threshold: 0.3      # 激活度阈值
   max_connections_per_node: 64   # 单节点连接绝对上限
+  persist_to_graph: true         # v2.0: Hebbian 连接持久化到图库（注入 store 后生效）
+  persist_every_n_updates: 1     # v2.0: 每 N 次更新批量落盘一次
 
 ssm:
   hidden_dim: 128                # 隐层维度
