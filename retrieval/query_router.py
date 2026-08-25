@@ -3324,9 +3324,158 @@ class QueryRouter:
                 logger.info(
                     "AtomicFact retrieved", entities=len(entities), candidates=len(extra))
                 results = results + extra
+
+            # 【方案 A v2.5】AtomicFact × PropertyVerNode 三元组联合查询通道:
+            # 属性题同时命中事实级(AtomicFactNode) + 版本链(PropertyVerNode),
+            # 消除"属性题只命中一边"的召回空洞; fact_channel.joint_enabled 控制
+            if getattr(ecfg, "joint_enabled", True):
+                try:
+                    results = self._fact_property_joint(results, entities, query)
+                except Exception:
+                    pass  # 联合通道失败不阻塞主检索
+
             return results
         except Exception:
             return results
+
+
+    def _fact_property_joint(self, results: list[dict], entities: list[str], query: str) -> list[dict]:
+        """【方案 A】AtomicFact × PropertyVerNode 三元组联合查询通道
+        
+        解决：_fact_retrieve 只做 subject CONTAINS 词面匹配，与 _property_temporal_retrieve
+       （属性时间版本链）互不相通，导致属性题只命中一边的召回空洞。
+        
+        机制：
+        1. 从查询实体出发，规范化 entity → 查 PropertyVerNode（属性版本链）
+        2. 同时查 AtomicFactNode（事实级）
+        3. 同一 predicate 下双源归并：事实值 + 版本值/时间版本链
+        4. 按 predicate 归并去重，score 加权融合
+        """
+        try:
+            ecfg = getattr(getattr(self, "config", None), "fact_channel", None)
+            if ecfg is None or not getattr(ecfg, "joint_enabled", True):
+                return results
+            store = getattr(self, "graphlite_store", None)
+            if store is None or not hasattr(store, "get_atomic_facts_by_subject"):
+                return results
+            if not hasattr(store, "query_property_ver"):
+                return results
+            
+            q_text = (query or "").strip()
+            if not q_text:
+                return results
+            
+            entities = self._extract_query_entities(query)
+            if not entities:
+                return results
+            
+            max_seed_score = max(
+                (float(r.get("score") or 0.0) for r in results if r.get("score") is not None),
+                default=0.0,
+            )
+            if max_seed_score <= 0.0:
+                return results
+            
+            joint_boost = 0.85  # 与事实通道保持一致的降权
+            max_facts = 5
+            existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            extra: list[dict] = []
+            seen_facts: set[str] = set()
+            
+            for ent in entities[:3]:
+                # 1. 规范化 entity
+                ent_obj = store.get_entity(ent) if hasattr(store, "get_entity") else None
+                canon_ent = ent_obj.get("name", ent) if ent_obj else ent
+                
+                # 2. 查 AtomicFactNode（复用现有）
+                try:
+                    facts = store.get_atomic_facts_by_subject(ent, limit=12)
+                except Exception:
+                    facts = []
+                
+                # 3. 提取属性词并查 PropertyVerNode
+                prop_terms = self._classify_property_terms(q_text)
+                if not prop_terms:
+                    continue
+                
+                prop_results = store.query_property_ver(
+                    entity=canon_ent, 
+                    predicates=prop_terms,
+                    limit=10
+                ) if hasattr(store, "query_property_ver") else []
+                
+                # 4. 双源归并：按 predicate 归并 AtomicFact + PropertyVer
+                # 先构建 predicate -> 事实/属性值映射
+                from collections import defaultdict
+                pred_to_facts = defaultdict(list)
+                for f in facts or []:
+                    pred = f.get("predicate", "").lower()
+                    if pred:
+                        pred_to_facts[pred].append(f)
+                
+                pred_to_props = defaultdict(list)
+                for p in prop_results or []:
+                    pred = p.get("predicate", "").lower()
+                    if pred:
+                        pred_to_props[pred].append(p)
+                
+                all_preds = set(pred_to_facts.keys()) | set(pred_to_props.keys())
+                
+                for pred in all_preds:
+                    facts_list = pred_to_facts.get(pred, [])
+                    props_list = pred_to_props.get(pred, [])
+                    
+                    # 融合：事实值 + 属性版本值/时间版本链
+                    # 简单策略：优先事实值，属性值作为版本补充
+                    fact_text = None
+                    prop_text = None
+                    vt = None
+                    
+                    if facts_list:
+                        f0 = facts_list[0]  # 取最相关的
+                        fact_text = f"{f0.get('subject', '')} {f0.get('predicate', '')} {f0.get('object', '')}"
+                        vt = f0.get("valid_time", "")
+                    
+                    if props_list:
+                        p0 = props_list[0]
+                        prop_text = f"{p0.get('subject', '')} {p0.get('predicate', '')} {p0.get('object', '')}"
+                        if not vt and p0.get("valid_time"):
+                            vt = p0.get("valid_time")
+                    
+                    if not fact_text and not prop_text:
+                        continue
+                    
+                    text = fact_text or prop_text
+                    if vt:
+                        text += f" ({vt})"
+                    
+                    # 去重
+                    text_lower = text.lower()
+                    if text_lower in existing_ids:
+                        continue
+                    
+                    extra.append({
+                        "node_id": f"joint_{hash(text)}",
+                        "content": text,
+                        "score": round(max_seed_score * 0.8, 6),
+                        "tau_value": 0.0,
+                        "fact_track": "active",
+                        "level": "atomic_fact",
+                        "_source": "atomic_fact_property_joint",
+                    })
+                    existing_ids.add(text.lower())
+                    
+                    if len(extra) >= max_facts:
+                        break
+            
+            if extra:
+                logger.info(
+                    "Fact-Property joint retrieved", entities=len(entities), candidates=len(extra))
+                results = results + extra
+            return results
+        except Exception:
+            return results
+
 
     def _schema_recall(self, results: list[dict], query: str) -> list[dict]:
         """【阶段4-1 Schema 模式蒸馏】补充非替代：查询术语 → Schema 节点 append。

@@ -230,6 +230,7 @@ class FactChannelConfig:
     enabled: bool = False       # 开关：评测 Phase A 显式开启
     boost: float = 0.85         # 事实分 = max(种子分) × boost（独立段降权）
     max_facts: int = 5          # 每查询最大事实候选数
+    joint_enabled: bool = True  # 【方案 A】AtomicFact×PropertyVerNode 三元组联合通道
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.boost < 1.0:
