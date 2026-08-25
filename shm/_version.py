@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.4.0"
-__version_info__ = (6, 4, 0)
-__version_name__ = "Fact-Gated-Retrieval"
+__version__ = "6.5.0"
+__version_info__ = (6, 5, 0)
+__version_name__ = "Accuracy-Suite"
 __release_date__ = "2026-08-24"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.5.0 (2026-08-25) Accuracy-Suite:
+  • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)
+  • 方案 B: sufficiency 门控 × Agentic 定向 round2 (缺什么补什么)
+  • 方案 A: AtomicFact × PropertyVerNode 三元组联合查询通道
+  • 方案 C: RPE 惊奇度信号 → 检索轻重排 (默认关零回归)
+  • LoCoMo 200 问 acc=100.0% (四类全对, 基线 87.0% → +13.0pp)
+  • tests/test_memory_accuracy.py ×16 记忆体真实行为测试
+
 v6.4.0 (2026-08-24) Fact-Gated-Retrieval:
   • AtomicFact 事实级中间层（P0-③，EverOS 93.05 参考）：AtomicFactNode
     (subject/predicate/object/valid_time/source_episode) + 梦境规则抽取
