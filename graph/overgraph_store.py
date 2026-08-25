@@ -741,8 +741,14 @@ class OverGraphStore:
         except Exception:
             return []
 
-    def get_atomic_facts_by_subject(self, subject: str, limit: int = 50) -> list[dict]:
-        """按 subject 查 AtomicFactNode（检索候选定位）。"""
+    def get_atomic_facts_by_subject(self, subject: str, limit: int = 50,
+                                    at_year: int | None = None) -> list[dict]:
+        """按 subject 查 AtomicFactNode（检索候选定位）。
+
+        at_year: 非 None 时只返回 valid_time 归一化后等于该年份的事实（cat=2 时间
+        推理根治：查询含年份/相对时间词时过滤掉其他时间版本）；None → 行为与
+        既有完全一致（零回归）。
+        """
         subj = (subject or "").strip()
         if not subj:
             return []
@@ -759,6 +765,9 @@ class OverGraphStore:
             out = []
             for r in rows:
                 if isinstance(r, dict):
+                    vt = str(r.get("valid_time", ""))
+                    if at_year is not None and self._normalize_year(vt) != at_year:
+                        continue
                     out.append({
                         "id": str(r.get("id", "")),
                         "subject": str(r.get("subject", "")),
@@ -769,6 +778,30 @@ class OverGraphStore:
             return out
         except Exception:
             return []
+
+    @staticmethod
+    def _normalize_year(s: str) -> int | None:
+        """把 valid_time/查询时间词解析为 int 年份；无法解析返回 None。
+
+        - '2019' → 2019（纯 4 位年份）
+        - '7 May 2023' / 'May 2023' → 2023（英文月份 + 年份/日 月 年）
+        - 空串/未知格式 → None（不参与 at_year 过滤，at_year 查询不命中）
+        """
+        text = (s or "").strip()
+        if not text:
+            return None
+        m = re.search(r'\b(19|20)\d{2}\b', text)
+        if m:
+            return int(m.group(0))
+        m = re.search(
+            r'\b(?:January|February|March|April|May|June|July|August|September|'
+            r'October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|'
+            r'Dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+(19|20)\d{2}\b',
+            text, re.IGNORECASE,
+        )
+        if m:
+            return int(m.group(1))
+        return None
 
     def get_entity(self, entity_name: str) -> dict | None:
         """按规范化 name 查 EntityNode（确定性 key O(1)）。"""
