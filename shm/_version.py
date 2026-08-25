@@ -3,7 +3,7 @@
 __version__ = "6.5.0"
 __version_info__ = (6, 5, 0)
 __version_name__ = "Accuracy-Suite"
-__release_date__ = "2026-08-24"
+__release_date__ = "2026-08-25"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
