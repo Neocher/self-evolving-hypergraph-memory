@@ -7,12 +7,12 @@
      → rerank top-50 → sufficiency → round2 追加 → LLM
 """
 import json, os, re, sys, time
-sys.path.insert(0, "/home/admin/shm")
-sys.path.insert(0, "/home/admin/.hermes/skills/research/memory-benchmark-eval/scripts")
+sys.path.insert(0, "/home/user/self-evolving-hypergraph-memory")
+
 import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 
-DATA = "/home/admin/shm/data/bench/locomo10.json"
+DATA = "/home/user/ai-memory-research/hindsight/hindsight-dev/benchmarks/locomo/datasets/locomo10.json"
 DB_PATH = "/tmp/locomo_og_eval_v71"
 SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
