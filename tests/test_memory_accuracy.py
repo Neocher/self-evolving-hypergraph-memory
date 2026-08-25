@@ -247,7 +247,12 @@ class TestRpeWriteRouteRealStore:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] == "created", f"deep 路由应正常落库，实际 {body}"
-        assert overgraph_store.get_episode(body["episode_id"]) is not None
+        got = overgraph_store.get_episode(body["episode_id"])
+        assert got is not None
+        # 【P3-C】deep 路由应落库 rpe_surprise（空库 max_sim=0 → surprise=1.0）
+        assert got.get("rpe_surprise") is not None, (
+            f"deep 路由应落库 rpe_surprise，实际 {got}"
+        )
 
     def test_route_cache_degrades_tau(self, client, overgraph_store, monkeypatch):
         """中等惊奇 → cache → τ 降为 cache_tau（快速衰减）。"""
@@ -287,3 +292,134 @@ class TestRpeWriteRouteRealStore:
         got = overgraph_store.get_episode(body["episode_id"])
         assert got is not None
         assert got.get("protected") in (True, "true", 1), "force_promote 应打 protected 标记"
+
+
+# ════════════════════════════════════════════════════════════════════
+# 三、P3-C RPE 惊奇度信号检索重排（默认关零回归；仅 FUSION 生效）
+# ════════════════════════════════════════════════════════════════════
+
+class TestRpeRerankRetrieval:
+    """RPE 惊奇度 → 检索重排真实行为。
+
+    - rpe_rerank_enabled=False → 与基线（_deduplicate_and_sort）逐字节等价
+    - =True → 高惊奇 boost / 低惊奇 dampen / 无信号不变 / 钳制不超种子最高分
+    - 走 retrieve(level=FUSION) 公共入口 + mock _fusion_retrieve 固定 docs
+    - 集成：真实 overgraph_store 落库 rpe_surprise → attach 回查 → boost
+    """
+
+    @staticmethod
+    def _fusion_stack(router, docs):
+        """patch _fusion_retrieve 返回固定 docs + 增强通道透传 + reranker 短路。
+
+        只测 RPE 重排钩子：_fusion_retrieve 之外的所有 _finish 补充通道透传，
+        _get_reranker 返回 None 让 bge-reranker 短路（不加载真实模型）。
+        """
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        stack = ExitStack()
+        stack.enter_context(
+            patch.object(router, "_fusion_retrieve",
+                         return_value=[dict(d) for d in docs])
+        )
+        for name in (
+            "_community_expansion", "_mesa_synthesis", "_visual_recall",
+            "_property_temporal_retrieve", "_entity_expansion",
+            "_attribute_expansion", "_scope_retrieve", "_schema_recall",
+            "_fact_retrieve",
+        ):
+            stack.enter_context(
+                patch.object(router, name, side_effect=lambda r, *a, **k: r)
+            )
+        stack.enter_context(patch.object(router, "_get_reranker", return_value=None))
+        return stack
+
+    def test_rpe_rerank_disabled_byte_identical(self):
+        """rpe_rerank_enabled=False → 结果与基线（_deduplicate_and_sort）逐字节等价。
+
+        即使结果 dict 携带 rpe_surprise 字段，关闭时钩子完全不介入。
+        """
+        from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
+        router = QueryRouter(None, None, None,
+                             config=QueryRouterConfig(rpe_rerank_enabled=False))
+        docs = [
+            {"node_id": "a", "content": "alpha memory", "score": 0.9,
+             "rpe_surprise": 0.8},
+            {"node_id": "b", "content": "beta memory", "score": 0.5,
+             "rpe_surprise": 0.1},
+            {"node_id": "c", "content": "gamma memory", "score": 0.4},
+        ]
+        golden = QueryRouter._deduplicate_and_sort([dict(d) for d in docs])
+        with self._fusion_stack(router, docs):
+            out = router.retrieve("memory", level=RetrievalLevel.FUSION)
+        assert out == golden, "rpe_rerank_enabled=False 应与关闭前逐字节等价"
+
+    def test_rpe_rerank_no_signal_unchanged(self):
+        """enabled=True 但节点均无 rpe_surprise → 仍与基线逐字节等价。"""
+        from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
+        router = QueryRouter(None, None, None,
+                             config=QueryRouterConfig(rpe_rerank_enabled=True))
+        docs = [
+            {"node_id": "a", "content": "alpha memory", "score": 0.9},
+            {"node_id": "b", "content": "beta memory", "score": 0.5},
+        ]
+        golden = QueryRouter._deduplicate_and_sort([dict(d) for d in docs])
+        with self._fusion_stack(router, docs):
+            out = router.retrieve("memory", level=RetrievalLevel.FUSION)
+        assert out == golden, "无 rpe_surprise 节点即使 enabled=True 也应不变"
+
+    def test_rpe_rerank_enabled_boost_dampen_clamp(self):
+        """enabled=True → 高惊奇 ×1.05 / 低惊奇 ×0.95 / 无信号不变 / 钳制不超种子最高分。"""
+        from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
+        router = QueryRouter(None, None, None, config=QueryRouterConfig(
+            rpe_rerank_enabled=True, rpe_rerank_high=0.7, rpe_rerank_low=0.3,
+        ))
+        docs = [
+            {"node_id": "a", "content": "alpha memory", "score": 0.9},
+            # 种子最高分节点无信号 → 不变；同时是钳制上限
+            {"node_id": "b", "content": "beta memory", "score": 0.5,
+             "rpe_surprise": 0.8},    # 高惊奇 → 0.5×1.05=0.525（< 0.9 不钳）
+            {"node_id": "c", "content": "gamma memory", "score": 0.4,
+             "rpe_surprise": 0.1},    # 低惊奇 → 0.4×0.95=0.38
+            {"node_id": "d", "content": "delta memory", "score": 0.88,
+             "rpe_surprise": 0.9},    # 高惊奇但 0.88×1.05=0.924>0.9 → 钳到 0.9
+            {"node_id": "e", "content": "epsilon memory", "score": 0.3,
+             "rpe_surprise": 0.5},    # 中等惊奇 → 不变
+        ]
+        with self._fusion_stack(router, docs):
+            out = router.retrieve("memory", level=RetrievalLevel.FUSION)
+        by_id = {r["node_id"]: r for r in out}
+        assert abs(by_id["a"]["score"] - 0.9) < 1e-9, "无信号节点不变"
+        assert abs(by_id["b"]["score"] - 0.525) < 1e-9, "高惊奇应 ×1.05 boost"
+        assert abs(by_id["c"]["score"] - 0.38) < 1e-9, "低惊奇应 ×0.95 dampen"
+        assert abs(by_id["d"]["score"] - 0.9) < 1e-9, "boost 钳制不超种子最高分"
+        assert abs(by_id["e"]["score"] - 0.3) < 1e-9, "中等惊奇不变"
+        scores = [r["score"] for r in out]
+        assert scores == sorted(scores, reverse=True), "重排后应保持降序"
+
+    def test_rpe_rerank_store_attach_real(self, overgraph_store):
+        """集成：write 侧落库 rpe_surprise → 检索 attach 回查 → boost（真实 store）。"""
+        from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
+        # 种子最高分节点无信号（钳制上限），高惊奇节点中分 → boost 可见
+        top_id = overgraph_store.create_episode({"content": "alpha memory"})
+        boost_id = overgraph_store.create_episode(
+            {"content": "beta memory", "rpe_surprise": 0.8})
+        router = QueryRouter(
+            graphlite_store=overgraph_store, faiss_index=None, tfidf_index=None,
+            config=QueryRouterConfig(
+                rpe_rerank_enabled=True, rpe_rerank_high=0.7, rpe_rerank_low=0.3,
+            ),
+        )
+        docs = [
+            {"node_id": top_id, "content": "alpha memory", "score": 0.9},
+            {"node_id": boost_id, "content": "beta memory", "score": 0.5,
+             "rpe_surprise": 0.8},
+        ]
+        with self._fusion_stack(router, docs):
+            out = router.retrieve("memory", level=RetrievalLevel.FUSION)
+        assert out, "应返回检索结果"
+        by_id = {r["node_id"]: r for r in out}
+        assert abs(by_id[top_id]["score"] - 0.9) < 1e-9, "无信号种子不变"
+        assert abs(by_id[boost_id]["score"] - 0.525) < 1e-9, (
+            f"rpe_surprise=0.8 → 应 boost 到 0.5×1.05=0.525，"
+            f"实际 {by_id[boost_id]['score']}"
+        )

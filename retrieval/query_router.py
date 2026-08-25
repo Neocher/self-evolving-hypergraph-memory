@@ -254,6 +254,10 @@ class QueryRouterConfig:
     fact_channel: FactChannelConfig = field(default_factory=FactChannelConfig)
     # 图作用域召回配置（阶段3 v6.0.0；仅 overgraph 后端生效，graphlite hasattr 假 no-op）
     scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
+    # 【P3-C】RPE 惊奇度检索重排（默认关零回归；仅 FUSION 生效）
+    rpe_rerank_enabled: bool = False
+    rpe_rerank_high: float = 0.7   # surprise > 此值 → ×1.05 boost
+    rpe_rerank_low: float = 0.3    # surprise < 此值 → ×0.95 dampen
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -1459,6 +1463,9 @@ class QueryRouter:
                 sorted_results = self._rerank_results(
                     sorted_results, raw_query, bool(rerank_enabled)
                 )
+            # 【P3-C】RPE 惊奇度轻重排（默认关零回归；仅 FUSION 生效）
+            if level == RetrievalLevel.FUSION:
+                sorted_results = self._rpe_rerank_results(sorted_results)
             return sorted_results
 
         strategy = self.detect_strategy(query)
@@ -3938,6 +3945,38 @@ class QueryRouter:
             logger.debug(
                 "rerank degraded, returning original results", exc_info=True
             )
+            return results
+
+    def _rpe_rerank_results(self, results: list[dict]) -> list[dict]:
+        """【P3-C】RPE 惊奇度 → 检索轻重排（默认关零回归）。
+
+        rpe_surprise > high (0.7)  → ×1.05 boost（钳制不超原最高分）
+        rpe_surprise < low  (0.3)  → ×0.95 dampen
+        无 rpe_surprise / 开关关   → 不变
+        """
+        cfg = getattr(self, "config", None)
+        if cfg is None or not getattr(cfg, "rpe_rerank_enabled", False):
+            return results
+        try:
+            hi_thr = float(getattr(cfg, "rpe_rerank_high", 0.7))
+            lo_thr = float(getattr(cfg, "rpe_rerank_low", 0.3))
+            max_score = max(
+                (float(r.get("score") or 0.0) for r in results),
+                default=0.0,
+            )
+            for r in results:
+                s = r.get("rpe_surprise")
+                if s is None:
+                    continue
+                sc = float(r.get("score") or 0.0)
+                if s > hi_thr:
+                    ns = min(sc * 1.05, max_score) if max_score > 0 else sc * 1.05
+                    r["score"] = round(ns, 6)
+                elif s < lo_thr:
+                    r["score"] = round(sc * 0.95, 6)
+            results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            return results
+        except Exception:
             return results
 
     @staticmethod

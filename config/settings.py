@@ -281,6 +281,10 @@ class RetrievalConfig:
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
+    # RPE 惊奇度信号检索重排（P3-C，默认关零回归；仅 FUSION 生效）
+    rpe_rerank_enabled: bool = False  # 开关：write 侧 rpe_surprise → 检索轻 boost/dampen
+    rpe_rerank_high: float = 0.7      # 惊奇度 > 此值 → ×1.05 boost（钳制不超种子最高分）
+    rpe_rerank_low: float = 0.3       # 惊奇度 < 此值 → ×0.95 dampen
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
@@ -291,6 +295,13 @@ class RetrievalConfig:
         # 静默落回单路与操作者意图不符（配置期 fail-fast 拒绝非法值）。
         if self.hyde_mode not in ("dual", "replace"):
             raise ValueError(f"RetrievalConfig.hyde_mode={self.hyde_mode} 必须 ∈ {{dual, replace}}")
+        # 【P3-C】rpe_rerank 阈值一致性：low > high 会让同节点同时满足两个分支
+        # （逻辑矛盾），配置期 fail-fast 拒绝非法值。
+        if self.rpe_rerank_low > self.rpe_rerank_high:
+            raise ValueError(
+                f"RetrievalConfig.rpe_rerank_low={self.rpe_rerank_low} 必须 <= "
+                f"rpe_rerank_high={self.rpe_rerank_high}"
+            )
 
 
 @dataclass

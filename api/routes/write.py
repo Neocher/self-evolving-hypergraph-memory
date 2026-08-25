@@ -568,6 +568,7 @@ async def create_episode(
     # 三分流：深度写入 / 快速缓存（τ 降低）/ 忽略（重复信息仅强化已有记忆）。
     # 在 SSM gate 之后、defense 之前执行；force_promote 绕过（强制语义无条件写入）。
     rpe_route = None  # deep / cache / ignore
+    _surprise = None  # 【P3-C】惊奇度信号（RPE 批判成功时赋值；检索侧重排消费）
     if (not req.force_promote and deps.encoder is not None
             and deps.graphlite_store is not None):
         try:
@@ -690,6 +691,11 @@ async def create_episode(
     episode_data["fact_track"] = classify_fact_track(
         req.content, ontology_type=(val_result.ontology_type if val_result else None)
     )
+    # 【P3-C RPE 惊奇度信号】deep 路由（高惊奇新信息）→ 落库 rpe_surprise，
+    # 供检索侧 _rpe_rerank_results 消费（轻 boost；默认 None 不写 → 无信号节点不变）。
+    # RPE 关闭 / 批判失败 / cache-ignore 路由 → _surprise 为 None 或非 deep → 不写（零回归）。
+    if rpe_route == "deep" and _surprise is not None:
+        episode_data["rpe_surprise"] = float(_surprise)
     # 【v5.27.0】force_promote=true → 打 protected 顶层标记，
     # 梦境 PRUNE 永不剪这类节点（dream_pipeline._prune_step 消费）。
     # GraphLite 布尔非 b64，读取经 _flatten_row 还原 Python True。
