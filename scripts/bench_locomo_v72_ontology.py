@@ -32,6 +32,7 @@ PREDICT_MODE = os.environ.get("PREDICT_MODE") == "1"
 PREDICT_QUESTIONS = os.environ.get("PREDICT_QUESTIONS", "")
 PREDICT_OUT = os.environ.get("PREDICT_OUT", "/tmp/locomo_refined_predictions.jsonl")
 PREDICT_RANGE = os.environ.get("PREDICT_RANGE", "")
+PREDICT_MAX_TOKENS = int(os.environ.get("PREDICT_MAX_TOKENS", "512"))  # 生成答案上限: 200→512 (枚举型答案截断修复)
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
 print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'}", flush=True)
 
@@ -772,14 +773,14 @@ Conversation snippets:
 Question: {question}
 Answer:"""
     try:
-        pred = llm_generate(prompt, max_tokens=200, temperature=0.2)
+        pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.2)
     except Exception as e:
         print(f"  [gen err] {e}", flush=True)
         results["errors"] += 1
         continue
     if PREDICT_MODE:
         with open(PREDICT_OUT, "a") as _pf:
-            _pf.write(json.dumps({"qa_id": q.get("qa_id", f"q{i}"), "predicted_answer": pred[:500]}) + "\n")
+            _pf.write(json.dumps({"qa_id": q.get("qa_id", f"q{i}"), "predicted_answer": pred[:4000]}) + "\n")
         if (i + 1) % 20 == 0 or i == len(qa_all) - 1:
             print(f"  [PREDICT] {i+1}/{len(qa_all)} elapsed={time.time()-t0:.0f}s", flush=True)
         continue
