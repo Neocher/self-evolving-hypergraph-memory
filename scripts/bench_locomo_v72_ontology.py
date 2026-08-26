@@ -7,13 +7,13 @@
      → rerank top-50 → sufficiency → round2 追加 → LLM
 """
 import json, os, re, sys, time
-sys.path.insert(0, "/home/user/self-evolving-hypergraph-memory")
+sys.path.insert(0, os.environ.get("SHM_ROOT", "/home/admin/shm"))
 
 import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 
-DATA = "/home/user/ai-memory-research/hindsight/hindsight-dev/benchmarks/locomo/datasets/locomo10.json"
-DB_PATH = "/tmp/locomo_og_eval_v71"
+DATA = "/home/admin/shm/data/bench/locomo10.json"
+DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
 SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
 RERANK_TOP = int(os.environ.get("RERANK_TOP", "50"))
@@ -23,7 +23,17 @@ BLOCK_TOP = int(os.environ.get("BLOCK_TOP", "8"))
 GRAPH_TOP = int(os.environ.get("GRAPH_TOP", "10"))      # 图遍历 episode 上限
 LIMIT_BLOCKS = int(os.environ.get("LIMIT_BLOCKS", "0"))
 EXTRACT_LIMIT = int(os.environ.get("EXTRACT_LIMIT", "1300"))
+# v6.5.1 并行评测: judge 切换 (openrouter=GPT-4o-mini 严格 / deepseek=默认) + 类别过滤
+JUDGE_PROVIDER = os.environ.get("JUDGE_PROVIDER", "deepseek")
+CAT_FILTER = os.environ.get("CAT_FILTER", "")          # 逗号分隔, 如 "1,2,3,4"
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "meta-llama/llama-3.3-70b-instruct")
+# 预测生成模式 (对接 LoCoMo-Refined 官方判卷): 输出 predictions.jsonl 不判卷
+PREDICT_MODE = os.environ.get("PREDICT_MODE") == "1"
+PREDICT_QUESTIONS = os.environ.get("PREDICT_QUESTIONS", "")
+PREDICT_OUT = os.environ.get("PREDICT_OUT", "/tmp/locomo_refined_predictions.jsonl")
+PREDICT_RANGE = os.environ.get("PREDICT_RANGE", "")
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'}", flush=True)
 
 from graph.overgraph_store import OverGraphStore
 from retrieval.vector_index import VectorIndexAdapter
@@ -67,41 +77,11 @@ data = json.load(open(DATA))
 print(f"LoCoMo 消息: {len(all_msgs)} 条, {len(conv_map)} 会话", flush=True)
 
 # ── 灌库 ──
-faiss_id_map = {}
-faiss_index = VectorIndexAdapter(store=gstore, dimension=512, faiss_id_map=faiss_id_map)
-msg_by_id = {}
-episode_cache = {}
-BATCH = 500
-id_buf, vec_buf = [], []
-t0 = time.time()
-for b_start in range(0, len(all_msgs), BATCH):
-    batch = all_msgs[b_start:b_start + BATCH]
-    vecs = np.asarray(enc.embed_batch(batch), dtype=np.float32)
-    for j, m in enumerate(batch):
-        midx = b_start + j
-        mid = f"ep_{midx}"
-        msg_by_id[mid] = m
-        try:
-            gstore.create_episode({
-                "id": mid, "content": m,
-                "created_at": time.time() - (len(all_msgs) - midx) * 60,
-                "source_type": "sensory", "layer": 1,
-            })
-        except Exception as e:
-            print(f"  graph err {mid}: {e}", flush=True)
-        id_buf.append(int(midx))
-        vec_buf.append(vecs[j])
-        faiss_id_map[int(midx)] = mid
-        episode_cache[mid] = {
-            "id": mid, "content": m, "created_at": time.time() - (len(all_msgs) - midx) * 60,
-            "source_type": "sensory", "layer": 1,
-        }
-    print(f"  灌入 {min(b_start+BATCH, len(all_msgs))}/{len(all_msgs)} ({time.time()-t0:.0f}s)", flush=True)
-if vec_buf:
-    faiss_index.add_with_ids(np.vstack(vec_buf), np.array(id_buf, dtype=np.int64))
-print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s", flush=True)
+# ── 包公两阶段灌库 (v6.5.1): INGEST_LOADED=1 跳过灌库 load 索引; INGEST_ONLY=1 灌库后退出
+INGEST_SKIP = os.environ.get("INGEST_LOADED") == "1"
+INGEST_ONLY = os.environ.get("INGEST_ONLY") == "1"
+INGEST_PKL = DB_PATH + "_index.pkl"
 
-# ── TF-IDF ──
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 class TfidfSearchIndex:
@@ -124,21 +104,70 @@ class TfidfSearchIndex:
         top_indices = np.argsort(scores)[-top_k:][::-1]
         return [(self.texts[i], float(scores[i])) for i in top_indices]
 tfidf_index = TfidfSearchIndex()
-tfidf_index.fit(list(msg_by_id.values()))
-print("TF-IDF 就绪", flush=True)
+faiss_index = None  # 各分支构造 (SKIP load / 灌库)
 
-config = QueryRouterConfig()
-config.agentic_enabled = False
-config.hyde_timeout = 10.0
-config.mesa_enabled = True
-config.mesa_boost = 0.4
-config.mesa_threshold = 0.5
-config.mesa_max_nodes = 5
-qr = QueryRouter(graphlite_store=gstore, faiss_index=faiss_index, tfidf_index=tfidf_index,
-                 encoder=enc, config=config, faiss_id_map=faiss_id_map, episode_cache=episode_cache)
+if INGEST_SKIP:
+    import pickle as _pkl
+    with open(INGEST_PKL, "rb") as _f:
+        _st = _pkl.load(_f)
+    faiss_id_map = _st["faiss_id_map"]
+    msg_by_id = _st["msg_by_id"]; episode_cache = _st["episode_cache"]
+    blocks = _st["blocks"]; block_vecs = _st["block_vecs"]
+    entity_eps = _st["entity_eps"]; entity_co = _st["entity_co"]
+    _triples_all = _st["triples"]; _dia_to_ep = _st["dia_to_ep"]
+    _ontology_facts = _st["ontology_facts"]
+    _schema_classes = _st["schema_classes"]; _top_classes = _st["top_classes"]
+    tfidf_index = _st["tfidf_index"]
+    faiss_index = VectorIndexAdapter(store=gstore, dimension=512,
+                                     faiss_id_map=faiss_id_map)
+    faiss_index.add_with_ids(_st["faiss_vecs"], _st["faiss_ids"])
+    import faiss
+    idx_blk = faiss.IndexFlatIP(512)
+    idx_blk.add(block_vecs)
+    print(f"[INGEST_LOADED] 索引恢复: {len(msg_by_id)} 条, blocks={len(blocks)}", flush=True)
+else:
+    faiss_id_map = {}
+    faiss_index = VectorIndexAdapter(store=gstore, dimension=512, faiss_id_map=faiss_id_map)
+    msg_by_id = {}
+    episode_cache = {}
+    BATCH = 500
+    id_buf, vec_buf = [], []
+    t0 = time.time()
+    for b_start in range(0, len(all_msgs), BATCH):
+        batch = all_msgs[b_start:b_start + BATCH]
+        # v6.5.1 提速: 超长消息截断再 embedding (16706 chars 单条会拖垮整批 padding)
+        vecs = np.asarray(enc.embed_batch([m[:1500] for m in batch]), dtype=np.float32)
+        for j, m in enumerate(batch):
+            midx = b_start + j
+            mid = f"ep_{midx}"
+            msg_by_id[mid] = m
+            try:
+                gstore.create_episode({
+                    "id": mid, "content": m,
+                    "created_at": time.time() - (len(all_msgs) - midx) * 60,
+                    "source_type": "sensory", "layer": 1,
+                })
+            except Exception as e:
+                print(f"  graph err {mid}: {e}", flush=True)
+            id_buf.append(int(midx))
+            vec_buf.append(vecs[j])
+            faiss_id_map[int(midx)] = mid
+            episode_cache[mid] = {
+                "id": mid, "content": m, "created_at": time.time() - (len(all_msgs) - midx) * 60,
+                "source_type": "sensory", "layer": 1,
+            }
+        print(f"  灌入 {min(b_start+BATCH, len(all_msgs))}/{len(all_msgs)} ({time.time()-t0:.0f}s)", flush=True)
+    if vec_buf:
+        faiss_index.add_with_ids(np.vstack(vec_buf), np.array(id_buf, dtype=np.int64))
+    print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s", flush=True)
 
-# ═══ A. LLM 压缩记忆块（MindMemOS）═══
-_BLOCK_PROMPT = """Compress the following conversation messages into a memory block that preserves ALL key facts for later retrieval.
+    # ── TF-IDF ──
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    tfidf_index.fit(list(msg_by_id.values()))
+
+    # ═══ A. LLM 压缩记忆块（MindMemOS）═══
+    _BLOCK_PROMPT = """Compress the following conversation messages into a memory block that preserves ALL key facts for later retrieval.
 Keep: entities (names, places), events, activities, preferences, dates/times, relationships, objects, amounts.
 Structure the block as:
 FACTS:
@@ -151,118 +180,179 @@ Conversation messages:
 
 Output only the FACTS/ENTITIES block. No preamble."""
 
-def _compress_block(msgs):
-    msgs_text = "\n".join(f"[{i+1}] {m[:250]}" for i, m in enumerate(msgs))
-    try:
-        raw = llm_generate(_BLOCK_PROMPT.replace("{messages}", msgs_text), max_tokens=1200, temperature=0.0)
-        return raw.strip()
-    except Exception:
-        return "\n".join(msgs)
+    def _compress_block(msgs):
+        msgs_text = "\n".join(f"[{i+1}] {m[:250]}" for i, m in enumerate(msgs))
+        try:
+            raw = llm_generate(_BLOCK_PROMPT.replace("{messages}", msgs_text), max_tokens=1200, temperature=0.0)
+            return raw.strip()
+        except Exception:
+            return "\n".join(msgs)
 
-print(f"LLM 压缩记忆块（{BLOCK_SIZE} 条/块）...", flush=True)
-blocks = []
-t0 = time.time()
-_n_total = (len(all_msgs) + BLOCK_SIZE - 1) // BLOCK_SIZE
-for b_start in range(0, len(all_msgs), BLOCK_SIZE):
-    if LIMIT_BLOCKS > 0 and len(blocks) >= LIMIT_BLOCKS:
-        break
-    b_end = min(b_start + BLOCK_SIZE, len(all_msgs))
-    summary = _compress_block(all_msgs[b_start:b_end])
-    blocks.append((f"blk_{len(blocks)}", b_start, b_end, summary))
-    if len(blocks) % 25 == 0:
-        print(f"  块 {len(blocks)}/{_n_total} ({time.time()-t0:.0f}s)", flush=True)
-print(f"记忆块完成: {len(blocks)} 块 ({time.time()-t0:.0f}s)", flush=True)
-json.dump([{"id": b[0], "start": b[1], "end": b[2], "summary": b[3]} for b in blocks],
-          open("/tmp/v71_blocks.json", "w"), ensure_ascii=False)
-import faiss
-block_vecs = np.asarray(enc.embed_batch([b[3][:1500] for b in blocks]), dtype=np.float32)
-block_vecs = block_vecs / np.linalg.norm(block_vecs, axis=1, keepdims=True)
-idx_blk = faiss.IndexFlatIP(512)
-idx_blk.add(block_vecs)
-print(f"块索引: {idx_blk.ntotal} 向量", flush=True)
+    print(f"LLM 压缩记忆块（{BLOCK_SIZE} 条/块）...", flush=True)
+    blocks = []
+    t0 = time.time()
+    _n_total = (len(all_msgs) + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-# ═══ B. semantica 图遍历索引（实体 → 属性关系/共现 episode）═══
-# 实体-属性抽取（v68 同款，产出 triples）
-def _parse_triple_objects(raw):
-    objs = []
-    try:
-        s, e = raw.find("["), raw.rfind("]")
-        if s >= 0 and e > s:
-            arr = json.loads(raw[s:e + 1])
-            if isinstance(arr, list):
-                return [x for x in arr if isinstance(x, dict)]
-    except Exception:
-        pass
-    for m in re.finditer(r'\{([^{}]*)\}', raw):
-        seg = m.group(1)
-        d = {}
-        for key in ("entity", "attribute", "value", "dia_id"):
-            km = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', seg)
-            if km:
-                d[key] = km.group(1).replace('\\"', '"')
-        if d.get("entity") and d.get("attribute") and d.get("dia_id"):
-            objs.append(d)
-    return objs
+    # config 由公共段 (if/else 后) 定义
+    for b_start in range(0, len(all_msgs), BLOCK_SIZE):
+        if LIMIT_BLOCKS > 0 and len(blocks) >= LIMIT_BLOCKS:
+            break
+        b_end = min(b_start + BLOCK_SIZE, len(all_msgs))
+        summary = _compress_block(all_msgs[b_start:b_end])
+        blocks.append((f"blk_{len(blocks)}", b_start, b_end, summary))
+        if len(blocks) % 25 == 0:
+            print(f"  块 {len(blocks)}/{_n_total} ({time.time()-t0:.0f}s)", flush=True)
+    print(f"记忆块完成: {len(blocks)} 块 ({time.time()-t0:.0f}s)", flush=True)
+    json.dump([{"id": b[0], "start": b[1], "end": b[2], "summary": b[3]} for b in blocks],
+              open("/tmp/v71_blocks.json", "w"), ensure_ascii=False)
+    import faiss
+    block_vecs = np.asarray(enc.embed_batch([b[3][:1500] for b in blocks]), dtype=np.float32)
+    block_vecs = block_vecs / np.linalg.norm(block_vecs, axis=1, keepdims=True)
+    idx_blk = faiss.IndexFlatIP(512)
+    idx_blk.add(block_vecs)
+    print(f"块索引: {idx_blk.ntotal} 向量", flush=True)
 
-_EXTRACT_PROMPT = """Extract ALL factual entity-attribute-value triples from these conversation messages. Be aggressive and exhaustive.
-Rules:
-- entity: person/place/thing proper noun (Caroline, Melanie, Paris, Yosemite)
-- attribute: verb phrase or property (went_to, camped_at, bought, painted, plays, has_pet, birthday, works_at, favorite)
-- value: the specific fact, include dates/places/names when present
-- Extract ALL facts per message: activities, opinions, preferences, family, work, school, travel, pets, hobbies, purchases. 2-5 per message.
-- dia_id MUST be the [D1:N] tag of the message the fact came from.
-Output STRICT JSON list only: [{"entity": "...", "attribute": "...", "value": "...", "dia_id": "D1:N"}]
-No other text. If nothing, output [].
+    # ═══ B. semantica 图遍历索引（实体 → 属性关系/共现 episode）═══
+    # 实体-属性抽取（v68 同款，产出 triples）
+    def _parse_triple_objects(raw):
+        objs = []
+        try:
+            s, e = raw.find("["), raw.rfind("]")
+            if s >= 0 and e > s:
+                arr = json.loads(raw[s:e + 1])
+                if isinstance(arr, list):
+                    return [x for x in arr if isinstance(x, dict)]
+        except Exception:
+            pass
+        for m in re.finditer(r'\{([^{}]*)\}', raw):
+            seg = m.group(1)
+            d = {}
+            for key in ("entity", "attribute", "value", "dia_id"):
+                km = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', seg)
+                if km:
+                    d[key] = km.group(1).replace('\\"', '"')
+            if d.get("entity") and d.get("attribute") and d.get("dia_id"):
+                objs.append(d)
+        return objs
 
-Messages:
-{messages}"""
+    _EXTRACT_PROMPT = """Extract ALL factual entity-attribute-value triples from these conversation messages. Be aggressive and exhaustive.
+    Rules:
+    - entity: person/place/thing proper noun (Caroline, Melanie, Paris, Yosemite)
+    - attribute: verb phrase or property (went_to, camped_at, bought, painted, plays, has_pet, birthday, works_at, favorite)
+    - value: the specific fact, include dates/places/names when present
+    - Extract ALL facts per message: activities, opinions, preferences, family, work, school, travel, pets, hobbies, purchases. 2-5 per message.
+    - dia_id MUST be the [D1:N] tag of the message the fact came from.
+    Output STRICT JSON list only: [{"entity": "...", "attribute": "...", "value": "...", "dia_id": "D1:N"}]
+    No other text. If nothing, output [].
 
-def _extract_batch(batch_msgs):
-    msgs_text = "\n".join(f"[{m['dia_id']}] {m['speaker']}: {m['text'][:200]}" for m in batch_msgs)
-    try:
-        raw = llm_generate(_EXTRACT_PROMPT.replace("{messages}", msgs_text), max_tokens=1800, temperature=0.0)
-        return _parse_triple_objects(raw)
-    except Exception:
-        return []
+    Messages:
+    {messages}"""
 
-_dia_to_ep = {}
-for _ci in range(len(conv_map)):
-    for _j in range(len(conv_map[_ci])):
-        _dia_to_ep[f"D{_ci+1}:{_j+1}"] = f"ep_{sum(len(conv_map[c]) for c in range(_ci)) + _j}"
+    def _extract_batch(batch_msgs):
+        msgs_text = "\n".join(f"[{m['dia_id']}] {m['speaker']}: {m['text'][:200]}" for m in batch_msgs)
+        try:
+            raw = llm_generate(_EXTRACT_PROMPT.replace("{messages}", msgs_text), max_tokens=1800, temperature=0.0)
+            return _parse_triple_objects(raw)
+        except Exception:
+            return []
 
-print("实体-属性抽取（LLM 分批）...", flush=True)
-_triples_all = []
-_mid_msgs = []
-for _ci in range(len(conv_map)):
-    for _j, _m in enumerate(conv_map[_ci]):
-        _mid_msgs.append({"dia_id": f"D{_ci+1}:{_j+1}", "speaker": _m.split("]")[0].replace("[", "").strip() if "]" in _m else "", "text": _m})
-if EXTRACT_LIMIT > 0:
-    _mid_msgs = _mid_msgs[:EXTRACT_LIMIT]
-for _i in range(0, len(_mid_msgs), 25):
-    _got = _extract_batch(_mid_msgs[_i:_i + 25])
-    _triples_all.extend(_got)
-    if (_i // 25) % 5 == 0:
-        print(f"  抽取 {min(_i+25, len(_mid_msgs))}/{len(_mid_msgs)} (cum {len(_triples_all)} triples)", flush=True)
-print(f"抽取完成: {len(_triples_all)} triples", flush=True)
+    _dia_to_ep = {}
+    for _ci in range(len(conv_map)):
+        for _j in range(len(conv_map[_ci])):
+            _dia_to_ep[f"D{_ci+1}:{_j+1}"] = f"ep_{sum(len(conv_map[c]) for c in range(_ci)) + _j}"
 
-# 图遍历索引：实体 → 属性关系 episode（属性值中含实体的消息）；实体 → 共现实体
-entity_eps = {}   # entity → {ep: score}
-entity_co = {}    # entity → {co_entity: count}
-for _t in _triples_all:
-    _e = (_t.get("entity") or "").strip()
-    _ep = _dia_to_ep.get((_t.get("dia_id") or "").strip(), "")
-    if not _e or not _ep:
-        continue
-    entity_eps.setdefault(_e, {})
-    entity_eps[_e][_ep] = entity_eps[_e].get(_ep, 0) + 1.0
-    # 共现：同 ep 的其他实体
-    entity_co.setdefault(_e, {})
-    for _t2 in _triples_all:
-        _e2 = (_t2.get("entity") or "").strip()
-        _ep2 = _dia_to_ep.get((_t2.get("dia_id") or "").strip(), "")
-        if _e2 and _e2 != _e and _ep2 == _ep:
-            entity_co[_e][_e2] = entity_co[_e].get(_e2, 0) + 1
-print(f"图遍历索引: {len(entity_eps)} 实体, 关联 episodes {sum(len(v) for v in entity_eps.values())}", flush=True)
+    print("实体-属性抽取（LLM 分批）...", flush=True)
+    _triples_all = []
+    _mid_msgs = []
+    for _ci in range(len(conv_map)):
+        for _j, _m in enumerate(conv_map[_ci]):
+            _mid_msgs.append({"dia_id": f"D{_ci+1}:{_j+1}", "speaker": _m.split("]")[0].replace("[", "").strip() if "]" in _m else "", "text": _m})
+    if EXTRACT_LIMIT > 0:
+        _mid_msgs = _mid_msgs[:EXTRACT_LIMIT]
+    for _i in range(0, len(_mid_msgs), 25):
+        _got = _extract_batch(_mid_msgs[_i:_i + 25])
+        _triples_all.extend(_got)
+        if (_i // 25) % 5 == 0:
+            print(f"  抽取 {min(_i+25, len(_mid_msgs))}/{len(_mid_msgs)} (cum {len(_triples_all)} triples)", flush=True)
+    print(f"抽取完成: {len(_triples_all)} triples", flush=True)
+
+    # 图遍历索引：实体 → 属性关系 episode（属性值中含实体的消息）；实体 → 共现实体
+    entity_eps = {}   # entity → {ep: score}
+    entity_co = {}    # entity → {co_entity: count}
+    for _t in _triples_all:
+        _e = (_t.get("entity") or "").strip()
+        _ep = _dia_to_ep.get((_t.get("dia_id") or "").strip(), "")
+        if not _e or not _ep:
+            continue
+        entity_eps.setdefault(_e, {})
+        entity_eps[_e][_ep] = entity_eps[_e].get(_ep, 0) + 1.0
+        # 共现：同 ep 的其他实体
+        entity_co.setdefault(_e, {})
+        for _t2 in _triples_all:
+            _e2 = (_t2.get("entity") or "").strip()
+            _ep2 = _dia_to_ep.get((_t2.get("dia_id") or "").strip(), "")
+            if _e2 and _e2 != _e and _ep2 == _ep:
+                entity_co[_e][_e2] = entity_co[_e].get(_e2, 0) + 1
+    print(f"图遍历索引: {len(entity_eps)} 实体, 关联 episodes {sum(len(v) for v in entity_eps.values())}", flush=True)
+
+    # ── 本体论组织（v72：实体事实簇 + 关系证据 + 全局线索 + 动态 schema）──
+    def triples_by_entity_map():
+        """triples → {entity: [fact_text]}（本体属性事实）"""
+        m = {}
+        for _t in _triples_all:
+            _e = (_t.get("entity") or "").strip()
+            _a = (_t.get("attribute") or "").strip()
+            _v = (_t.get("value") or "").strip()
+            if _e and _a and _v:
+                m.setdefault(_e, []).append(f"{_e} {_a}: {_v}")
+        return m
+
+    _ontology_facts = triples_by_entity_map()
+
+    # ═══ schema 自进化（Ontology v2 思想）：从 triples 动态发现高频属性模式 → 动态类 ═══
+    def discover_schema(triples, min_support=3):
+        """动态 schema：统计 (attribute → 计数)，高频属性成为 schema 类。
+        非硬编码——schema 从数据自适应涌现（自进化）。"""
+        attr_cnt, attr_vals = {}, {}
+        for _t in triples:
+            _a = (_t.get("attribute") or "").strip()
+            _v = (_t.get("value") or "").strip()
+            if _a and _v:
+                attr_cnt[_a] = attr_cnt.get(_a, 0) + 1
+                attr_vals.setdefault(_a, []).append(_v)
+        # 高频属性 → schema 类（支持度 ≥ min_support）
+        classes = {a: vals for a, vals in attr_vals.items() if attr_cnt[a] >= min_support}
+        return classes
+
+    _schema_classes = discover_schema(_triples_all)
+    print(f"schema 自进化: {len(_schema_classes)} 个动态类（高频属性模式）", flush=True)
+    _top_classes = sorted(_schema_classes.items(), key=lambda x: -len(x[1]))[:15]
+    # 注: faiss add 已在灌库循环内完成, 这里只 dump
+    import pickle as _pkl
+    with open(INGEST_PKL, "wb") as _f:
+        _pkl.dump({"faiss_id_map": faiss_id_map, "faiss_vecs": np.vstack(vec_buf),
+                   "faiss_ids": np.array(id_buf, dtype=np.int64),
+                   "msg_by_id": msg_by_id, "episode_cache": episode_cache,
+                   "blocks": blocks, "block_vecs": block_vecs,
+                   "entity_eps": entity_eps, "entity_co": entity_co,
+                   "triples": _triples_all, "dia_to_ep": _dia_to_ep,
+                   "ontology_facts": _ontology_facts,
+                   "schema_classes": _schema_classes, "top_classes": _top_classes,
+                   "tfidf_index": tfidf_index}, _f)
+    print(f"[INGEST_DONE] 索引已存: {INGEST_PKL}", flush=True)
+    if INGEST_ONLY:
+        print("[INGEST_ONLY] 灌库完成, 退出", flush=True)
+        sys.exit(0)
+
+config = QueryRouterConfig()
+config.agentic_enabled = False
+config.hyde_timeout = 10.0
+config.mesa_enabled = True
+config.mesa_boost = 0.4
+config.mesa_threshold = 0.5
+config.mesa_max_nodes = 5
+qr = QueryRouter(graphlite_store=gstore, faiss_index=faiss_index, tfidf_index=tfidf_index,
+                 encoder=enc, config=config, faiss_id_map=faiss_id_map, episode_cache=episode_cache)
 
 def extract_query_entities(question):
     """从问题提取实体（与 entity_eps 键匹配：直接词匹配 + LLM 兜底）"""
@@ -303,6 +393,55 @@ def graph_walk(question):
         if c:
             out.append(c)
     return out
+
+# v6.5.1 并行评测: OpenRouter GPT-4o-mini judge (严格判卷)
+def _or_key():
+    try:
+        txt = open(os.path.expanduser("~/.hermes/.env")).read()
+    except OSError:
+        txt = ""
+    m = re.search(r'OPENROUTER_API_KEY\s*=\s*"?([^"\s]+)"?', txt)
+    return m.group(1) if m else os.environ.get("OPENROUTER_API_KEY", "")
+
+
+def _judge_openrouter(question, ground_truth, prediction, model=JUDGE_MODEL):
+    """OpenRouter LLM-as-judge (GPT-4o-mini): 对齐 LoCoMo 判定协议。"""
+    import urllib.request
+    key = _or_key()
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY 缺失")
+    prompt = (f"判断以下回答是否正确。\n\n问题: {question}\n标准答案: {ground_truth}\n"
+              f"待评回答: {prediction}\n\n"
+              "只输出 JSON: {\"correct\": true/false, \"reason\": \"一句话\"}")
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "max_tokens": 100, "temperature": 0.0}).encode()
+    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
+                                 data=body, headers={
+                                     "Content-Type": "application/json",
+                                     "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        resp = json.loads(r.read())
+    content = resp["choices"][0]["message"]["content"]
+    s, e = content.find("{"), content.rfind("}")
+    if s >= 0 and e > s:
+        d = json.loads(content[s:e + 1])
+        return bool(d.get("correct"))
+    return False
+
+
+def _judge(q, gold, pred):
+    if JUDGE_PROVIDER == "openrouter":
+        return _judge_openrouter(q, gold, pred)
+    return llm_judge(q, gold, pred)
+
+
+def _judge_call(q, gold, pred):
+    try:
+        return _judge(q, gold, pred)
+    except Exception as e:
+        print(f"  [judge err] {e}", flush=True)
+        return False
+
 
 # ═══ C. 检索融合 ═══
 def multi_query_expand(question):
@@ -437,37 +576,6 @@ def rrf_fuse(channels, k=60):
     return sorted(scores, key=lambda x: -scores[x])
 
 # ── 本体论组织（v72：实体事实簇 + 关系证据 + 全局线索 + 动态 schema）──
-def triples_by_entity_map():
-    """triples → {entity: [fact_text]}（本体属性事实）"""
-    m = {}
-    for _t in _triples_all:
-        _e = (_t.get("entity") or "").strip()
-        _a = (_t.get("attribute") or "").strip()
-        _v = (_t.get("value") or "").strip()
-        if _e and _a and _v:
-            m.setdefault(_e, []).append(f"{_e} {_a}: {_v}")
-    return m
-
-_ontology_facts = triples_by_entity_map()
-
-# ═══ schema 自进化（Ontology v2 思想）：从 triples 动态发现高频属性模式 → 动态类 ═══
-def discover_schema(triples, min_support=3):
-    """动态 schema：统计 (attribute → 计数)，高频属性成为 schema 类。
-    非硬编码——schema 从数据自适应涌现（自进化）。"""
-    attr_cnt, attr_vals = {}, {}
-    for _t in triples:
-        _a = (_t.get("attribute") or "").strip()
-        _v = (_t.get("value") or "").strip()
-        if _a and _v:
-            attr_cnt[_a] = attr_cnt.get(_a, 0) + 1
-            attr_vals.setdefault(_a, []).append(_v)
-    # 高频属性 → schema 类（支持度 ≥ min_support）
-    classes = {a: vals for a, vals in attr_vals.items() if attr_cnt[a] >= min_support}
-    return classes
-
-_schema_classes = discover_schema(_triples_all)
-print(f"schema 自进化: {len(_schema_classes)} 个动态类（高频属性模式）", flush=True)
-_top_classes = sorted(_schema_classes.items(), key=lambda x: -len(x[1]))[:15]
 
 def ontology_organize(question, channels):
     """本体论核心融合：实体/属性/关系/事实/动态schema 五维度组织（非排名平铺）"""
@@ -583,9 +691,32 @@ for ci, item in enumerate(data):
     for q in item["qa"]:
         qa_conv[id(q)] = ci
 qa_all = []
-for item in data:
-    qa_all.extend(item["qa"])
+if PREDICT_QUESTIONS:
+    with open(PREDICT_QUESTIONS) as _fq:
+        for _l in _fq:
+            _l = _l.strip()
+            if not _l:
+                continue
+            _q = json.loads(_l)
+            qa_all.append({"qa_id": _q.get("qa_id"), "question": _q.get("question"), "answer": _q.get("answer")})
+    _sample_map = {}
+    for _ci, _item in enumerate(data):
+        _sample_map[_item.get("sample_id")] = _ci
+    for _q in qa_all:
+        _sid = str(_q.get("qa_id", "")).split("#")[0]
+        qa_conv[id(_q)] = _sample_map.get(_sid, 0)
+    if PREDICT_RANGE:
+        _s, _e = PREDICT_RANGE.split(":")
+        qa_all = qa_all[int(_s):int(_e)]
+    print(f"[PREDICT] 加载 LoCoMo-Refined 问题: {len(qa_all)} 问 (range={PREDICT_RANGE or 'all'})", flush=True)
+else:
+    for item in data:
+        qa_all.extend(item["qa"])
 qa_all = [q for q in qa_all if q.get("category") != 5 and q.get("answer")]
+if CAT_FILTER:
+    cats = {int(c) for c in CAT_FILTER.split(",") if c.strip().isdigit()}
+    qa_all = [q for q in qa_all if q.get("category", 0) in cats]
+    print(f"类别过滤: {sorted(cats)} → {len(qa_all)} 问", flush=True)
 if SAMPLE_N > 0:
     qa_all = qa_all[:SAMPLE_N]
 print(f"评测规模: {len(qa_all)} 问", flush=True)
@@ -646,14 +777,27 @@ Answer:"""
         print(f"  [gen err] {e}", flush=True)
         results["errors"] += 1
         continue
+    if PREDICT_MODE:
+        with open(PREDICT_OUT, "a") as _pf:
+            _pf.write(json.dumps({"qa_id": q.get("qa_id", f"q{i}"), "predicted_answer": pred[:500]}) + "\n")
+        if (i + 1) % 20 == 0 or i == len(qa_all) - 1:
+            print(f"  [PREDICT] {i+1}/{len(qa_all)} elapsed={time.time()-t0:.0f}s", flush=True)
+        continue
     results["total"] += 1
-    try:
-        ok = llm_judge(question, gold, pred)
-    except Exception as e:
-        print(f"  [judge err] {e}", flush=True)
-        ok = False
+    ok = _judge_call(question, gold, pred)
     if ok:
         results["correct"] += 1
+    # ── 诊断模式 (DIAG_DUMP=1): 每题落盘，供错误归因（默认不生效，不改评测口径）──
+    if os.environ.get("DIAG_DUMP") == "1":
+        _gt = set(t for t in re.findall(r"[A-Za-z]{4,}|\d+", str(gold).lower()) if t not in
+                  {"what","when","where","who","how","many","the","and","was","did","does","they","she","he","her","his","their","have","has","been","with","from","that","this","for","are","you","your","would","could","should","will","going","went","go","about","there","its","them","him","not","one","two","three","time","day","week","month","year","said","told"})
+        _dtxt = " ".join(docs).lower()
+        _hit = [t for t in _gt if t in _dtxt]
+        _diag = {"i": i, "q": question, "gold": gold, "pred": pred[:300], "ok": bool(ok),
+                 "n_docs": len(docs), "n_gold_key": len(_gt), "key_hit": _hit[:10],
+                 "round2_total": results["round2_used"]}
+        with open(os.environ.get("DIAG_OUT", "/tmp/locomo_diag.jsonl"), "a") as _f:
+            _f.write(json.dumps(_diag, ensure_ascii=False) + "\n")
     results["by_cat"].setdefault(cat, {"t": 0, "c": 0})
     results["by_cat"][cat]["t"] += 1
     if ok:
@@ -670,10 +814,11 @@ for cat in sorted(results["by_cat"]):
     d = results["by_cat"][cat]
     print(f"  cat={cat}: {d['c']}/{d['t']} = {d['c']/max(1,d['t'])*100:.1f}%", flush=True)
 
-out = "/tmp/locomo_v72_results.json"
+out = f"/tmp/locomo_v72_results_cat{CAT_FILTER or 'all'}_{JUDGE_PROVIDER}.json"
 json.dump({"acc": acc, "correct": results["correct"], "total": results["total"],
            "by_cat": results["by_cat"], "errors": results["errors"], "round2_used": results["round2_used"],
            "blocks": len(blocks), "entities": len(entity_eps),
+           "judge": JUDGE_PROVIDER, "judge_model": JUDGE_MODEL,
            "version": "6.4.0-ontology"},
           open(out, "w"), ensure_ascii=False, indent=2)
 print(f"结果已存: {out}", flush=True)

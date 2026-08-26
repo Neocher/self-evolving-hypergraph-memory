@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _BGE_M3_MODEL = "BAAI/bge-m3"
 _BGE_M3_ONNX_REPO = "EmbeddedLLM/bge-m3-onnx-o2-cpu"  # ORT O2 CPU 优化 ONNX（HF 缓存加载，不进 git）
 _TRUNCATE_DIM = 512  # bge-m3 MRL 截断目标维度：匹配 overgraph.dense_vector_dimension=512（HNSW 契约）
-_INTRA_OP_THREADS = 8  # ORT SessionOptions intra 线程：16 核实测最优点（单条 -28% 批量 -22%）；16 与生产多进程超订
+_INTRA_OP_THREADS = int(os.environ.get("ORT_INTRA_THREADS", "8"))  # ORT SessionOptions intra 线程：单进程 16 核实测 8 最优点；多进程并行评测时设 4 (4×4=16 核防超订)
 
 # ─── Tier 1: Cloud Embedding API ──────────────────────────
 
