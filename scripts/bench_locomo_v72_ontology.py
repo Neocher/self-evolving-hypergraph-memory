@@ -701,6 +701,7 @@ if PREDICT_QUESTIONS:
                 continue
             _q = json.loads(_l)
             qa_all.append({"qa_id": _q.get("qa_id"), "question": _q.get("question"), "answer": _q.get("answer"),
+                           "category": _q.get("category"),
                            "evidence": _q.get("evidence"), "evidence_messages": _q.get("evidence_messages")})
     _sample_map = {}
     for _ci, _item in enumerate(data):
@@ -742,16 +743,23 @@ for i, q in enumerate(qa_all):
         ev_msgs = q.get("evidence_messages") or []
         ev_texts = [e.get("text", "") for e in ev_msgs if e.get("text")]
         cat_s = str(cat)
-        c = hitk_stats["by_cat"].setdefault(cat_s, {"total": 0, "k1": 0, "k3": 0, "k5": 0})
+        c = hitk_stats["by_cat"].setdefault(cat_s, {"total": 0, "k1": 0, "k3": 0, "k5": 0, "k10": 0, "k20": 0, "k40": 0})
         c["total"] += 1
         hitk_stats["total"] += 1
-        for kk in (1, 3, 5):
+        # 滑动窗口探针: 25 字符片段 (压缩块可能改写原文, 全句匹配过严)
+        probes = []
+        for et in ev_texts:
+            t = et.strip()
+            if not t:
+                continue
+            probes += [t[i:i + 25] for i in range(0, max(1, len(t) - 24), 20)][:8]
+        probes = [p for p in probes if len(p) >= 15]
+        for kk in (1, 3, 5, 10, 20, 40):
             topk = docs[:kk]
-            ok = any(probe and any(probe in d for d in topk)
-                     for et in ev_texts for probe in [et[:40].strip()] if probe)
+            ok = any(any(p in d for d in topk) for p in probes)
             if ok:
                 c[f"k{kk}"] += 1
-        if (i + 1) % 100 == 0 or i == len(qa_all) - 1:
+        if (i + 1) % 50 == 0 or i == len(qa_all) - 1:
             print(f"  [HITK] {i+1}/{len(qa_all)} elapsed={time.time()-t0:.0f}s", flush=True)
         continue
 
@@ -842,7 +850,7 @@ if HITK_MODE:
     for cat_s in sorted(hitk_stats["by_cat"], key=lambda x: int(x) if x.isdigit() else 99):
         d = hitk_stats["by_cat"][cat_s]
         t = max(1, d["total"])
-        print(f"  cat={cat_s}: n={d['total']} hit@1={d['k1']/t*100:.1f}% hit@3={d['k3']/t*100:.1f}% hit@5={d['k5']/t*100:.1f}%", flush=True)
+        print(f"  cat={cat_s}: n={d['total']} hit@1={d['k1']/t*100:.1f}% @3={d['k3']/t*100:.1f}% @5={d['k5']/t*100:.1f}% @10={d['k10']/t*100:.1f}% @20={d['k20']/t*100:.1f}% @40={d['k40']/t*100:.1f}%", flush=True)
     hitk_out = f"/tmp/locomo_v72_hitk.json"
     json.dump(hitk_stats, open(hitk_out, "w"), ensure_ascii=False, indent=2)
     print(f"hit@k 结果已存: {hitk_out}", flush=True)
