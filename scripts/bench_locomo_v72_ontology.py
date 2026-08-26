@@ -761,6 +761,7 @@ for i, q in enumerate(qa_all):
                 c[f"k{kk}"] += 1
         if (i + 1) % 50 == 0 or i == len(qa_all) - 1:
             print(f"  [HITK] {i+1}/{len(qa_all)} elapsed={time.time()-t0:.0f}s", flush=True)
+            json.dump(hitk_stats, open("/tmp/locomo_v72_hitk.json", "w"), ensure_ascii=False, indent=2)  # checkpoint 防中断丢数据
         continue
 
     # agentic 协同：sufficiency 基于分区后完整证据（保守触发——v71 教训 76% 太高）
