@@ -18,6 +18,7 @@ SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
 RERANK_TOP = int(os.environ.get("RERANK_TOP", "50"))
 RERANK_LIGHT = os.environ.get("RERANK_LIGHT") == "1"  # 轻量重排 A/B: 词重叠信号(零依赖)
+RERANK_MODE = os.environ.get("RERANK_MODE", "")       # auto=分类混合(cat1/4 cross-enc, cat2 轻量, cat3 原序)
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "20000"))
 BLOCK_SIZE = int(os.environ.get("BLOCK_SIZE", "15"))
 BLOCK_TOP = int(os.environ.get("BLOCK_TOP", "8"))
@@ -595,6 +596,9 @@ def light_rerank(query, docs, top_k=30):
 
 # ── 本体论组织（v72：实体事实簇 + 关系证据 + 全局线索 + 动态 schema）──
 
+_cur_cat = "0"  # 当前问题类别（RERANK_MODE=auto 分类路由用）
+
+
 def ontology_organize(question, channels):
     """本体论核心融合：实体/属性/关系/事实/动态schema 五维度组织（非排名平铺）"""
     ents = extract_query_entities(question)
@@ -647,7 +651,16 @@ def ontology_organize(question, channels):
     # 5. 直接证据（消息级 rerank——不加回 B/C，避免污染）
     fused = rrf_fuse(channels)
     try:
-        if RERANK_LIGHT:
+        if RERANK_MODE == "auto":
+            # 分类混合: cat1/4 cross-encoder, cat2 轻量(词重叠), cat3 原序(推理类重排退化)
+            if str(_cur_cat) == "3":
+                direct = fused[:30]
+            elif str(_cur_cat) == "2":
+                direct = light_rerank(question, fused[:RERANK_POOL], top_k=30)
+            else:
+                get_reranker()
+                direct = rerank(question, fused[:RERANK_POOL], top_n=30)
+        elif RERANK_LIGHT:
             direct = light_rerank(question, fused[:RERANK_POOL], top_k=30)
         else:
             get_reranker()
@@ -753,6 +766,7 @@ for i, q in enumerate(qa_all):
     session_ts = parse_session_ts(conv_ts.get(ci))
 
     # 三通道检索（有机融合）+ 证据分区
+    _cur_cat = str(cat)
     channels = retrieve_channels(question, hitk=HITK_MODE)
     ctx, docs = build_ctx(question, channels, rerank_top=40)
 
