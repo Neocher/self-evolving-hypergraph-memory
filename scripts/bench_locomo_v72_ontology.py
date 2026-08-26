@@ -17,6 +17,7 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
 SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
 RERANK_TOP = int(os.environ.get("RERANK_TOP", "50"))
+RERANK_LIGHT = os.environ.get("RERANK_LIGHT") == "1"  # 轻量重排 A/B: 词重叠信号(零依赖)
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "20000"))
 BLOCK_SIZE = int(os.environ.get("BLOCK_SIZE", "15"))
 BLOCK_TOP = int(os.environ.get("BLOCK_TOP", "8"))
@@ -578,6 +579,20 @@ def rrf_fuse(channels, k=60):
             scores[d] += 1.0 / (k + rank + 1)
     return sorted(scores, key=lambda x: -scores[x])
 
+
+_STOP = set("the a an is are was were be been being of to in on at for with from by about as and or not no it its this that these those what when where who which how why do does did have has had will would can could should may might".split())
+
+
+def light_rerank(query, docs, top_k=30):
+    """轻量重排：query 词重叠率加权（零依赖；alpha=0.5 与 RRF 原序混合，tiebreak 保 RRF 顺序）"""
+    q_tokens = set(re.findall(r"[a-z']+", query.lower())) - _STOP
+    if not q_tokens:
+        return docs[:top_k]
+    # 稳定排序：overlap 降序，同分保持原 RRF 序
+    scored = sorted(((sum(1 for t in q_tokens if t in d.lower()) / len(q_tokens), i, d)
+                     for i, d in enumerate(docs)), key=lambda x: (-x[0], x[1]))
+    return [d for _, _, d in scored][:top_k]
+
 # ── 本体论组织（v72：实体事实簇 + 关系证据 + 全局线索 + 动态 schema）──
 
 def ontology_organize(question, channels):
@@ -632,9 +647,11 @@ def ontology_organize(question, channels):
     # 5. 直接证据（消息级 rerank——不加回 B/C，避免污染）
     fused = rrf_fuse(channels)
     try:
-        get_reranker()
-        reranked = rerank(question, fused[:RERANK_POOL], top_n=30)
-        direct = [d for d, s in reranked]
+        if RERANK_LIGHT:
+            direct = light_rerank(question, fused[:RERANK_POOL], top_k=30)
+        else:
+            get_reranker()
+            direct = rerank(question, fused[:RERANK_POOL], top_n=30)
     except Exception:
         direct = fused[:30]
     ev_sec = "\n".join(f"[{j+1}] {d}" for j, d in enumerate(direct[:30]))

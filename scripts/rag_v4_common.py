@@ -14,7 +14,7 @@ def _key():
     k = os.environ.get("DEEPSEEK_API_KEY", "")
     if k:
         return k
-    m = re.search(r'DEEPSEEK_API_KEY="([^"]+)"',
+    m = re.search(r'DEEPSEEK_API_KEY\s*=\s*"?([^"\s]+)"?',
                   Path(os.path.expanduser("~/.bashrc")).read_text())
     return m.group(1) if m else ""
 
@@ -61,10 +61,35 @@ def llm_judge(question: str, ground_truth: str, prediction: str) -> dict:
         return {"correct": False, "reason": f"judge parse fail: {raw[:80]}"}
 
 
-def rerank(query: str, docs: list, top_k: int = 10):
-    """bge-reranker 不可用时的降级：原序截断（评测脚本内部已有 fallback）。"""
-    return docs[:top_k]
+_reranker_model = None
 
 
 def get_reranker():
-    return None
+    """bge-reranker cross-encoder（懒加载；失败返回 None 走降级）"""
+    global _reranker_model
+    if _reranker_model is None:
+        try:
+            from sentence_transformers import CrossEncoder
+            name = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-base")
+            _reranker_model = CrossEncoder(name, max_length=512)
+            print(f"[reranker] 已加载 {name}", flush=True)
+        except Exception as e:
+            print(f"[reranker] 加载失败, 走原序降级: {e}", flush=True)
+            _reranker_model = False
+    return _reranker_model or None
+
+
+def rerank(query: str, docs: list, top_k: int = 10, top_n: int = None):
+    """bge-reranker cross-encoder 重排；不可用时原序截断。兼容 top_k/top_n 两种调用。"""
+    model = get_reranker()
+    k = top_n or top_k
+    if not model or not docs:
+        return docs[:k]
+    try:
+        pairs = [[query, d[:1000]] for d in docs]
+        scores = model.predict(pairs, batch_size=32, show_progress_bar=False)
+        ranked = sorted(zip(docs, scores), key=lambda x: -float(x[1]))
+        return [d for d, s in ranked][:k]
+    except Exception as e:
+        print(f"[reranker] 推理失败, 原序降级: {e}", flush=True)
+        return docs[:k]
