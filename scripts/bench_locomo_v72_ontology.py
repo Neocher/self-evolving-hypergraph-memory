@@ -526,9 +526,10 @@ def _graph_add(question, seen, docs):
     except Exception:
         pass
 
-def retrieve_channels(question):
+def retrieve_channels(question, hitk=False):
     """三通道并行检索，各自独立打分（有机融合——不塞池竞争）"""
-    queries = [question] + multi_query_expand(question)
+    # P2 基线: HITK 模式单查询(基础检索能力), 不含 multi_query 增强
+    queries = [question] + ([] if hitk else multi_query_expand(question))
     seen_a, docs_a = set(), []
     for q in queries:
         _fuse(q, seen_a, docs_a)
@@ -735,7 +736,7 @@ for i, q in enumerate(qa_all):
     session_ts = parse_session_ts(conv_ts.get(ci))
 
     # 三通道检索（有机融合）+ 证据分区
-    channels = retrieve_channels(question)
+    channels = retrieve_channels(question, hitk=HITK_MODE)
     ctx, docs = build_ctx(question, channels, rerank_top=40)
 
     # P2 hit@k 基线: evidence 消息文本是否进入 top-k docs (纯检索, 不调 LLM)
