@@ -1,6 +1,6 @@
 # SHM — Self-evolving Hypergraph Memory
 
-**v6.5.0** | *8 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
+**v6.5.1** | *8 unique capabilities · 5 protocol interfaces · 3 cognitive engines*
 
 > Memory that learns, consolidates, and evolves — like the brain.
 >
@@ -275,6 +275,24 @@ python -m pytest tests/ -q
 **分类型 Recall@10**：信息抽取 1.000 / 知识更新 1.000 / 时间推理 0.958 / 用户偏好 0.875 / 助手信息 0.875 / 多会话推理 0.859
 
 **方法论文本**：测的是检索架构（BM25+FAISS 双通道复刻，不写生产库）；英文数据用英文模型（生产 bge-small-zh 中文模型对英文失效——语种不匹配）；社区扩召回用真实 GraphLite 验证（构造社区边 ON=3/3 vs OFF=0/3），LongMemEval-S 干扰 session 独立结构测不出社区桥接（基准适配边界）。
+
+---
+
+## 📊 LoCoMo-Refined Benchmark (v6.5.1)
+
+[LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined)（mem-eval-suite 官方判卷协议，1382 问，非商业 CC BY-NC 4.0）全量评测结果：
+
+| 类别 | 题数 | 正确 | 准确率 |
+|:--|:--|:--|:--|
+| cat1 事实问答 | 213 | 138 | 64.8% |
+| cat2 关系推理 | 299 | 210 | 70.2% |
+| cat3 时间推理 | 68 | 53 | 77.9% |
+| cat4 跨会话综合 | 802 | 714 | **89.0%** |
+| **合计** | **1382** | **1115** | **80.68%** |
+
+**对照官方参考分**：EverMemOS 58.25% · Mem0 48.91%（SHM +22~32pp）
+
+**口径**：SHM v72 管道生成预测（predictions.jsonl）→ 官方 `evaluate.py` refined 判卷协议；judge=deepseek-chat（官方 prompt，与 qwen3-8b 逐条 100% 一致，非官方 Qwen3-14B 参考口径）。全量零缺失零错误。早期 200 问宽松 judge 100.0%（v6.5.0）→ 严格协议 80.68%。
 
 ---
 

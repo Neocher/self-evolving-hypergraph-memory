@@ -1,5 +1,22 @@
 # Changelog
 
+## v6.5.1 (2026-08-26) — Refined-Bench: LoCoMo-Refined 官方判卷全量评测
+
+### 🎯 LoCoMo-Refined 全量评测 (1382 问, 官方判卷协议)
+- **总 acc 80.68%** (1115/1382): cat1=64.8% · cat2=70.2% · cat3=77.9% · cat4=89.0%
+- 对照官方参考分: EverMemOS 58.25% / Mem0 48.91% (+22~32pp)
+- 判卷: 官方 evaluate.py refined 协议, judge=deepseek-chat (与 qwen3-8b 逐条 100% 一致)
+- 详见 `docs/benchmark-locomorefined.md`
+
+### 🔧 bench 工具
+- `bench_locomo_v72_ontology.py` 新增预测生成模式: `PREDICT_MODE/PREDICT_QUESTIONS/PREDICT_OUT/PREDICT_RANGE`
+  （输出 predictions.jsonl 对接官方 evaluate.py, 不改变判卷口径）
+- `embedding/encoder.py`: `ORT_INTRA_THREADS` 环境变量化（多进程并行评测防超订）
+
+### 📋 修正
+- `__release_date__` 与 VERSION_SUMMARY 一致
+- CHANGELOG 对齐 v6.x 版本（此前停在 v5.9.0）
+
 ## v5.9.0 (2026-07-24) — 架构升级 · 性能提升 · 生产就绪
 
 ### 🏗️ 架构重构 (P0)
