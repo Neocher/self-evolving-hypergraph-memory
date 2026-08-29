@@ -97,12 +97,12 @@ class TestFAISSSpeed:
 
     def test_flat_l2_is_fast(self):
         """FlatL2 对小数据集应 < 5ms"""
-        import faiss
+        from retrieval.vector_store import FaissStore
         dim = 384
         n = 2000
-        index = faiss.IndexFlatL2(dim)
+        index = FaissStore(dimension=dim)
         vecs = np.random.randn(n, dim).astype(np.float32)
-        index.add(vecs)
+        index.add(vecs, np.arange(n, dtype=np.int64))
 
         query = np.random.randn(1, dim).astype(np.float32)
         times = []

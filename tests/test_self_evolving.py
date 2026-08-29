@@ -14,8 +14,8 @@ import time
 
 import numpy as np
 import pytest
-import faiss
 
+from retrieval.vector_store import FaissStore
 from retrieval.self_evolving import (
     EvolvableParams, FailureLogger, RetrievalSnapshot,
     DiagnosisEngine, EvolutionGuard, SelfEvolvingRetrieval,
@@ -80,8 +80,9 @@ def _real_router(n_docs: int = 10, top_k_l1: int = 2, **cfg_over):
     """
     dim = 8
     rng = np.random.RandomState(42)
-    base = faiss.IndexFlatL2(dim)
-    base.add(rng.randn(n_docs, dim).astype("float32"))
+    base = FaissStore(dimension=dim)
+    base.add(rng.randn(n_docs, dim).astype("float32"),
+             np.arange(n_docs, dtype=np.int64))
 
     class DegradableFaiss:
         """真实 FAISS 索引封装：down=True 时返回全 -1（模拟检索降级）"""

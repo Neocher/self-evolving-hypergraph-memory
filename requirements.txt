@@ -10,7 +10,6 @@
 #     export GRAPHLITE_SDK=~/GraphLite/sdk-python/src
 #
 # 以下均为 PyPI 依赖：
-faiss-cpu>=1.7.4
 numpy>=1.24.0
 sentence-transformers>=2.2.0
 structlog>=23.0.0

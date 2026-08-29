@@ -269,8 +269,8 @@ def _init_services() -> Services:
                 svc.faiss_nlist = 0
                 logger.info("VectorStore initialized", engine="overgraph-hnsw", dim=dim)
             else:
-                from retrieval.vector_store import VectorStoreFactory
-                store = VectorStoreFactory.create(
+                from retrieval.vector_store import FaissStore
+                store = FaissStore(
                     dimension=dim,
                     index_type=cfg.faiss.index_type,
                     nlist=cfg.faiss.nlist,
