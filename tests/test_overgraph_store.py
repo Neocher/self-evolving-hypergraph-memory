@@ -267,9 +267,9 @@ def test_translation_star_return(overgraph_store):
     # OverGraphStore._flatten_row 展开 props
     flat = store._flatten_row(rows[0], "e")
     assert flat["content"] == "星号" and flat["created_at"] == 100.0
-    # GraphLiteStore._flatten_row 兼容形态（user_profile 消费方零改动）
-    from graph.graphlite_store import GraphLiteStore
-    flat2 = GraphLiteStore._flatten_row(rows[0], "e")
+    # OverGraphStore._flatten_row 兼容形态（user_profile 消费方零改动）
+    from graph.overgraph_store import OverGraphStore
+    flat2 = OverGraphStore._flatten_row(rows[0], "e")
     assert flat2["content"] == "星号"
 
 
@@ -528,7 +528,7 @@ def test_circuit_breaker_counts_overgraph_error(overgraph_store, monkeypatch):
     # 跳闸后 query_cypher 静默返回 []（永不抛契约）
     assert store.query_cypher("MATCH (e:EpisodeNode) RETURN e.id AS id") == []
     # execute_cypher 抛 CircuitBreakerOpen（写路径显式失败）
-    from graph.graphlite_store import CircuitBreakerOpen
+    from graph.common import CircuitBreakerOpen
     with pytest.raises(CircuitBreakerOpen):
         store.execute_cypher("MATCH (e:EpisodeNode) RETURN e.id AS id")
 
@@ -563,78 +563,6 @@ def test_vector_search_and_internal_id(overgraph_store):
 
 
 # ─── GraphLite/OverGraph 行为对拍（P1#7 真实 diff fixture）────────────
-
-
-def _same_dataset(graphlite_store, overgraph_store):
-    """同一数据集落两库（显式 id 对齐，使对拍可按 key 强比对）。"""
-    gl, og = graphlite_store, overgraph_store
-    for i in range(3):
-        gl.create_episode({"id": f"p{i}", "content": f"对拍内容{i}",
-                           "created_at": float(i)})
-        og.create_episode({"id": f"p{i}", "content": f"对拍内容{i}",
-                           "created_at": float(i)})
-    gl.create_hyperedge_node({"id": "he_x", "type": "episode"})
-    og.create_hyperedge_node({"id": "he_x", "type": "episode"})
-    gl.link_hyperedge_member("he_x", "p0")
-    og.link_hyperedge_member("he_x", "p0")
-    return gl, og
-
-
-def test_behavior_parity_read_shapes(graphlite_store, overgraph_store):
-    """同一数据集上 GraphLite/OverGraph 关键读形态输出 diff（P1#7）。
-
-    对拍面：别名列 RETURN、整节点 RETURN e.*（顶层 props 契约）、
-    超边成员反查、CAS 乐观锁 —— 显式 id 对齐后按 key 强比对。
-    """
-    gl, og = _same_dataset(graphlite_store, overgraph_store)
-
-    # 1) 别名列 RETURN（e.id AS id, e.content AS content）→ 逐行强等
-    gl_rows = gl.query_cypher(
-        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content ORDER BY e.id")
-    og_rows = og.query_cypher(
-        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content ORDER BY e.id")
-    assert og_rows == gl_rows == [
-        {"id": "p0", "content": "对拍内容0"},
-        {"id": "p1", "content": "对拍内容1"},
-        {"id": "p2", "content": "对拍内容2"},
-    ]
-
-    # 2) 整节点 RETURN e.* → 顶层 props 契约（P0#3）
-    #    GraphLite 原始形态为嵌套 {'e': {'Node': {'properties': {...}}}}（SDK
-    #    原样返回，消费方 row.get("id") 拿不到）；OverGraph 按 P0#3 契约把
-    #    props 提升到行顶层 —— 对拍语义 = 两引擎 props 集合逐键等价
-    gl_star = gl.query_cypher(
-        "MATCH (e:EpisodeNode {id: 'p1'}) RETURN e.*")
-    og_star = og.query_cypher(
-        "MATCH (e:EpisodeNode {id: 'p1'}) RETURN e.*")
-    assert len(gl_star) == len(og_star) == 1
-    gl_node = gl_star[0]["e"]["Node"]
-    gl_props = {k: (next(iter(v.values())) if isinstance(v, dict) else v)
-                for k, v in gl_node["properties"].items()}
-    og_row = og_star[0]
-    assert og_row["id"] == "p1"  # P0#3 消费方契约：row.get("id") 直接可用
-    assert set(og_row) == set(gl_props)
-    for k in gl_props:
-        assert og_row[k] == gl_props[k], k
-
-    # 3) 超边成员反查（RETURN e.id，无 AS 裸列）
-    gl_m = gl.query_cypher(
-        "MATCH (h:HyperedgeNode {id: 'he_x'})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id")
-    og_m = og.query_cypher(
-        "MATCH (h:HyperedgeNode {id: 'he_x'})-[:HYPEREDGE_MEMBER]->(e:EpisodeNode) RETURN e.id")
-    assert og_m == gl_m == [{"e.id": "p0"}]
-
-    # 4) CAS 乐观锁对拍（成功 / 旧版本冲突 / force）
-    assert gl.update_with_version("p2", {"content": "v1"}, 1) is True
-    assert og.update_with_version("p2", {"content": "v1"}, 1) is True
-    assert gl.update_with_version("p2", {"content": "v2"}, 1) is False
-    assert og.update_with_version("p2", {"content": "v2"}, 1) is False
-    assert gl.update_with_version("p2", {"content": "f"}, None) is True
-    assert og.update_with_version("p2", {"content": "f"}, None) is True
-    assert gl.get_episode("p2")["content"] == og.get_episode("p2")["content"] == "f"
-
-
-# ─── 向量度量实证（P2#9）/ HNSW ef_search（P2#10）────────────────────
 
 
 def _build_metric_store(metric: str, tmp_path):

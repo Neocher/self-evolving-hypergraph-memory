@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import MagicMock
 
-from graph.graphlite_store import _gql_value, CircuitBreakerState
+from graph.common import _gql_value, CircuitBreakerState
 from api.routes.system import _flush_hebbian_batch
 from core.ontology_validator import OntologyValidator, OntologyConfig
 
@@ -62,11 +62,11 @@ class TestFlushHebbianWritePathNeutral:
     def test_flush_hebbian_failure_raises_and_neutral_to_breaker(self, overgraph_store):
 
         """execute_cypher 不吞异常：真实 SDK QueryError 上抛；失败不打点窗口。"""
-        from graphlite_sdk.error import QueryError
+        from overgraph import OverGraphError
 
         store, orig = self._fresh_store(overgraph_store)
         store._session = MagicMock()
-        store._session.query.side_effect = QueryError("real sdk query error")
+        store._session.query.side_effect = OverGraphError("real sdk query error")
 
         with pytest.raises(QueryError):
             _flush_hebbian_batch(store, [("n1", "n2", 0.5)])

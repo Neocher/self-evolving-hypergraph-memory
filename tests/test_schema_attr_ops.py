@@ -30,7 +30,7 @@ from core.ontology_evolution import (
     evolve_once,
     load_extended,
 )
-from graph.graphlite_store import GraphLiteStore
+from graph.overgraph_store import OverGraphStore
 from retrieval.query_router import QueryRouter, QueryRouterConfig
 from retrieval.self_evolving import SelfEvolvingRetrieval
 
@@ -90,13 +90,13 @@ class TestGetDistinctAttrNames:
             {"attr_name": "market_cap"},
             {"attr_name": "revenue"},  # 重复 → 去重
         ]
-        names = GraphLiteStore.get_distinct_attr_names(store)
+        names = OverGraphStore.get_distinct_attr_names(store)
         assert names == ["revenue", "market_cap"]
 
     def test_failure_returns_empty(self):
         store = MagicMock()
         store.query_cypher.return_value = []  # GraphLite 失败 → query_cypher 返回 []
-        assert GraphLiteStore.get_distinct_attr_names(store) == []
+        assert OverGraphStore.get_distinct_attr_names(store) == []
 
     def test_non_dict_rows_skipped(self):
         store = MagicMock()
@@ -106,7 +106,7 @@ class TestGetDistinctAttrNames:
             {"attr_name": None},
             {"attr_name": ""},
         ]
-        assert GraphLiteStore.get_distinct_attr_names(store) == ["revenue"]
+        assert OverGraphStore.get_distinct_attr_names(store) == ["revenue"]
 
 
 # ─── 2. _apply_attr_ops ─────────────────────────────────────

@@ -340,13 +340,13 @@ class TestRetrieveR3Fix:
         修复前 degraded=True 置于 wait_for 之后，非超时异常跳外层 except 时该行
         未执行 → degraded 恒 False。修复后置位于 wait_for 之前，异常仍 degraded=True。
         """
-        from graphlite_sdk.error import QueryError
+        from overgraph import OverGraphError
         from api.routes._deps import _result_cache, _result_cache_lock
 
         mock_qr = MagicMock()
         mock_qr.retrieve.return_value = []
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.side_effect = QueryError(
+        mock_services.graphlite_store.query_cypher.side_effect = OverGraphError(
             "simulated cypher fallback failure"
         )
 

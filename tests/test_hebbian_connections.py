@@ -3,10 +3,10 @@ import pytest
 from unittest.mock import MagicMock
 
 
-def _make_store() -> "GraphLiteStore":
-    """构造无 _db 的 GraphLiteStore 实例（避免 __del__ 报错）。"""
-    from graph.graphlite_store import GraphLiteStore
-    store = GraphLiteStore.__new__(GraphLiteStore)
+def _make_store() -> "OverGraphStore":
+    """构造无 _db 的 OverGraphStore 实例（避免 __del__ 报错）。"""
+    from graph.overgraph_store import OverGraphStore
+    store = OverGraphStore.__new__(OverGraphStore)
     store._db = None
     return store
 

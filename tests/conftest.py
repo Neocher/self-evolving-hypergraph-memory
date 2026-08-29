@@ -33,37 +33,6 @@ def temp_db_path() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def mock_graphlite_store(temp_db_path: Path):
-    """图存储 mock（旧 RyuStore 已删除，引擎为 GraphLite）。
-
-    真实 GraphLiteStore 集成测试请直接构造 GraphLiteStore 实例；
-    此 fixture 仅用于不依赖真实图引擎的单元测试。
-    """
-    store = MagicMock()
-    store.query_cypher.return_value = []
-    store.get_all_nodes.return_value = {}
-    store.get_all_connections.return_value = {}
-    return store
-
-
-@pytest.fixture
-def graphlite_store(temp_db_path: Path, request):
-    """真实 GraphLiteStore 临时库（本体矛盾检测等集成测试用）。
-
-    支持 indirect parametrize 注入 cb_config：
-        @pytest.mark.parametrize('graphlite_store', [cb_cfg], indirect=True)
-    """
-    from graph.graphlite_store import GraphLiteStore
-
-    config = type("cfg", (), {"database_path": str(temp_db_path), "max_threads": 4})()
-    cb_config = getattr(request, 'param', None)
-    store = GraphLiteStore(config=config, cb_config=cb_config)
-    store.connect()
-    yield store
-    store.close()
-
-
-@pytest.fixture
 def overgraph_store(temp_db_path: Path, request):
     """真实 OverGraphStore 临时库（v6.0.0 overgraph 后端集成测试用）。
 

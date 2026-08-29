@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from graph.graphlite_store import EpisodeCache
+from graph.common import EpisodeCache
 from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel, RetrievalStrategy
 
 
