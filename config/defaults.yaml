@@ -35,7 +35,7 @@ ssm:
 dream:
   idle_timeout_seconds: 300      # 空闲触发等待时间（秒），5分钟
   accum_threshold: 200           # 累积新节点触发阈值（原20过激：批量写入时每分钟触发梦境+LLM调用抢资源）
-  min_interval_seconds: 60       # 最小梦境间隔（秒）
+  min_interval_seconds: 600       # 最小梦境间隔（秒）【H9 2026-08-29: 60→600, 防 idle 链式触发每 3.5min 一轮吃 CPU】
   max_dream_duration_seconds: 450  # 单次梦境最长执行时间（秒）
   cpu_affinity_low_priority: true  # 低优先级 CPU 亲和性
   memory_limit_mb: 256           # 梦境线程内存限制（MB）
@@ -44,11 +44,6 @@ graph:
   backend: "overgraph"       # v6.0.0: OverGraph 唯一后端（graphlite 已移除；字段保留一个发布周期供回滚）
   hnsw:                        # OverGraph HNSW 搜索参数（D11；m/ef_construction 无 SDK 设置 API 已移除）
     ef_search: 64             # 搜索时 HNSW 候选集（≥ k 保证召回；vector_search ef_search= 透传）
-
-graphlite:
-  database_path: "./data/shm_graphlite_db"  # 【legacy】GraphLite 后端配置——v6.0.0 已由 OverGraph 替代，保留一个发布周期供回滚，下版删除
-  buffer_pool_size_mb: 1024      # 缓冲池大小（MB），适配 424MB 数据库
-  max_threads: 4                 # 最大工作线程数
 
 overgraph:
   database_path: "./data/shm_overgraph_db"  # OverGraph 数据库路径（backend=overgraph 时使用）

@@ -222,13 +222,17 @@ class DreamPipeline:
         self.retrieval_guard = retrieval_guard
 
     async def retrieval_health_probe(self, nodes: list[dict],
-                                     sample_size: int = 30) -> float:
+                                     sample_size: int = 5) -> float:
         """梦境侧检索健康探针（离线、低频、不污染热路径）。
 
         抽核心节点（高 τ = 近期写入/重要）→ content 片段作 query → 直调内层
         QueryRouter（不经 SelfEvolvingRetrieval.retrieve，避免自增
         _total_calls 干扰周期触发）→ 计算 top-10 命中率（recall）→
         低召回时喂给 retrieval_guard.report_probe() 作为触发信号。
+
+        【H7 2026-08-28】sample_size 30→5：每次检索为全量 QueryRouter
+        (向量+BM25+图+fusion)，30 次≈450s 导致 dream 必超时 + to_thread
+        孤儿线程持续吃 CPU。5 次(~75s) 仍可估 recall，回归可接受。
         """
         guard = self.retrieval_guard
         if guard is None or not nodes:
@@ -313,8 +317,15 @@ class DreamPipeline:
         logger.info("Dream %s: GATHER — %d active nodes", dream_id, len(gathered))
 
         # Step 0: Retrieval 健康探针（离线低频，失败不阻塞梦境）
+        # 【H8 2026-08-29】整体 30s 超时：内层 retrieve 无 API 3s 超时保护，
+        # 每次硬跑 60-90s，5 次≈450s 导致 dream 必超时+孤儿线程吃 CPU。
+        # 超时直接跳过 probe（探针价值 < 阻塞成本），不卡 dream 主流程。
         try:
-            await self.retrieval_health_probe(gathered)
+            await asyncio.wait_for(
+                self.retrieval_health_probe(gathered), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("Dream %s: retrieval health probe timed out (skipped)",
+                           dream_id)
         except Exception:
             logger.warning("Dream %s: retrieval health probe failed (non-fatal)",
                            dream_id, exc_info=True)

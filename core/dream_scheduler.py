@@ -77,6 +77,9 @@ class DreamScheduler:
         self._lock = asyncio.Lock()
         self._dream_run_count: int = 0  # 【FIX】梦境执行计数器
         self._dream_fail_count: int = 0  # 【H3】梦境失败/超时统计
+        # 【H6】失败退避: 超时失败后冷却 N 秒再允许触发 (防无限空转循环)
+        self._dream_fail_cooldown_until: float = 0.0
+        self._dream_fail_cooldown_seconds: int = 1800
         # FAISS 增量更新引用（由 app.py 注入）
         self._faiss_index = None
         self._faiss_id_map: dict = {}
@@ -125,6 +128,9 @@ class DreamScheduler:
                 return False
             now = time.time()
             if now - self._last_run_time < self.config.min_interval_seconds:
+                return False
+            # 【H6】失败退避: 超时失败后冷却期内不触发 (防无限空转)
+            if now < self._dream_fail_cooldown_until:
                 return False
 
             idle_time = now - self._last_activity_time
@@ -286,11 +292,15 @@ class DreamScheduler:
                     )
                 except asyncio.TimeoutError:
                     self._dream_fail_count += 1
+                    # 【H6】失败退避: 超时失败后 30 分钟冷却, 防 poll+idle 双触发无限循环
+                    self._dream_fail_cooldown_until = time.time() + self._dream_fail_cooldown_seconds
                     logger.error(
-                        "Dream %s timed out after %d s (max_dream_duration_seconds=%d); counted as failed",
+                        "Dream %s timed out after %d s (max_dream_duration_seconds=%d); counted as failed; "
+                        "cooldown %ds until next attempt",
                         self._current_dream_id,
                         self.config.max_dream_duration_seconds,
                         self.config.max_dream_duration_seconds,
+                        self._dream_fail_cooldown_seconds,
                     )
                     return
 
@@ -328,6 +338,9 @@ class DreamScheduler:
             logger.exception("Dream pipeline failed")
         finally:
             self._is_running = False
+            # 【H9】dream 完成视为活动：刷新活动时间戳, 防 idle 链式触发
+            # (启动后无节点活动时 idle 恒 >300s → 每 min_interval 立即触发)
+            self._last_activity_time = time.time()
             self._current_dream_id = None  # 【H5】梦境结束，清空运行中标记
             # 【H4】完成/失败/超时后保存最新状态（含更新后的计数），
             # 显式触发路径同样走此保存

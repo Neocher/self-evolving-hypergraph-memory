@@ -351,7 +351,7 @@ class TextEncoder:
 
         # Tier 2: Local model (ONNX preferred)
         if self._onnx_model is not None:
-            inputs = self._tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            inputs = self._tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
             outputs = self._onnx_model(**inputs)
             # bge v1.5 pooling=CLS + Normalize（实测 1_Pooling/config.json），
             # 与 ST encode 输出一致（FAISS L2 = cosine）
@@ -418,7 +418,7 @@ class TextEncoder:
             chunk_vecs: list[np.ndarray] = []
             for start in range(0, len(unique_texts), 32):
                 chunk = unique_texts[start : start + 32]
-                inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True)
+                inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 outputs = self._onnx_model(**inputs)
                 raw = outputs.last_hidden_state[:, 0].detach().numpy().astype(np.float32)
                 norms = np.linalg.norm(raw, axis=1, keepdims=True)
@@ -458,7 +458,7 @@ class TextEncoder:
         except Exception:
             pass
         try:
-            inputs = self._tokenizer("", return_tensors="pt", padding=True, truncation=True)
+            inputs = self._tokenizer("", return_tensors="pt", padding=True, truncation=True, max_length=512)
             outputs = self._onnx_model(**inputs)
             vec = outputs.last_hidden_state[:, 0].detach().numpy()
             return int(vec.shape[-1])

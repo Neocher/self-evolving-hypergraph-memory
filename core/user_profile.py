@@ -181,8 +181,9 @@ def scan_rows(rows: list, store=None) -> list[dict]:
                 if store is not None:
                     flat = store._flatten_row(row, "e")
                 else:
-                    from graph.graphlite_store import GraphLiteStore
-                    flat = GraphLiteStore._flatten_row(row, "e")
+                    # v6.5.x: GraphLite 已移除, fallback 用 OverGraphStore 等价方法
+                    from graph.overgraph_store import OverGraphStore
+                    flat = OverGraphStore._flatten_row(row, "e")
                 nodes.append(flat)
             except Exception:
                 continue

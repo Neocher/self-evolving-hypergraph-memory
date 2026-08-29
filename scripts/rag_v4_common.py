@@ -36,7 +36,10 @@ def _chat(prompt: str, max_tokens: int, temperature: float) -> str:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         })
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    # 显式禁代理（对齐 retrieval/hyde.py）：Hermes 会话注入 ALL_PROXY=socks5h://127.0.0.1:1081
+    # 会劫持 urllib——昨 00:49 WARP 半开时 socks5 双向等待致评测挂死 2h；禁代理直连成功
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=120) as resp:
         d = json.loads(resp.read())
     return d["choices"][0]["message"]["content"]
 
