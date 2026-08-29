@@ -382,8 +382,8 @@ class SHMClientConfig:
 @dataclass
 class HealthConfig:
     """健康检查阈值（内存监控）"""
-    memory_warning_mb: int = 2048
-    memory_critical_mb: int = 3072
+    memory_warning_mb: int = 6144
+    memory_critical_mb: int = 8192
 
 
 @dataclass

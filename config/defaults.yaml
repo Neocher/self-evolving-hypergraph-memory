@@ -168,5 +168,5 @@ shm_client:
   mcp_http_port: 8222               # MCP HTTP 服务器端口
 
 health:
-  memory_warning_mb: 2048           # RSS 超过此值 → memory_status=warning
-  memory_critical_mb: 3072          # RSS 超过此值 → memory_status=critical
+  memory_warning_mb: 6144           # RSS 超过此值 → memory_status=warning（bge-m3 ONNX 基线 ~4GB，旧 2048 恒 warning）
+  memory_critical_mb: 8192          # RSS 超过此值 → memory_status=critical（旧 3072 恒 critical，2026-08-29 调整）
