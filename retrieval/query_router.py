@@ -40,7 +40,7 @@ from config.settings import (
 from core.schema_distiller import extract_terms
 from graph.common import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
-from retrieval.vector_store import FaissStore
+from retrieval.vector_store import VisualVectorStore
 
 from observability.logger import get_logger
 
@@ -332,7 +332,7 @@ class QueryRouter:
     ) -> None:
         """
         Args:
-            graphlite_store: GraphLiteStore 实例
+            graphlite_store: 图存储实例（OverGraphStore，参数名保留兼容）
             faiss_index: FAISS 向量索引
             tfidf_index: TF-IDF 关键词索引
             encoder: 文本嵌入编码器（可选）
@@ -343,7 +343,7 @@ class QueryRouter:
             attr_aliases: 属性别名归一表 {canonical: [alias...]}（【v5.50.0 P2】；
                 空表 → 属性通道检索逐字节等价零回归）
         """
-        self.graphlite_store = graphlite_store
+        self.graph_store = graphlite_store
         self.faiss_index = faiss_index
         self.tfidf_index = tfidf_index
         self.encoder = encoder
@@ -438,14 +438,14 @@ class QueryRouter:
         # 不阻塞事件循环等待构建完成；锁只保护最终 swap（短临界区）。
         self._bm25_building: bool = False
         # 【P2-a V-Mem】视觉检索通道（prewarm_visual 构建 + add_visual_node 增量，_visual_recall 消费）：
-        #   _visual_index    — 384d FaissStore（VisualNode embedding 空间）
+        #   _visual_index    — 384d VisualVectorStore（VisualNode embedding 空间）
         #   _visual_id_map   — faiss int id → VisualNode id
         #   _visual_meta     — VisualNode id → {caption, created_at, image_path}
         #   _visual_vecs     — VisualNode id → 384d 向量（【P1-1】写路径增量节点
         #                      留存，供 prewarm 全量重建时合并，防快照覆盖丢节点）
         #   _visual_projection — 512→384 随机投影（无 services 时本实例自持）
         #   _visual_built    — prewarm 成功置位（防重复构建）
-        self._visual_index: Optional[FaissStore] = None
+        self._visual_index: Optional[VisualVectorStore] = None
         self._visual_id_map: dict[int, str] = {}
         self._visual_meta: dict[str, dict] = {}
         self._visual_vecs: dict[str, np.ndarray] = {}
@@ -455,7 +455,7 @@ class QueryRouter:
         # 完成「index 变更 + 三个字典 swap」，读侧（_visual_snapshot）锁内一次性
         # 快照 —— 保证并发下读到全旧或全新的 (index, id_map, meta) 一致三元组，
         # 杜绝「新 index + 旧 map」的 fid 错配与「新节点已入 index 未入 map」的漏召回。
-        # 锁内只做内存操作（FaissStore.add 自带内部锁），临界区微秒级，读侧性能无损。
+        # 锁内只做内存操作（VisualVectorStore.add 自带内部锁），临界区微秒级，读侧性能无损。
         self._visual_lock = threading.Lock()
         # 【P3a】bge-reranker 懒加载状态：__init__ 不加载模型（CPU ~5-15s / ~400MB），
         # 首次 FUSION 检索经 _get_reranker 双重检查锁加载；失败置 _rerank_failed=True
@@ -548,12 +548,12 @@ class QueryRouter:
             state = (vectorizer, doc_ids, doc_contents, doc_tau, doc_fact_track,
                      term_matrix, idf, doc_lens, avgdl)，失败返回 None。
         """
-        if self.graphlite_store is None:
+        if self.graph_store is None:
             logger.warning("BM25: graphlite_store unavailable, skipping index build")
             return None
 
         try:
-            rows = self.graphlite_store.query_cypher(
+            rows = self.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) "
                 "WHERE (e.archived IS NULL OR e.archived = false) "
                 "RETURN e.id AS node_id, e.content AS content, "
@@ -739,7 +739,7 @@ class QueryRouter:
 
         链路：GraphLite 拉取 VisualNode（LIMIT visual_limit）→ 解析 embedding
         （JSON 字符串 → json.loads → f32；维度非 384 防御性跳过 + warning）→
-        FaissStore(384).add + _visual_id_map/_visual_meta/_visual_vecs。
+        VisualVectorStore(384).add + _visual_id_map/_visual_meta/_visual_vecs。
         【P1-1】与写路径增量（add_visual_node）合并：重建时携带内存中已增量
         索引的节点（_visual_vecs），防「prewarm DB 快照覆盖丢失并发写入节点」。
         【P2-1】合并 + 构建 + swap 在 _visual_lock 内原子完成（与 add_visual_node
@@ -758,7 +758,7 @@ class QueryRouter:
             cfg = get_settings().retrieval.visual_recall
             if not getattr(cfg, "enabled", True):
                 return
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_visual_nodes"):
                 return
             visual_limit = int(getattr(cfg, "visual_limit", 10000))
@@ -821,7 +821,7 @@ class QueryRouter:
                 if not embs:
                     logger.debug("Visual prewarm: no valid 384d embeddings, channel stays empty")
                     return
-                index = FaissStore(dimension=384)
+                index = VisualVectorStore(dimension=384)
                 index.add(np.stack(embs), np.arange(len(embs), dtype=np.int64))
                 self._visual_index = index
                 self._visual_id_map = id_map
@@ -902,7 +902,7 @@ class QueryRouter:
                     return False
                 index = getattr(self, "_visual_index", None)
                 if index is None:
-                    index = FaissStore(dimension=384)
+                    index = VisualVectorStore(dimension=384)
                     self._visual_index = index
                 fid = index.count  # append-only：下一个可用 faiss id（同 prewarm 序号）
                 emb_384 = emb.astype(np.float32)
@@ -959,7 +959,7 @@ class QueryRouter:
                 svc._clip_projection = proj
         return proj
 
-    def _visual_snapshot(self) -> tuple[Optional[FaissStore], dict, dict]:
+    def _visual_snapshot(self) -> tuple[Optional[VisualVectorStore], dict, dict]:
         """【P2-1】原子快照 (index, id_map, meta)：锁内一次性读取三个结构。
 
         写侧（add_visual_node / prewarm 重建）在同一把锁内完成「index 变更 +
@@ -1169,7 +1169,7 @@ class QueryRouter:
         Returns:
             [{"node_id", "content", "score", "tau_value", "level": "entity_match"}, ...]
         """
-        if self.graphlite_store is None:
+        if self.graph_store is None:
             logger.warning("Entity match: graphlite_store unavailable")
             return []
 
@@ -1210,7 +1210,7 @@ class QueryRouter:
                 f"LIMIT $limit"
             )
             params["limit"] = k * 2
-            rows = self.graphlite_store.query_cypher(cypher, params)
+            rows = self.graph_store.query_cypher(cypher, params)
         except Exception:
             # 【P1-1】SDK 通道故障（QueryError/ConnectionError）向上抛，不静默吞成 []：
             # _fusion_retrieve 的 per-channel except Exception 会捕获并置
@@ -1223,7 +1223,7 @@ class QueryRouter:
         # 降级（熔断 open / 重试耗尽）表现为返回 []（非异常）。读同线程标志区分
         # 「正常无匹配」与「基础设施降级」，后者抛 _EntityChannelDegraded →
         # _fusion_retrieve per-channel handler 置 fusion_channel_skipped=True。
-        degraded_fn = getattr(self.graphlite_store, "last_query_infra_degraded", None)
+        degraded_fn = getattr(self.graph_store, "last_query_infra_degraded", None)
         if not rows and degraded_fn is not None and degraded_fn():
             raise _EntityChannelDegraded("entity channel infra degraded")
 
@@ -1867,7 +1867,7 @@ class QueryRouter:
         复用 _graph_expansion（相对尾分缩放，append 非替代）；失败静默返回原 results。
         """
         try:
-            if not results or self.graphlite_store is None:
+            if not results or self.graph_store is None:
                 return results
             # 【P2-1】先按 score 降序再取头尾——未排序时 results[:5]/[-1]
             # 非真实 top/lowest（_fuse_results 输出为 dict 无序集合）
@@ -2035,11 +2035,11 @@ class QueryRouter:
         node_uuids = list(uuid_map.values())
         episodes_dict: dict[str, dict] = {}
         missing = [u for u in node_uuids if u not in self._episode_cache]
-        if missing and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
+        if missing and self.graph_store is not None and hasattr(self.graph_store, 'get_episodes_batch'):
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in self.graphlite_store.get_episodes_batch(missing)
+                    for ep in self.graph_store.get_episodes_batch(missing)
                 }
             except CircuitBreakerOpen:
                 raise  # 熔断跳闸：向上传播，由 retrieve() L613 级联到 L2
@@ -2066,7 +2066,7 @@ class QueryRouter:
                 results.append(episode)
 
         # Graph expansion (v5.26.0): 从向量种子沿超边扩散
-        if results and self.graphlite_store is not None:
+        if results and self.graph_store is not None:
             try:
                 seeds = [r["node_id"] for r in results[:5] if r.get("node_id")]
                 existing_ids = {r["node_id"] for r in results}
@@ -2087,7 +2087,7 @@ class QueryRouter:
         if not seeds:
             return []
         try:
-            all_neighbors = self.graphlite_store.get_hypergraph_neighbors(
+            all_neighbors = self.graph_store.get_hypergraph_neighbors(
                 seeds, self.config.graph_expansion_max
             )
         except CircuitBreakerOpen:
@@ -2162,7 +2162,7 @@ class QueryRouter:
             cfg = get_settings().retrieval.community_expansion
             if not getattr(cfg, "enabled", True) or not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_communities_by_seeds"):
                 return results
             seeds = [r.get("node_id") for r in results[:5] if r.get("node_id")]
@@ -2287,7 +2287,7 @@ class QueryRouter:
             cfg = self.config
             if not getattr(cfg, "mesa_enabled", False) or not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_communities_by_seeds"):
                 return results
             seeds = [r.get("node_id") for r in results[:5] if r.get("node_id")]
@@ -2691,7 +2691,7 @@ class QueryRouter:
         非 None 时直接按 at_time 取该时点前版本、不重算（【P1-2】）。
         """
         try:
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_property_versions_for_entities"):
                 return results
             candidates = self._extract_query_entities(raw_query or query)
@@ -2849,7 +2849,7 @@ class QueryRouter:
             ecfg = getattr(getattr(self, "config", None), "entity_expansion", None)
             if ecfg is None or not getattr(ecfg, "enabled", True) or not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "query_cypher"):
                 return results
             entities = self._extract_proper_nouns(raw_query or query)
@@ -2997,7 +2997,7 @@ class QueryRouter:
             ecfg = getattr(getattr(self, "config", None), "entity_expansion", None)
             if ecfg is None or not getattr(ecfg, "enabled", True) or not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_entities"):
                 return results
             max_seed_score = max(
@@ -3093,7 +3093,7 @@ class QueryRouter:
             scfg = getattr(getattr(self, "config", None), "scope_recall", None)
             if scfg is None or not getattr(scfg, "enabled", True) or not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "vector_search_scoped"):
                 return results
             if query_embedding is None:
@@ -3218,7 +3218,7 @@ class QueryRouter:
             ecfg = getattr(getattr(self, "config", None), "fact_channel", None)
             if ecfg is None or not getattr(ecfg, "enabled", False):
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_atomic_facts_by_subject"):
                 return results
             q_text = (raw_query or query or "").strip()
@@ -3362,7 +3362,7 @@ class QueryRouter:
             ecfg = getattr(getattr(self, "config", None), "fact_channel", None)
             if ecfg is None or not getattr(ecfg, "joint_enabled", True):
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "get_atomic_facts_by_subject"):
                 return results
             if not hasattr(store, "query_property_ver"):
@@ -3499,7 +3499,7 @@ class QueryRouter:
         try:
             if not results:
                 return results
-            store = getattr(self, "graphlite_store", None)
+            store = getattr(self, "graph_store", None)
             if store is None or not hasattr(store, "query_schema_nodes"):
                 return results
             terms = [t for t in extract_terms(query) if t]
@@ -3583,11 +3583,11 @@ class QueryRouter:
 
         # 批量回查 GraphLite 获取节点详情（content、tau_value 等）
         episodes_dict: dict[str, dict] = {}
-        if uuid_map and self.graphlite_store is not None and hasattr(self.graphlite_store, 'get_episodes_batch'):
+        if uuid_map and self.graph_store is not None and hasattr(self.graph_store, 'get_episodes_batch'):
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in self.graphlite_store.get_episodes_batch(list(uuid_map.values()))
+                    for ep in self.graph_store.get_episodes_batch(list(uuid_map.values()))
                 }
             except CircuitBreakerOpen:
                 episodes_dict = {}  # 熔断降级：静默跳过回查（内容为空，不刷异常日志）
@@ -3669,7 +3669,7 @@ class QueryRouter:
             检索结果列表 [{"node_id", "content", "score", "level": "graphlite_fallback"}, ...]
              失败时返回空列表（不抛异常）。
         """
-        if self.graphlite_store is None:
+        if self.graph_store is None:
             logger.warning("L4 fallback: graphlite_store unavailable")
             return []
 
@@ -3703,7 +3703,7 @@ class QueryRouter:
                 "LIMIT $limit"
             )
             params["limit"] = self.config.top_k_keyword
-            rows = self.graphlite_store.query_cypher(cypher, params)
+            rows = self.graph_store.query_cypher(cypher, params)
             results = []
             for row in rows:
                 if isinstance(row, dict):
@@ -4036,12 +4036,12 @@ class QueryRouter:
 
     def _lookup_archived_ids(self, node_ids: list[str]) -> set[str]:
         """批量回查节点归档状态，返回已归档 id 集合（回查失败返回空集，不误过滤）。"""
-        if not node_ids or self.graphlite_store is None:
+        if not node_ids or self.graph_store is None:
             return set()
         try:
-            if not hasattr(self.graphlite_store, "get_episodes_batch"):
+            if not hasattr(self.graph_store, "get_episodes_batch"):
                 return set()
-            eps = self.graphlite_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
+            eps = self.graph_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
             if not isinstance(eps, (list, tuple)):
                 return set()
             return {
@@ -4054,12 +4054,12 @@ class QueryRouter:
 
     def _lookup_fact_track(self, node_ids: list[str]) -> dict[str, str]:
         """批量回查节点 fact_track，返回 {node_id: fact_track}（回查失败返回空，缺省 active）。"""
-        if not node_ids or self.graphlite_store is None:
+        if not node_ids or self.graph_store is None:
             return {}
         try:
-            if not hasattr(self.graphlite_store, "get_episodes_batch"):
+            if not hasattr(self.graph_store, "get_episodes_batch"):
                 return {}
-            eps = self.graphlite_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
+            eps = self.graph_store.get_episodes_batch(list(dict.fromkeys(node_ids)))
             if not isinstance(eps, (list, tuple)):
                 return {}
             return {

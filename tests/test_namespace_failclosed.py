@@ -50,7 +50,7 @@ def _make_svc() -> Services:
         {"node_id": "ns_node_a", "content": "private memory of ns", "score": 0.9,
          "level": "hypergraph"},
     ]
-    svc.graphlite_store = MagicMock()
+    svc.graph_store = MagicMock()
     svc.quarantine_store = None
     svc.ontology_validator = None
     svc.tau_engine = None
@@ -60,7 +60,7 @@ def _make_svc() -> Services:
 def test_namespace_prefetch_raises_sdk_error_fail_closed(client):
     """预取抛真实 OverGraphError → 结果必须为空（不放行全量）。"""
     svc = _make_svc()
-    svc.graphlite_store.query_cypher.side_effect = (
+    svc.graph_store.query_cypher.side_effect = (
         OverGraphError("ns query failed") if HAS_OVERGRAPH else RuntimeError("ns query failed")
     )
 
@@ -78,7 +78,7 @@ def test_namespace_prefetch_raises_sdk_error_fail_closed(client):
 def test_namespace_prefetch_empty_rows_fail_closed(client):
     """预取返回空（该命名空间无任何会话节点）→ 结果必须为空。"""
     svc = _make_svc()
-    svc.graphlite_store.query_cypher.return_value = []
+    svc.graph_store.query_cypher.return_value = []
 
     resp = client(svc).post("/memories/retrieve", json={
         "query": "find something",

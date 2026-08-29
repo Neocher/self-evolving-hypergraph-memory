@@ -29,7 +29,7 @@ def _make_router(corpus: list[str]) -> QueryRouter:
     """用 __new__ 构造 QueryRouter，绕过真实引擎依赖。"""
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = FakeGraphLiteStore(
+    router.graph_store = FakeGraphLiteStore(
         [
             {"node_id": f"n{i}", "content": content, "tau_value": 1.0}
             for i, content in enumerate(corpus)
@@ -70,7 +70,7 @@ def test_empty_corpus_no_crash() -> None:
     """空语料构建不崩溃（返回不抛异常）。"""
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = FakeGraphLiteStore([])
+    router.graph_store = FakeGraphLiteStore([])
     router._bm25_doc_ids = []
     router._bm25_doc_contents = []
     router._bm25_doc_tau = []
@@ -162,7 +162,7 @@ class FailingThenWorkingStore(FakeGraphLiteStore):
 def _make_bare_router(store) -> QueryRouter:
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = store
+    router.graph_store = store
     router._bm25_doc_ids = []
     router._bm25_doc_contents = []
     router._bm25_doc_tau = []
@@ -257,7 +257,7 @@ def test_prewarm_empty_corpus_does_not_set_terminal() -> None:
     """
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = FakeGraphLiteStore([])
+    router.graph_store = FakeGraphLiteStore([])
     router._bm25_doc_ids = []
     router._bm25_doc_contents = []
     router._bm25_doc_tau = []

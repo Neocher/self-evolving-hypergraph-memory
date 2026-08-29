@@ -41,14 +41,14 @@ class _Store:
 class _Router:
     def __init__(self):
         self.config = _Cfg()
-        self.graphlite_store = _Store()
+        self.graph_store = _Store()
 
     def _attribute_expansion(self, results, query, raw_query, now_ts=None):
         from retrieval.query_router import QueryRouter
         # 复用真实实现：临时绑定 store/config
         r = QueryRouter.__new__(QueryRouter)
         r.config = self.config
-        r.graphlite_store = self.graphlite_store
+        r.graph_store = self.graph_store
         return r._attribute_expansion(results, query, raw_query, now_ts=now_ts)
 
 
@@ -83,7 +83,7 @@ def test_attribute_expansion_no_seed_score_returns_original():
 
 def test_attribute_expansion_skips_candidate_not_solidified():
     r = _Router()
-    r.graphlite_store.entities.append(
+    r.graph_store.entities.append(
         {"id": "ent_cand", "name": "赵六", "attrs_json": {
             "title": {"candidates": {"abc": {"value": "CFO"}}}}}  # 候选未固化
     )

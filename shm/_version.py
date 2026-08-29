@@ -109,7 +109,7 @@ v6.0.0 (2026-08-19) OverGraph-Engine:
   • 图引擎迁移阶段1 — 新增 graph/overgraph_store.py OverGraphStore
     （OverGraph Rust/PyO3 0.17.0，Apache-2.0）与 GraphLiteStore 同接口契约
     （39 公开方法 + 4 向量方法），config graph.backend 单开关切换，
-    svc.graphlite_store 属性名保留（duck-typing 上层零改动）
+    svc.graph_store 属性名保留（duck-typing 上层零改动）
   • 零 b64 — OverGraph 中文原生直写直查（CONTAINS 中文子串直用），
     GraphLite 的 {{b64}} 透明编解码整体移除（读侧 helper 保留兼容遗留库）
   • GQL 白名单翻译层 — SHM 101 处裸 GQL 收敛：INSERT 节点→typed
@@ -347,7 +347,7 @@ v5.46.0 (2026-08-16) V-Mem-Modal-Route:
     /memories/retrieve 召回；本次补视觉检索通道（CC 设计审查通过，方案 A）
   • QueryRouter._visual_recall — 补充非替代：CLIP 512d 文本 query →
     共享写路径 512→384 投影（seed 42 列归一，与 write.py 逐元素一致）→
-    384d FaissStore 检索 VisualNode → 相对尾分缩放（1/(1+dist) ×
+    384d VisualVectorStore 检索 VisualNode → 相对尾分缩放（1/(1+dist) ×
     min(种子分) × boost 0.6，严格低于文本种子）→ append modality="visual"
   • prewarm_visual — 启动异步建索引：GQL 拉取 VisualNode（LIMIT
     visual_limit）→ JSON 字符串 embedding 解析 → 非 384d 防御性跳过；

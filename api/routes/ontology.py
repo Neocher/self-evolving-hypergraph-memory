@@ -244,9 +244,9 @@ async def ontology_discover(
     engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
 
     contents = []
-    if deps.graphlite_store:
+    if deps.graph_store:
         try:
-            rows = deps.graphlite_store.query_cypher(
+            rows = deps.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
             )
             for r in rows:
@@ -300,9 +300,9 @@ async def ontology_discover_apply(
     engine = EntityDiscoveryEngine(ontology=deps.ontology_v2)
 
     contents = []
-    if deps.graphlite_store:
+    if deps.graph_store:
         try:
-            rows = deps.graphlite_store.query_cypher(
+            rows = deps.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) RETURN e.content LIMIT 2000"
             )
             for r in rows:
@@ -352,7 +352,7 @@ async def batch_relations(
             # 【v5.24】6 次 execute_cypher 组闭包整体经写队列（写线程内原子,
             # 先建 subj/obj 节点再建边；不阻塞事件循环）
             await qsubmit(deps, _upsert_batch_relation,
-                          deps.graphlite_store, subj, obj, rel_type, rel)
+                          deps.graph_store, subj, obj, rel_type, rel)
             results["created"] += 1
         except Exception as e:
             results["errors"] += 1
@@ -511,7 +511,7 @@ async def ontology_evolve(
 
     dry_run=True 只返回统计不落库。失败降级返回 partial 标记（degraded 自愈语义）。
     """
-    store = deps.graphlite_store
+    store = deps.graph_store
     if store is None or not hasattr(store, "locked_update_entity_props"):
         raise HTTPException(status_code=503, detail="Schema evolution not supported by backend")
     from core.attribute_extractor import extract_attributes
@@ -658,7 +658,7 @@ async def entity_attributes(
     entity_id: str,
     deps: Services = Depends(get_services),
 ) -> dict:
-    store = deps.graphlite_store
+    store = deps.graph_store
     if store is None or not hasattr(store, "get_entity_attributes"):
         raise HTTPException(status_code=503, detail="Not supported by backend")
     return store.get_entity_attributes(entity_id)
@@ -670,7 +670,7 @@ async def entity_relations(
     entity_id: str,
     deps: Services = Depends(get_services),
 ) -> dict:
-    store = deps.graphlite_store
+    store = deps.graph_store
     if store is None or not hasattr(store, "get_entity_relations"):
         raise HTTPException(status_code=503, detail="Not supported by backend")
     return store.get_entity_relations(entity_id)
@@ -683,7 +683,7 @@ async def entity_relations_neighbors(
     predicates: Optional[str] = None,
     deps: Services = Depends(get_services),
 ) -> dict:
-    store = deps.graphlite_store
+    store = deps.graph_store
     if store is None or not hasattr(store, "get_rel_neighbors"):
         raise HTTPException(status_code=503, detail="Not supported by backend")
     pred_list = [p.strip() for p in predicates.split(",")] if predicates else None

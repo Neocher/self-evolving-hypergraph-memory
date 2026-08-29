@@ -23,7 +23,7 @@ async def list_communities(
     set_trace_id()
 
     try:
-        rows = deps.graphlite_store.query_cypher(
+        rows = deps.graph_store.query_cypher(
             "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC "
             "SKIP $offset LIMIT $limit",
             {"offset": offset, "limit": limit},
@@ -69,7 +69,7 @@ async def get_community(
     set_trace_id()
 
     try:
-        rows = deps.graphlite_store.query_cypher(
+        rows = deps.graph_store.query_cypher(
             "MATCH (c:CommunityNode) WHERE c.id = $id RETURN c.*",
             {"id": community_id},
         )
@@ -100,11 +100,11 @@ async def list_conflicts(
     """列出所有冲突节点，扩展版本信息和 OCC 冲突日志统计。"""
     start = _now()
     set_trace_id()
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     resolved_filter = "" if include_resolved else "AND c.resolved = false"
-    rows = deps.graphlite_store.execute_cypher(
+    rows = deps.graph_store.execute_cypher(
         f"MATCH (c:ConflictNode) WHERE 1=1 {resolved_filter} "
         "RETURN c.id, c.episode_a, c.episode_b, c.rule_id, "
         "c.detected_at, c.resolved ORDER BY c.detected_at DESC LIMIT $limit",
@@ -122,9 +122,9 @@ async def list_conflicts(
             all_episode_ids.add(e_b)
 
     episode_map = {}
-    if all_episode_ids and deps.graphlite_store is not None:
+    if all_episode_ids and deps.graph_store is not None:
         try:
-            ep_rows = deps.graphlite_store.query_cypher(
+            ep_rows = deps.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.id IN $ids RETURN e.id, e.version",
                 {"ids": list(all_episode_ids)}
             )
@@ -171,12 +171,12 @@ async def resolve_conflict(
     """标记指定冲突为已解决。"""
     start = _now()
     set_trace_id()
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     # 【v5.24】SET 写经写队列提交（不阻塞事件循环）
     await qsubmit(
-        deps, deps.graphlite_store.execute_cypher,
+        deps, deps.graph_store.execute_cypher,
         "MATCH (c:ConflictNode) WHERE c.id = $id "
         "SET c.resolved = true",
         {"id": conflict_id},
@@ -193,12 +193,12 @@ async def resolve_all_conflicts(
     """标记所有未解决冲突为已解决。"""
     start = _now()
     set_trace_id()
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     # 【v5.24】SET 写经写队列提交（不阻塞事件循环）
     await qsubmit(
-        deps, deps.graphlite_store.execute_cypher,
+        deps, deps.graph_store.execute_cypher,
         "MATCH (c:ConflictNode) WHERE c.resolved = false "
         "SET c.resolved = true",
         {},
@@ -269,7 +269,7 @@ async def reconcile_conflict(
                 # 桥接 tx_manager 的 conflict_log 到 logger
                 pass  # WriteReconciler 有自己的 ConflictLogger
             reconciler = WriteReconciler(
-                graphlite_store=deps.graphlite_store,
+                graphlite_store=deps.graph_store,
                 conflict_logger=conflict_logger,
             )
         except Exception as e:
@@ -294,7 +294,7 @@ async def reconcile_conflict(
             # （写线程内读-写原子，版本检查不会被并发写撕裂）；OCC 检测 resolve()
             # 是纯内存读节点版本，留在事件循环。
             await qsubmit(
-                deps, deps.graphlite_store.update_with_version,
+                deps, deps.graph_store.update_with_version,
                 node_id=node_id,
                 updates=write_data,
                 expected_version=result["current_version"] if not force else None,

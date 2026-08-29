@@ -35,7 +35,7 @@ class CountingStore:
 def _make_router(store) -> QueryRouter:
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = store
+    router.graph_store = store
     router._cjk_warned = False
     router._episode_cache = {}
     router._time_keywords = ["最近", "刚刚", "刚才", "之前说的", "上一条", "昨天", "今天", "几分钟前", "上一次", "recent", "just now", "earlier", "last", "previous", "yesterday"]
@@ -198,7 +198,7 @@ class TestM5EpisodeCache:
         router = QueryRouter.__new__(QueryRouter)
         router.config = QueryRouterConfig()
         router._episode_cache = cache
-        router.graphlite_store = MagicMock()
+        router.graph_store = MagicMock()
         router._cjk_warned = False
         # L1 超图检索 cache 命中：不再回查 GraphLite
         router.faiss_index = MagicMock()
@@ -206,7 +206,7 @@ class TestM5EpisodeCache:
             np.array([[-0.9]]), np.array([[1]]),
         )
         router.faiss_id_map = {1: "ep-1"}
-        router.graphlite_store.get_episodes_batch = MagicMock(return_value=[])
+        router.graph_store.get_episodes_batch = MagicMock(return_value=[])
         results = router._hypergraph_retrieve("test", query_embedding=np.zeros(8, dtype=np.float32))
         assert results, "cache 命中应返回结果（不回查 GraphLite）"
-        router.graphlite_store.get_episodes_batch.assert_not_called()
+        router.graph_store.get_episodes_batch.assert_not_called()

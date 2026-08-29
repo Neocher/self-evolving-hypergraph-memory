@@ -150,7 +150,7 @@ def test_process_embed_queue_batch_fail_fallback():
     svc.faiss_index.add_with_ids = lambda vecs, ids: None
     svc._faiss_buffer_lock = threading.Lock()
     svc.hebbian_updater = None
-    svc.graphlite_store = None
+    svc.graph_store = None
 
     items = [(f"e{i}", f"内容文本 {i} 号", float(i)) for i in range(4)]
     with deps_mod._embed_queue_lock:

@@ -116,7 +116,7 @@ class _BM25Store:
 def _make_bm25_router(rows: list[dict]) -> QueryRouter:
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = _BM25Store(rows)
+    router.graph_store = _BM25Store(rows)
     router._bm25_built = False
     router._build_bm25_index()
     return router
@@ -270,7 +270,7 @@ class TestCacheHitFactTrack:
         svc.faiss_index = types.SimpleNamespace(add_with_ids=lambda v, i: None)
         svc.faiss_id_map = {}
         svc._faiss_buffer = [(1, np.array([0.1, 0.2]), "ep-core")]
-        svc.graphlite_store = _FakeStore([
+        svc.graph_store = _FakeStore([
             {"id": "ep-core", "content": "我喜欢喝茶", "fact_track": "core"},
         ])
         assert flush_faiss_buffer(svc) == 1
@@ -279,7 +279,7 @@ class TestCacheHitFactTrack:
         router = QueryRouter.__new__(QueryRouter)
         router.config = QueryRouterConfig()
         router._episode_cache = svc._episode_cache
-        router.graphlite_store = svc.graphlite_store
+        router.graph_store = svc.graph_store
         router._cjk_warned = False
         router.faiss_index = _FakeFaiss(np.array([[-0.9]]), np.array([[1]]))
         router.faiss_id_map = {1: "ep-core"}
@@ -329,7 +329,7 @@ class TestWriteMultiSourceBoost:
     def test_multi_source_write_boosts_tau(self, client, overgraph_store, tmp_path):
         """清单 5：同内容第二次以不同 source 写入 → tau_initial 提升至 0.85。"""
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.evidence_tracker = EvidenceTracker(data_dir=str(tmp_path))
 
         content = "我喜欢喝茶"

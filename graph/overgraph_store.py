@@ -3,7 +3,7 @@
 SHM v6.0.0 OverGraph 引擎接入（阶段1）。与 GraphLiteStore 同接口契约：
 `config/graph.backend: overgraph` 时经 api/app.py make_store(cfg) 装配，
 上层业务（write/search/dashboard/query_router）零改动（duck-typing，
-svc.graphlite_store 属性名保留）。FAISS 主通道同期替换为 OverGraph HNSW
+svc.graph_store 属性名保留）。FAISS 主通道同期替换为 OverGraph HNSW
 （retrieval/vector_index.py VectorIndexAdapter）。
 
 ═══════════════════════════════════════════════════════════════════

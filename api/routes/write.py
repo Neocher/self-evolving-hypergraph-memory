@@ -163,7 +163,7 @@ async def _revoke_conflicts(deps: Services, val_result, episode_data: dict) -> i
         ):
             continue
         try:
-            await qsubmit(deps, deps.graphlite_store.archive_node, old_id,
+            await qsubmit(deps, deps.graph_store.archive_node, old_id,
                           replacement_id=episode_data["id"], priority="low")
             revoked += 1
             logger.info("P1 conflict revoked: %s superseded by %s",
@@ -216,7 +216,7 @@ def _run_entity_resolver(deps: Services, content: str, triples=None) -> dict:
     【P0-1】接入属性时间版本链：triples.attributes → PropertyVerNode 版本编排
     （同样在写线程 qsubmit 内执行；失败仅日志，不阻断主写入）。"""
     from core.entity_resolver import EntityResolver
-    resolver = EntityResolver(graphlite_store=deps.graphlite_store)
+    resolver = EntityResolver(graphlite_store=deps.graph_store)
     result = resolver.process(content)
     try:
         prop_count = resolver.update_properties_from_triples(triples or [])
@@ -242,7 +242,7 @@ async def write_sensory(
     set_trace_id()
 
     record_id = str(uuid.uuid4())
-    buf = getattr(deps.graphlite_store, "_sensory_buffer", None)
+    buf = getattr(deps.graph_store, "_sensory_buffer", None)
     buffer_usage = 0
 
     if buf is not None:
@@ -259,7 +259,7 @@ async def write_sensory(
         # 无环形缓冲区：直接写入 GraphLite EpisodeNode 作为兜底
         # 【v5.23】写串行化：经写队列提交，不阻塞事件循环
         # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
-        await qsubmit(deps, _write_episode_with_session, deps.graphlite_store, {
+        await qsubmit(deps, _write_episode_with_session, deps.graph_store, {
             "id": record_id,
             "content": record.content,
             "source": record.source,
@@ -450,7 +450,7 @@ async def write_multimodal(
             emb_384 = visual_emb @ proj  # (512,) @ (512, 384) → (384,)
 
             visual_node_id = str(uuid.uuid4())
-            if deps.graphlite_store is not None:
+            if deps.graph_store is not None:
                 vnode = {
                     "id": visual_node_id,
                     "image_path": media_paths[0] if media_paths else "",
@@ -460,15 +460,15 @@ async def write_multimodal(
                     "created_at": created_at,
                 }
                 await qsubmit_visual_index(
-                    deps, deps.graphlite_store.create_visual_node, vnode
+                    deps, deps.graph_store.create_visual_node, vnode
                 )
         except Exception:
             logger.exception("VisualNode creation failed (non-fatal)")
 
     # ── 写入 EpisodeNode（文本索引）──
-    if merged_text and deps.graphlite_store is not None:
+    if merged_text and deps.graph_store is not None:
         # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
-        await qsubmit(deps, _write_episode_with_session, deps.graphlite_store, {
+        await qsubmit(deps, _write_episode_with_session, deps.graph_store, {
             "id": episode_id,
             "content": merged_text,
             "source": req.source,
@@ -570,14 +570,14 @@ async def create_episode(
     rpe_route = None  # deep / cache / ignore
     _surprise = None  # 【P3-C】惊奇度信号（RPE 批判成功时赋值；检索侧重排消费）
     if (not req.force_promote and deps.encoder is not None
-            and deps.graphlite_store is not None):
+            and deps.graph_store is not None):
         try:
             from config.settings import get_settings
             _wgc = getattr(get_settings(), "write_gate", None)
             if _wgc is not None and _wgc.enabled:
                 _emb = deps.encoder.embed(req.content)
                 if _emb is not None:
-                    _hits = deps.graphlite_store.vector_search_dense(_wgc.top_k, _emb)
+                    _hits = deps.graph_store.vector_search_dense(_wgc.top_k, _emb)
                     _max_sim = 0.0
                     for _ep, _s in (_hits or []):
                         if float(_s) > _max_sim:
@@ -668,7 +668,7 @@ async def create_episode(
                     conflict_id = c.get("conflict_id", "")
                     conflict_node_id = f"conflict_{episode_id}_{conflict_id}"
                     # 【v5.23】MATCH 检查 + INSERT 组闭包整体入队（写线程内原子）
-                    await qsubmit(deps, _upsert_conflict_node, deps.graphlite_store,
+                    await qsubmit(deps, _upsert_conflict_node, deps.graph_store,
                                   conflict_node_id, episode_id, conflict_id)
                 except Exception:
                     logger.warning("Conflict node creation failed for %s / %s", episode_id, conflict_id)
@@ -724,7 +724,7 @@ async def create_episode(
             logger.exception("Evidence tracker error (non-fatal)")
 
     # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
-    await qsubmit(deps, _write_episode_with_session, deps.graphlite_store,
+    await qsubmit(deps, _write_episode_with_session, deps.graph_store,
                   episode_data, req.namespace or None)
 
     # 【P1 显式冲突撤销】新节点落库后仲裁（时序关键：SUPERSEDES 边 MATCH (b)
@@ -765,7 +765,7 @@ async def create_episode(
 
     # [Step 1] 关系抽取：批量 GraphLite 操作（减少 3N→2 次往返）
     triples = None
-    if deps.graphlite_store is not None and len(req.content) > 50:
+    if deps.graph_store is not None and len(req.content) > 50:
         try:
             from core.relation_extractor import RelationExtractor
             rext = RelationExtractor()
@@ -781,18 +781,18 @@ async def create_episode(
                             seen_entities.add(entity_name)
                             # 【v5.23】MATCH 检查 + INSERT 组闭包整体入队
                             await qsubmit(deps, _upsert_ontology_entity,
-                                          deps.graphlite_store, entity_name)
+                                          deps.graph_store, entity_name)
                 # 批量创建关系边（GraphLite 不支持 MERGE：MATCH 边存在性 + INSERT）
                 for t in triples:
                     await qsubmit(deps, _upsert_ontology_relation,
-                                  deps.graphlite_store, t.subject, t.obj, t.relation)
+                                  deps.graph_store, t.subject, t.obj, t.relation)
             if triples:
                 logger.info("Relation extraction: %d typed edges", len(triples))
         except Exception:
             logger.exception("Relation extraction error (non-fatal)")
 
     # [Step 3] 实体消歧 + P0-1 属性时间版本链 — 仅对有一定信息量的内容执行
-    if deps.graphlite_store is not None and len(req.content) > 80:
+    if deps.graph_store is not None and len(req.content) > 80:
         try:
             # 【v5.24】整个同步调用包闭包入队（link_aliases 的 ALIAS_OF 写在写线程）
             # 【P0-1】triples 一并传入闭包：属性版本链（PropertyVerNode）同样在写线程执行
@@ -840,13 +840,13 @@ async def create_episode(
     # 【P0-①】会话观测节点：通过 X-Session-Id header 关联记忆到同一会话
     try:
         session_id = request.headers.get("X-Session-Id") or request.headers.get("x-session-id")
-        if session_id and deps.graphlite_store is not None:
+        if session_id and deps.graph_store is not None:
             session_node_id = await qsubmit(
-                deps, deps.graphlite_store.get_or_create_session,
+                deps, deps.graph_store.get_or_create_session,
                 session_id, metadata=json.dumps({"source": req.source}),
             )
             if session_node_id:
-                await qsubmit(deps, deps.graphlite_store.link_session_member,
+                await qsubmit(deps, deps.graph_store.link_session_member,
                               session_node_id, episode_id)
     except Exception:
         logger.exception("Session memory link failed for episode %s", episode_id)
@@ -880,8 +880,8 @@ async def create_episodes_batch(
         created_at = _now()
         tau_initial = 1.0
         try:
-            if deps.graphlite_store is not None:
-                await qsubmit(deps, deps.graphlite_store.create_episode, {
+            if deps.graph_store is not None:
+                await qsubmit(deps, deps.graph_store.create_episode, {
                     "id": episode_id, "content": req.content, "source": req.source,
                     "source_type": resolve_source_type(req.source, req.source_type),
                     "visibility": req.visibility, "created_at": created_at,
@@ -889,9 +889,9 @@ async def create_episodes_batch(
                     "metadata": req.metadata,
                 })
             # namespace 关联(同单条逻辑)
-            if req.namespace and deps.graphlite_store is not None:
-                await qsubmit(deps, deps.graphlite_store.ensure_session, req.namespace)
-                await qsubmit(deps, deps.graphlite_store.link_to_session, req.namespace, episode_id)
+            if req.namespace and deps.graph_store is not None:
+                await qsubmit(deps, deps.graph_store.ensure_session, req.namespace)
+                await qsubmit(deps, deps.graph_store.link_to_session, req.namespace, episode_id)
             # 【P1-1】超边创建改为批量合并 (循环外每 source 2 次查询),
             # 不再逐条触发 (原: 每项 2 次 MATCH 全表扫描)。
             created_entries.append((episode_id, req.source))
@@ -927,7 +927,7 @@ async def get_episode(
     start = _now()
     set_trace_id()
 
-    node = deps.graphlite_store.get_episode(episode_id)
+    node = deps.graph_store.get_episode(episode_id)
     if node is None:
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
 
@@ -950,7 +950,7 @@ async def restore_episode(
     start = _now()
     set_trace_id()
 
-    store = deps.graphlite_store
+    store = deps.graph_store
     if store is None or not hasattr(store, "unarchive"):
         raise HTTPException(status_code=503, detail="GraphLite store unavailable")
     if store.get_episode(episode_id) is None:
@@ -981,13 +981,13 @@ async def promote_to_episode(
 
     # 尝试从 GraphLite 查找原始记录内容
     content = ""
-    existing = deps.graphlite_store.get_episode(req.sensory_record_id)
+    existing = deps.graph_store.get_episode(req.sensory_record_id)
     if existing:
         content = existing.get("content", "")
     else:
         content = "promoted_record"
 
-    await qsubmit(deps, deps.graphlite_store.create_episode, {
+    await qsubmit(deps, deps.graph_store.create_episode, {
         "id": episode_id,
         "content": content,
         "source": "promoted",
@@ -1046,9 +1046,9 @@ async def _process_embed_queue(deps: Services) -> int:
     # mutate，逐条语义不变。不给 get_all_hebbian_connections 加 LIMIT——会静默
     # 截断连接图破坏 hebbian top-K 正确性。
     conns: dict = {}
-    if deps.hebbian_updater and deps.graphlite_store:
+    if deps.hebbian_updater and deps.graph_store:
         try:
-            conns = await asyncio.to_thread(deps.graphlite_store.get_all_connections)
+            conns = await asyncio.to_thread(deps.graph_store.get_all_connections)
         except Exception:
             logger.exception("get_all_connections failed for embed batch")
             conns = {}
@@ -1084,7 +1084,7 @@ async def _process_embed_queue(deps: Services) -> int:
                 with deps._faiss_buffer_lock:
                     deps._faiss_buffer.append((faiss_id, emb_array.flatten(), episode_id))
                 try:
-                    if deps.hebbian_updater and deps.graphlite_store:
+                    if deps.hebbian_updater and deps.graph_store:
                         # 【P2】conns 已提到批循环外（本批内复用），写随闭包入队
                         # 【v5.42】priority="normal"：50 条 flush 不全占 high 额度，
                         # 让 v5.40 低准入闸生效（high 留给外部写）
@@ -1116,7 +1116,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
     - 时态超边：同一 source 在 300s 内写入的节点
     - 情节超边：同一 source 在 3600s 内连续写入的节点
     """
-    if deps.hyperedge_manager is None or deps.graphlite_store is None:
+    if deps.hyperedge_manager is None or deps.graph_store is None:
         return 0
 
     try:
@@ -1129,7 +1129,7 @@ async def _auto_create_hyperedges(episode_id: str, source: str, content: str, de
         # 包 asyncio.to_thread——原实现 loop 上持锁同步读，不再冻结事件循环。
         # 批量路径（_auto_create_hyperedges_batch）已各自合并，不动。
         rows = await asyncio.to_thread(
-            deps.graphlite_store.query_cypher,
+            deps.graph_store.query_cypher,
             "MATCH (e:EpisodeNode) WHERE e.id <> $id AND e.source = $src "
             "AND e.created_at >= $cutoff "
             "RETURN e.id, e.created_at ORDER BY e.created_at DESC LIMIT 20",
@@ -1189,7 +1189,7 @@ async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Se
     改为每 source 2 次 MATCH (时态窗口 + 情节窗口), 创建 ≤1 条时态 + ≤1 条情节超边。
     entries: [(episode_id, source), ...]
     """
-    if deps.hyperedge_manager is None or deps.graphlite_store is None or not entries:
+    if deps.hyperedge_manager is None or deps.graph_store is None or not entries:
         return 0
     from collections import defaultdict
     by_source: dict[str, list[str]] = defaultdict(list)
@@ -1200,7 +1200,7 @@ async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Se
     try:
         for src, new_ids in by_source.items():
             # 时态超边: 一次性查 recent 300s 窗口 (每 source 1 次)
-            recent_rows = deps.graphlite_store.query_cypher(
+            recent_rows = deps.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.source = $src "
                 "AND e.created_at >= $cutoff "
                 "RETURN e.id ORDER BY e.created_at DESC LIMIT 5",
@@ -1221,7 +1221,7 @@ async def _auto_create_hyperedges_batch(entries: list[tuple[str, str]], deps: Se
                 created += 1
                 logger.info("Batch TEMPORAL hyperedge: %d members (source=%s)", len(merged), src)
             # 情节超边: 3600s 窗口 (每 source 1 次)
-            window_rows = deps.graphlite_store.query_cypher(
+            window_rows = deps.graph_store.query_cypher(
                 "MATCH (e:EpisodeNode) WHERE e.source = $src "
                 "AND e.created_at >= $cutoff "
                 "RETURN e.id ORDER BY e.created_at DESC LIMIT 20",

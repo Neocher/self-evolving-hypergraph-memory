@@ -43,7 +43,7 @@ def client():
 
 def _svc(overgraph_store, validator=None) -> Services:
     svc = Services()
-    svc.graphlite_store = overgraph_store
+    svc.graph_store = overgraph_store
     svc.ontology_validator = validator
     return svc
 

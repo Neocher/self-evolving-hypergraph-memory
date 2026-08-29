@@ -470,8 +470,8 @@ class TestSerialStrategyCache:
         svc = Services()
         svc.query_router = MagicMock()
         svc.query_router.retrieve.return_value = []
-        svc.graphlite_store = MagicMock()
-        svc.graphlite_store.query_cypher.return_value = []
+        svc.graph_store = MagicMock()
+        svc.graph_store.query_cypher.return_value = []
 
         app = FastAPI()
         app.include_router(router)

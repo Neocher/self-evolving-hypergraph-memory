@@ -53,7 +53,7 @@ def _make_svc(**overrides) -> Services:
     gstore.link_to_session = MagicMock()
     gstore.get_episode = MagicMock(return_value=None)
     gstore.get_or_create_session = MagicMock(return_value="")
-    svc.graphlite_store = gstore
+    svc.graph_store = gstore
     for k, v in overrides.items():
         setattr(svc, k, v)
     return svc
@@ -66,7 +66,7 @@ def _make_gateway_svc(**overrides) -> Services:
     gstore.create_episode = MagicMock(return_value=None)
     gstore.ensure_session = MagicMock()
     gstore.link_to_session = MagicMock()
-    svc.graphlite_store = gstore
+    svc.graph_store = gstore
     for k, v in overrides.items():
         setattr(svc, k, v)
     return svc
@@ -106,12 +106,12 @@ class TestGatewayWriteQueue:
             api = GatewayAPI(svc)
             resp = asyncio.run(api.write_sensory("hello world", source="tester", namespace="ns1"))
             assert resp.record_id
-            svc.graphlite_store.create_episode.assert_called_once()
-            payload = svc.graphlite_store.create_episode.call_args[0][0]
+            svc.graph_store.create_episode.assert_called_once()
+            payload = svc.graph_store.create_episode.call_args[0][0]
             assert payload["content"] == "hello world"
-            svc.graphlite_store.ensure_session.assert_called_once_with("ns1")
-            svc.graphlite_store.link_to_session.assert_called_once()
-            assert svc.graphlite_store.link_to_session.call_args[0][0] == "ns1"
+            svc.graph_store.ensure_session.assert_called_once_with("ns1")
+            svc.graph_store.link_to_session.assert_called_once()
+            assert svc.graph_store.link_to_session.call_args[0][0] == "ns1"
             assert q.pending_count() == 0
         finally:
             q.shutdown()
@@ -124,10 +124,10 @@ class TestGatewayWriteQueue:
             api = GatewayAPI(svc)
             resp = asyncio.run(api.store_episode("episode content", source="user", namespace="ns2"))
             assert resp.episode_id
-            payload = svc.graphlite_store.create_episode.call_args[0][0]
+            payload = svc.graph_store.create_episode.call_args[0][0]
             assert payload["content"] == "episode content"
-            svc.graphlite_store.ensure_session.assert_called_once_with("ns2")
-            svc.graphlite_store.link_to_session.assert_called_once()
+            svc.graph_store.ensure_session.assert_called_once_with("ns2")
+            svc.graph_store.link_to_session.assert_called_once()
             assert q.pending_count() == 0
         finally:
             q.shutdown()
@@ -140,9 +140,9 @@ class TestGatewayWriteQueue:
             api = GatewayAPI(svc)
             resp = asyncio.run(api.store_multimodal(text="multimodal text", namespace="ns3"))
             assert resp.episode_id
-            payload = svc.graphlite_store.create_episode.call_args[0][0]
+            payload = svc.graph_store.create_episode.call_args[0][0]
             assert payload["content"] == "multimodal text"
-            svc.graphlite_store.ensure_session.assert_called_once_with("ns3")
+            svc.graph_store.ensure_session.assert_called_once_with("ns3")
             assert q.pending_count() == 0
         finally:
             q.shutdown()
@@ -153,7 +153,7 @@ class TestGatewayWriteQueue:
         api = GatewayAPI(svc)
         resp = asyncio.run(api.write_sensory("no queue", source="tester"))
         assert resp.record_id
-        svc.graphlite_store.create_episode.assert_called_once()
+        svc.graph_store.create_episode.assert_called_once()
 
 
 class TestGatewayConcurrency:
@@ -173,7 +173,7 @@ class TestGatewayConcurrency:
             gstore.create_episode = _slow_create
             gstore.ensure_session = MagicMock()
             gstore.link_to_session = MagicMock()
-            svc.graphlite_store = gstore
+            svc.graph_store = gstore
             svc.write_queue = q
             api = GatewayAPI(svc)
 
@@ -230,8 +230,8 @@ class TestVisualQueue:
                 "image_base64": image_b64, "caption": "a cat", "source": "tester",
             })
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.create_visual_node.assert_called_once()
-            payload = svc.graphlite_store.create_visual_node.call_args[0][0]
+            svc.graph_store.create_visual_node.assert_called_once()
+            payload = svc.graph_store.create_visual_node.call_args[0][0]
             assert payload["caption"] == "a cat"
             assert len(payload["embedding"]) == 384, "写路径必须落 384d（CLIP 投影空间）"
             assert q.pending_count() == 0
@@ -249,8 +249,8 @@ class TestCommunitiesQueue:
             svc = _make_svc(write_queue=q)
             resp = client(svc).post("/conflicts/c1/resolve")
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.execute_cypher.assert_called_once()
-            cypher = svc.graphlite_store.execute_cypher.call_args[0][0]
+            svc.graph_store.execute_cypher.assert_called_once()
+            cypher = svc.graph_store.execute_cypher.call_args[0][0]
             assert "SET c.resolved = true" in cypher
             assert q.pending_count() == 0
         finally:
@@ -262,8 +262,8 @@ class TestCommunitiesQueue:
             svc = _make_svc(write_queue=q)
             resp = client(svc).post("/conflicts/resolve-all")
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.execute_cypher.assert_called_once()
-            cypher = svc.graphlite_store.execute_cypher.call_args[0][0]
+            svc.graph_store.execute_cypher.assert_called_once()
+            cypher = svc.graph_store.execute_cypher.call_args[0][0]
             assert "SET c.resolved = true" in cypher
             assert "c.resolved = false" in cypher
             assert q.pending_count() == 0
@@ -287,8 +287,8 @@ class TestCommunitiesQueue:
                 "expected_version": 1, "strategy": "lww",
             })
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.update_with_version.assert_called_once()
-            kwargs = svc.graphlite_store.update_with_version.call_args[1]
+            svc.graph_store.update_with_version.assert_called_once()
+            kwargs = svc.graph_store.update_with_version.call_args[1]
             assert kwargs["node_id"] == "n1"
             assert kwargs["updates"]["content"] == "resolved"
             assert "unrelated" not in kwargs["updates"]  # 只写允许字段
@@ -317,7 +317,7 @@ class TestOntologyBatchQueue:
             })
             assert resp.status_code == 200, resp.text
             assert resp.json()["created"] == 2
-            assert svc.graphlite_store.execute_cypher.call_count == 12  # 2 三元组 × 6 次
+            assert svc.graph_store.execute_cypher.call_count == 12  # 2 三元组 × 6 次
             assert q.pending_count() == 0
         finally:
             q.shutdown()
@@ -421,8 +421,8 @@ def _make_embed_svc(write_queue=None, hebbian_delay: float = 0.0) -> Services:
         svc.hebbian_updater.update.side_effect = _slow_update
     else:
         svc.hebbian_updater = MagicMock()
-    svc.graphlite_store = MagicMock()
-    svc.graphlite_store.get_all_connections.return_value = {}
+    svc.graph_store = MagicMock()
+    svc.graph_store.get_all_connections.return_value = {}
     svc.write_queue = write_queue
     return svc
 
@@ -502,7 +502,7 @@ class TestPersistDreamState:
             svc = Services()
             gstore = MagicMock()
             gstore.execute_cypher = MagicMock(return_value=False)  # MATCH 空 → INSERT
-            svc.graphlite_store = gstore
+            svc.graph_store = gstore
             svc.write_queue = q
             _persist_dream_state(svc, {"status": "running", "n": 1})
             assert gstore.execute_cypher.call_count == 2  # MATCH + INSERT
@@ -519,7 +519,7 @@ class TestPersistDreamState:
             svc = Services()
             gstore = MagicMock()
             gstore.execute_cypher = MagicMock(return_value=False)
-            svc.graphlite_store = gstore
+            svc.graph_store = gstore
             svc.write_queue = q
 
             async def run():
@@ -541,7 +541,7 @@ class TestPersistDreamState:
         svc = Services()
         gstore = MagicMock()
         gstore.execute_cypher = MagicMock(return_value=False)
-        svc.graphlite_store = gstore
+        svc.graph_store = gstore
         svc.write_queue = None
         _persist_dream_state(svc, {"status": "x"})
         assert gstore.execute_cypher.call_count == 2
@@ -556,7 +556,7 @@ class TestPersistDreamState:
         svc = Services()
         gstore = MagicMock()
         gstore.execute_cypher = MagicMock(return_value=False)
-        svc.graphlite_store = gstore
+        svc.graph_store = gstore
         svc.write_queue = _ClosedQueue()
         _persist_dream_state(svc, {"status": "x"})
         assert gstore.execute_cypher.call_count == 0

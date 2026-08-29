@@ -290,7 +290,7 @@ class TestQsubmit:
         svc = Services()
         gstore = MagicMock()
         gstore.create_episode = MagicMock(return_value="e1")
-        svc.graphlite_store = gstore
+        svc.graph_store = gstore
 
         result = asyncio.run(qsubmit(svc, gstore.create_episode, {"id": "e1"}))
         assert result == "e1"
@@ -343,7 +343,7 @@ def _make_svc(**overrides) -> Services:
     gstore.link_to_session = MagicMock()
     gstore.get_episode = MagicMock(return_value=None)
     gstore.get_or_create_session = MagicMock(return_value="")
-    svc.graphlite_store = gstore
+    svc.graph_store = gstore
     for k, v in overrides.items():
         setattr(svc, k, v)
     return svc
@@ -371,13 +371,13 @@ class TestWriteRouteWithQueue:
                 "content": "queue integration", "source": "tester", "namespace": "ns1",
             })
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.create_episode.assert_called_once()
-            payload = svc.graphlite_store.create_episode.call_args[0][0]
+            svc.graph_store.create_episode.assert_called_once()
+            payload = svc.graph_store.create_episode.call_args[0][0]
             assert payload["content"] == "queue integration"
             # 命名空间链接经队列且顺序保持（ensure 先于 link）
-            svc.graphlite_store.ensure_session.assert_called_once_with("ns1")
-            svc.graphlite_store.link_to_session.assert_called_once()
-            assert svc.graphlite_store.link_to_session.call_args[0][0] == "ns1"
+            svc.graph_store.ensure_session.assert_called_once_with("ns1")
+            svc.graph_store.link_to_session.assert_called_once()
+            assert svc.graph_store.link_to_session.call_args[0][0] == "ns1"
             # 请求结束后队列排空（无残留任务）
             assert q.pending_count() == 0
         finally:
@@ -388,13 +388,13 @@ class TestWriteRouteWithQueue:
         q = WriteQueue(wait_timeout=5.0)
         try:
             svc = _make_svc(write_queue=q)
-            svc.graphlite_store._sensory_buffer = None  # 触发无环形缓冲区的兜底写路径
+            svc.graph_store._sensory_buffer = None  # 触发无环形缓冲区的兜底写路径
             resp = client(svc).post("/memories/sensory", json={
                 "content": "sensory via queue", "source": "tester",
             })
             assert resp.status_code == 200, resp.text
-            svc.graphlite_store.create_episode.assert_called_once()
-            payload = svc.graphlite_store.create_episode.call_args[0][0]
+            svc.graph_store.create_episode.assert_called_once()
+            payload = svc.graph_store.create_episode.call_args[0][0]
             assert payload["content"] == "sensory via queue"
         finally:
             q.shutdown()

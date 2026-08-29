@@ -44,7 +44,7 @@ def _make_router(store, hypergraph_results: list[dict]):
     router.config = QueryRouterConfig()
     router._zh_en_tech_map = {}
     router._time_keywords = set()
-    router.graphlite_store = store
+    router.graph_store = store
     router._hypergraph_retrieve = MagicMock(return_value=hypergraph_results)
     return router
 

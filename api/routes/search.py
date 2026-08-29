@@ -158,7 +158,7 @@ async def retrieve(
         results_raw = []
 
     # 当所有上游检索都返回空时，直接 Cypher 兜底
-    if not results_raw and deps.graphlite_store is not None:
+    if not results_raw and deps.graph_store is not None:
         try:
             words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
             if words:
@@ -178,7 +178,7 @@ async def retrieve(
                 degraded = True
                 try:
                     fallback_rows = await asyncio.wait_for(
-                        asyncio.to_thread(deps.graphlite_store.query_cypher, cypher, params),
+                        asyncio.to_thread(deps.graph_store.query_cypher, cypher, params),
                         timeout=_DEGRADE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
@@ -243,13 +243,13 @@ async def retrieve(
         deduped = []
         # 如果指定了命名空间，预取该空间下的所有 node_id
         ns_set: set[str] | None = None
-        if req.namespace and deps.graphlite_store is not None:
+        if req.namespace and deps.graph_store is not None:
             try:
                 # 【H2】【H2-a】命名空间预取移入线程池 + 套 wait_for：
                 # GraphLite 卡死时超时跳过命名空间过滤，不挂起
                 ns_rows = await asyncio.wait_for(
                     asyncio.to_thread(
-                        deps.graphlite_store.query_cypher,
+                        deps.graph_store.query_cypher,
                         "MATCH (s:SessionNode {id: $ns})-[:SESSION_MEMBER]->(e:EpisodeNode) "
                         "RETURN e.id",
                         {"ns": req.namespace},
@@ -418,10 +418,10 @@ async def delete_namespace(
     deps: Services = Depends(get_services),
 ) -> dict:
     """删除指定命名空间下的所有 EpisodeNode + SessionNode。"""
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
     try:
-        count = deps.graphlite_store.delete_namespace(namespace)
+        count = deps.graph_store.delete_namespace(namespace)
         return {"deleted": count, "namespace": namespace, "status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -503,11 +503,11 @@ async def search_vector(
 
         # 批量回查 GraphLite（与 query_router 批量回查同模式，一次 GraphLite 查询）
         episodes_dict: dict[str, dict] = {}
-        if hits and deps.graphlite_store is not None:
+        if hits and deps.graph_store is not None:
             try:
                 episodes_dict = {
                     ep["id"]: ep
-                    for ep in deps.graphlite_store.get_episodes_batch(
+                    for ep in deps.graph_store.get_episodes_batch(
                         [eid for _, eid, _ in hits]
                     )
                 }
@@ -554,10 +554,10 @@ async def get_session_memories(
     start = _now()
     set_trace_id()
 
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    rows = deps.graphlite_store.get_session_memories(session_id, limit)
+    rows = deps.graph_store.get_session_memories(session_id, limit)
     memories = []
     for r in rows:
         memories.append({

@@ -57,7 +57,7 @@ def _make_svc(**overrides) -> Services:
     gstore.get_episode = MagicMock(return_value=None)
     # 显式覆盖：任何未 mock 的方法调用返回空字符串/None（非 truthy）
     gstore.get_or_create_session = MagicMock(return_value="")
-    svc.graphlite_store = gstore
+    svc.graph_store = gstore
     svc.quarantine_store = MagicMock()
     svc.quarantine_store.quarantine = MagicMock()
     for k, v in overrides.items():
@@ -90,7 +90,7 @@ class TestDefenseTimeoutFailClosed:
 
         assert resp.status_code == 200, resp.text
         # 写入照常完成（隔离标记在写入后执行）
-        assert svc.graphlite_store.create_episode.called
+        assert svc.graph_store.create_episode.called
         # 关键断言：超时 → QUARANTINE（quarantine() 被调用），而非 ALLOW
         assert svc.quarantine_store.quarantine.called, (
             "pre_check 超时应降级为 QUARANTINE（fail-closed），而不是 ALLOW"
@@ -292,7 +292,7 @@ class TestForcePromoteProtectedFlagRoute:
         与 GraphLite 原生 "true"/1 形态。
         """
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "重要记忆 force promote 路由级测试",
@@ -327,8 +327,8 @@ class TestP2EmbedBatchSingleConnScan:
         svc._faiss_buffer_lock = __import__("threading").Lock()
         svc._faiss_buffer = []
         svc.hebbian_updater = MagicMock()
-        svc.graphlite_store = MagicMock()
-        svc.graphlite_store.get_all_connections = MagicMock(return_value={"a": {"b": 0.5}})
+        svc.graph_store = MagicMock()
+        svc.graph_store.get_all_connections = MagicMock(return_value={"a": {"b": 0.5}})
         svc.quarantine_store = MagicMock()
         svc.quarantine_store.get_quarantined_ids.return_value = set()
         return svc
@@ -346,9 +346,9 @@ class TestP2EmbedBatchSingleConnScan:
         count = asyncio.run(run())
 
         assert count == 2, f"2 条批应都处理: {count}"
-        assert svc.graphlite_store.get_all_connections.call_count == 1, (
+        assert svc.graph_store.get_all_connections.call_count == 1, (
             "P2: get_all_connections 应提到批循环外（每批 1 次），"
-            f"实际 {svc.graphlite_store.get_all_connections.call_count} 次"
+            f"实际 {svc.graph_store.get_all_connections.call_count} 次"
         )
 
     @patch("api.routes.write._embed_queue", [("e1", "c1", 1.0), ("e2", "c2", 1.0)])
@@ -367,7 +367,7 @@ class TestP2EmbedBatchSingleConnScan:
 
         assert len(hebbian_calls) == 2, f"2 条批应触发 2 次 hebbian update: {len(hebbian_calls)}"
         # 每次 update 收到的是同一 conns 对象（引用复用，而非每批重取）
-        assert all(call[1] is svc.graphlite_store.get_all_connections.return_value
+        assert all(call[1] is svc.graph_store.get_all_connections.return_value
                    for call in hebbian_calls), "循环内应复用同一 conns dict"
 
 
@@ -387,7 +387,7 @@ class TestP7SingleWriteSingleWindowScan:
         svc = Services()
         gstore = MagicMock()
         gstore.query_cypher = MagicMock(return_value=rows)
-        svc.graphlite_store = gstore
+        svc.graph_store = gstore
         svc.hyperedge_manager = MagicMock()
         return svc
 
@@ -397,9 +397,9 @@ class TestP7SingleWriteSingleWindowScan:
 
         svc = self._svc([])
         asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
-        assert svc.graphlite_store.query_cypher.call_count == 1, (
+        assert svc.graph_store.query_cypher.call_count == 1, (
             "P7: 单条写两条窗口查询应合并为 1 条 GQL，"
-            f"实际 {svc.graphlite_store.query_cypher.call_count} 次"
+            f"实际 {svc.graph_store.query_cypher.call_count} 次"
         )
 
     def test_merged_query_uses_3600s_window_limit20(self):
@@ -408,11 +408,11 @@ class TestP7SingleWriteSingleWindowScan:
 
         svc = self._svc([])
         asyncio.run(_auto_create_hyperedges("e1", "src", "c", svc))
-        gql = svc.graphlite_store.query_cypher.call_args[0][0]
+        gql = svc.graph_store.query_cypher.call_args[0][0]
         assert "created_at >= $cutoff" in gql
         assert "LIMIT 20" in gql
         assert "e.created_at" in gql, "合并查询应 RETURN e.created_at 供 Python 侧过滤"
-        params = svc.graphlite_store.query_cypher.call_args[0][1]
+        params = svc.graph_store.query_cypher.call_args[0][1]
         assert params["cutoff"] <= time.time(), "cutoff 应为 3600s 窗（now-3600）"
 
     def test_recent_filtered_in_python(self):

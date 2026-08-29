@@ -165,7 +165,7 @@ class FakeStore:
 def _bare_router(store) -> QueryRouter:
     router = QueryRouter.__new__(QueryRouter)
     router.config = QueryRouterConfig()
-    router.graphlite_store = store
+    router.graph_store = store
     router._bm25_doc_ids = []
     router._bm25_doc_contents = []
     router._bm25_doc_tau = []
@@ -380,7 +380,7 @@ class TestP6FusionParallel:
             def query_cypher(self, *a, **k):
                 raise OverGraphError("entity channel down")
 
-        router.graphlite_store = _BoomStore()  # type: ignore[attr-defined]
+        router.graph_store = _BoomStore()  # type: ignore[attr-defined]
         router._fuse_results = lambda *a, **k: [{"node_id": "v1", "content": "vector hit", "score": 0.9}]  # type: ignore[method-assign]
 
         result = router._fusion_retrieve("memory system", raw_query="memory system")

@@ -67,7 +67,7 @@ class TestQueryRouterNullTau:
         class FakeStore:
             def query_cypher(self, gql, params=None):
                 return rows
-        qr.graphlite_store = FakeStore()
+        qr.graph_store = FakeStore()
 
         # 直接调核心构建（绕过锁，验证解析逻辑）
         state = qr._build_bm25_index_core()
@@ -90,7 +90,7 @@ class TestQueryRouterNullTau:
         class FakeStore:
             def query_cypher(self, gql, params=None):
                 return rows
-        qr.graphlite_store = FakeStore()
+        qr.graph_store = FakeStore()
 
         # 直接调核心构建
         state = qr._build_bm25_index_core()

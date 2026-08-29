@@ -46,7 +46,7 @@ def _make_fusion_router(
     router.config = QueryRouterConfig(agentic_enabled=agentic_enabled, **cfg)
     router._zh_en_tech_map = {}
     router._time_keywords = set()
-    router.graphlite_store = None
+    router.graph_store = None
     router._cjk_warned = False
     router._episode_cache = {}
     router._services = None
@@ -273,7 +273,7 @@ class TestP21HypergraphSupplementSort:
 
     def test_sorts_before_head_tail(self):
         router = _make_fusion_router()
-        router.graphlite_store = MagicMock()
+        router.graph_store = MagicMock()
         captured = {}
 
         def fake_expansion(seeds, existing_ids, tail_score):
@@ -438,7 +438,7 @@ class TestR3N1PublicEntryIntegration:
         )
 
         router = _make_fusion_router(fusion_results=[_r("ep1", "Apple 的业务情况", 0.9)])
-        router.graphlite_store = overgraph_store
+        router.graph_store = overgraph_store
         router._property_temporal_retrieve = (
             QueryRouter._property_temporal_retrieve.__get__(router, QueryRouter)
         )

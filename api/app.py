@@ -99,7 +99,7 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
     create_task 提交（写线程执行 MATCH+SET/INSERT，事件循环不被阻塞）；
     队列不存在/无 running loop 时降级同步直调（与原实现一致）。
     """
-    if svc.graphlite_store is None:
+    if svc.graph_store is None:
         return
     try:
         import json as _json
@@ -107,7 +107,7 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
         if svc.write_queue is not None:
             async def _submit() -> None:
                 try:
-                    await qsubmit(svc, _upsert_system_node, svc.graphlite_store,
+                    await qsubmit(svc, _upsert_system_node, svc.graph_store,
                                   "dream_scheduler_state", state_json, priority="normal")
                 except HTTPException:
                     # 队列满/关闭（如 shutdown 竞态）→ 降级记 WARNING，不落 ERROR
@@ -127,7 +127,7 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
                 asyncio.run(_submit())
         else:
             # 降级：同步直调（与原实现一致）
-            _upsert_system_node(svc.graphlite_store, "dream_scheduler_state", state_json)
+            _upsert_system_node(svc.graph_store, "dream_scheduler_state", state_json)
     except Exception:
         logger.warning("Dream scheduler state persist failed (non-fatal)")
 
@@ -135,7 +135,7 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
 def make_store(cfg):
     """图存储后端构造（v6.0.0: OverGraph 唯一后端，GraphLite 已移除）。
 
-    svc.graphlite_store 属性名保留，duck-typing 上层零改动。
+    svc.graph_store 属性名保留，duck-typing 上层零改动。
     """
     from graph.overgraph_store import OverGraphStore
     store_cfg = type("cfg", (), {
@@ -194,11 +194,11 @@ def _init_services() -> Services:
 
     # 1. 图数据库（v6.0.0: OverGraph 唯一后端）
     try:
-        svc.graphlite_store = make_store(cfg)
-        svc.graphlite_store.connect()
+        svc.graph_store = make_store(cfg)
+        svc.graph_store.connect()
         logger.info("GraphStore initialized",
                     backend="overgraph",
-                    path=getattr(svc.graphlite_store, "_db_path", ""))
+                    path=getattr(svc.graph_store, "_db_path", ""))
     except Exception as e:
         import traceback
         errors.append(f"GraphStore: {e}")
@@ -217,7 +217,7 @@ def _init_services() -> Services:
         logger.warning("WriteQueue init failed (fallback: sync direct writes)", error=str(e))
 
     # 2. FAISS 向量索引
-    if svc.graphlite_store is not None:
+    if svc.graph_store is not None:
         try:
             # ── 编码器初始化（三层降级架构） ──
             # Tier 1: Cloud API / Tier 2: Local sentence-transformers / Tier 3: TF-IDF
@@ -259,7 +259,7 @@ def _init_services() -> Services:
                 from retrieval.vector_index import VectorIndexAdapter
                 svc.faiss_id_map = {}
                 adapter = VectorIndexAdapter(
-                    store=svc.graphlite_store, dimension=dim,
+                    store=svc.graph_store, dimension=dim,
                     faiss_id_map=svc.faiss_id_map,
                 )
                 svc.vector_store = adapter
@@ -269,8 +269,8 @@ def _init_services() -> Services:
                 svc.faiss_nlist = 0
                 logger.info("VectorStore initialized", engine="overgraph-hnsw", dim=dim)
             else:
-                from retrieval.vector_store import FaissStore
-                store = FaissStore(
+                from retrieval.vector_store import VisualVectorStore
+                store = VisualVectorStore(
                     dimension=dim,
                     index_type=cfg.faiss.index_type,
                     nlist=cfg.faiss.nlist,
@@ -287,10 +287,10 @@ def _init_services() -> Services:
             logger.warning("FAISS init failed (fallback: vector search disabled)", error=str(e))
 
     # 3. HyperedgeManager
-    if svc.graphlite_store is not None:
+    if svc.graph_store is not None:
         try:
             from graph.hyperedge import HyperedgeManager
-            svc.hyperedge_manager = HyperedgeManager(graphlite_store=svc.graphlite_store)
+            svc.hyperedge_manager = HyperedgeManager(graphlite_store=svc.graph_store)
             logger.info("HyperedgeManager initialized")
         except Exception as e:
             errors.append(f"HyperedgeManager: {e}")
@@ -318,7 +318,7 @@ def _init_services() -> Services:
         # 【H1】注入 graphlite_store：_persist_batch 由"永不执行"变为真正落库
         # （原实现未注入 store → 重启丢权重；注入后 config.persist_to_graph 生效）
         svc.hebbian_updater = SparseHebbianUpdater(config=cfg.hebbian,
-                                                   graphlite_store=svc.graphlite_store)
+                                                   graphlite_store=svc.graph_store)
         logger.info("HebbianUpdater initialized", k_sparsity=cfg.hebbian.k_sparsity)
     except Exception as e:
         errors.append(f"HebbianUpdater: {e}")
@@ -360,11 +360,11 @@ def _init_services() -> Services:
     except Exception as e:
         logger.warning("Ontology extended load failed (fallback: native only): %s", e)
 
-    if svc.graphlite_store is not None:
+    if svc.graph_store is not None:
         try:
             from core.ontology_validator import OntologyValidator
             svc.ontology_validator = OntologyValidator(
-                graphlite_store=svc.graphlite_store,
+                graphlite_store=svc.graph_store,
                 encoder=svc.encoder,
                 config=cfg.ontology,
                 extended_types=ontology_extended_types,
@@ -423,7 +423,7 @@ def _init_services() -> Services:
             ontology_evolution = OntologyEvolution(
                 extended_path=ontology_extended_path,
                 llm_client=llm_client,
-                graphlite_store=svc.graphlite_store,
+                graphlite_store=svc.graph_store,
             )
             svc.ontology_evolution = ontology_evolution
             logger.info("OntologyEvolution initialized")
@@ -470,7 +470,7 @@ def _init_services() -> Services:
             state_persist_fn=_persist_dream_state_closure,
         )
         # 【FIX】注入GraphLite引用供梦境调度器拉取数据
-        svc.dream_scheduler._graphlite_store = svc.graphlite_store
+        svc.dream_scheduler._graphlite_store = svc.graph_store
         # 注入FAISS引用供梦境后增量更新索引
         svc.dream_scheduler._faiss_index = svc.faiss_index
         svc.dream_scheduler._faiss_id_map = getattr(svc, "faiss_id_map", {})
@@ -519,7 +519,7 @@ def _init_services() -> Services:
         svc.tfidf_index = tfidf_index
 
         qr_kwargs = {
-            "graphlite_store": svc.graphlite_store,
+            "graphlite_store": svc.graph_store,
             "faiss_index": svc.faiss_index,
             "tfidf_index": tfidf_index,
             "encoder": svc.encoder,
@@ -568,10 +568,10 @@ def _init_services() -> Services:
         logger.warning("DefenseEngine init failed (fallback: no defense)", error=str(e))
 
     # 11. 隔离存储（依赖 GraphLite）
-    if svc.graphlite_store is not None:
+    if svc.graph_store is not None:
         try:
             from core.quarantine_store import QuarantineStore
-            svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
+            svc.quarantine_store = QuarantineStore(graph_store=svc.graph_store)
             # 启动时从 GraphLite 同步已有隔离节点
             q_count = svc.quarantine_store.refresh()
             logger.info("QuarantineStore initialized", quarantined_count=q_count)
@@ -663,17 +663,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             from core import user_profile as _up
             from retrieval.query_router import set_user_profile
             profile = _up.load_profile(_up._DEFAULT_PROFILE_PATH)
-            if svc.graphlite_store is not None:
+            if svc.graph_store is not None:
                 # 【P3】同步 query_cypher 移入线程池，避免阻塞事件循环；
                 # 排除 archived/quarantine 节点（同检索侧过滤语义）
                 rows = await asyncio.to_thread(
-                    svc.graphlite_store.query_cypher,
+                    svc.graph_store.query_cypher,
                     "MATCH (e:EpisodeNode) "
                     "WHERE (e.archived IS NULL OR e.archived = false) "
                     "AND (e.quarantine IS NULL OR e.quarantine = false) "
                     "RETURN e LIMIT 10000",
                 )
-                profile = _up.rebuild_or_keep(profile, _up.scan_rows(rows, store=svc.graphlite_store))
+                profile = _up.rebuild_or_keep(profile, _up.scan_rows(rows, store=svc.graph_store))
             if profile:
                 _up.save_profile(profile, _up._DEFAULT_PROFILE_PATH)
             set_user_profile(profile)
@@ -708,9 +708,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     DREAM_POLL_INTERVAL = 60.0
 
     # 【P1-3】从 GraphLite SystemNode 恢复梦境调度器状态
-    if svc.graphlite_store is not None and svc.dream_scheduler is not None:
+    if svc.graph_store is not None and svc.dream_scheduler is not None:
         try:
-            rows = svc.graphlite_store.query_cypher(
+            rows = svc.graph_store.query_cypher(
                 "MATCH (s:SystemNode) WHERE s.id = 'dream_scheduler_state' "
                 "RETURN s.payload"
             )
@@ -775,7 +775,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                             else:
                                 applied, communities, deleted, summaries = await qsubmit(
                                     svc, svc.dream_candidate_store.auto_apply_candidates,
-                                    svc.graphlite_store, priority="normal",
+                                    svc.graph_store, priority="normal",
                                 )
                                 if applied > 0:
                                     logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)
@@ -812,11 +812,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         while True:
             try:
                 await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)
-                if svc.hyperedge_manager is not None and svc.graphlite_store is not None:
+                if svc.hyperedge_manager is not None and svc.graph_store is not None:
                     # 扫描长时间窗口内的同源节点
                     cutoff = time.time() - 7200
                     rows = await asyncio.to_thread(
-                        svc.graphlite_store.query_cypher,
+                        svc.graph_store.query_cypher,
                         "MATCH (e:EpisodeNode) WHERE e.created_at >= $cutoff "
                         "RETURN e.id, e.source, e.content ORDER BY e.created_at DESC LIMIT 100",
                         {"cutoff": cutoff},
@@ -856,8 +856,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.info("WriteQueue drained and shut down")
         except Exception:
             logger.exception("WriteQueue drain failed (non-fatal)")
-    if svc.graphlite_store:
-        svc.graphlite_store.close()
+    if svc.graph_store:
+        svc.graph_store.close()
     logger.info("SHM v4.0 shutting down")
 
 
@@ -912,7 +912,7 @@ def create_app() -> FastAPI:
         if svc is None:
             return {"status": "ok", "graph_connected": False, "faiss_loaded": False}
         result = HealthChecker(
-            graph_store=svc.graphlite_store,
+            graph_store=svc.graph_store,
             faiss_index=svc.faiss_index,
         ).check()
         return {

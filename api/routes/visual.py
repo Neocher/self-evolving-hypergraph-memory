@@ -44,7 +44,7 @@ async def create_visual_memory(
     source = req.get("source", "user")
     if not image_b64 or not caption:
         raise HTTPException(status_code=400, detail="image_base64 and caption required")
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     # CLIP 嵌入器（共享写路径实例，懒加载创建）
@@ -108,7 +108,7 @@ async def create_visual_memory(
         "source": source,
         "created_at": created_at,
     }
-    await qsubmit_visual_index(deps, deps.graphlite_store.create_visual_node, visual_node)
+    await qsubmit_visual_index(deps, deps.graph_store.create_visual_node, visual_node)
 
     record_request("POST", "/memories/visual", "200", _now() - start)
     return {
@@ -125,10 +125,10 @@ async def list_visual_memories(
     deps: Services = Depends(get_services),
 ) -> dict:
     """列出所有视觉记忆节点。"""
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    rows = deps.graphlite_store.get_visual_nodes(limit)
+    rows = deps.graph_store.get_visual_nodes(limit)
     items = []
     for r in rows:
         items.append({
@@ -147,10 +147,10 @@ async def get_visual_memory(
     deps: Services = Depends(get_services),
 ) -> dict:
     """查询单个视觉记忆节点详情，含 base64 image。"""
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    node = deps.graphlite_store.get_visual_node(visual_id)
+    node = deps.graph_store.get_visual_node(visual_id)
     if not node:
         raise HTTPException(status_code=404, detail="Visual node not found")
 
@@ -179,10 +179,10 @@ async def visualize_attention(
     当真实 vision encoder 就绪后，此端点将替换为 VLM 注意力软图。
     当前版本：基于 caption 分词 + 关键词 TF-IDF 权重生成合成热图区域。
     """
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
-    node = deps.graphlite_store.get_visual_node(visual_id)
+    node = deps.graph_store.get_visual_node(visual_id)
     if not node:
         raise HTTPException(status_code=404, detail="Visual node not found")
 

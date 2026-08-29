@@ -44,7 +44,7 @@ class TestWritePathRegistersNode:
     def test_create_episode_registers_node(self, client, overgraph_store):
         """POST /memories/episodes → register_node 已调用且 importance 生效。"""
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.tau_engine = TauDecayEngine()
 
         content = "一条用于 τ 接线回归的记忆"
@@ -65,7 +65,7 @@ class TestWritePathRegistersNode:
     def test_create_episode_no_longer_gated_by_tau(self, client, overgraph_store):
         """P0-3：正常写入不再被恒真 τ 门卫拒绝（400 分支已删除）。"""
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.tau_engine = TauDecayEngine()
 
         resp = client(svc).post("/memories/episodes", json={
@@ -83,7 +83,7 @@ class TestRetrievalPathRefreshesTau:
         svc = Services()
         svc.query_router = MagicMock()
         svc.query_router.retrieve.return_value = results
-        svc.graphlite_store = MagicMock()
+        svc.graph_store = MagicMock()
         svc.quarantine_store = None
         svc.ontology_validator = None
         svc.tau_engine = TauDecayEngine()

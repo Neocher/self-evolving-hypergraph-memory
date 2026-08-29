@@ -655,7 +655,7 @@ def _make_route_app(store):
     from graph.hyperedge import HyperedgeManager
 
     svc = Services()
-    svc.graphlite_store = store
+    svc.graph_store = store
     svc.hyperedge_manager = HyperedgeManager(store)
     app = FastAPI()
     app.include_router(router)

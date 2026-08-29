@@ -2,7 +2,7 @@
 向量存储可插拔层
 ================
 提供统一的 BaseVectorStore 抽象基类，使向量检索后端可替换。
-当前封装 FAISS 为 FaissStore，后续可接入 Milvus / Qdrant / Pinecone / Chroma 等。
+视觉召回：纯 numpy 实现 VisualVectorStore（384d CLIP 空间，命名已去 FAISS 误导），后续可接入 Milvus / Qdrant / Pinecone / Chroma 等。
 
 环境变量:
     SHM_VECTOR_STORE: 向量存储引擎类型 (默认: "faiss")
@@ -74,7 +74,7 @@ class BaseVectorStore(abc.ABC):
         ...
 
 
-class FaissStore(BaseVectorStore):
+class VisualVectorStore(BaseVectorStore):
     """纯 numpy FlatL2 向量存储（替代 faiss.IndexFlatL2 + IndexIDMap）。
 
     faiss 语义等价：精确暴力 L2（平方距离，与 IndexFlatL2 一致）、IndexIDMap
@@ -226,7 +226,7 @@ class VectorStoreFactory:
     """向量存储工厂——根据配置创建对应的 BaseVectorStore 实例。"""
 
     _STORE_REGISTRY: dict[str, type[BaseVectorStore]] = {
-        "faiss": FaissStore,
+        "faiss": VisualVectorStore,
     }
 
     @classmethod

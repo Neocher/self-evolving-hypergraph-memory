@@ -279,7 +279,7 @@ class TestR6WriteEndpoint:
         gstore.link_to_session = MagicMock()
         gstore.get_episode = MagicMock(return_value=None)
         gstore.get_or_create_session = MagicMock(return_value="")
-        svc.graphlite_store = gstore
+        svc.graph_store = gstore
         svc.quarantine_store = MagicMock()
         svc.quarantine_store.quarantine = MagicMock()
         for k, v in overrides.items():

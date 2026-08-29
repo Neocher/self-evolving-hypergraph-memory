@@ -52,7 +52,7 @@ def _make_app(store):
     from api.routes._deps import Services, get_services
 
     svc = Services()
-    svc.graphlite_store = store
+    svc.graph_store = store
     svc.faiss_index = None
     svc.audit_chain = None
     svc.dream_scheduler = None
@@ -156,7 +156,7 @@ class TestHealthCache:
         """P1: 缓存命中时 circuit_breaker 应报告真实状态而非 unknown。
 
         此前 checker.graph_store=None 导致 _check_circuit_breaker()
-        返回 {"state":"unknown"}。修复后从 deps.graphlite_store 重建。
+        返回 {"state":"unknown"}。修复后从 deps.graph_store 重建。
         """
         store = _make_graph_store()
         # 设定真实断路器状态

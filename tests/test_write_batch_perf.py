@@ -24,7 +24,7 @@ def _make_svc(**overrides) -> Services:
     gstore.ensure_session = MagicMock()
     gstore.link_to_session = MagicMock()
     gstore.query_cypher = MagicMock(return_value=[])
-    svc.graphlite_store = gstore
+    svc.graph_store = gstore
     svc.hyperedge_manager = MagicMock()
     # 路由对 on_activity/on_node_created 使用 await → 必须 async mock
     svc.dream_scheduler = AsyncMock()
@@ -57,9 +57,9 @@ class TestBatchHyperedgeMerge:
         body = resp.json()
         assert body["count"] == 4
         assert all(r["status"] == "created" for r in body["results"])
-        assert svc.graphlite_store.create_episode.call_count == 4
+        assert svc.graph_store.create_episode.call_count == 4
         # 超边查询: 1 source × 2 窗口 = 2 次 (原逐条实现为 4 项 × 2 = 8 次)
-        query_calls = [c for c in svc.graphlite_store.query_cypher.call_args_list]
+        query_calls = [c for c in svc.graph_store.query_cypher.call_args_list]
         assert len(query_calls) == 2, f"expected 2 MATCH queries, got {len(query_calls)}"
         # 批次节点已落库 → recent 窗口含本批, 时态超边应创建 (4 成员 ≥ 2)
         svc.hyperedge_manager.create_temporal_hyperedge.assert_called_once()
@@ -81,7 +81,7 @@ class TestBatchHyperedgeMerge:
     def test_batch_error_item_skipped_from_hyperedges(self, client):
         svc = _make_svc()
         # 仅第一条失败, 第二条成功 (side_effect 列表按调用顺序消费)
-        svc.graphlite_store.create_episode.side_effect = [RuntimeError("boom"), None]
+        svc.graph_store.create_episode.side_effect = [RuntimeError("boom"), None]
 
         resp = client(svc).post("/memories/episodes/batch", json=[
             {"content": "fail", "source": "src_c"},

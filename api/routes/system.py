@@ -143,7 +143,7 @@ async def health_check(
     set_trace_id()
 
     checker = HealthChecker(
-        graph_store=deps.graphlite_store,
+        graph_store=deps.graph_store,
         faiss_index=deps.faiss_index,
         audit_chain=deps.audit_chain,
         dream_scheduler=deps.dream_scheduler,
@@ -165,16 +165,16 @@ async def health_check(
 
         # 用快速 RETURN 1 验证图连接（COUNT(*) 全扫描的 1/10 以内延迟）
         # P2 fix: query_cypher 永不抛异常，必须检查返回值
-        if deps.graphlite_store is not None:
+        if deps.graph_store is not None:
             try:
-                rows = deps.graphlite_store.query_cypher("RETURN 1 AS test")
+                rows = deps.graph_store.query_cypher("RETURN 1 AS test")
                 health.graph_connected = bool(rows)
             except Exception:
                 health.graph_connected = False
 
         # P1 fix: checker.graph_store=None 导致 _check_circuit_breaker()
-        # 返回 {"state":"unknown"}。此处从 deps.graphlite_store 重建。
-        cb = getattr(deps.graphlite_store, "circuit_breaker", None)
+        # 返回 {"state":"unknown"}。此处从 deps.graph_store 重建。
+        cb = getattr(deps.graph_store, "circuit_breaker", None)
         if cb is not None:
             window = getattr(cb, "_window", [])
             ws = len(window)
@@ -185,7 +185,7 @@ async def health_check(
                 "recent_failures": rf,
                 "success_rate": ((ws - rf) / ws * 100) if ws > 0 else 100.0,
             }
-        elif deps.graphlite_store is not None:
+        elif deps.graph_store is not None:
             health.details["circuit_breaker"] = {"state": "not_configured"}
 
         # 重算整体状态（check() 在 graph_store=None 时将 status 误判为 error）
@@ -198,7 +198,7 @@ async def health_check(
             _HEALTH_STATS_CACHE["hyperedge_count"] = health.hyperedge_count
             _HEALTH_STATS_CACHE_TIME = start
 
-    cb = getattr(deps.graphlite_store, "circuit_breaker", None)
+    cb = getattr(deps.graph_store, "circuit_breaker", None)
     if cb is not None:
         state_map = {"closed": 0, "half_open": 1, "open": 2}
         cb_state = cb.state.value if hasattr(cb.state, "value") else str(cb.state)
@@ -258,7 +258,7 @@ async def cypher_query(
         from fastapi import HTTPException as _HE
         raise _HE(status_code=400, detail=f"Write queries blocked: contains CREATE/DELETE/SET/DROP/MERGE/REMOVE/DETACH/INSERT/LOAD CSV")
     try:
-        rows = deps.graphlite_store.query_cypher(req.query, req.params)
+        rows = deps.graph_store.query_cypher(req.query, req.params)
         return {"rows": rows, "count": len(rows)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -293,7 +293,7 @@ def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
       s < 0.3 丢弃（与原 1-dist/2 阈值的保守对齐）
     - adapter 为共享引用，无需替换 deps.faiss_index / query_router 引用
     """
-    store = deps.graphlite_store
+    store = deps.graph_store
     start = _now()
     rows = store.query_cypher(
         "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content LIMIT 10000"
@@ -395,7 +395,7 @@ async def rebuild_index(
     start = _now()
     set_trace_id()
 
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
     if deps.encoder is None:
         raise HTTPException(status_code=503, detail="Text encoder not available")
@@ -422,7 +422,7 @@ async def list_procedural_patterns(
 ):
     """查询高频重复行动模式——程序记忆层。"""
     from core.procedural_memory import ProceduralMemoryEngine
-    engine = ProceduralMemoryEngine(graphlite_store=svc.graphlite_store)
+    engine = ProceduralMemoryEngine(graphlite_store=svc.graph_store)
     patterns = engine.query_patterns(min_confidence=min_confidence)
     return {"patterns": patterns, "total": len(patterns)}
 
@@ -435,7 +435,7 @@ async def list_concepts(
 ):
     """查询跨社区的抽象概念——概念记忆层。"""
     from core.conceptual_memory import ConceptualMemoryEngine
-    engine = ConceptualMemoryEngine(graphlite_store=svc.graphlite_store)
+    engine = ConceptualMemoryEngine(graphlite_store=svc.graph_store)
     concepts = engine.get_concepts(level=abstraction_level)
     return {"concepts": concepts, "total": len(concepts)}
 
@@ -447,7 +447,7 @@ async def analyze_concepts(
 ):
     """分析现有社区，自动发现跨社区概念。"""
     from core.conceptual_memory import ConceptualMemoryEngine
-    rows = svc.graphlite_store.query_cypher(
+    rows = svc.graph_store.query_cypher(
         "MATCH (c:CommunityNode) RETURN c.* ORDER BY c.created_at DESC"
     )
     communities = []
@@ -466,6 +466,6 @@ async def analyze_concepts(
             "nodes": [],
         })
 
-    engine = ConceptualMemoryEngine(graphlite_store=svc.graphlite_store)
+    engine = ConceptualMemoryEngine(graphlite_store=svc.graph_store)
     concepts = engine.analyze_communities(communities)
     return {"concepts_found": len(concepts), "concepts": concepts}

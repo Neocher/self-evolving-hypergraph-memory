@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from api.routes import router, Services, get_services
 from core.write_queue import WriteQueueClosedError, WriteQueueFullError
 from retrieval.query_router import QueryRouter, QueryRouterConfig
-from retrieval.vector_store import FaissStore
+from retrieval.vector_store import VisualVectorStore
 
 
 # ─── 辅助构造 ──────────────────────────────────────────────
@@ -168,7 +168,7 @@ class TestVisualRecallEndToEnd:
 
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None
@@ -308,7 +308,7 @@ class TestEmptyChannelShortCircuit:
 
     def test_index_empty_ntotal_zero_no_clip(self):
         qr, store = self._build()
-        qr._visual_index = FaissStore(dimension=384)  # 空索引 ntotal=0
+        qr._visual_index = VisualVectorStore(dimension=384)  # 空索引 ntotal=0
         qr._visual_id_map = {}
         qr._visual_meta = {}
         with (
@@ -337,7 +337,7 @@ class TestClipDegradation:
         faiss_id_map = _seed_text_channel(faiss)
         # 索引已构建但 CLIP 不可用（模型加载失败降级）
         qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
-        qr._visual_index = FaissStore(dimension=384)
+        qr._visual_index = VisualVectorStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
             np.array([0], dtype=np.int64),
@@ -365,7 +365,7 @@ class TestClipDegradation:
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
         qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
-        qr._visual_index = FaissStore(dimension=384)
+        qr._visual_index = VisualVectorStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
             np.array([0], dtype=np.int64),
@@ -561,7 +561,7 @@ class TestVisualRouteWritePath:
         clip = FakeClip()
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None
@@ -615,7 +615,7 @@ class TestClipColdStartIsolation:
         faiss = MockFaissIndex()
         faiss_id_map = _seed_text_channel(faiss)
         qr = _make_router(overgraph_store, faiss=faiss, faiss_id_map=faiss_id_map, services=svc)
-        qr._visual_index = FaissStore(dimension=384)
+        qr._visual_index = VisualVectorStore(dimension=384)
         qr._visual_index.add(
             np.random.default_rng(5).standard_normal((1, 384)).astype(np.float32),
             np.array([0], dtype=np.int64),
@@ -680,7 +680,7 @@ class TestRealClipSmoke:
         proj = _write_proj()
         emb_384 = emb_512 @ proj
         assert emb_384.shape == (384,)
-        index = FaissStore(dimension=384)
+        index = VisualVectorStore(dimension=384)
         index.add(emb_384[None].astype(np.float32), np.array([0], dtype=np.int64))
         distances, indices = index.search(emb_384[None].astype(np.float32), 1)
         assert float(distances[0][0]) < 1e-3, "投影后同源向量应自命中（距离≈0）"
@@ -784,7 +784,7 @@ class TestVisualWriteQueueTimeoutPath:
         svc = Services()
         svc._clip_embedder = clip
         svc._clip_projection = proj
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
         svc.encoder = MockEncoder()
         svc.quarantine_store = None
         svc.ontology_validator = None

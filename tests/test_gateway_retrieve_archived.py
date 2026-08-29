@@ -23,7 +23,7 @@ class _FakeQueryRouter:
 class _FakeServices:
     def __init__(self, router):
         self.query_router = router
-        self.graphlite_store = None
+        self.graph_store = None
 
 
 def _make_api(router=None):
@@ -125,7 +125,7 @@ async def test_cypher_fallback_timeout_degraded_true():
 
     class _Svcs:
         query_router = _EmptyRouter()
-        graphlite_store = _TimeoutStore()
+        graph_store = _TimeoutStore()
 
     api = GatewayAPI.__new__(GatewayAPI)
     api._svc = _Svcs()

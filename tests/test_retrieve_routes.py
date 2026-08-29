@@ -28,12 +28,12 @@ def mock_services():
         return_value=(np.array([[0.5, 0.3, 0.1]]), np.array([[0, 1, 2]]))
     )
     svc.faiss_id_map = {0: "node_a", 1: "node_b", 2: "node_c"}
-    svc.graphlite_store = MagicMock()
-    svc.graphlite_store.query_cypher = MagicMock(return_value=[
+    svc.graph_store = MagicMock()
+    svc.graph_store.query_cypher = MagicMock(return_value=[
         {"id": "node_a", "content": "test content A", "tau_initial": 0.9, "source": "test"},
         {"id": "node_b", "content": "test content B", "tau_initial": 0.8, "source": "test"},
     ])
-    svc.graphlite_store.get_all_nodes.return_value = {}
+    svc.graph_store.get_all_nodes.return_value = {}
     svc.query_router = None
     svc.ontology_validator = None
     svc.ontology_v2 = None
@@ -93,7 +93,7 @@ class TestRetrieveEndpoint:
         mock_qr = MagicMock()
         mock_qr.retrieve.return_value = []
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
         response = client.post("/memories/retrieve", json={
             "query": "nonexistent content",
             "top_k": 5,
@@ -112,7 +112,7 @@ class TestRetrieveEndpoint:
             "context": "【用户画像】\n- preferences: 咖啡 (weight 1.0)",
         }
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
         response = client.post("/memories/retrieve", json={
             "query": "咖啡",
             "top_k": 5,
@@ -128,7 +128,7 @@ class TestRetrieveEndpoint:
         mock_qr._qr = mock_qr
         mock_qr.search_profile.return_value = {"matched": False, "context": ""}
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
         response = client.post("/memories/retrieve", json={
             "query": "随便问问",
             "top_k": 5,
@@ -158,7 +158,7 @@ class TestRetrieveEndpoint:
                 "tau_value": 1.0, "created_at": time.time(),
             }])
             mock_services.query_router = router
-            mock_services.graphlite_store.query_cypher.return_value = []
+            mock_services.graph_store.query_cypher.return_value = []
             response = client.post("/memories/retrieve", json={
                 "query": "今天喝咖啡",
                 "top_k": 5,
@@ -188,7 +188,7 @@ class TestRetrieveR3Fix:
             "score": 0.9, "level": "fusion_multi", "tau_value": 1.0,
         }]
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
 
         with _result_cache_lock:
             _result_cache.clear()
@@ -226,7 +226,7 @@ class TestRetrieveR3Fix:
             "score": 0.9, "level": "l1_faiss", "tau_value": 1.0,
         }]
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
 
         with _result_cache_lock:
             _result_cache.clear()
@@ -270,7 +270,7 @@ class TestRetrieveR3Fix:
             np.array([[0]]),
         )
         mock_services.query_router = router
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
 
         def _passthrough(results, *args, **kwargs):
             return results
@@ -316,7 +316,7 @@ class TestRetrieveR3Fix:
             "level": "vector", "tau_value": 1.0, "fact_track": "active",
         }])
         mock_services.query_router = router
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
 
         with _result_cache_lock:
             _result_cache.clear()
@@ -346,7 +346,7 @@ class TestRetrieveR3Fix:
         mock_qr = MagicMock()
         mock_qr.retrieve.return_value = []
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.side_effect = OverGraphError(
+        mock_services.graph_store.query_cypher.side_effect = OverGraphError(
             "simulated cypher fallback failure"
         )
 
@@ -372,7 +372,7 @@ class TestRetrieveR3Fix:
         mock_qr = MagicMock()
         mock_qr.retrieve.return_value = []
         mock_services.query_router = mock_qr
-        mock_services.graphlite_store.query_cypher.return_value = []
+        mock_services.graph_store.query_cypher.return_value = []
 
         with _result_cache_lock:
             _result_cache.clear()
@@ -409,7 +409,7 @@ class TestSearchVectorEndpoint:
             np.array([[0.9, 0.5, 0.3]]),
             np.array([[0, 1, 2]]),
         )
-        mock_services.graphlite_store.get_episode = MagicMock(return_value={
+        mock_services.graph_store.get_episode = MagicMock(return_value={
             "content": "test content", "id": "node_a", "tau_initial": 0.9
         })
         response = client.post("/search/vector", json={
@@ -481,7 +481,7 @@ class TestDegradePathTimeout:
             time.sleep(0.3)  # 模拟 GraphLite 挂死（远超兜底超时 0.1s）
             return [("n1", "content 1")]
 
-        mock_services.graphlite_store.query_cypher = MagicMock(side_effect=slow_cypher)
+        mock_services.graph_store.query_cypher = MagicMock(side_effect=slow_cypher)
 
         with patch("api.routes.search._DEGRADE_TIMEOUT", 0.1):
             # 唯一 query 避免命中其他用例写入的 _result_cache 缓存键

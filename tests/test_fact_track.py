@@ -118,7 +118,7 @@ class TestWriteRouteFactTrack:
     def test_preference_content_persists_core(self, client, overgraph_store):
         """偏好内容经生产写路径 → 落库 fact_track=="core"。"""
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "我喜欢喝茶",
@@ -134,7 +134,7 @@ class TestWriteRouteFactTrack:
     def test_event_content_persists_active(self, client, overgraph_store):
         """事件内容经生产写路径 → 落库 fact_track=="active"。"""
         svc = Services()
-        svc.graphlite_store = overgraph_store
+        svc.graph_store = overgraph_store
 
         resp = client(svc).post("/memories/episodes", json={
             "content": "今天下午开会",

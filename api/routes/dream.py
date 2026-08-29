@@ -130,7 +130,7 @@ async def apply_dream_candidate(
     if store is None:
         raise HTTPException(status_code=503, detail="Dream candidate store not available")
 
-    if deps.graphlite_store is None:
+    if deps.graph_store is None:
         raise HTTPException(status_code=503, detail="GraphLite store not available")
 
     # 【v5.25】apply_candidate（PRUNE DETACH DELETE + MERGE 循环写）整体闭包入队：
@@ -141,7 +141,7 @@ async def apply_dream_candidate(
         success = await qsubmit(
             deps,
             store.apply_candidate,
-            dream_id, deps.graphlite_store,
+            dream_id, deps.graph_store,
         )
     except HTTPException:
         logger.warning("Write queue busy, dream apply deferred (non-fatal)")

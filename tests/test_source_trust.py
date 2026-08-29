@@ -33,7 +33,7 @@ def client():
 
 def _svc(overgraph_store) -> Services:
     svc = Services()
-    svc.graphlite_store = overgraph_store
+    svc.graph_store = overgraph_store
     return svc
 
 

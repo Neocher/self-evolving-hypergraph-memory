@@ -41,7 +41,7 @@ def _make_router(store, hypergraph_results: list[dict], mesa_enabled: bool = Fal
     router.config = QueryRouterConfig(mesa_enabled=mesa_enabled, **mesa_cfg)
     router._zh_en_tech_map = {}
     router._time_keywords = set()
-    router.graphlite_store = store
+    router.graph_store = store
     router._hypergraph_retrieve = MagicMock(return_value=hypergraph_results)
     return router
 
@@ -257,7 +257,7 @@ class TestMesaAgenticPath:
         router._zh_en_tech_map = {}
         router._time_keywords = set()
         router._cjk_warned = False
-        router.graphlite_store = store
+        router.graph_store = store
         router._episode_cache = {}
         router._services = None
         router.faiss_index = None

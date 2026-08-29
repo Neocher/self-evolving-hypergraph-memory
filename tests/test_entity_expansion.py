@@ -49,7 +49,7 @@ def _make_router(store, seeds, entity_expansion: EntityExpansionConfig | None = 
     )
     router._zh_en_tech_map = {}
     router._time_keywords = set()
-    router.graphlite_store = store
+    router.graph_store = store
     router._fusion_retrieve = MagicMock(return_value=seeds)
     router._community_expansion = MagicMock(side_effect=lambda r, q, qe, rq: r)
     router._mesa_synthesis = MagicMock(side_effect=lambda r, q, rq: r)
@@ -360,7 +360,7 @@ class TestEntityExpansionAgenticPath:
         )
         router._zh_en_tech_map = {}
         router._time_keywords = set()
-        router.graphlite_store = store
+        router.graph_store = store
         router._episode_cache = {}
         router._services = None
         router.faiss_index = None

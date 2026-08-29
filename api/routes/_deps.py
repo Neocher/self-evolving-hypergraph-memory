@@ -88,7 +88,7 @@ router = APIRouter()
 class Services:
     """依赖注入服务容器，由 app.py 在启动时构造。"""
 
-    graphlite_store: Any = None
+    graph_store: Any = None
     faiss_index: Any = None
     faiss_dim: int = 512
     faiss_index_type: str = "IVFFlat"
@@ -158,7 +158,7 @@ def init_services(svc: Services) -> None:
         logger.warning("DefenseEngine init failed (non-fatal)")
     try:
         if svc.quarantine_store is None:
-            svc.quarantine_store = QuarantineStore(graph_store=svc.graphlite_store)
+            svc.quarantine_store = QuarantineStore(graph_store=svc.graph_store)
     except Exception:
         logger.warning("QuarantineStore init failed (non-fatal)")
     _services = svc
@@ -283,7 +283,7 @@ def flush_faiss_buffer(deps: Services) -> int:
         # v6.0.0 OverGraph 分支：ep_id 已在 buffer → 直写 dense_vector
         from retrieval.vector_index import VectorIndexAdapter
         if isinstance(deps.faiss_index, VectorIndexAdapter):
-            store = getattr(deps, "graphlite_store", None)
+            store = getattr(deps, "graph_store", None)
             if store is None or not hasattr(store, "batch_upsert_embeddings"):
                 raise RuntimeError("overgraph backend without vector-capable store")
             store.batch_upsert_embeddings([
@@ -310,7 +310,7 @@ def flush_faiss_buffer(deps: Services) -> int:
             cache = EpisodeCache()
             deps._episode_cache = cache
         fact_tracks: dict[str, str] = {}
-        store = getattr(deps, "graphlite_store", None)
+        store = getattr(deps, "graph_store", None)
         if store is not None and hasattr(store, "get_episodes_batch"):
             ep_ids = [ep_id for _faiss_id, _emb, ep_id in batch]
             try:

@@ -31,7 +31,7 @@ from core.write_queue import WriteQueue, WriteQueueFullError
 def _make_dream_svc(**overrides) -> Services:
     """构造含 dream_candidate_store + graphlite_store 的 Services。"""
     svc = Services()
-    svc.graphlite_store = MagicMock()
+    svc.graph_store = MagicMock()
     store = MagicMock()
     store.apply_candidate.return_value = True
     svc.dream_candidate_store = store
@@ -67,7 +67,7 @@ class TestDreamApplyQueue:
             svc.dream_candidate_store.apply_candidate.assert_called_once()
             args = svc.dream_candidate_store.apply_candidate.call_args[0]
             assert args[0] == "dream-1"
-            assert args[1] is svc.graphlite_store
+            assert args[1] is svc.graph_store
             assert q.pending_count() == 0
         finally:
             q.shutdown()
@@ -95,7 +95,7 @@ class TestDreamApplyQueue:
         assert resp.status_code == 200, resp.text
         assert resp.json()["success"] is True
         svc.dream_candidate_store.apply_candidate.assert_called_once_with(
-            "dream-3", svc.graphlite_store)
+            "dream-3", svc.graph_store)
 
     def test_apply_dream_candidate_failure_propagates(self, client):
         """apply_candidate 内部失败 → 返回 success=False（原有语义不变）。"""
@@ -131,7 +131,7 @@ class TestPersistDreamStateSDKException:
         q = WriteQueue(wait_timeout=5.0)
         try:
             svc = Services()
-            svc.graphlite_store = MagicMock()
+            svc.graph_store = MagicMock()
             svc.write_queue = q
 
             async def run():
@@ -166,7 +166,7 @@ class TestPersistDreamStateSDKException:
         q = WriteQueue(wait_timeout=5.0)
         try:
             svc = Services()
-            svc.graphlite_store = MagicMock()
+            svc.graph_store = MagicMock()
             svc.write_queue = q
             _persist_dream_state(svc, {"status": "x"})
             assert calls == ["dream_scheduler_state"]

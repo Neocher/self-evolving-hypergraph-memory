@@ -38,7 +38,7 @@ class VectorIndexAdapter:
 
     @property
     def index(self):
-        """暴露自身（FaissStore.index 等价物）。"""
+        """暴露自身（VisualVectorStore.index 等价物）。"""
         return self
 
     @property

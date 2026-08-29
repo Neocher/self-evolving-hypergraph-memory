@@ -180,7 +180,7 @@ def client():
 def _svc_with_store(overgraph_store):
     """Services 容器：真实 OverGraphStore + 假 encoder + 必需下游 mock。"""
     svc = Services()
-    svc.graphlite_store = overgraph_store
+    svc.graph_store = overgraph_store
     svc.encoder = _FakeEncoder()
     # 下游可选服务置 None（路由逐项 hasattr 判空，等价生产最小启动）
     svc.tau_engine = None

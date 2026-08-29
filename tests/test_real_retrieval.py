@@ -64,7 +64,7 @@ class TestRealChineseVectorRetrieval:
     """真实 bge + FAISS + GraphLite 全链路中文检索"""
 
     def test_real_chain_chinese_hits(self, _enc, overgraph_store):
-        from retrieval.vector_store import FaissStore
+        from retrieval.vector_store import VisualVectorStore
         from retrieval.query_router import (
             QueryRouter, QueryRouterConfig as QRCfg, RetrievalLevel,
         )
@@ -77,7 +77,7 @@ class TestRealChineseVectorRetrieval:
             })
             ids.append(eid)
 
-        vs = FaissStore(dimension=_enc.dimension)
+        vs = VisualVectorStore(dimension=_enc.dimension)
         faiss_nums = np.arange(len(DOCS), dtype=np.int64)
         vs.add(np.asarray(_enc.embed_batch(DOCS), dtype=np.float32), faiss_nums)
         faiss_id_map = {int(faiss_nums[i]): ids[i] for i in range(len(ids))}
@@ -104,7 +104,7 @@ class TestRealChineseVectorRetrieval:
             )
 
     def test_real_chain_faiss_dim_matches_encoder(self, _enc):
-        from retrieval.vector_store import FaissStore
+        from retrieval.vector_store import VisualVectorStore
 
-        vs = FaissStore(dimension=_enc.dimension)
+        vs = VisualVectorStore(dimension=_enc.dimension)
         assert vs.dimension == _enc.dimension == 512

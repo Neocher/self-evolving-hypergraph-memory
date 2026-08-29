@@ -150,7 +150,7 @@ def _build_svc(
     svc = Services(
         encoder=encoder,
         faiss_index=faiss_index,
-        graphlite_store=graphlite_store,
+        graph_store=graphlite_store,
     )
     if faiss_id_map is not None:
         svc.faiss_id_map = faiss_id_map
