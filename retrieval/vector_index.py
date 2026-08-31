@@ -17,6 +17,12 @@ import uuid
 
 import numpy as np
 
+# 【v5.10 向量索引退化修复】主通道搜索同时覆盖 EpisodeNode 与 CommunityNode：
+# 梦境社区摘要节点（占节点多数）参与向量检索，不再只有 37 个 EpisodeNode。
+# Hebbian 建边 / RPE 写门等内部直调 store.vector_search_dense 仍走默认
+# EpisodeNode-only（保持既有语义），此处仅放宽主检索通道。
+_SEARCH_LABELS = ("EpisodeNode", "CommunityNode")
+
 
 def faiss_id(ep_id: str) -> int:
     """uuid5(ep_id) 映射契约（D3，与 write.py flush 路径一致）。"""
@@ -67,7 +73,21 @@ class VectorIndexAdapter:
             return (np.empty((1, 0), dtype=np.float32),
                     np.empty((1, 0), dtype=np.int64))
         query_vec = np.asarray(query, dtype=np.float32).reshape(-1)
-        hits = self._store.vector_search_dense(k, query_vec)
+        # 【v5.10 向量索引退化修复】OverGraph label_filter 为 AND 语义：
+        # {"labels": ["EpisodeNode","CommunityNode"]} 要求节点同时具备两个 label
+        # → 恒空。必须按 label 逐次查询后按 score 合并去重（实测 2026-08-31）。
+        hits = self._store.vector_search_dense(
+            k, query_vec, label_filter=list(_SEARCH_LABELS)
+        )
+        if not hits and len(_SEARCH_LABELS) > 1:
+            merged: dict[str, float] = {}
+            for lbl in _SEARCH_LABELS:
+                for ep_id, s in self._store.vector_search_dense(
+                    k, query_vec, label_filter=[lbl]
+                ):
+                    if s > 0.0 and (ep_id not in merged or s > merged[ep_id]):
+                        merged[ep_id] = s
+            hits = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)[:k]
         distances: list[float] = []
         indices: list[int] = []
         for ep_id, s in hits:
@@ -87,20 +107,35 @@ class VectorIndexAdapter:
                 np.array([indices], dtype=np.int64))
 
     def add_with_ids(self, embeddings: np.ndarray, ids: np.ndarray) -> int:
-        """批量添加（防御性）：反查 faiss_id_map → ep_id → 写 dense_vector。
+        """批量添加（防御性）：反查 faiss_id_map → node_id → 写 dense_vector。
 
         正常路径由 api/routes/_deps.flush_faiss_buffer 的 overgraph 分支直调
         store.batch_upsert_embeddings（buffer 含 ep_id）；此处供 map 已就绪的
         调用兜底（map 无该 id → 跳过，不落库）。
+
+        【v5.10 向量索引退化修复】map 现可含 CommunityNode fid → 按节点实际
+        label 写向量（EpisodeNode/CommunityNode），避免把社区节点错写成
+        EpisodeNode 产生幻影节点。
         """
         ids = np.asarray(ids, dtype=np.int64).reshape(-1)
         embeddings = np.asarray(embeddings, dtype=np.float32)
         nodes: list[dict] = []
         for i, fid in enumerate(ids):
-            ep_id = self.faiss_id_map.get(int(fid))
-            if ep_id is None:
+            node_id = self.faiss_id_map.get(int(fid))
+            if node_id is None:
                 continue
-            nodes.append({"node_id": ep_id, "embedding": embeddings[i]})
+            label = None
+            for cand in ("EpisodeNode", "CommunityNode"):
+                if self._store.get_node_internal_id(node_id, label=cand) is not None:
+                    label = cand
+                    break
+            if label is None:
+                continue  # 节点已不存在 → 不写幻影向量
+            nodes.append({
+                "node_id": node_id,
+                "embedding": embeddings[i],
+                "label": label,
+            })
         if not nodes:
             return 0
         added = self._store.batch_upsert_embeddings(nodes)

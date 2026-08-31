@@ -287,49 +287,73 @@ async def evidence_stats(
 def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
     """v6.0.0 OverGraph 后端索引重建（D8）：dense_vector 批量写 + Hebbian 近邻。
 
-    - 向量写入 EpisodeNode.dense_vector（adapter.rebuild 覆盖式）
-    - Hebbian 边经 store.vector_search_dense（802×1 次，替代 FAISS search）：
+    - 向量写入 EpisodeNode.dense_vector + CommunityNode.dense_vector（adapter.rebuild
+      覆盖式）。【v5.10 向量索引退化修复】CommunityNode 占节点 94.5%（梦境社区摘要，
+      仅 37 个 EpisodeNode 有向量 → 检索长期 degraded）。社区节点以 summary 为
+      文本源参与向量索引，主检索通道（VectorIndexAdapter.search）同时搜索两种 label。
+    - Hebbian 边仅 Episode-Episode（store.vector_search_dense 默认 EpisodeNode-only）：
       similarity = cosine s 直接用作边权重（R1 定标 d=1/s-1 的原始得分），
-      s < 0.3 丢弃（与原 1-dist/2 阈值的保守对齐）
+      s < 0.3 丢弃（与原 1-dist/2 阈值的保守对齐）；社区节点不参与建边（语义保留）
     - adapter 为共享引用，无需替换 deps.faiss_index / query_router 引用
     """
     store = deps.graph_store
     start = _now()
-    rows = store.query_cypher(
+
+    def _fetch_rows(gql: str) -> list[tuple[str, str]]:
+        rows = store.query_cypher(gql)
+        out: list[tuple[str, str]] = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                nid = str(row.get("id", "") or "")
+                content = str(row.get("content", "") or "")
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                nid = str(row[0]) if row[0] is not None else ""
+                content = str(row[1]) if row[1] is not None else ""
+            else:
+                continue
+            if nid and content.strip():
+                out.append((nid, content))
+        return out
+
+    ep_items = _fetch_rows(
         "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content LIMIT 10000"
     )
-    if not rows:
+    comm_items = _fetch_rows(
+        "MATCH (c:CommunityNode) RETURN c.id AS id, c.summary AS content LIMIT 10000"
+    )
+    if not ep_items and not comm_items:
         return {"status": "ok", "indexed_count": 0, "message": "No episodes found"}
 
-    node_ids = []
-    contents = []
-    for row in rows:
-        if isinstance(row, dict):
-            nid = str(row.get("id", "") or "")
-            content = str(row.get("content", "") or "")
-        else:
-            nid, content = "", ""
-        if nid and content.strip():
-            node_ids.append(nid)
-            contents.append(content)
+    node_ids: list[str] = []
+    contents: list[str] = []
+    labels: list[str] = []
+    for nid, content in ep_items:
+        node_ids.append(nid)
+        contents.append(content)
+        labels.append("EpisodeNode")
+    for nid, content in comm_items:
+        node_ids.append(nid)
+        contents.append(content)
+        labels.append("CommunityNode")
 
-    if not contents:
-        return {"status": "ok", "indexed_count": 0, "message": "No episodes with content"}
-
-    logger.info("Rebuilding OverGraph vectors: encoding %d episodes", len(contents))
+    logger.info("Rebuilding OverGraph vectors: encoding %d nodes "
+                "(%d episodes + %d communities)", len(contents),
+                len(ep_items), len(comm_items))
     embeddings = deps.encoder.embed_batch(contents)
-    nodes = [{"node_id": nid, "embedding": vec}
-             for nid, vec in zip(node_ids, embeddings)]
+    nodes = [{"node_id": nid, "embedding": vec, "label": lbl}
+             for nid, vec, lbl in zip(node_ids, embeddings, labels)]
     indexed = adapter.rebuild(nodes)
 
-    # Hebbian 批量建边（HEBBIAN_BATCH 上限与 graphlite 路径一致）
+    # Hebbian 批量建边（HEBBIAN_BATCH 上限与 graphlite 路径一致）；仅 Episode 源
+    episode_indices = [i for i, lbl in enumerate(labels) if lbl == "EpisodeNode"]
     hebbian_count = 0
     try:
         store.query_cypher("MATCH ()-[r:HEBBIAN_CONNECTION]->() DELETE r")
     except Exception:
         logger.exception("Failed to clear Hebbian connections")
     pending: list[tuple[str, str, float]] = []
-    for i, qv in enumerate(embeddings):
+    for i in episode_indices:
+        qv = embeddings[i]
         try:
             hits = store.vector_search_dense(6, qv)
             for ep_id, s in hits:

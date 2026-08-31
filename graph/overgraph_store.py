@@ -612,24 +612,48 @@ class OverGraphStore:
         retryable_exceptions=_INFRA_EXCEPTIONS,
     )
     def _get_episodes_batch_retryable(self, node_ids: list[str]) -> list[dict]:
-        """底层批量查询（熔断门控 + 重试）：成功返回 episodes。
+        """底层批量查询（熔断门控 + 重试）：成功返回节点 props 字典。
 
         - open 状态 raise CircuitBreakerOpen（query_router L1 传播链入口）
         - 基础设施错误交给 with_retry 重试；失败计数由 get_episodes_batch 统一记录
         - 应用错误不计数、不重试，返回 []
+        - 【v5.10 向量索引退化修复】labels 覆盖 EpisodeNode + CommunityNode：
+          向量主通道现可命中社区摘要节点，内容回查须能解析 CommunityNode key；
+          content 优先，缺失时回落 summary（社区节点无 content 字段）。
         """
         if not self.circuit_breaker.allow_request():
             raise CircuitBreakerOpen("circuit breaker open, batch lookup rejected")
         try:
-            views = self._db.get_nodes_by_keys(
-                [{"labels": [LABEL_EPISODE], "key": str(i)} for i in node_ids]
-            )
+            views: list = []
+            remaining: list[str] = list(dict.fromkeys(str(i) for i in node_ids))
+            # 逐 label 查询（规避 get_nodes_by_keys 多 label 语义不确定），
+            # 已命中的 key 不再进入下一轮（幂等去重）。
+            for label in (LABEL_EPISODE, LABEL_COMMUNITY):
+                if not remaining:
+                    break
+                found = self._db.get_nodes_by_keys(
+                    [{"labels": [label], "key": k} for k in remaining]
+                )
+                found_keys = {
+                    str(v.key) for v in found if v is not None
+                }
+                views.extend(found)
+                remaining = [k for k in remaining if k not in found_keys]
         except _INFRA_EXCEPTIONS:
             raise
         except Exception:
             return []
         self.circuit_breaker.record_success()
-        return [self._flatten_view(v) for v in views if v is not None]
+        result: list[dict] = []
+        for v in views:
+            if v is None:
+                continue
+            flat = self._flatten_view(v)
+            # 社区节点无 content 字段 → 回落 summary（下游 get("content","") 契约）
+            if not flat.get("content") and flat.get("summary"):
+                flat["content"] = flat["summary"]
+            result.append(flat)
+        return result
 
     def get_episodes_batch(self, node_ids: list[str]) -> list[dict]:
         """Batch GET by ids（熔断门控 + 重试，契约同 GraphLiteStore）。"""
@@ -1872,11 +1896,14 @@ class OverGraphStore:
                 for h in hits]
 
     def batch_upsert_embeddings(self, nodes: list[dict]) -> int:
-        """批量写 EpisodeNode.dense_vector（读-合并-批量 upsert，不破坏 props）。
+        """批量写 dense_vector（读-合并-批量 upsert，不破坏 props）。
 
         OverGraph 无「仅更新向量」API（GQL SET e.dense_vector 写的是同名 props
         非一等字段）→ 只能 typed upsert_node(dense_vector=)，而它整体替换 props，
         故先读回现有 props 合并。nodes: [{"node_id": str, "embedding": vec}]。
+
+        label 可选（默认 EpisodeNode，向后兼容既有调用）：v5.10 修复向量索引
+        退化后 CommunityNode 也可携带 dense_vector（梦境社区摘要参与向量检索）。
         """
         if not nodes:
             return 0
@@ -1887,11 +1914,12 @@ class OverGraphStore:
                 nid = str(n.get("node_id") or n.get("id") or "")
                 if not nid:
                     continue
-                view = self._db.get_node_by_key(LABEL_EPISODE, nid)
+                label = str(n.get("label") or LABEL_EPISODE)
+                view = self._db.get_node_by_key(label, nid)
                 props = dict(view.props) if view is not None else {"id": nid}
                 props["id"] = nid
                 items.append({
-                    "labels": [LABEL_EPISODE],
+                    "labels": [label],
                     "key": nid,
                     "props": props,
                     "dense_vector": _as_float32(n.get("embedding")),

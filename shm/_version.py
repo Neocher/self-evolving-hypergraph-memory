@@ -1,12 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.9.1"
-__version_info__ = (6, 9, 1)
-__version_name__ = "DepFix"
+__version__ = "6.10.0"
+__version_info__ = (6, 10, 0)
+__version_name__ = "FullIndex"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.10.0 (2026-08-31) FullIndex:
+  • 修复: 向量索引长期退化 — 梦境 CommunityNode 占 94.5% 从不参与重建，
+    仅 37 个 EpisodeNode 有向量。_rebuild_index_overgraph 现同时索引
+    EpisodeNode + CommunityNode（summary 为文本源），batch_upsert
+    label-aware，主检索通道按 label 分次查询合并去重（OverGraph
+    label_filter 为 AND 语义，多 label 恒空）
+  • Hebbian 边仍仅 Episode-Episode（社区节点不建边，语义保留）
+  • 回归测试: tests/test_vector_index_degradation.py（5 例）
+  • 验证: 重启 rebuild 37 → 6020 节点全量入索引，检索冒烟命中
+
 v6.9.1 (2026-08-31) DepFix:
   • 补 overgraph>=0.17.0 依赖声明 (requirements.txt + pyproject.toml)
   • 修复: overgraph 引擎此前未入依赖清单 → 新环境 clone 后装不上引擎
