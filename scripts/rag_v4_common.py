@@ -1,13 +1,17 @@
-"""rag_v4_common 兼容垫片 — LLM 调用走 DeepSeek API (DEEPSEEK_API_KEY from ~/.bashrc)。
+"""rag_v4_common 兼容垫片 — 双后端: MAAS (阿里云百炼 qwen3-14b, 评测口径) / DeepSeek (通用)。
 
 为 bench_locomo_* 系列脚本提供 llm_generate / llm_judge / rerank / get_reranker。
+优先 MAAS (设置 MAAS_API_KEY 即走 MAAS, 保持与 locomo-refined 官方评测口径一致);
+否则回退 DeepSeek (DEEPSEEK_API_KEY from ~/.bashrc)。
 """
 import json
 import os
 import re
 from pathlib import Path
-
 import urllib.request
+
+MAAS_BASE = os.environ.get("MAAS_API_BASE", "https://llm-kegm398o6acjmcer.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")
+MAAS_MODEL = os.environ.get("MAAS_MODEL", "qwen3-14b")
 
 
 def _key():
@@ -19,10 +23,32 @@ def _key():
     return m.group(1) if m else ""
 
 
-def _chat(prompt: str, max_tokens: int, temperature: float) -> str:
+def _chat(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
+    maas_key = os.environ.get("MAAS_API_KEY", "")
+    # 显式禁代理（对齐 retrieval/hyde.py）：Hermes 会话注入 ALL_PROXY=socks5h://127.0.0.1:1081
+    # 会劫持 urllib——昨 00:49 WARP 半开时 socks5 双向等待致评测挂死 2h；禁代理直连成功
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    if maas_key:
+        body = json.dumps({
+            "model": MAAS_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+            "enable_thinking": False,  # Qwen3 非流式调用必须关闭 thinking
+        }).encode()
+        req = urllib.request.Request(
+            f"{MAAS_BASE}/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {maas_key}"})
+        with opener.open(req, timeout=300) as resp:
+            d = json.loads(resp.read())
+        return d["choices"][0]["message"]["content"]
+
     key = _key()
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY not set")
+        raise RuntimeError("DEEPSEEK_API_KEY not set (且未设 MAAS_API_KEY)")
     body = json.dumps({
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
@@ -36,24 +62,27 @@ def _chat(prompt: str, max_tokens: int, temperature: float) -> str:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         })
-    # 显式禁代理（对齐 retrieval/hyde.py）：Hermes 会话注入 ALL_PROXY=socks5h://127.0.0.1:1081
-    # 会劫持 urllib——昨 00:49 WARP 半开时 socks5 双向等待致评测挂死 2h；禁代理直连成功
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=120) as resp:
         d = json.loads(resp.read())
     return d["choices"][0]["message"]["content"]
 
 
-def llm_generate(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
-    return _chat(prompt, max_tokens, temperature)
+def llm_generate(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
+    """生成文本（用于记忆压缩、假设生成等）"""
+    return _chat(prompt, max_tokens, 0.0)
 
 
 def llm_judge(question: str, ground_truth: str, prediction: str) -> dict:
-    """LLM-as-judge：对预测答案打分 (对齐 LoCoMo 口径)。"""
+    """LLM-as-judge：对预测答案打分（对齐 LoCoMo 评测口径）。
+
+    返回: {"correct": bool, "reason": "判断理由"}
+    """
     prompt = (
-        f"判断以下回答是否正确。\n\n问题: {question}\n标准答案: {ground_truth}\n"
+        f"判断以下回答是否正确。\n\n"
+        f"问题: {question}\n"
+        f"标准答案: {ground_truth}\n"
         f"待评回答: {prediction}\n\n"
-        "只输出 JSON: {\"correct\": true/false, \"reason\": \"一句话\"}"
+        "只输出 JSON: {\"correct\": true/false, \"reason\": \"一句话理由\"}"
     )
     raw = _chat(prompt, 100, 0.0)
     i = raw.find("{")

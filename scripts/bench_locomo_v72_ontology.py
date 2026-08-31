@@ -12,7 +12,7 @@ sys.path.insert(0, os.environ.get("SHM_ROOT", "/home/admin/shm"))
 import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 
-DATA = "/home/admin/shm/data/bench/locomo10.json"
+DATA = os.environ.get("DATA_PATH", "/home/admin/shm/data/bench/locomo10.json")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
 SAMPLE_N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 RERANK_POOL = int(os.environ.get("RERANK_POOL", "200"))
@@ -51,9 +51,53 @@ enc = TextEncoder(device="cpu")
 enc.load()
 
 def load_messages(path):
-    raw = json.load(open(path))
+    """Load conversation messages. Supports both legacy locomo10.json and official LoCoMo-Refined jsonl format.
+
+    Legacy format:  JSON list, each item has ``conversation.session_N`` dicts with ``session_N_date_time``.
+    Official format: JSONL (one conversation per line), each line has ``sessions[].messages[]`` with dia_ids.
+
+    Returns: (conv_map: {conv_idx: [formatted_msg_str, ...]}, all_msgs: [str, ...], dia_ids: [str, ...])
+        — ``dia_ids[i]`` is the official dia_id (e.g. 'D1:3') for ``all_msgs[i]``;
+          None when the legacy format is used (caller falls back to synthesising D{ci+1}:{j+1}).
+    """
+    # ── detect format ──
+    is_jsonl = path.endswith(".jsonl")
     conv_map, sess_date = {}, {}
     all_msgs = []
+    dia_ids = []          # parallel to all_msgs; official dia_id or None (legacy)
+    conv_first_dt = {}    # conv_idx → first session date_time string (for conv_ts)
+
+    if is_jsonl:
+        raw = []
+        with open(path) as _f:
+            for _l in _f:
+                _l = _l.strip()
+                if _l:
+                    raw.append(json.loads(_l))
+        for ci, item in enumerate(raw):
+            sessions = item.get("sessions", [])
+            msgs = []
+            for sess in sessions:
+                si = sess.get("session_index", 0)
+                dt = sess.get("date_time", "")
+                if ci not in conv_first_dt and dt:
+                    conv_first_dt[ci] = dt
+                date_prefix = f"[date: {dt}] " if dt else ""
+                for m in sess.get("messages", []):
+                    speaker = m.get("speaker", "")
+                    text = m.get("text", "")
+                    did = m.get("dia_id") or f"D{si}:{m.get('message_index', '')}"
+                    if text:
+                        fm = f"{date_prefix}[{speaker}] {text}"
+                        msgs.append(fm)
+                        dia_ids.append(did)
+            conv_map[ci] = msgs
+            all_msgs.extend(msgs)
+        # legacy callers expect 2-tuple; return 3-tuple with dia_ids
+        return conv_map, all_msgs, dia_ids, raw, conv_first_dt
+
+    # ── legacy locomo10.json ──
+    raw = json.load(open(path))
     for ci, item in enumerate(raw):
         conv = item.get("conversation", {})
         for k in list(conv.keys()):
@@ -74,10 +118,9 @@ def load_messages(path):
                             msgs.append(f"{date_prefix}[{speaker}] {text}")
         conv_map[ci] = msgs
         all_msgs.extend(msgs)
-    return conv_map, all_msgs
+    return conv_map, all_msgs, None, raw, sess_date
 
-conv_map, all_msgs = load_messages(DATA)
-data = json.load(open(DATA))
+conv_map, all_msgs, _dia_ids_official, data, conv_first_dt = load_messages(DATA)
 print(f"LoCoMo 消息: {len(all_msgs)} 条, {len(conv_map)} 会话", flush=True)
 
 # ── 灌库 ──
@@ -261,16 +304,31 @@ Output only the FACTS/ENTITIES block. No preamble."""
             return []
 
     _dia_to_ep = {}
-    for _ci in range(len(conv_map)):
-        for _j in range(len(conv_map[_ci])):
-            _dia_to_ep[f"D{_ci+1}:{_j+1}"] = f"ep_{sum(len(conv_map[c]) for c in range(_ci)) + _j}"
+    if _dia_ids_official:
+        # Official jsonl format: dia_ids are parallel to all_msgs
+        for _i, _did in enumerate(_dia_ids_official):
+            _dia_to_ep[_did] = f"ep_{_i}"
+    else:
+        # Legacy format: synthesise D{ci+1}:{j+1} (global message index)
+        for _ci in range(len(conv_map)):
+            for _j in range(len(conv_map[_ci])):
+                _dia_to_ep[f"D{_ci+1}:{_j+1}"] = f"ep_{sum(len(conv_map[c]) for c in range(_ci)) + _j}"
 
     print("实体-属性抽取（LLM 分批）...", flush=True)
     _triples_all = []
     _mid_msgs = []
-    for _ci in range(len(conv_map)):
-        for _j, _m in enumerate(conv_map[_ci]):
-            _mid_msgs.append({"dia_id": f"D{_ci+1}:{_j+1}", "speaker": _m.split("]")[0].replace("[", "").strip() if "]" in _m else "", "text": _m})
+    if _dia_ids_official:
+        # Official format: use real dia_ids from the flat list
+        _global_idx = 0
+        for _ci in range(len(conv_map)):
+            for _j, _m in enumerate(conv_map[_ci]):
+                _did = _dia_ids_official[_global_idx]
+                _mid_msgs.append({"dia_id": _did, "speaker": _m.split("]")[0].replace("[", "").strip() if "]" in _m else "", "text": _m})
+                _global_idx += 1
+    else:
+        for _ci in range(len(conv_map)):
+            for _j, _m in enumerate(conv_map[_ci]):
+                _mid_msgs.append({"dia_id": f"D{_ci+1}:{_j+1}", "speaker": _m.split("]")[0].replace("[", "").strip() if "]" in _m else "", "text": _m})
     if EXTRACT_LIMIT > 0:
         _mid_msgs = _mid_msgs[:EXTRACT_LIMIT]
     for _i in range(0, len(_mid_msgs), 25):
@@ -710,8 +768,12 @@ Output a single search query string. No other text."""
         return question
 
 conv_ts = {}
-for item in data:
-    conv_ts[len(conv_ts)] = item.get("conversation", {}).get("session_1_date_time", 0)
+if _dia_ids_official:
+    # Official jsonl format: use conv_first_dt from first session date_time
+    conv_ts = conv_first_dt
+else:
+    for item in data:
+        conv_ts[len(conv_ts)] = item.get("conversation", {}).get("session_1_date_time", 0)
 
 def parse_session_ts(ts):
     try:
@@ -721,7 +783,7 @@ def parse_session_ts(ts):
 
 qa_conv = {}
 for ci, item in enumerate(data):
-    for q in item["qa"]:
+    for q in item.get("qa", []):
         qa_conv[id(q)] = ci
 qa_all = []
 if PREDICT_QUESTIONS:
@@ -746,7 +808,7 @@ if PREDICT_QUESTIONS:
     print(f"[PREDICT] 加载 LoCoMo-Refined 问题: {len(qa_all)} 问 (range={PREDICT_RANGE or 'all'})", flush=True)
 else:
     for item in data:
-        qa_all.extend(item["qa"])
+        qa_all.extend(item.get("qa", []))
 qa_all = [q for q in qa_all if q.get("category") != 5 and q.get("answer")]
 if CAT_FILTER:
     cats = {int(c) for c in CAT_FILTER.split(",") if c.strip().isdigit()}
