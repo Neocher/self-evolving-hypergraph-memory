@@ -271,8 +271,11 @@ class TextEncoder:
         import os as _os
 
         # ① ONNX（EmbeddedLLM/bge-m3-onnx-o2-cpu，外置权重 model.onnx.data）
+        # 【v6.10.1】device 显式 cuda 时跳过 ONNX（ONNX 为 CPU 版，ST 才能
+        # 用 CUDA 加速；auto 解析回 cpu 时仍走 ONNX 省显存）
         onnx_snap = _find_model_snapshot(_BGE_M3_ONNX_REPO)
-        if onnx_snap and _os.path.exists(_os.path.join(onnx_snap, "model.onnx")):
+        if (onnx_snap and self.device != "cuda"
+                and _os.path.exists(_os.path.join(onnx_snap, "model.onnx"))):
             try:
                 from optimum.onnxruntime import ORTModelForFeatureExtraction
                 from transformers import AutoTokenizer

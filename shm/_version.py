@@ -1,12 +1,17 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.10.0"
-__version_info__ = (6, 10, 0)
-__version_name__ = "FullIndex"
+__version__ = "6.10.1"
+__version_info__ = (6, 10, 1)
+__version_name__ = "CudaAccel"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.10.1 (2026-08-31) CudaAccel:
+  • 本机 embedding 强制 CUDA（config device: cuda）— ST bge-m3 ~2.2G 显存
+  • device=cuda 时跳过 ONNX（ONNX 为 CPU 版）；auto 解析回 cpu 仍走 ONNX
+  • 实测: rebuild 6020 节点 3 分 22 秒 (ONNX CPU 84 分钟+), 检索冒烟命中
+
 v6.10.0 (2026-08-31) FullIndex:
   • 修复: 向量索引长期退化 — 梦境 CommunityNode 占 94.5% 从不参与重建，
     仅 37 个 EpisodeNode 有向量。_rebuild_index_overgraph 现同时索引

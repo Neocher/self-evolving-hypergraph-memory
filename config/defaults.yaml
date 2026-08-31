@@ -110,7 +110,7 @@ retrieval:
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）
-  device: "auto"                # 推理设备: auto=自动检测(CUDA可用且显存充足→cuda,否则cpu) / cpu / cuda 强制
+  device: "cuda"                # 推理设备: auto=自动检测(CUDA可用且显存充足→cuda,否则cpu) / cpu / cuda 强制（本机 2026-08-31 起强制 cuda：ST bge-m3 ~2.9G，rebuild 6020 条 3min vs ONNX CPU 84min）
 
 api:
   host: "127.0.0.1"             # 服务监听地址（生产环境使用 0.0.0.0）
