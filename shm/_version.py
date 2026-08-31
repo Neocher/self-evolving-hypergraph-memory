@@ -1,19 +1,16 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.9.0"
-__version_info__ = (6, 9, 0)
-__version_name__ = "BatchWrite"
+__version__ = "6.9.1"
+__version_info__ = (6, 9, 1)
+__version_name__ = "DepFix"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.9.0 (2026-08-31) BatchWrite:
-  • OverGraph 批量写入优化: 梦境持久化从逐条 GQL 改 WriteTxn.stage 批量事务
-  • _persist_community_nodes / dream_pipeline PERSIST 批量化 (分块提交+心跳兼容)
-  • 提速 46x-95x (pytest 基准: 0.915s→0.020s; 独立基准 1500 边: 3.858s→0.041s)
-  • 引擎实测: batch_upsert_* 不参与 WriteTxn → 热路径用 begin_write_txn+stage
-  • tests/test_batch_write.py ×6 (批量调用断言/回滚无残留/性能基准)
-  • 零新增依赖 · 零新增测试失败
+v6.9.1 (2026-08-31) DepFix:
+  • 补 overgraph>=0.17.0 依赖声明 (requirements.txt + pyproject.toml)
+  • 修复: overgraph 引擎此前未入依赖清单 → 新环境 clone 后装不上引擎
+  • 升级路径: pip install --upgrade overgraph → pytest 全量 → 重启生效
 
 v6.5.0 (2026-08-25) Accuracy-Suite:
   • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)

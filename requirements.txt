@@ -24,3 +24,4 @@ blake3>=1.0.0
 pyyaml>=6.0
 httpx>=0.27.0
 mcp>=2.0.0
+overgraph>=0.17.0  # 存储引擎（纯 Rust 嵌入式图数据库，overgraph.io；v6.0.0 起唯一后端）

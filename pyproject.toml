@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm"
-version = "6.9.0"
+version = "6.9.1"
 description = "SHM — 自演化超图记忆系统 (Self-evolving Hypergraph Memory)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,6 +40,7 @@ dependencies = [
     "leidenalg>=0.10.0",
     "blake3>=1.0.0",
     "pyyaml>=6.0",
+    "overgraph>=0.17.0",  # 存储引擎（纯 Rust 嵌入式图数据库，v6.0.0 起唯一后端）
 ]
 
 [project.urls]
