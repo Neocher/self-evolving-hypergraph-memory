@@ -7,6 +7,10 @@
 - 梦境阶段的 LLM 已产出社区 report + patterns（可复用模式），此处不做 LLM 调用
   （_dream_poll_loop 60s 间隔不能卡）
 - 质量门三合一过滤 → 动作短语命名（kebab-case）→ 判重 → 生成 SKILL.md 写入
+- 【Phase 3 验证门】提供 query_router 且有失败查询集（≥12 item）时，写入前对
+  技能候选做失败查询 A/B 配对检验（core/skill_validation）：ACCEPT 写入 /
+  REJECT 丢弃（记 net/CI/reason）；无 router / 无失败集 / <12 item → 保持现状
+  直接写入（向后兼容）
 - Hermes skills_dir.rglob("SKILL.md") 递归扫描，直接写文件即被加载
 
 约束：
@@ -298,10 +302,29 @@ def generate_skill_md(entry: dict) -> str:
     )
 
 
-def sync_from_dream(community_summaries: list, skills_dir: str | None = None) -> list[str]:
-    """主入口：质量门 → 命名 → 判重 → 生成 → 写入。每轮最多 3 个。"""
+def sync_from_dream(community_summaries: list, skills_dir: str | None = None,
+                    query_router=None, failure_queries_path: str | None = None) -> list[str]:
+    """主入口：质量门 → 命名 → 判重 → 生成 →（验证门）→ 写入。每轮最多 3 个。
+
+    【Phase 3】新增可选参数（默认行为零变化）：
+      - query_router: 提供时对技能候选做失败查询 A/B 配对检验（ACCEPT 写入 /
+        REJECT 丢弃并记录 net/CI/reason）；默认 None = 不验证直接写入
+      - failure_queries_path: 失败查询集文件路径；默认 None → 仓库
+        data/failure_queries.json（缺失/不足 12 item 时跳过验证直接写入）
+    """
     if skills_dir is None:
         skills_dir = _DEFAULT_SKILLS_DIR
+    # 有 router 时才读取失败查询集（默认路径下缺失 → 空集 → 跳过验证，兼容）
+    failure_queries = []
+    if query_router is not None:
+        # 惰性 import：保持 skill_bridge 模块加载轻量（默认路径零变化）
+        from core.skill_validation import (
+            DEFAULT_FAILURE_QUERIES_PATH,
+            extract_failure_queries_from_file,
+            validate_skill_candidate,
+        )
+        failure_queries = extract_failure_queries_from_file(
+            failure_queries_path or DEFAULT_FAILURE_QUERIES_PATH)
     existing = _scan_existing_skills(skills_dir)
     created = []
     for entry in extract_reusable_patterns(community_summaries):
@@ -316,10 +339,24 @@ def sync_from_dream(community_summaries: list, skills_dir: str | None = None) ->
         target = os.path.join(skills_dir, name, "SKILL.md")
         if os.path.exists(target):  # 不覆盖已有 skill
             continue
+        skill_md = generate_skill_md(entry)
+        if query_router is not None:
+            verdict = validate_skill_candidate(skill_md, failure_queries, query_router)
+            if verdict is not None and not verdict.accept:
+                logger.info(
+                    "Skill-Bridge REJECT skill %s (net=%.4f, ci=%s, n_dn=%d, reason=%s)",
+                    name, verdict.net, verdict.ci, verdict.n_regressed, verdict.reason,
+                )
+                continue  # 未通过配对检验：丢弃，不写入技能库
+            if verdict is not None:
+                logger.info(
+                    "Skill-Bridge ACCEPT skill %s (net=%.4f, ci=%s, n_up=%d, reason=%s)",
+                    name, verdict.net, verdict.ci, verdict.n_improved, verdict.reason,
+                )
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8") as f:
-                f.write(generate_skill_md(entry))
+                f.write(skill_md)
         except OSError as e:
             logger.warning("Skill-Bridge write failed for %s: %s", name, e)
             continue
