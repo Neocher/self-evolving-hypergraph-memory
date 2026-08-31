@@ -35,7 +35,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 # 可插拔向量存储工厂
 from retrieval.vector_store import VectorStoreFactory, BaseVectorStore
@@ -370,7 +370,9 @@ class EvolutionGuard:
     def __init__(self, revert_threshold: float = 0.15,
                  explore_after: int = 6,
                  min_samples: int = 3,
-                 initial_params: Optional[EvolvableParams] = None):
+                 initial_params: Optional[EvolvableParams] = None,
+                 heldout_builder: Optional[Callable] = None,
+                 min_heldout_items: int = 12):
         self.params = initial_params or EvolvableParams()
         self.history: list[ConfigVersion] = []
         self._version = 0
@@ -379,6 +381,12 @@ class EvolutionGuard:
         self._min_samples = min_samples
         self._no_change_count = 0
         self._pending: Optional[ConfigVersion] = None  # 待验证的版本
+        # 【Phase 2】配对统计门：应用候选配置后调用
+        # failure_eval.build_heldout_scores(prev_params, new_params)，失败查询集
+        # ≥ min_heldout_items 时用 held_out_paired_gate 统计判定（ACCEPT/REJECT）；
+        # 不足或无 builder → 回退现有在线启发式（check_revert）。
+        self._heldout_builder = heldout_builder
+        self._min_heldout_items = min_heldout_items
 
     def current(self) -> EvolvableParams:
         return self.params
@@ -425,10 +433,62 @@ class EvolutionGuard:
         )
         self.history.append(self._pending)
 
+        # 【Phase 2】配对统计门：候选配置应用后，失败查询集 ≥ min_heldout_items
+        # 时用 held_out_paired_gate 统计判定（ACCEPT 保留 / REJECT 回滚）；
+        # 不足或无 builder → 回退现有在线启发式（后续 report_quality/check_revert
+        # 兜底），保持原行为。
+        if self._heldout_builder is not None:
+            verdict = self._run_heldout_gate(old_params, new_params)
+            if verdict is not None and not verdict.accept:
+                # REJECT：回滚到旧参数，当前版本标记 reverted（history 保留审计）；
+                # 返回 False → 调用方不 _sync_params/save_state，cfg 保持旧参数
+                self.params = old_params
+                self._pending.reverted = True
+                self._pending = None
+                logger.warning("配对检验 REJECT #%d: %s（已回滚）",
+                               self._version, verdict.reason)
+                return False, f"配对检验 REJECT: {verdict.reason}，已回滚"
+
         changes = {k: f"{getattr(old_params, k)}→{v}"
                    for k, v in suggested.items() if hasattr(old_params, k)}
         logger.info("演化 #%d: %s", self._version, changes)
         return True, f"应用演化 #{self._version}: {changes}"
+
+    def _run_heldout_gate(self, base_params, cand_params) -> Optional["Verdict"]:
+        """配对统计门：base/cand 同一批失败查询重放 → held_out_paired_gate 判定。
+
+        失败查询集不足 min_heldout_items（Recuris 防过拟合要求）或评估器
+        异常 → 返回 None（调用方回退在线启发式路径）。
+        """
+        try:
+            # 惰性 import：failure_eval 依赖本模块，且验证门为已发布稳定依赖
+            from core.validation_gate import held_out_paired_gate
+            builder = self._heldout_builder
+            # 轻量预检：评估器暴露 extract_failed_queries 时先数 item，
+            # 不足阈值不重放（省只读检索调用，避免无谓评估开销）
+            extractor = getattr(builder, "extract_failed_queries", None)
+            if extractor is not None and len(extractor()) < self._min_heldout_items:
+                return None
+            if hasattr(builder, "build_heldout_scores"):
+                scores = builder.build_heldout_scores(base_params, cand_params)
+            else:
+                scores = builder(base_params, cand_params)
+        except Exception as e:
+            logger.warning("配对检验评估失败，回退在线启发式: %s", e)
+            return None
+        base = scores.get("base") or {}
+        cand = scores.get("cand") or {}
+        items = sorted(set(base) & set(cand))
+        if len(items) < self._min_heldout_items:
+            logger.info("配对检验跳过：失败查询集 %d < %d item，回退在线启发式",
+                        len(items), self._min_heldout_items)
+            return None
+        verdict = held_out_paired_gate(base, cand)
+        logger.info("配对检验 #%d: net=%+.4f CI=%s n_up=%d n_dn=%d → %s",
+                    self._version, verdict.net, verdict.ci,
+                    verdict.n_improved, verdict.n_regressed,
+                    "ACCEPT" if verdict.accept else "REJECT")
+        return verdict
 
     def report_quality(self, quality: float):
         """报告当前配置下的检索质量，用于验证"""
@@ -558,9 +618,24 @@ class SelfEvolvingRetrieval:
         self._qr = query_router
         self.logger = FailureLogger(quality_threshold=quality_threshold)
         self.diagnoser = DiagnosisEngine()
-        # 初始值从 QueryRouterConfig 读（不硬编码覆盖用户配置）
+        # 【Phase 2】失败查询评估集构建器：惰性 import 防循环依赖
+        #（failure_eval 模块级 import RetrievalSnapshot from self_evolving）
+        from retrieval.failure_eval import FailedQueryEval
+        self._failure_eval = FailedQueryEval(
+            logger=self.logger,
+            query_router=query_router,
+            quality_threshold=quality_threshold,
+            persist_path=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data", "failure_queries.json",
+            ),
+        )
+        # 初始值从 QueryRouterConfig 读（不硬编码覆盖用户配置）；
+        # 接入配对统计门：失败查询集 ≥12 item 走 held_out_paired_gate
+        #（ACCEPT 保留 / REJECT 回滚），不足回退在线启发式（check_revert）
         self.guard = EvolutionGuard(
-            initial_params=EvolvableParams.from_config(query_router.config))
+            initial_params=EvolvableParams.from_config(query_router.config),
+            heldout_builder=self._failure_eval)
         self._total_calls = 0
         self._probe_every = max(1, probe_every)
         self._latency_threshold_ms = latency_threshold_ms

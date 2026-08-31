@@ -1,18 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.6.0"
-__version_info__ = (6, 6, 0)
-__version_name__ = "Validation-Gate"
+__version__ = "6.7.0"
+__version_info__ = (6, 7, 0)
+__version_name__ = "Failure-Driven"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.6.0 (2026-08-31) Validation-Gate:
-  • Recuris 验证门控 (arXiv:2608.24876, Apache-2.0): held_out_paired_gate 移植
-  • 「模型提议，算术裁决」: 演化候选须通过配对 held-out bootstrap 检验才被接纳
-  • ontology_evolution.evolve_once() 落盘前 A/B 验证门 (向后兼容, 无评估集行为不变)
-  • tests/test_validation_gate.py ×10 (ACCEPT/REJECT/回归/reg_cap/material/集成)
-  • 零新增依赖 (仅标准库 random+statistics) · 零新增测试失败 (164 ontology 回归全绿)
+v6.7.0 (2026-08-31) Failure-Driven:
+  • 失败驱动闭环: 检索失败快照 → held-out 评估集 → Recuris 配对统计检验
+  • retrieval/failure_eval.py 新增: 失败查询提取(quality<0.4/degraded) + 重放打分
+  • EvolutionGuard 升级: ≥12 失败 item 走 held_out_paired_gate (ACCEPT/REJECT+回滚),
+    不足回退在线启发式 (向后兼容, 默认 None 行为零变化)
+  • data/failure_queries.json 持久化失败查询集
+  • tests/test_failure_eval.py ×15 (提取/重放/ACCEPT/REJECT/回退/集成)
+  • 零新增依赖 (仅标准库) · 零新增测试失败 (全量 1139 passed)
 
 v6.5.0 (2026-08-25) Accuracy-Suite:
   • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)
