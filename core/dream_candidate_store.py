@@ -25,6 +25,14 @@ _DEFAULT_CANDIDATE_DIR = os.path.join(
     "data", "dream_candidates",
 )
 
+# OverGraph 批量写入（_persist_community_nodes 用；与 graph/overgraph_store.py
+# LABEL_* 常量同值，本地定义避免 core→graph 导入耦合）
+_LABEL_COMMUNITY = "CommunityNode"
+_LABEL_EPISODE = "EpisodeNode"
+_LABEL_COMMUNITY_MEMBER = "COMMUNITY_MEMBER"
+# 分块粒度：每块一个 WriteTxn 原子提交，块间心跳（与心跳节奏 ~10 一致）
+_PERSIST_CHUNK_SIZE = 10
+
 
 @dataclass
 class DreamCandidate:
@@ -304,11 +312,22 @@ class DreamCandidateStore:
         self, candidate: DreamCandidate, graphlite_store,
         heartbeat_fn: Optional[Callable[[], None]] = None,
     ) -> int:
-        """从候选 data 创建 GraphLite CommunityNode + COMMUNITY_MEMBER 边。
+        """从候选 data 创建 OverGraph CommunityNode + COMMUNITY_MEMBER 边（批量事务）。
 
-        使用 MATCH 存在性判断 + INSERT/SET 的 upsert 模式（GraphLite 不支持 MERGE）。
-        边操作分三阶段：按成员清旧边 → 建新边 → 清理跨社区成员旧边。
-        按 member_count 倒序，只创建 top-50 最高质量社区。
+        【v6.9 批量化治本】原实现逐社区/逐成员 execute_cypher（PRUNE + persist
+        可达 10-17 分钟）。现改用 OverGraph 批量写入：begin_write_txn +
+        WriteTxn.stage 编排（upsert_node / upsert_edge / delete_edge）→ 单次
+        commit 原子落库，异常 rollback 全量回滚（实测 db 级 batch_upsert_*
+        不参与 WriteTxn，故事务内批量走 stage 编排——引擎的原子批量通道）。
+        行为与原实现等价：
+        - 按 member_count 倒序只创建 top-50 社区；upsert_node 读-合并 =
+          原 MATCH+INSERT/SET（SET 保留其他 props 语义）
+        - 每成员先删旧边再建新边（原阶段 1+2；EpisodeNode 不存在 → 跳过，
+          原 MATCH 无行天然安全；edge_uniqueness=False 下不先删会累积重复边）
+        - 阶段 3：每成员只保留最大社区的边，只删自己社区的边（不动外部社区）
+        - 返回 created（成功建节点的社区数，含无 member_ids 的旧格式社区）
+        - 分块（_PERSIST_CHUNK_SIZE=10）提交：块失败 → rollback + warning 降级
+          继续（原逐社区容错的块级升级版），块间调用 heartbeat_fn
         heartbeat_fn: 可选心跳回调——每处理 ~10 个社区调用一次（长写期间保持
             写队列心跳新鲜，避免看门狗误判；纯增量，不改变写入逻辑/返回语义）。
         Returns: 创建的社区数
@@ -330,81 +349,124 @@ class DreamCandidateStore:
             candidate.community_summaries,
             key=lambda c: c.get("member_count", 0),
             reverse=True,
-        )
-        for idx, comm in enumerate(sorted_comms[:50]):
-            comm_id = comm.get("id", "")
-            if not comm_id:
-                continue
-            report = (comm.get("report", "") or "")[:800]
-            comm_vals = {
-                "id": comm_id,
-                "name": f"dream_{candidate.dream_id[:8]}_comm_{created}",
-                "summary": report,
-                "score": 0.0,
-                "created_at": time.time(),
-            }
+        )[:50]
+
+        # 分块：每块一个 WriteTxn（原子提交，失败整块回滚），块间心跳
+        chunks = [
+            sorted_comms[i:i + _PERSIST_CHUNK_SIZE]
+            for i in range(0, len(sorted_comms), _PERSIST_CHUNK_SIZE)
+        ]
+        for chunk in chunks:
+            chunk_created = 0
+            chunk_member_sets: dict[str, set[str]] = {}
             try:
-                # GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT / SET
-                if graphlite_store.execute_cypher(
-                    "MATCH (c:CommunityNode {id: $id}) RETURN c",
-                    {"id": comm_id},
-                ):
-                    graphlite_store.execute_cypher(
-                        "MATCH (c:CommunityNode {id: $id}) "
-                        "SET c.name = $name, c.summary = $summary, "
-                        "c.leiden_score = $score, c.created_at = $created_at",
-                        comm_vals,
-                    )
-                else:
-                    graphlite_store.execute_cypher(
-                        "INSERT (c:CommunityNode {id: $id, name: $name, "
-                        "summary: $summary, leiden_score: $score, "
-                        "created_at: $created_at})",
-                        comm_vals,
-                    )
-
-                # 处理 COMMUNITY_MEMBER 边
-                member_ids = comm.get("member_ids", [])
-                if not member_ids:
-                    # 旧格式候选兼容：无 member_ids → 只建节点不建边
-                    logger.warning(
-                        "Community %s from dream %s has no member_ids "
-                        "(old format), skipping COMMUNITY_MEMBER edges",
-                        comm_id, candidate.dream_id[:12],
-                    )
-                else:
-                    member_set: set[str] = set()
-                    for member_id in member_ids:
-                        member_set.add(member_id)
+                with graphlite_store.batch_write_txn() as (txn, db):
+                    for comm in chunk:
+                        comm_id = comm.get("id", "")
+                        if not comm_id:
+                            continue
+                        report = (comm.get("report", "") or "")[:800]
+                        comm_vals = {
+                            "id": comm_id,
+                            "name": (
+                                f"dream_{candidate.dream_id[:8]}_comm_"
+                                f"{created + chunk_created}"
+                            ),
+                            "summary": report,
+                            "leiden_score": 0.0,
+                            "created_at": time.time(),
+                        }
+                        # upsert 整体替换 props → 读-合并（原 SET 保留其他 props）
                         try:
-                            # 阶段 1：按成员 ID 清旧边
-                            graphlite_store.execute_cypher(
-                                "MATCH (c:CommunityNode {id: $cid})"
-                                "-[r:COMMUNITY_MEMBER]->"
-                                "(e:EpisodeNode {id: $mid}) DELETE r",
-                                {"cid": comm_id, "mid": member_id},
+                            existing = db.get_node_by_key(
+                                _LABEL_COMMUNITY, comm_id)
+                            props = (
+                                dict(existing.props)
+                                if existing is not None else {}
                             )
                         except Exception:
-                            pass
-                        try:
-                            # 阶段 2：建新边（成员不存在 → MATCH 无行 → 天然安全）
-                            graphlite_store.execute_cypher(
-                                "MATCH (c:CommunityNode {id: $cid}), "
-                                "(e:EpisodeNode {id: $mid}) "
-                                "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
-                                {"cid": comm_id, "mid": member_id},
-                            )
-                        except Exception:
-                            # MATCH 失败自然跳过（EpisodeNode 不存在等）
-                            pass
-                    new_member_sets[comm_id] = member_set
+                            props = {}
+                        props.update(comm_vals)
+                        txn.stage([{
+                            "op": "upsert_node",
+                            "labels": [_LABEL_COMMUNITY],
+                            "key": comm_id,
+                            "props": props,
+                        }])
+                        chunk_created += 1
 
-                created += 1
+                        # 处理 COMMUNITY_MEMBER 边
+                        member_ids = comm.get("member_ids", [])
+                        if not member_ids:
+                            # 旧格式候选兼容：无 member_ids → 只建节点不建边
+                            logger.warning(
+                                "Community %s from dream %s has no member_ids "
+                                "(old format), skipping COMMUNITY_MEMBER edges",
+                                comm_id, candidate.dream_id[:12],
+                            )
+                            continue
+                        member_set: set[str] = set()
+                        edge_ops: list[dict] = []
+                        for member_id in member_ids:
+                            member_set.add(member_id)
+                            try:
+                                mview = db.get_node_by_key(
+                                    _LABEL_EPISODE, member_id)
+                            except Exception:
+                                mview = None
+                            if mview is None:
+                                # EpisodeNode 不存在 → 原 MATCH 无行 → 不建边
+                                continue
+                            # 阶段 1：清旧边（原 DELETE r；upsert_edge 是插入
+                            # 语义，不先删旧边会累积重复边）
+                            try:
+                                cview = db.get_node_by_key(
+                                    _LABEL_COMMUNITY, comm_id)
+                                ci = (
+                                    int(cview.id)
+                                    if cview is not None else None
+                                )
+                                if ci is not None:
+                                    old = db.get_edge_by_triple(
+                                        ci, int(mview.id),
+                                        _LABEL_COMMUNITY_MEMBER,
+                                    )
+                                    if old is not None:
+                                        edge_ops.append({
+                                            "op": "delete_edge",
+                                            "target": {"id": int(old.id)},
+                                        })
+                            except Exception:
+                                pass
+                            # 阶段 2：建新边（from 用 labels+key 引用，同事务
+                            # 内新社区节点也可解析——引擎语义，无需内部 ID）
+                            edge_ops.append({
+                                "op": "upsert_edge",
+                                "from": {
+                                    "labels": [_LABEL_COMMUNITY],
+                                    "key": comm_id,
+                                },
+                                "to": {
+                                    "labels": [_LABEL_EPISODE],
+                                    "key": member_id,
+                                },
+                                "label": _LABEL_COMMUNITY_MEMBER,
+                                "props": {},
+                            })
+                        if edge_ops:
+                            txn.stage(edge_ops)
+                        chunk_member_sets[comm_id] = member_set
             except Exception as e:
-                logger.warning("Community persist failed for %s: %s", comm_id, e)
-            # 【心跳】每处理 ~10 个社区 touch 一次（长写防看门狗误判 CRITICAL）
-            if (idx + 1) % 10 == 0:
-                _hb()
+                # 块级回滚（batch_write_txn 已 rollback）：不计入 created、
+                # 不进阶段 3 —— 与「失败回滚 + 无部分残留」语义一致
+                logger.warning(
+                    "Community persist chunk failed (rolled back): %s", e,
+                )
+                continue
+            created += chunk_created
+            new_member_sets.update(chunk_member_sets)
+            # 【心跳】每块（~10 社区）touch 一次（长写防看门狗误判 CRITICAL）
+            _hb()
 
         # 最终清理：防同一 EpisodeNode 属两个社区
         # 【FIX 2026-08-09】原实现用 WHERE c.id <> $cid DELETE r 对每个 (cid, member)
@@ -419,22 +481,49 @@ class DreamCandidateStore:
                 if mid not in max_community_by_member:
                     max_community_by_member[mid] = cid
 
-        # 阶段 3b：只删自己社区到非最大成员的边（不动外部社区）
-        try:
-            for cid, members in new_member_sets.items():
-                for mid in members:
-                    if max_community_by_member.get(mid, cid) != cid:
-                        # 该成员属于更大的社区 → 只删自己社区的边
-                        graphlite_store.execute_cypher(
-                            "MATCH (c:CommunityNode {id: $cid})"
-                            "-[r:COMMUNITY_MEMBER]->"
-                            "(e:EpisodeNode {id: $mid}) DELETE r",
-                            {"cid": cid, "mid": mid},
-                        )
-        except Exception:
-            logger.warning(
-                "Failed to clean up stale COMMUNITY_MEMBER edges", exc_info=True,
-            )
+        # 阶段 3b：只删自己社区到非最大成员的边（不动外部社区）——单事务批量删
+        if new_member_sets:
+            # 无成员社区（全部失败/无 member_ids）→ 无清理对象，跳过空事务
+            try:
+                with graphlite_store.batch_write_txn() as (txn, db):
+                    delete_ops: list[dict] = []
+                    for cid, members in new_member_sets.items():
+                        try:
+                            cview = db.get_node_by_key(_LABEL_COMMUNITY, cid)
+                        except Exception:
+                            cview = None
+                        ci = int(cview.id) if cview is not None else None
+                        if ci is None:
+                            continue
+                        for mid in members:
+                            if max_community_by_member.get(mid, cid) != cid:
+                                # 该成员属于更大的社区 → 只删自己社区的边
+                                try:
+                                    mview = db.get_node_by_key(
+                                        _LABEL_EPISODE, mid)
+                                except Exception:
+                                    mview = None
+                                if mview is None:
+                                    continue
+                                try:
+                                    old = db.get_edge_by_triple(
+                                        ci, int(mview.id),
+                                        _LABEL_COMMUNITY_MEMBER,
+                                    )
+                                except Exception:
+                                    old = None
+                                if old is not None:
+                                    delete_ops.append({
+                                        "op": "delete_edge",
+                                        "target": {"id": int(old.id)},
+                                    })
+                    if delete_ops:
+                        txn.stage(delete_ops)
+            except Exception:
+                logger.warning(
+                    "Failed to clean up stale COMMUNITY_MEMBER edges",
+                    exc_info=True,
+                )
 
         # ✅ Phase 1 + Phase 3 同源湮灭 bug 已在 dream_pipeline.py 同步修复：
         #    - Phase 1 (L1117-1127): MATCH 限定 {id: $cid}，不碰外部社区边

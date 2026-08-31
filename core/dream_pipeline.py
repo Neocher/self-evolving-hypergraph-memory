@@ -1787,6 +1787,12 @@ Text:
         """【v5.40】单社区持久化块（切块原语）：清理该社区旧 COMMUNITY_MEMBER 边
         （限定 {id: $cid} 不碰外部社区）+ MERGE 幂等 upsert 社区节点与成员边。
 
+        【v6.9 批量化】改用 OverGraph 批量写入（batch_write_txn + WriteTxn.stage
+        编排：delete_edge 清旧边 + upsert_node 读-合并 + upsert_edge 建边，单次
+        commit 原子落库，异常 rollback）。行为与逐条 execute_cypher 等价：
+        created∈{0,1}、member_set 语义不变、不碰外部社区边、EpisodeNode 不存在
+        跳过（原 MATCH 无行）、重复 apply 不累积重复边。
+
         返回 (created, member_set)：created∈{0,1}（upsert 成功数）；
         member_set 供阶段 3 同源湮灭（每成员只保留最大社区边）。
         生产 _persist_direct 每社区单独经写队列提交一个 low 任务（~3s/块），
@@ -1794,68 +1800,79 @@ Text:
         """
         created = 0
         member_set: set[str] = set()
-        # 阶段 1：清理该社区旧边（限定 cid，不碰外部社区）
-        # 【FIX 2026-08-09】原实现 MATCH (c:CommunityNode) 无社区过滤 →
-        # 对每个 dream 成员删除所有社区（含外部）指向它的边（实证 EXT→epX 被删）。
-        # 修复：限定 {id: $cid}，与 dream_candidate_store.py L368-376 一致。
+        comm_id = comm.get("id", "")
+        if not comm_id:
+            return created, member_set
         try:
-            for member_id in comm.get("members", []):
-                graphlite_store.query_cypher(
-                    "MATCH (c:CommunityNode {id: $cid})"
-                    "-[r:COMMUNITY_MEMBER]->"
-                    "(e:EpisodeNode {id: $eid}) DELETE r",
-                    {"cid": comm["id"], "eid": member_id},
-                )
-        except Exception:
-            logger.warning("Failed to clean before community upsert", exc_info=True)
-        # 阶段 2：GraphLite 不支持 MERGE：MATCH 存在性检查 + INSERT 建节点 / SET 更新属性
-        try:
-            comm_vals = {
-                "id": comm["id"],
-                "name": f"dream_{dream_id[:8]}_comm_{idx}",
-                "summary": comm.get("report", "")[:800],
-                "score": 0.0,
-                "created_at": time.time(),
-            }
-            if graphlite_store.execute_cypher(
-                "MATCH (c:CommunityNode {id: $id}) RETURN c",
-                {"id": comm["id"]},
-            ):
-                graphlite_store.execute_cypher(
-                    "MATCH (c:CommunityNode {id: $id}) "
-                    "SET c.name = $name, c.summary = $summary, "
-                    "c.leiden_score = $score, c.created_at = $created_at",
-                    comm_vals,
-                )
-            else:
-                graphlite_store.execute_cypher(
-                    "INSERT (c:CommunityNode {id: $id, name: $name, "
-                    "summary: $summary, leiden_score: $score, "
-                    "created_at: $created_at})",
-                    comm_vals,
-                )
-            for member_id in comm.get("members", []):
-                member_set.add(member_id)
+            with graphlite_store.batch_write_txn() as (txn, db):
+                # 阶段 1：清理该社区旧边（限定 cid，不碰外部社区）
+                # 【FIX 2026-08-09】原实现 MATCH (c:CommunityNode) 无社区过滤 →
+                # 对每个 dream 成员删除所有社区（含外部）指向它的边（实证 EXT→epX 被删）。
+                # 修复：限定 {id: $cid}，与 dream_candidate_store.py 一致。
+                member_ids = list(comm.get("members", []))
+                member_set.update(member_ids)
                 try:
-                    # GraphLite 不支持 MERGE：MATCH 边存在性检查 + INSERT（幂等）
-                    if not graphlite_store.execute_cypher(
-                        "MATCH (c:CommunityNode {id: $cid})"
-                        "-[:COMMUNITY_MEMBER]->"
-                        "(e:EpisodeNode {id: $eid}) RETURN c",
-                        {"cid": comm["id"], "eid": member_id},
-                    ):
-                        graphlite_store.execute_cypher(
-                            "MATCH (c:CommunityNode {id: $cid}), "
-                            "(e:EpisodeNode {id: $eid}) "
-                            "INSERT (c)-[:COMMUNITY_MEMBER]->(e)",
-                            {"cid": comm["id"], "eid": member_id},
-                        )
+                    cview = db.get_node_by_key("CommunityNode", comm_id)
                 except Exception:
-                    logger.warning("Failed to CREATE COMMUNITY_MEMBER edge", exc_info=True)
-            created = 1
+                    cview = None
+                ci = int(cview.id) if cview is not None else None
+                edge_ops: list[dict] = []
+                for member_id in member_ids:
+                    try:
+                        mview = db.get_node_by_key("EpisodeNode", member_id)
+                    except Exception:
+                        mview = None
+                    if mview is None:
+                        # EpisodeNode 不存在 → 原 MATCH 无行 → 不建边
+                        continue
+                    if ci is not None:
+                        try:
+                            old = db.get_edge_by_triple(
+                                ci, int(mview.id), "COMMUNITY_MEMBER")
+                        except Exception:
+                            old = None
+                        if old is not None:
+                            edge_ops.append({
+                                "op": "delete_edge",
+                                "target": {"id": int(old.id)},
+                            })
+                    edge_ops.append({
+                        "op": "upsert_edge",
+                        "from": {"labels": ["CommunityNode"], "key": comm_id},
+                        "to": {"labels": ["EpisodeNode"], "key": member_id},
+                        "label": "COMMUNITY_MEMBER",
+                        "props": {},
+                    })
+                # 阶段 2：upsert 社区节点（读-合并 = 原 MATCH-exists INSERT/SET）
+                comm_vals = {
+                    "id": comm_id,
+                    "name": f"dream_{dream_id[:8]}_comm_{idx}",
+                    "summary": (comm.get("report", "") or "")[:800],
+                    "leiden_score": 0.0,
+                    "created_at": time.time(),
+                }
+                try:
+                    existing = db.get_node_by_key("CommunityNode", comm_id)
+                    props = dict(existing.props) if existing is not None else {}
+                except Exception:
+                    props = {}
+                props.update(comm_vals)
+                ops: list[dict] = [{
+                    "op": "upsert_node",
+                    "labels": ["CommunityNode"],
+                    "key": comm_id,
+                    "props": props,
+                }]
+                ops.extend(edge_ops)
+                if ops:
+                    txn.stage(ops)
+                created = 1
         except Exception as e:
             logger.warning("Community persist failed: %s", e)
         return created, member_set
+
+
+
 
     def _persist_communities_prune_edges(
         self, graphlite_store, new_member_sets: dict[str, set[str]],
@@ -1961,7 +1978,13 @@ Text:
                 if op.op_type == "update" and op.node_id]
 
     def _persist_hyperedges(self, graphlite_store, communities: list[dict], dream_id: str) -> int:
-        """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。"""
+        """梦境结束后，为每个社区创建HyperedgeNode（Layer4）。
+
+        【v6.9 批量化】原逐成员 query_cypher CREATE/INSERT → batch_write_txn +
+        WriteTxn.stage 编排（每社区一个事务：HyperedgeNode upsert + 全部
+        HYPEREDGE_MEMBER 边），单次 commit 原子落库，异常 rollback。
+        EpisodeNode 不存在 → 跳过（原 MATCH 无行）；created 语义不变。
+        """
         import json
         created = 0
         for comm in communities:
@@ -1975,24 +1998,41 @@ Text:
                     "community_id": comm["id"],
                     "keywords": comm.get("keywords", []),
                 }, ensure_ascii=False)
-                graphlite_store.query_cypher(
-                    "CREATE (h:HyperedgeNode {id: $id, type: 'semantic', "
-                    "created_at: $created_at, gate_value: 1.0, metadata: $metadata})",
-                    {"id": hyperedge_id, "created_at": time.time(), "metadata": metadata}
-                )
-                for member_id in members:
-                    try:
-                        graphlite_store.query_cypher(
-                            "MATCH (h:HyperedgeNode {id: $hid}), (e:EpisodeNode {id: $eid}) "
-                            "INSERT (h)-[:HYPEREDGE_MEMBER]->(e)",
-                            {"hid": hyperedge_id, "eid": member_id}
-                        )
-                    except Exception:
-                        logger.warning("Failed to INSERT HYPEREDGE_MEMBER edge", exc_info=True)
+                with graphlite_store.batch_write_txn() as (txn, db):
+                    ops: list[dict] = [{
+                        "op": "upsert_node",
+                        "labels": ["HyperedgeNode"],
+                        "key": hyperedge_id,
+                        "props": {
+                            "id": hyperedge_id,
+                            "type": "semantic",
+                            "created_at": time.time(),
+                            "gate_value": 1.0,
+                            "metadata": metadata,
+                        },
+                    }]
+                    for member_id in members:
+                        try:
+                            mview = db.get_node_by_key("EpisodeNode", member_id)
+                        except Exception:
+                            mview = None
+                        if mview is None:
+                            continue
+                        ops.append({
+                            "op": "upsert_edge",
+                            "from": {"labels": ["HyperedgeNode"], "key": hyperedge_id},
+                            "to": {"labels": ["EpisodeNode"], "key": member_id},
+                            "label": "HYPEREDGE_MEMBER",
+                            "props": {},
+                        })
+                    txn.stage(ops)
                 created += 1
             except Exception as e:
                 logger.warning("Hyperedge persist failed: %s", e)
         return created
+
+
+
 
     def _jaccard_similarity(self, text_a: str, text_b: str) -> float:
         """计算两个文本的 Jaccard 相似度（基于词集）。"""

@@ -56,6 +56,7 @@ import time
 import uuid
 import hashlib
 import json
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -1920,6 +1921,63 @@ class OverGraphStore:
         except Exception:
             return None
         return int(view.id) if view is not None else None
+
+    # ─── 批量写入（Batch Write）────────────────────────
+
+    @contextmanager
+    def batch_write_txn(self):
+        """事务内批量写：begin_write_txn + 编排 stage → commit，异常 rollback。
+
+        【设计约束（实测）】db 级 batch_upsert_nodes / batch_upsert_edges_binary
+        是引擎的快速批量通道，但**不参与 WriteTxn**（rollback 后其写入仍在）——
+        需要「失败回滚 + 无部分残留」的批量写必须走 WriteTxn.stage 编排：
+        同事务内 upsert_node（labels+key ref）可与 upsert_edge/delete_edge 互相
+        引用（新节点无需内部 ID），单次 commit 原子落库，异常 rollback 全量回滚。
+        本 contextmanager 持 _session_lock 覆盖整个事务生命周期（引擎非线程安全）。
+
+        Yields: (txn, db) —— txn: WriteTxn（仅需编排 stage ops，commit/rollback 由
+        本方法托管）；db: 原生 OverGraph 实例（事务内读用，避免锁重入问题）。
+        """
+        with self._session_lock:
+            assert self._db is not None
+            txn = self._db.begin_write_txn()
+            try:
+                yield txn, self._db
+            except Exception:
+                try:
+                    txn.rollback()
+                except Exception:
+                    logger.warning("batch_write_txn: rollback failed", exc_info=True)
+                raise
+            else:
+                txn.commit()
+
+    def batch_upsert_nodes(self, nodes: list[dict]) -> list:
+        """批量 upsert 节点（db 级快速通道，不参与事务；返回引擎内部 ID 列表）。
+
+        语义：整体替换 props（与 typed upsert_node 一致，调用方需自行读-合并）；
+        重复调用按 (labels, key) 幂等更新（INSERT/SET 等价）。
+        """
+        if not nodes:
+            return []
+        with self._session_lock:
+            assert self._db is not None
+            return self._db.batch_upsert_nodes(nodes)
+
+    def batch_upsert_edges_binary(self, buffer: bytes) -> list:
+        """批量 upsert 边（db 级快速通道，不参与事务；返回新边内部 ID 列表）。
+
+        buffer 为 little-endian packed 二进制（引擎 docstring）：
+            [count: u32]，每条边 [from: u64][to: u64][label_len: u16][label: utf8]
+            [weight: f32][valid_from: i64][valid_to: i64][props_len: u32][props: json utf8]
+        注意：插入语义（edge_uniqueness=False 下重复边会新增），幂等需调用方
+        先删旧边（与 GraphLite INSERT 语义一致，SHM 侧由存在性守卫防重复）。
+        """
+        if not buffer:
+            return []
+        with self._session_lock:
+            assert self._db is not None
+            return self._db.batch_upsert_edges_binary(buffer)
 
     # ─── Helpers ──────────────────────────────────────
 

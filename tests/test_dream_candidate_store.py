@@ -351,9 +351,29 @@ class TestAutoApplyHeartbeat:
         )
         store = self._store_with_candidates(tmp_path, monkeypatch, candidate)
 
+        class FakeTxn:
+            def stage(self, ops):
+                self.staged = getattr(self, "staged", 0) + len(ops)
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        class FakeDb:
+            """模拟原生 OverGraph：无任何 EpisodeNode → 成员边全部跳过。"""
+
+            def get_node_by_key(self, label, key):
+                return None
+
+            def get_edge_by_triple(self, frm, to, label):
+                return None
+
         class FakeStore:
             def __init__(self):
                 self.cypher_calls = []
+                self.staged_ops = 0
 
             def query_cypher(self, statement, params=None):
                 self.cypher_calls.append(("query", statement, params))
@@ -362,6 +382,17 @@ class TestAutoApplyHeartbeat:
             def execute_cypher(self, statement, params=None):
                 self.cypher_calls.append(("execute", statement, params))
                 return []
+
+            def batch_write_txn(self):
+                from contextlib import contextmanager
+
+                @contextmanager
+                def _cm():
+                    txn = FakeTxn()
+                    yield txn, FakeDb()
+                    self.staged_ops += getattr(txn, "staged", 0)
+
+                return _cm()
 
         fake = FakeStore()
         hb_calls = []
@@ -391,12 +422,38 @@ class TestAutoApplyHeartbeat:
         )
         store = self._store_with_candidates(tmp_path, monkeypatch, candidate)
 
+        class FakeTxn:
+            def stage(self, ops):
+                pass
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        class FakeDb:
+            def get_node_by_key(self, label, key):
+                return None
+
+            def get_edge_by_triple(self, frm, to, label):
+                return None
+
         class FakeStore:
             def query_cypher(self, statement, params=None):
                 return []
 
             def execute_cypher(self, statement, params=None):
                 return []
+
+            def batch_write_txn(self):
+                from contextlib import contextmanager
+
+                @contextmanager
+                def _cm():
+                    yield FakeTxn(), FakeDb()
+
+                return _cm()
 
         result = store.auto_apply_candidates(FakeStore())
         assert result == (1, 1, 1, comms)

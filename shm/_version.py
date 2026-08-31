@@ -1,18 +1,19 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.8.1"
-__version_info__ = (6, 8, 1)
-__version_name__ = "WriteHeartbeat"
+__version__ = "6.9.0"
+__version_info__ = (6, 9, 0)
+__version_name__ = "BatchWrite"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.8.1 (2026-08-31) WriteHeartbeat:
-  • 写队列长任务心跳: _WriteTask 支持 heartbeat_fn, _run 侧心跳线程每 30s touch
-  • auto_apply_candidates 分块 touch (每批 ~10 社区), 看门狗不再误报 CRITICAL
-  • api/app.py 接线 heartbeat 回调
-  • tests: TestWriteQueueHeartbeat ×4 + TestAutoApplyHeartbeat ×2 (28 passed)
-  • 零新增依赖 · 零新增测试失败 (全量 1160 passed)
+v6.9.0 (2026-08-31) BatchWrite:
+  • OverGraph 批量写入优化: 梦境持久化从逐条 GQL 改 WriteTxn.stage 批量事务
+  • _persist_community_nodes / dream_pipeline PERSIST 批量化 (分块提交+心跳兼容)
+  • 提速 46x-95x (pytest 基准: 0.915s→0.020s; 独立基准 1500 边: 3.858s→0.041s)
+  • 引擎实测: batch_upsert_* 不参与 WriteTxn → 热路径用 begin_write_txn+stage
+  • tests/test_batch_write.py ×6 (批量调用断言/回滚无残留/性能基准)
+  • 零新增依赖 · 零新增测试失败
 
 v6.5.0 (2026-08-25) Accuracy-Suite:
   • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)
