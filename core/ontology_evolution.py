@@ -20,6 +20,7 @@ import tempfile
 from typing import Any, Optional
 
 from core.ontology_validator import ONTOLOGY_TYPES
+from core.validation_gate import held_out_paired_gate
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,26 @@ Respond with a single JSON object only:
 Do not add any text outside the JSON object."""
 
 
+# ─── Recuris 验证门（Phase 1）────────────────────────────────
+
+
+async def get_heldout_scores() -> Optional[dict]:
+    """读取当前演化候选的 held-out 评估集（可插拔接入点）。
+
+    返回 None = 无评估集 → evolve_once 保持原有行为（提议 → 语法守卫 → 直接落盘）。
+
+    真实评估集存储应返回：
+        {"base": {item_id: [per-seed scores]}, "cand": {item_id: [per-seed scores]}}
+    其中 base = 现状基线在 held-out 集上的逐 item 逐 seed 分数，cand = 候选
+    变更在**同一批 held-out item** 上的分数（配对，每 item 可多个 seed）。
+    接入方式：把本函数替换为从评估存储读取的实现（评估库查询 / 评估服务
+    回调），或在 OntologyEvolution 层注入由外部评估管线提供的评估集。
+    消费方：evolve_once() 落盘前调用 held_out_paired_gate（core/validation_gate.py），
+    ACCEPT 才落盘，REJECT → {"action": "skip", "reason": "gate_rejected:..."}。
+    """
+    return None
+
+
 # ─── 主入口 ──────────────────────────────────────────────────
 
 
@@ -399,6 +420,18 @@ async def evolve_once(summaries: list, llm_client, extended_path: str,
 
     # 落盘：asyncio.to_thread（不进事件循环；失败不声称成功）
     if mutation is not None:
+        # 【Phase 1 Recuris 验证门】有 held-out 评估集时执行 A/B 检验：候选
+        # 变更必须在配对 held-out 集上通过统计检验（bootstrap CI 排除 0 且
+        # 回归 item 数 ≤ reg_cap）才被接纳；无评估集（None）保持原行为。
+        heldout = await get_heldout_scores()
+        if heldout is not None:
+            verdict = held_out_paired_gate(heldout["base"], heldout["cand"])
+            if not verdict.accept:
+                logger.info("Ontology evolution REJECTED by validation gate: "
+                            "net=%s ci=%s improved=%d regressed=%d reason=%s",
+                            verdict.net, verdict.ci, verdict.n_improved,
+                            verdict.n_regressed, verdict.reason)
+                return {"action": "skip", "reason": f"gate_rejected:{verdict.reason}"}
         ok = await asyncio.to_thread(_atomic_write, extended_path, _extended_only(mutation))
         if not ok:
             logger.warning("Ontology evolution persist failed — %s NOT saved",

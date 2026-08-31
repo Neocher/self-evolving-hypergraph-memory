@@ -1,19 +1,18 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.5.1"
-__version_info__ = (6, 5, 1)
-__version_name__ = "Refined-Bench"
-__release_date__ = "2026-08-26"
+__version__ = "6.6.0"
+__version_info__ = (6, 6, 0)
+__version_name__ = "Validation-Gate"
+__release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.5.1 (2026-08-26) Refined-Bench:
-  • LoCoMo-Refined 官方判卷协议全量评测: 1382 问 acc=80.68% (1115/1382)
-  • 类别: cat1=64.8% · cat2=70.2% · cat3=77.9% · cat4=89.0% (跨会话综合最强)
-  • 对照官方参考分: EverMemOS 58.25% / Mem0 48.91% (+22~32pp)
-  • bench 新增预测生成模式 (PREDICT_MODE→predictions.jsonl, 对接官方 evaluate.py)
-  • ORT_INTRA_THREADS 参数化 (多进程并行评测防超订)
-  • judge 口径: deepseek-chat × 官方 refined prompt (与 qwen3-8b 逐条 100% 一致)
+v6.6.0 (2026-08-31) Validation-Gate:
+  • Recuris 验证门控 (arXiv:2608.24876, Apache-2.0): held_out_paired_gate 移植
+  • 「模型提议，算术裁决」: 演化候选须通过配对 held-out bootstrap 检验才被接纳
+  • ontology_evolution.evolve_once() 落盘前 A/B 验证门 (向后兼容, 无评估集行为不变)
+  • tests/test_validation_gate.py ×10 (ACCEPT/REJECT/回归/reg_cap/material/集成)
+  • 零新增依赖 (仅标准库 random+statistics) · 零新增测试失败 (164 ontology 回归全绿)
 
 v6.5.0 (2026-08-25) Accuracy-Suite:
   • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)
