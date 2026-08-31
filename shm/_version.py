@@ -1,20 +1,18 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.8.0"
-__version_info__ = (6, 8, 0)
-__version_name__ = "Skill-Gate"
+__version__ = "6.8.1"
+__version_info__ = (6, 8, 1)
+__version_name__ = "WriteHeartbeat"
 __release_date__ = "2026-08-31"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.8.0 (2026-08-31) Skill-Gate:
-  • 记忆→技能闭环: 技能候选须通过失败查询配对检验才写入技能库
-  • core/skill_validation.py 新增: validate_skill_candidate (base=无技能注入 /
-    cand=技能注入重放, held_out_paired_gate 判定) + 可插拔注入策略
-  • skill_bridge.sync_from_dream() 接入验证门: ACCEPT 写入 / REJECT 丢弃,
-    无 router/无失败集/<12 item → 保持现状 (向后兼容)
-  • tests/test_skill_validation.py ×15 (ACCEPT/REJECT/跳过/解析/集成)
-  • 零新增依赖 (仅标准库) · 零新增测试失败 (全量 1154 passed)
+v6.8.1 (2026-08-31) WriteHeartbeat:
+  • 写队列长任务心跳: _WriteTask 支持 heartbeat_fn, _run 侧心跳线程每 30s touch
+  • auto_apply_candidates 分块 touch (每批 ~10 社区), 看门狗不再误报 CRITICAL
+  • api/app.py 接线 heartbeat 回调
+  • tests: TestWriteQueueHeartbeat ×4 + TestAutoApplyHeartbeat ×2 (28 passed)
+  • 零新增依赖 · 零新增测试失败 (全量 1160 passed)
 
 v6.5.0 (2026-08-25) Accuracy-Suite:
   • 方案 D: valid_time 索引 + at_year 过滤 (cat=2 时间推理根治)

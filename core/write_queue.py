@@ -88,6 +88,11 @@ class _WriteTask:
     args: tuple
     kwargs: dict
     fut: Future  # concurrent.futures.Future（跨线程 set_result 合法）
+    # 【心跳】长任务心跳回调（可空）：_run 在 task.fn 执行期间由心跳线程周期
+    # 调用（内部 touch _last_activity），避免长写（如梦境 PERSIST 10-17 分钟）
+    # 触发看门狗 CRITICAL 误报。心跳线程不访问存储、不发起任何写——单写线程
+    # 约束不变。
+    heartbeat_fn: Optional[Callable[[], None]] = None
 
 
 class WriteQueue:
@@ -158,6 +163,10 @@ class WriteQueue:
         # 【L3】当前在途任务快照（写线程侧设置；critical 文案附 repr）
         self._current_task: Optional[_WriteTask] = None
         self._ping_fn = ping_fn
+        # 【心跳】长任务心跳周期（秒）：task.heartbeat_fn 存在时，_run 侧心跳线程
+        # 每该间隔调用一次（测试可调小）。默认 30s，远小于 stuck_timeout 下限
+        # 60s → 长写期间 _last_activity 持续新鲜，看门狗不误报。
+        self._heartbeat_interval: float = 30.0
 
     # ─── 事件循环侧：唯一入口 ───────────────────────────
 
@@ -166,6 +175,7 @@ class WriteQueue:
         fn: Callable[..., Any],
         *args,
         priority: str = "normal",
+        heartbeat_fn: Optional[Callable[[], None]] = None,
         **kwargs,
     ) -> Any:
         """入队并等待写线程完成，返回 fn 的结果。
@@ -179,6 +189,11 @@ class WriteQueue:
           （迟到完成），调用方**不应安全重试**（写入用 uuid 主键天然幂等，
           但重复触发仍由调用方自行判断）。
         - 写线程内重入 submit → 直接同步执行（防死锁）。
+        - heartbeat_fn: 可选长任务心跳回调（如 touch 写队列心跳）。任务执行期间
+          _run 侧心跳线程每 _heartbeat_interval 秒调用一次（不阻塞任务本身，
+          也不注入 fn 的 kwargs——fn 无需接受该参数）。当前梦境 auto-apply 用它
+          每 30s touch，长写（10-17 分钟）期间 _last_activity 保持新鲜，看门狗
+          不误报 CRITICAL。None 则无心跳。
         """
         if self._closed:
             raise WriteQueueClosedError("write queue closed")
@@ -189,7 +204,10 @@ class WriteQueue:
         if self._is_stuck():
             self._restart_worker()
         fut: Future = Future()
-        task = _WriteTask(fn=fn, args=args, kwargs=kwargs, fut=fut)
+        task = _WriteTask(
+            fn=fn, args=args, kwargs=kwargs, fut=fut,
+            heartbeat_fn=heartbeat_fn,
+        )
         # 【v5.40】低准入闸：low/normal 积压达 low_max 即拒（high 不受限，
         # 仅在 qsize==maxsize 时经 put_nowait 背压）。准入闸在重入检查之后——
         # 写线程内重入直接同步执行，不入队。
@@ -291,6 +309,20 @@ class WriteQueue:
                 self._q.task_done()
                 break
             task: _WriteTask = item[2]
+            # 【心跳】长任务心跳线程：task.fn 执行期间周期调用 task.heartbeat_fn()
+            # （内部 touch _last_activity），避免长写（如梦境 PERSIST 10-17 分钟）
+            # 触发看门狗 CRITICAL 误报。心跳线程只调回调、不碰存储/不写库——
+            # 单写线程约束不变。任务完成（含异常）后 stop + join。
+            stop_hb = threading.Event()
+            hb_thread: Optional[threading.Thread] = None
+            if task.heartbeat_fn is not None:
+                hb_thread = threading.Thread(
+                    target=self._heartbeat_loop,
+                    args=(task.heartbeat_fn, stop_hb),
+                    daemon=True,
+                    name="shm-writer-heartbeat",
+                )
+                hb_thread.start()
             try:
                 # 【F3】心跳：任务开始前打点（即便任务卡死也能检测）
                 self._touch_activity()
@@ -301,6 +333,9 @@ class WriteQueue:
             except BaseException as exc:  # 含 GraphLite 异常 / CircuitBreakerOpen
                 task.fut.set_exception(exc)
             finally:
+                if hb_thread is not None:
+                    stop_hb.set()
+                    hb_thread.join(timeout=2.0)
                 self._current_task = None
                 self._touch_activity()
                 self._q.task_done()
@@ -309,9 +344,29 @@ class WriteQueue:
                 with self._stuck_lock:
                     self._completed_tasks += 1
 
+    def _heartbeat_loop(
+        self, heartbeat_fn: Callable[[], None], stop: threading.Event,
+    ) -> None:
+        """长任务心跳线程体：每 _heartbeat_interval 秒调一次回调，直至 stop 置位。
+
+        回调异常不致命（心跳是尽力而为）：吞掉并记 debug，不打断长任务。
+        """
+        while not stop.wait(self._heartbeat_interval):
+            try:
+                heartbeat_fn()
+            except Exception:
+                logger.debug(
+                    "write queue heartbeat_fn failed (non-fatal)", exc_info=True,
+                )
+
     def _touch_activity(self) -> None:
         with self._stuck_lock:
             self._last_activity = time.monotonic()
+
+    def touch_activity(self) -> None:
+        """公开心跳打点：长任务内部/心跳回调通过它保持 _last_activity 新鲜，
+        避免看门狗把长写误判为卡死（CRITICAL）。线程安全（_stuck_lock 保护）。"""
+        self._touch_activity()
 
     def _is_stuck(self) -> bool:
         """诊断：线程死亡，或有在途任务但心跳超时（慢写/挂起）。

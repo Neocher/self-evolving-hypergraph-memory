@@ -282,6 +282,107 @@ class TestWriteQueueThroughput:
             q.shutdown()
 
 
+class TestWriteQueueHeartbeat:
+    """长任务心跳：task.heartbeat_fn 在任务执行期间被周期调用，保持
+    _last_activity 新鲜，避免看门狗把长写（如梦境 PERSIST 10-17 分钟）
+    误判为卡死（CRITICAL）。心跳线程不访问存储、不写库——单写线程不变。"""
+
+    def test_long_task_with_heartbeat_stays_alive(self):
+        """带 heartbeat_fn 的长任务：执行期间 _last_activity 持续新鲜，
+        看门狗不误报（_is_stuck / _is_stuck_sustained 恒 False）。"""
+        q = WriteQueue(wait_timeout=10.0)
+        # 缩小看门狗阈值（__init__ 下限 60s，测试直改小值）与心跳周期
+        q._stuck_timeout = 0.5
+        q._stuck_observe_window = 1.0
+        q._heartbeat_interval = 0.1
+        try:
+            hb_calls = []
+            stuck_samples = []
+
+            def long_task():
+                # 模拟 10-17 分钟长写（压缩为 1.2s）；每步采样看门狗判定
+                for _ in range(12):
+                    time.sleep(0.1)
+                    stuck_samples.append(q._is_stuck())
+                return "done"
+
+            def hb():
+                hb_calls.append(time.monotonic())
+                q.touch_activity()  # 心跳回调内部 touch _last_activity
+
+            assert asyncio.run(q.submit(long_task, heartbeat_fn=hb)) == "done"
+            assert len(hb_calls) >= 3, f"heartbeat_fn called only {len(hb_calls)}x"
+            assert not any(stuck_samples), (
+                "watchdog falsely flagged heartbeated long task as stuck"
+            )
+            assert not q._is_stuck_sustained()
+        finally:
+            q.shutdown()
+
+    def test_long_task_without_heartbeat_shows_stuck_but_recovers(self):
+        """对照组：无 heartbeat_fn 的同类长任务执行中 _is_stuck() 短暂为 True
+        （心跳过期），但任务完成即恢复 → 不构成 sustained（不误报 CRITICAL）。"""
+        q = WriteQueue(wait_timeout=10.0)
+        q._stuck_timeout = 0.5
+        q._stuck_observe_window = 1.0
+        try:
+            stuck_samples = []
+
+            def long_task():
+                for _ in range(6):
+                    time.sleep(0.2)
+                    stuck_samples.append(q._is_stuck())
+                return "done"
+
+            assert asyncio.run(q.submit(long_task)) == "done"
+            assert any(stuck_samples), "long task without heartbeat should go stuck"
+            assert not q._is_stuck_sustained(), "stuck must not be sustained"
+        finally:
+            q.shutdown()
+
+    def test_heartbeat_thread_stops_after_task(self):
+        """任务完成后心跳线程被 stop + join，不残留（防线程泄漏）。"""
+        q = WriteQueue(wait_timeout=10.0)
+        q._heartbeat_interval = 0.05
+        try:
+            def hb():
+                q.touch_activity()
+
+            assert asyncio.run(q.submit(lambda: time.sleep(0.2), heartbeat_fn=hb)) is None
+            # set_result 先于写线程 finally 完成 join，短轮询等线程退出
+            deadline = time.monotonic() + 2.0
+            leftover = [
+                t for t in threading.enumerate() if t.name == "shm-writer-heartbeat"
+            ]
+            while leftover and time.monotonic() < deadline:
+                time.sleep(0.02)
+                leftover = [
+                    t for t in threading.enumerate() if t.name == "shm-writer-heartbeat"
+                ]
+            assert leftover == [], "heartbeat thread leaked after task"
+        finally:
+            q.shutdown()
+
+    def test_submit_heartbeat_fn_not_leaked_into_fn_kwargs(self):
+        """heartbeat_fn 只供写线程侧心跳线程使用，不注入 fn kwargs（fn 无需
+        接受该参数——裸 sleep 长任务也能配心跳）。"""
+        q = WriteQueue(wait_timeout=10.0)
+        try:
+            seen = []
+
+            def probe():
+                seen.append(1)
+                return "ok"
+
+            def hb():
+                q.touch_activity()
+
+            assert asyncio.run(q.submit(probe, heartbeat_fn=hb)) == "ok"
+            assert seen == [1], "heartbeat_fn leaked into fn kwargs"
+        finally:
+            q.shutdown()
+
+
 class TestQsubmit:
     """qsubmit 帮助函数：写队列集成点 + 降级/503 语义。"""
 

@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -302,16 +302,28 @@ class DreamCandidateStore:
 
     def _persist_community_nodes(
         self, candidate: DreamCandidate, graphlite_store,
+        heartbeat_fn: Optional[Callable[[], None]] = None,
     ) -> int:
         """从候选 data 创建 GraphLite CommunityNode + COMMUNITY_MEMBER 边。
 
         使用 MATCH 存在性判断 + INSERT/SET 的 upsert 模式（GraphLite 不支持 MERGE）。
         边操作分三阶段：按成员清旧边 → 建新边 → 清理跨社区成员旧边。
         按 member_count 倒序，只创建 top-50 最高质量社区。
+        heartbeat_fn: 可选心跳回调——每处理 ~10 个社区调用一次（长写期间保持
+            写队列心跳新鲜，避免看门狗误判；纯增量，不改变写入逻辑/返回语义）。
         Returns: 创建的社区数
         """
         created = 0
         new_member_sets: dict[str, set[str]] = {}
+
+        def _hb() -> None:
+            if heartbeat_fn is not None:
+                try:
+                    heartbeat_fn()
+                except Exception:
+                    logger.debug(
+                        "persist heartbeat_fn failed (non-fatal)", exc_info=True,
+                    )
 
         # 按 member_count 倒序，只创建 top-50
         sorted_comms = sorted(
@@ -319,7 +331,7 @@ class DreamCandidateStore:
             key=lambda c: c.get("member_count", 0),
             reverse=True,
         )
-        for comm in sorted_comms[:50]:
+        for idx, comm in enumerate(sorted_comms[:50]):
             comm_id = comm.get("id", "")
             if not comm_id:
                 continue
@@ -390,6 +402,9 @@ class DreamCandidateStore:
                 created += 1
             except Exception as e:
                 logger.warning("Community persist failed for %s: %s", comm_id, e)
+            # 【心跳】每处理 ~10 个社区 touch 一次（长写防看门狗误判 CRITICAL）
+            if (idx + 1) % 10 == 0:
+                _hb()
 
         # 最终清理：防同一 EpisodeNode 属两个社区
         # 【FIX 2026-08-09】原实现用 WHERE c.id <> $cid DELETE r 对每个 (cid, member)
@@ -431,7 +446,10 @@ class DreamCandidateStore:
         )
         return created
 
-    def auto_apply_candidates(self, graphlite_store) -> tuple[int, int, int, list]:
+    def auto_apply_candidates(
+        self, graphlite_store,
+        heartbeat_fn: Optional[Callable[[], None]] = None,
+    ) -> tuple[int, int, int, list]:
         """自动审查并应用高质量的梦境候选。
 
         触发条件：
@@ -447,6 +465,10 @@ class DreamCandidateStore:
         - community_count > 0 且至少一个社区有成员
         - conflict_count == 0
         - 社区摘要长度 > 30 字符
+
+        heartbeat_fn: 可选心跳回调——PRUNE 循环每 ~10 个操作、_persist_community_nodes
+            每 ~10 个社区调用一次（长写期间保持写队列心跳新鲜，避免看门狗 CRITICAL
+            误报；纯增量，不改变写入逻辑/返回语义/调用方契约）。
 
         Returns:
             (applied_count, community_created_count, file_deleted_count,
@@ -500,10 +522,23 @@ class DreamCandidateStore:
         # 【v5.37】apply 前从内存收集社区摘要（文件随后删除，不能依赖删后读取）
         community_summaries = list(candidate.community_summaries)
 
+        # 【心跳】分批 touch 回调（如写队列 touch_activity）：长写（PRUNE +
+        # _persist_community_nodes 可达 10-17 分钟）期间保持写队列心跳新鲜，
+        # 避免看门狗 CRITICAL 误报。纯增量，不改写入逻辑/返回语义。回调异常
+        # 不致命（心跳尽力而为）：吞掉并记 debug，不打断应用流程。
+        def _hb() -> None:
+            if heartbeat_fn is not None:
+                try:
+                    heartbeat_fn()
+                except Exception:
+                    logger.debug(
+                        "auto-apply heartbeat_fn failed (non-fatal)", exc_info=True,
+                    )
+
         try:
             # 1. 执行 PRUNE（删除已废弃节点）
             deleted_count = 0
-            for op in candidate.prune_ops:
+            for idx, op in enumerate(candidate.prune_ops):
                 try:
                     graphlite_store.query_cypher(
                         "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
@@ -512,9 +547,14 @@ class DreamCandidateStore:
                     deleted_count += 1
                 except Exception:
                     pass
+                # 【心跳】每 ~10 个 PRUNE 操作 touch 一次
+                if (idx + 1) % 10 == 0:
+                    _hb()
 
             # 2. 创建 CommunityNode
-            comm_created = self._persist_community_nodes(candidate, graphlite_store)
+            comm_created = self._persist_community_nodes(
+                candidate, graphlite_store, heartbeat_fn=heartbeat_fn,
+            )
 
             # 3. 删除候选 JSON 文件（而不是标记 applied）
             filepath = self._candidate_path(candidate.dream_id)

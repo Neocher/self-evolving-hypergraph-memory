@@ -773,9 +773,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                                     q.pending_count(),
                                 )
                             else:
+                                # 【心跳】长写（PRUNE + _persist_community_nodes 可达
+                                # 10-17 分钟）期间周期 touch 写队列心跳，避免看门狗
+                                # CRITICAL 误报。qsubmit 原样转发 heartbeat_fn →
+                                # submit 透传 _WriteTask，写线程侧心跳线程每
+                                # _heartbeat_interval（默认 30s）调用一次。
+                                hb = q.touch_activity if q is not None else None
                                 applied, communities, deleted, summaries = await qsubmit(
                                     svc, svc.dream_candidate_store.auto_apply_candidates,
                                     svc.graph_store, priority="normal",
+                                    heartbeat_fn=hb,
                                 )
                                 if applied > 0:
                                     logger.info("Auto-applied %d dreams: %d communities, %d files cleaned", applied, communities, deleted)

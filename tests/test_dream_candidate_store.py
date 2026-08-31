@@ -305,3 +305,98 @@ class TestPersistCommunityNodes:
                 f"Expected exactly 1 edge for {comm_id}->{ep_id}, "
                 f"got {len(edge_rows)}: {edge_rows}"
             )
+
+
+class TestAutoApplyHeartbeat:
+    """auto_apply_candidates 分块心跳：长写（PRUNE + _persist_community_nodes）
+    期间按批调用 heartbeat_fn，不改变写入逻辑/返回语义。"""
+
+    @staticmethod
+    def _store_with_candidates(tmp_path, monkeypatch, candidate) -> DreamCandidateStore:
+        """构造 storage_dir 含 20 个占位候选文件的 store，并注入唯一候选。"""
+        store = DreamCandidateStore(storage_dir=str(tmp_path))
+        # 候选文件数阈值 >= 20（内容无关：_load_all_candidates 被替换）
+        for i in range(20):
+            (tmp_path / f"cand-{i:02d}.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(store, "_load_all_candidates", lambda: [candidate])
+        return store
+
+    @staticmethod
+    def _comm(i: int) -> dict:
+        return {
+            "id": f"comm-{i:02d}",
+            "member_count": 5,
+            "member_ids": [f"ep-{i:02d}-{j}" for j in range(3)],
+            "report": "x" * 50,
+            "keywords": [],
+            "topics": [],
+            "patterns": [],
+            "contradictions": [],
+        }
+
+    def test_auto_apply_calls_heartbeat_per_batch(self, tmp_path, monkeypatch):
+        """PRUNE 每 ~10 个操作、persist 每 ~10 个社区 touch 一次心跳。"""
+        comms = [self._comm(i) for i in range(25)]
+        candidate = DreamCandidate(
+            dream_id="hb-test-001",
+            created_at=time.time(),
+            trigger_mode="test",
+            stats={"created": 0, "updated": 0, "deleted": 0},
+            community_count=len(comms),
+            prune_count=25,
+            conflict_count=0,
+            community_summaries=comms,
+            prune_ops=[{"node_id": f"node-{i}"} for i in range(25)],
+            merge_ops=[],
+        )
+        store = self._store_with_candidates(tmp_path, monkeypatch, candidate)
+
+        class FakeStore:
+            def __init__(self):
+                self.cypher_calls = []
+
+            def query_cypher(self, statement, params=None):
+                self.cypher_calls.append(("query", statement, params))
+                return []
+
+            def execute_cypher(self, statement, params=None):
+                self.cypher_calls.append(("execute", statement, params))
+                return []
+
+        fake = FakeStore()
+        hb_calls = []
+        applied, created, deleted, summaries = store.auto_apply_candidates(
+            fake, heartbeat_fn=lambda: hb_calls.append(1),
+        )
+        # 返回语义不变：1 个候选应用、25 个社区、文件删除标记 1、25 条摘要
+        assert (applied, created, deleted) == (1, 25, 1)
+        assert len(summaries) == 25
+        # PRUNE 25 ops → 2 批；persist 25 comms → 2 批；合计 >= 4 次心跳
+        assert len(hb_calls) >= 4, f"heartbeat called only {len(hb_calls)}x"
+
+    def test_auto_apply_heartbeat_none_unchanged(self, tmp_path, monkeypatch):
+        """heartbeat_fn=None（默认）→ 行为与旧版一致，返回语义不变。"""
+        comms = [self._comm(0)]
+        candidate = DreamCandidate(
+            dream_id="hb-test-002",
+            created_at=time.time(),
+            trigger_mode="test",
+            stats={"created": 0, "updated": 0, "deleted": 0},
+            community_count=1,
+            prune_count=0,
+            conflict_count=0,
+            community_summaries=comms,
+            prune_ops=[],
+            merge_ops=[],
+        )
+        store = self._store_with_candidates(tmp_path, monkeypatch, candidate)
+
+        class FakeStore:
+            def query_cypher(self, statement, params=None):
+                return []
+
+            def execute_cypher(self, statement, params=None):
+                return []
+
+        result = store.auto_apply_candidates(FakeStore())
+        assert result == (1, 1, 1, comms)
