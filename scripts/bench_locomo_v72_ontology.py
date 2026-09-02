@@ -155,23 +155,58 @@ faiss_index = None  # 各分支构造 (SKIP load / 灌库)
 
 if INGEST_SKIP:
     import pickle as _pkl
-    with open(INGEST_PKL, "rb") as _f:
-        _st = _pkl.load(_f)
-    faiss_id_map = _st["faiss_id_map"]
-    msg_by_id = _st["msg_by_id"]; episode_cache = _st["episode_cache"]
-    blocks = _st["blocks"]; block_vecs = _st["block_vecs"]
-    entity_eps = _st["entity_eps"]; entity_co = _st["entity_co"]
-    _triples_all = _st["triples"]; _dia_to_ep = _st["dia_to_ep"]
-    _ontology_facts = _st["ontology_facts"]
-    _schema_classes = _st["schema_classes"]; _top_classes = _st["top_classes"]
-    tfidf_index = _st["tfidf_index"]
-    faiss_index = VectorIndexAdapter(store=gstore, dimension=512,
-                                     faiss_id_map=faiss_id_map)
-    faiss_index.add_with_ids(_st["faiss_vecs"], _st["faiss_ids"])
-    import faiss
-    idx_blk = faiss.IndexFlatIP(512)
-    idx_blk.add(block_vecs)
-    print(f"[INGEST_LOADED] 索引恢复: {len(msg_by_id)} 条, blocks={len(blocks)}", flush=True)
+    _restored = False
+    if os.path.exists(INGEST_PKL) and os.path.getsize(INGEST_PKL) > 0:
+        try:
+            with open(INGEST_PKL, "rb") as _f:
+                _st = _pkl.load(_f)
+            faiss_id_map = _st["faiss_id_map"]
+            msg_by_id = _st["msg_by_id"]; episode_cache = _st["episode_cache"]
+            blocks = _st["blocks"]; block_vecs = _st["block_vecs"]
+            entity_eps = _st["entity_eps"]; entity_co = _st["entity_co"]
+            _triples_all = _st["triples"]; _dia_to_ep = _st["dia_to_ep"]
+            _ontology_facts = _st["ontology_facts"]
+            _schema_classes = _st["schema_classes"]; _top_classes = _st["top_classes"]
+            tfidf_index = _st["tfidf_index"]
+            faiss_index = VectorIndexAdapter(store=gstore, dimension=512,
+                                             faiss_id_map=faiss_id_map)
+            faiss_index.add_with_ids(_st["faiss_vecs"], _st["faiss_ids"])
+            import faiss
+            idx_blk = faiss.IndexFlatIP(512)
+            idx_blk.add(block_vecs)
+            print(f"[INGEST_LOADED] pkl 索引恢复: {len(msg_by_id)} 条, blocks={len(blocks)}", flush=True)
+            _restored = True
+        except Exception as _e:
+            print(f"[INGEST_LOADED] pkl 损坏 ({_e}), 走 OverGraph 直连恢复", flush=True)
+    if not _restored:
+        # OverGraph 直连恢复 (2026-09-02): 本地 pkl 快照不可依赖 (被误覆盖/丢失),
+        # 数据本体在 OverGraph DB — EpisodeNode 全量 + 引擎 dense HNSW 即生产检索链路。
+        _rows = gstore._locked_execute_gql(
+            "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content, e.created_at AS ts", {})["rows"]
+        msg_by_id = {r["id"]: r.get("content", "") for r in _rows}
+        faiss_id_map = {}
+        episode_cache = {}
+        for _r in _rows:
+            _n = int(_r["id"].split("_")[1])
+            faiss_id_map[_n] = _r["id"]
+            episode_cache[_r["id"]] = {"id": _r["id"], "content": _r.get("content", ""),
+                                       "created_at": _r.get("ts") or time.time(),
+                                       "source_type": "sensory", "layer": 1}
+        blocks = []
+        block_vecs = np.zeros((0, 512), dtype=np.float32)
+        entity_eps = {}
+        entity_co = {}
+        _triples_all = []
+        _dia_to_ep = {}
+        _ontology_facts = {}
+        _schema_classes = {}
+        _top_classes = []  # [(cls, vals), ...] 列表 (灌库路径 sorted items 产物)
+        tfidf_index.fit(list(msg_by_id.values()))
+        faiss_index = VectorIndexAdapter(store=gstore, dimension=512, faiss_id_map=faiss_id_map)
+        import faiss
+        idx_blk = faiss.IndexFlatIP(512)  # 块级向量缺失 → 空索引, B 通道检索自然为空
+        print(f"[INGEST_LOADED] OverGraph 直连恢复: {len(msg_by_id)} 条 EpisodeNode "
+              f"(pkl 不可用, blocks/entity 空 — 评测口径同 hitk OverGraph 版)", flush=True)
 else:
     faiss_id_map = {}
     faiss_index = VectorIndexAdapter(store=gstore, dimension=512, faiss_id_map=faiss_id_map)
@@ -821,8 +856,30 @@ print(f"评测规模: {len(qa_all)} 问", flush=True)
 results = {"total": 0, "correct": 0, "errors": 0, "by_cat": {}, "round2_used": 0}
 hitk_stats = {"total": 0, "by_cat": {}}  # P2 hit@k 基线
 t0 = time.time()
+
+# ── 断点续跑 (RESUME=1): 跳过 PREDICT_OUT 已存在的 qa_id，不重复调 LLM ──
+_done_qids = set()
+if PREDICT_MODE and os.environ.get("RESUME") == "1" and os.path.exists(PREDICT_OUT):
+    try:
+        with open(PREDICT_OUT, encoding="utf-8", errors="ignore") as _f:
+            for _l in _f:
+                _l = _l.strip().strip("\x00")
+                if not _l:
+                    continue
+                try:
+                    _d = json.loads(_l)
+                except Exception:
+                    continue  # 跳过被中断的坏行/NUL 残留, 不中断续跑
+                if _d.get("qa_id"):
+                    _done_qids.add(_d["qa_id"])
+        print(f"[RESUME] 已有 {len(_done_qids)} 条预测, 跳过继续", flush=True)
+    except Exception as _e:
+        print(f"[RESUME] 读取已有预测失败, 从头跑: {_e}", flush=True)
+
 for i, q in enumerate(qa_all):
     qid = id(q)
+    if PREDICT_MODE and q.get("qa_id") in _done_qids:
+        continue
     ci = qa_conv.get(qid, 0)
     question, gold, cat = q["question"], q["answer"], q.get("category", 0)
     session_ts = parse_session_ts(conv_ts.get(ci))
@@ -830,6 +887,11 @@ for i, q in enumerate(qa_all):
     # 三通道检索（有机融合）+ 证据分区
     _cur_cat = str(cat)
     channels = retrieve_channels(question, hitk=HITK_MODE)
+    # falsification 实验 (2026-09-02): oracle 注入 = 金标证据人工置顶 (人工正确排序)
+    if os.environ.get("ORACLE_INJECT") == "1":
+        _ev = [e.get("text", "").strip() for e in (q.get("evidence_messages") or []) if e.get("text")]
+        _seen = {c[:200] for c in channels["A"]}
+        channels["A"] = [e for e in _ev if e[:200] not in _seen] + channels["A"]
     ctx, docs = build_ctx(question, channels, rerank_top=40)
 
     # P2 hit@k 基线: evidence 消息文本是否进入 top-k docs (纯检索, 不调 LLM)

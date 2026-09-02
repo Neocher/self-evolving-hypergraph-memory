@@ -107,6 +107,18 @@ retrieval:
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
+  # 【P0 达摩院收敛】FUSION 融合路径每通道候选深度独立参数化（默认扩池，防
+  # top_k_vector=20 截断导致证据 rank 21+ 在候选生成阶段流失；仅 FUSION 生效，
+  # 级联 L1/L2/L3 仍走 top_k_* 原值零回归）
+  fusion_vector_topk: 100        # FUSION 向量通道 FAISS 检索深度
+  fusion_bm25_topk: 100          # FUSION BM25 通道候选深度
+  fusion_entity_topk: 100        # FUSION 实体通道候选深度（GQL LIMIT 走 k*2）
+  # 【P0 达摩院收敛】扩池后跨通道近重复去重（仅 FUSION 生效）：归一化文本字符
+  # bigram Jaccard ≥ fusion_dedup_threshold 判近重复，贪心保留融合分最高代表项，
+  # 防近重复项把有效证据挤出 top-40；短文本跳过防误杀；异常静默降级原列表
+  fusion_dedup_enabled: true     # 近重复去重开关
+  fusion_dedup_threshold: 0.9    # 相似度 ≥ 此值判近重复（∈ (0,1)）
+  fusion_dedup_min_len: 40       # 短文本跳过（字符数 < 此值不参与去重）
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

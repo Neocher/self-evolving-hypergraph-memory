@@ -281,6 +281,16 @@ class RetrievalConfig:
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
+    # 【P0 达摩院收敛】FUSION 融合路径每通道候选深度独立参数化（默认扩池防
+    # top_k_vector=20 截断；仅 FUSION 生效，级联 L1/L2/L3 仍走 top_k_* 零回归）
+    fusion_vector_topk: int = 100   # FUSION 向量通道 FAISS 检索深度
+    fusion_bm25_topk: int = 100     # FUSION BM25 通道候选深度
+    fusion_entity_topk: int = 100   # FUSION 实体通道候选深度（GQL LIMIT 走 k*2）
+    # 【P0 达摩院收敛】扩池后跨通道近重复去重（仅 FUSION 生效）：归一化文本字符
+    # bigram Jaccard ≥ 阈值判近重复，贪心保留融合分最高代表项；短文本跳过防误杀
+    fusion_dedup_enabled: bool = True    # 近重复去重开关
+    fusion_dedup_threshold: float = 0.9  # 相似度 ≥ 此值判近重复（∈ (0,1)）
+    fusion_dedup_min_len: int = 40       # 短文本跳过（字符数 < 此值不参与去重）
     # RPE 惊奇度信号检索重排（P3-C，默认关零回归；仅 FUSION 生效）
     rpe_rerank_enabled: bool = False  # 开关：write 侧 rpe_surprise → 检索轻 boost/dampen
     rpe_rerank_high: float = 0.7      # 惊奇度 > 此值 → ×1.05 boost（钳制不超种子最高分）
@@ -295,6 +305,21 @@ class RetrievalConfig:
         # 静默落回单路与操作者意图不符（配置期 fail-fast 拒绝非法值）。
         if self.hyde_mode not in ("dual", "replace"):
             raise ValueError(f"RetrievalConfig.hyde_mode={self.hyde_mode} 必须 ∈ {{dual, replace}}")
+        # 【P0 达摩院收敛】FUSION 通道深度/去重配置校验：0/负数会让通道静默空返回、
+        # 阈值越界会让去重静默失效或误杀——配置期 fail-fast 拒绝非法值。
+        for name in ("fusion_vector_topk", "fusion_bm25_topk", "fusion_entity_topk"):
+            value = getattr(self, name)
+            if value < 1:
+                raise ValueError(f"RetrievalConfig.{name}={value} 必须 >= 1")
+        if not 0.0 < self.fusion_dedup_threshold < 1.0:
+            raise ValueError(
+                f"RetrievalConfig.fusion_dedup_threshold={self.fusion_dedup_threshold} "
+                f"必须 ∈ (0, 1)"
+            )
+        if self.fusion_dedup_min_len < 1:
+            raise ValueError(
+                f"RetrievalConfig.fusion_dedup_min_len={self.fusion_dedup_min_len} 必须 >= 1"
+            )
         # 【P3-C】rpe_rerank 阈值一致性：low > high 会让同节点同时满足两个分支
         # （逻辑矛盾），配置期 fail-fast 拒绝非法值。
         if self.rpe_rerank_low > self.rpe_rerank_high:

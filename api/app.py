@@ -174,6 +174,13 @@ def _build_router_config(rcfg):
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
+        # 【P0 达摩院收敛】FUSION 通道深度/去重透传（getattr 缺省，旧配置对象零回归）
+        fusion_vector_topk=getattr(rcfg, "fusion_vector_topk", 100),
+        fusion_bm25_topk=getattr(rcfg, "fusion_bm25_topk", 100),
+        fusion_entity_topk=getattr(rcfg, "fusion_entity_topk", 100),
+        fusion_dedup_enabled=getattr(rcfg, "fusion_dedup_enabled", True),
+        fusion_dedup_threshold=getattr(rcfg, "fusion_dedup_threshold", 0.9),
+        fusion_dedup_min_len=getattr(rcfg, "fusion_dedup_min_len", 40),
     )
     # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）

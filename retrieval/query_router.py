@@ -222,6 +222,18 @@ class QueryRouterConfig:
     bm25_k1: float = 1.5  # BM25 k1 参数
     bm25_b: float = 0.75  # BM25 b 参数
     top_k_fusion: int = 30  # 融合检索总 top-K
+    # 【P0 达摩院收敛】FUSION 融合路径每通道候选深度独立参数化（默认扩池，防
+    # top_k_vector=20 截断导致证据 rank 21+ 在候选生成阶段流失；仅 FUSION 路径
+    # 生效——级联 L1/L2/L3 仍走 top_k_* 原值，逐字节零回归）
+    fusion_vector_topk: int = 100  # FUSION 向量通道 FAISS 检索深度
+    fusion_bm25_topk: int = 100  # FUSION BM25 通道候选深度
+    fusion_entity_topk: int = 100  # FUSION 实体通道候选深度（LIMIT 走 k*2）
+    # 【P0 达摩院收敛】扩池后跨通道近重复去重：文本归一化后字符 bigram Jaccard
+    # ≥ fusion_dedup_threshold 判近重复，贪心保留融合分最高代表项——防近重复项
+    # 把有效证据挤出 top-40（仅 FUSION 生效；任何异常静默降级原列表）
+    fusion_dedup_enabled: bool = True  # 近重复去重开关
+    fusion_dedup_threshold: float = 0.9  # 相似度 ≥ 此值判近重复
+    fusion_dedup_min_len: int = 40  # 短文本跳过（字符数 < 此值不参与去重，防误杀）
     max_bm25_corpus: int = 50000  # BM25 索引最大语料数
     bm25_build_timeout: float = 30.0  # BM25 索引构建超时（秒），超时静默降级
     bm25_retry_cooldown: float = 30.0  # BM25 构建失败后重试冷却窗口（秒），避免失败后每次检索都全量重建
@@ -265,6 +277,21 @@ class QueryRouterConfig:
         if self.hyde_mode not in ("dual", "replace"):
             raise ValueError(
                 f"QueryRouterConfig.hyde_mode={self.hyde_mode} 必须 ∈ {{dual, replace}}"
+            )
+        # 【P0 达摩院收敛】FUSION 通道深度/去重配置校验：0/负数会让通道静默空返回、
+        # 阈值越界会让去重静默不触发或误杀全量——配置期 fail-fast 拒绝非法值。
+        for name in ("fusion_vector_topk", "fusion_bm25_topk", "fusion_entity_topk"):
+            value = getattr(self, name)
+            if value < 1:
+                raise ValueError(f"QueryRouterConfig.{name}={value} 必须 >= 1")
+        if not 0.0 < self.fusion_dedup_threshold < 1.0:
+            raise ValueError(
+                f"QueryRouterConfig.fusion_dedup_threshold={self.fusion_dedup_threshold} "
+                f"必须 ∈ (0, 1)"
+            )
+        if self.fusion_dedup_min_len < 1:
+            raise ValueError(
+                f"QueryRouterConfig.fusion_dedup_min_len={self.fusion_dedup_min_len} 必须 >= 1"
             )
 
 
@@ -1455,6 +1482,11 @@ class QueryRouter:
             if not include_archived:
                 results = self._filter_archived(results)
             sorted_results = self._deduplicate_and_sort(results)
+            # 【P0 达摩院收敛】扩池后跨通道近重复去重：仅 FUSION 且 fusion_dedup_enabled。
+            # 在 rerank 头部切分（head=results[:rerank_input_k]）之前收缩近重复簇，
+            # 防扩池引入的同义改写/跨通道重复项把有效证据挤出 top-40。
+            if level == RetrievalLevel.FUSION and self.config.fusion_dedup_enabled:
+                sorted_results = self._dedup_near_duplicates(sorted_results)
             # 【P3a】bge-reranker 重排：仅在 FUSION 且 rerank 开启时触发，在去重+boost+钳制
             # 之后重排头部覆盖 score，尾部原序保留。rerank=None → 读 config.rerank_enabled；
             # 异常/模型失败静默降级原列表（零回归）。
@@ -1576,8 +1608,6 @@ class QueryRouter:
         Returns:
             融合检索结果列表
         """
-        cfg = self.config
-
         # 【M4】CJK 查询跳过实体通道：GraphLite lexer 不支持 UTF-8，CONTAINS 对
         # 中文无子串保持性（b64 块编码），通道恒空——纯省一次全表扫描。
         # 在提交任务前判断：CJK 时根本不提交 entity 任务。
@@ -1591,15 +1621,17 @@ class QueryRouter:
         entity_results: list[dict] = []
 
         def _run_vector():
-            return self._vector_retrieve(query, query_embedding)
+            # 【P0 达摩院收敛】FUSION 路径向量通道用独立扩池深度（fusion_vector_topk），
+            # 与级联 L2 的 top_k_vector 解耦——rank 21+ 证据不再在候选阶段被截断。
+            return self._vector_retrieve(query, query_embedding, k=self.config.fusion_vector_topk)
 
         def _run_bm25():
             # BM25 通道用未归一化的原始查询：语料为原始中文，归一化后无交集
             bm25_query = raw_query if raw_query is not None else query
-            return self._bm25_search(bm25_query, cfg.top_k_vector)
+            return self._bm25_search(bm25_query, self.config.fusion_bm25_topk)
 
         def _run_entity():
-            return self._entity_match(query, cfg.top_k_keyword)
+            return self._entity_match(query, self.config.fusion_entity_topk)
 
         fusion_channel_skipped = False
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -3550,13 +3582,19 @@ class QueryRouter:
             return results
 
     def _vector_retrieve(
-        self, query: str, query_embedding: Optional[np.ndarray] = None
+        self, query: str, query_embedding: Optional[np.ndarray] = None, k: Optional[int] = None
     ) -> list[dict]:
         """
         L2 纯向量检索（FAISS + GraphLite 回查）。
 
         在节点向量空间中检索，通过 GraphLite 回查补充节点内容、tau 值等字段。
         参考 /search/vector 路由的实现方式。
+
+        Args:
+            query: 查询文本
+            query_embedding: 预计算查询向量（None 则通过 encoder 编码）
+            k: 检索深度覆盖（None → config.top_k_vector，级联 L2/L3 路径零回归；
+                FUSION 融合路径传 config.fusion_vector_topk 扩池）
 
         Raises:
             FAISSUnavailable: FAISS 索引不可用
@@ -3566,8 +3604,11 @@ class QueryRouter:
         if query_embedding is None:
             raise FAISSUnavailable("No encoder available for query embedding")
 
+        search_k = self.config.top_k_vector if k is None else int(k)
+        if search_k < 1:
+            raise FAISSUnavailable(f"Invalid search depth: {search_k}")
         try:
-            distances, indices = self.faiss_index.search(query_embedding, self.config.top_k_vector)
+            distances, indices = self.faiss_index.search(query_embedding, search_k)
             node_scores = list(zip(indices[0], distances[0]))
         except Exception as e:
             raise FAISSUnavailable(f"FAISS search failed: {e}") from e
@@ -3977,6 +4018,57 @@ class QueryRouter:
             results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             return results
         except Exception:
+            return results
+
+    def _dedup_near_duplicates(self, results: list[dict]) -> list[dict]:
+        """【P0 达摩院收敛】跨通道近重复去重（仅 FUSION 扩池后调用）。
+
+        输入已按 score 降序（_deduplicate_and_sort 输出）。贪心保序：遍历每个结果，
+        若其文本与任一已保留代表项构成近重复（归一化字符 bigram Jaccard ≥
+        fusion_dedup_threshold）则丢弃（保留更高分的代表项），否则保留成为新代表。
+        长度 < fusion_dedup_min_len 的短文本不参与比较（防误杀短句）。
+        任何异常 → 原列表返回（主检索零回归，不静默丢结果）。
+        """
+        try:
+            threshold = float(self.config.fusion_dedup_threshold)
+            min_len = int(self.config.fusion_dedup_min_len)
+            if not (0.0 < threshold < 1.0):
+                return results
+            kept: list[dict] = []
+            kept_grams: list[frozenset] = []
+            for r in results:
+                text = str(r.get("content", "") or "").strip()
+                if len(text) < min_len:
+                    kept.append(r)
+                    kept_grams.append(frozenset())
+                    continue
+                norm = re.sub(r"\s+", " ", text).lower()
+                grams = frozenset(norm[i:i + 2] for i in range(len(norm) - 1))
+                if not grams:
+                    kept.append(r)
+                    kept_grams.append(frozenset())
+                    continue
+                is_near_dup = False
+                for kept_gram in kept_grams:
+                    if not kept_gram:
+                        continue
+                    union = len(grams | kept_gram)
+                    if union and len(grams & kept_gram) / union >= threshold:
+                        is_near_dup = True
+                        break
+                if not is_near_dup:
+                    kept.append(r)
+                    kept_grams.append(grams)
+            if len(kept) != len(results):
+                logger.info(
+                    "Fusion near-dup dedup",
+                    before=len(results), after=len(kept),
+                )
+            return kept
+        except Exception:
+            logger.debug(
+                "near-dup dedup degraded, returning original results", exc_info=True
+            )
             return results
 
     @staticmethod
