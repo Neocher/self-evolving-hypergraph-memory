@@ -1,12 +1,21 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.11.0"
-__version_info__ = (6, 11, 0)
-__version_name__ = "CudaAccel"
-__release_date__ = "2026-08-31"
+__version__ = "6.13.0"
+__version_info__ = (6, 13, 0)
+__version_name__ = "DataPlaneRestore"
+__release_date__ = "2026-09-03"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.13.0 (2026-09-03) DataPlaneRestore:
+  • 达摩院 R1A 评测数据面重建 — REBUILD_SHADOW_ONLY=1 在已灌 episode 层
+    的评测库 (eval_db_p1) 补跑 LLM 影子段 (压缩记忆块/实体抽取/ontology/
+    schema) 落 eval_db*_index.pkl，恢复 0901 口径 blocks=393/entity/
+    ontology 组织段（episode 层零写入，修复第0轮 65.05% 的 pkl 缺失消融）
+  • bge-reranker CUDA OOM 静默降级显式化 — [RERANK] 标记 + torch.cuda.
+    empty_cache（排序语义零改动）
+  • CTX_DUMP=1 评测检索 ctx 落盘（每题 jsonl，事后归因用，默认关）
+
 v6.11.0 (2026-09-02) FusionChannelPool:
   • 本机 embedding 强制 CUDA（config device: cuda）— ST bge-m3 ~2.2G 显存
   • device=cuda 时跳过 ONNX（ONNX 为 CPU 版）；auto 解析回 cpu 仍走 ONNX

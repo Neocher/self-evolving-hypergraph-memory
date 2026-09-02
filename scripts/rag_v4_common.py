@@ -96,6 +96,22 @@ def llm_judge(question: str, ground_truth: str, prediction: str) -> dict:
 _reranker_model = None
 
 
+def _cuda_oom(exc: Exception) -> bool:
+    """CUDA OOM 判定 (bge-reranker 显存不足): PyTorch 'out of memory' 特征。"""
+    msg = str(exc).lower()
+    return "out of memory" in msg or ("cuda" in msg and "memory" in msg)
+
+
+def _empty_cuda_cache() -> None:
+    """OOM 降级后释放 reranker 占用显存 (无 CUDA/清理失败均静默)。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def get_reranker():
     """bge-reranker cross-encoder（懒加载；失败返回 None 走降级）"""
     global _reranker_model
@@ -106,7 +122,12 @@ def get_reranker():
             _reranker_model = CrossEncoder(name, max_length=512)
             print(f"[reranker] 已加载 {name}", flush=True)
         except Exception as e:
-            print(f"[reranker] 加载失败, 走原序降级: {e}", flush=True)
+            if _cuda_oom(e):
+                # 2026-09-03 达摩院 R1: OOM 静默降级 → 显式标记 + 清理显存 (不动排序语义)
+                print("[RERANK] CUDA OOM → 原序降级 (bge-reranker 加载)", flush=True)
+                _empty_cuda_cache()
+            else:
+                print(f"[reranker] 加载失败, 走原序降级: {e}", flush=True)
             _reranker_model = False
     return _reranker_model or None
 
@@ -123,5 +144,10 @@ def rerank(query: str, docs: list, top_k: int = 10, top_n: int = None):
         ranked = sorted(zip(docs, scores), key=lambda x: -float(x[1]))
         return [d for d, s in ranked][:k]
     except Exception as e:
-        print(f"[reranker] 推理失败, 原序降级: {e}", flush=True)
+        if _cuda_oom(e):
+            # 2026-09-03 达摩院 R1: CUDA OOM 显式降级 (原静默走原序) + empty_cache; 排序不变
+            print("[RERANK] CUDA OOM → 原序降级", flush=True)
+            _empty_cuda_cache()
+        else:
+            print(f"[reranker] 推理失败, 原序降级: {e}", flush=True)
         return docs[:k]
