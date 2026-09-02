@@ -6,7 +6,7 @@
      → query: 消息级 FUSION ⊕ 块级检索 ⊕ 图遍历（实体→属性关系/共现 episode）
      → rerank top-50 → sufficiency → round2 追加 → LLM
 """
-import json, os, re, sys, time
+import datetime, json, os, re, sys, time
 sys.path.insert(0, os.environ.get("SHM_ROOT", "/home/admin/shm"))
 
 import numpy as np
@@ -39,6 +39,75 @@ HITK_MODE = os.environ.get("HITK_MODE") == "1"  # 纯检索 hit@k 基线 (P2: �
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
 print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'}", flush=True)
 
+# ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
+# 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
+#   会话日期无关), 检索器时间感知路径已接线但无机器可读时间可消费 → 时间题
+#   hit@40 全类别最低。P1 = 零 LLM 脚本化回填: 灌库解析会话 date_time
+#   ('1:56 pm on 8 May, 2023') 写真实 epoch 到 created_at + conversation_idx 存
+#   episode.session_id; 评测 _fuse 不再硬编码 session_ts=None, 传 conv 级时间锚。
+P1_ANCHOR = os.environ.get("P1_ANCHOR", "last")   # conv 时间锚取会话窗口 first|last
+                                                  # (默认 last=会话结束=回顾性问询时刻)
+P1_WINDOW_FILTER = os.environ.get("P1_WINDOW_FILTER") == "1"  # 题面含绝对时间窗时轻量重排(零引擎改动, 默认关)
+_INGEST_DT_WARN = 0   # created_at 日期解析失败回落合成值的条数 (灌库结束汇总打印)
+_P1_MONTHS = {m.lower(): i for i, m in enumerate([
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december"], start=1)}
+_P1_MONTHS.update({m[:3]: i for m, i in list(_P1_MONTHS.items())})
+
+
+def _p1_dt_to_epoch(raw):
+    """会话日期字符串 → 本地 epoch float; 无法解析返回 None (调用方计数回落, 不抛异常)。
+
+    支持: '1:56 pm on 8 May, 2023' (官方 LoCoMo-Refined 会话格式) /
+          '8 May, 2023' / '8th May, 2023' / 'May 8, 2023' /
+          ISO '2023-05-08[ T13:56[:ss]]'。年份缺失/非法日期 → None。
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        dt = None
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?", s)
+        if m:
+            dt = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                   int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0))
+        else:
+            # 'H:MM am/pm on D Month, YYYY'
+            m = re.fullmatch(
+                r"(\d{1,2}):(\d{2})\s*(am|pm)\s+on\s+(\d{1,2})\s+([A-Za-z]+),?\s+(\d{4})",
+                s, re.IGNORECASE)
+            if m:
+                hh = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+                _mon = _P1_MONTHS.get(m.group(5).lower()) or _P1_MONTHS.get(m.group(5).lower()[:3])
+                if _mon:
+                    dt = datetime.datetime(int(m.group(6)), _mon, int(m.group(4)), hh, int(m.group(2)))
+            else:
+                # 'D[th] Month, YYYY' / 'Month D[th], YYYY' (日期级粒度)
+                m = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(\d{4})", s, re.IGNORECASE)
+                if m:
+                    _mon = _P1_MONTHS.get(m.group(2).lower()) or _P1_MONTHS.get(m.group(2).lower()[:3])
+                    if _mon:
+                        dt = datetime.datetime(int(m.group(3)), _mon, int(m.group(1)))
+                else:
+                    m = re.fullmatch(r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", s, re.IGNORECASE)
+                    if m:
+                        _mon = _P1_MONTHS.get(m.group(1).lower()) or _P1_MONTHS.get(m.group(1).lower()[:3])
+                        if _mon:
+                            dt = datetime.datetime(int(m.group(3)), _mon, int(m.group(2)))
+        if dt is None:
+            return None
+        return time.mktime(dt.timetuple())  # naive 本地时间 → epoch (夏令时经 mktime 处理)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _p1_content_date_ts(text):
+    """消息 content 前缀 '[date: <date_time>]' → epoch (P1 时间窗过滤/自检用); 无前缀 → None。"""
+    m = re.search(r"\[date:\s*([^\]]+)\]", (text or "")[:300])
+    return _p1_dt_to_epoch(m.group(1)) if m else None
+
 from graph.overgraph_store import OverGraphStore
 from retrieval.vector_index import VectorIndexAdapter
 from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
@@ -56,16 +125,21 @@ def load_messages(path):
     Legacy format:  JSON list, each item has ``conversation.session_N`` dicts with ``session_N_date_time``.
     Official format: JSONL (one conversation per line), each line has ``sessions[].messages[]`` with dia_ids.
 
-    Returns: (conv_map: {conv_idx: [formatted_msg_str, ...]}, all_msgs: [str, ...], dia_ids: [str, ...])
+    Returns: (conv_map, all_msgs, dia_ids, raw, conv_first_dt, conv_last_dt, msg_conv, msg_dt)
         — ``dia_ids[i]`` is the official dia_id (e.g. 'D1:3') for ``all_msgs[i]``;
           None when the legacy format is used (caller falls back to synthesising D{ci+1}:{j+1}).
+          ``conv_first_dt/conv_last_dt``: conv_idx → 首/末会话 date_time 字符串;
+          ``msg_conv[i]/msg_dt[i]``: all_msgs[i] 所属 conv idx 与会话 date_time (P1 灌库用)。
     """
     # ── detect format ──
     is_jsonl = path.endswith(".jsonl")
-    conv_map, sess_date = {}, {}
+    conv_map = {}
     all_msgs = []
     dia_ids = []          # parallel to all_msgs; official dia_id or None (legacy)
     conv_first_dt = {}    # conv_idx → first session date_time string (for conv_ts)
+    conv_last_dt = {}     # conv_idx → last session date_time string (P1 conv 时间锚=会话结束时刻)
+    msg_conv = []         # parallel to all_msgs: 消息所属 conv idx (P1 灌库 session_id)
+    msg_dt = []           # parallel to all_msgs: 消息所属会话 date_time 字符串 (P1 created_at 真实回填)
 
     if is_jsonl:
         raw = []
@@ -80,8 +154,9 @@ def load_messages(path):
             for sess in sessions:
                 si = sess.get("session_index", 0)
                 dt = sess.get("date_time", "")
-                if ci not in conv_first_dt and dt:
-                    conv_first_dt[ci] = dt
+                if dt:
+                    conv_first_dt.setdefault(ci, dt)
+                    conv_last_dt[ci] = dt   # 文件序最后出现的非空会话日期 = 会话结束
                 date_prefix = f"[date: {dt}] " if dt else ""
                 for m in sess.get("messages", []):
                     speaker = m.get("speaker", "")
@@ -91,36 +166,49 @@ def load_messages(path):
                         fm = f"{date_prefix}[{speaker}] {text}"
                         msgs.append(fm)
                         dia_ids.append(did)
+                        msg_conv.append(ci)
+                        msg_dt.append(dt)
             conv_map[ci] = msgs
             all_msgs.extend(msgs)
-        # legacy callers expect 2-tuple; return 3-tuple with dia_ids
-        return conv_map, all_msgs, dia_ids, raw, conv_first_dt
+        return conv_map, all_msgs, dia_ids, raw, conv_first_dt, conv_last_dt, msg_conv, msg_dt
 
     # ── legacy locomo10.json ──
     raw = json.load(open(path))
     for ci, item in enumerate(raw):
         conv = item.get("conversation", {})
+        # 会话级日期 (session_N_date_time) 按键序号归一: 会话键 session_N 与日期键一一对应
+        sess_date = {}
         for k in list(conv.keys()):
             if k.startswith("session_") and k.endswith("_date_time"):
                 sess_date[k.replace("_date_time", "")] = conv[k]
+        sess_nums = sorted((int(k[len("session_"):]), k) for k in list(conv.keys())
+                           if k.startswith("session_") and k[len("session_"):].isdigit())
+        first_done = False
         msgs = []
-        for k in list(conv.keys()):
-            if k.startswith("session_") and k[len("session_"):].isdigit():
-                v = conv[k]
-                date_prefix = f"[date: {sess_date.get(k, '')}] " if sess_date.get(k) else ""
-                if isinstance(v, list):
-                    for m in v:
-                        if isinstance(m, dict):
-                            speaker, text = m.get("speaker", ""), m.get("text", "")
-                        else:
-                            speaker, text = "", str(m)
-                        if text:
-                            msgs.append(f"{date_prefix}[{speaker}] {text}")
+        for _n, k in sess_nums:
+            v = conv[k]
+            _dt = sess_date.get(k, "")
+            if _dt:
+                if not first_done:
+                    conv_first_dt[ci] = _dt
+                    first_done = True
+                conv_last_dt[ci] = _dt
+            date_prefix = f"[date: {_dt}] " if _dt else ""
+            if isinstance(v, list):
+                for m in v:
+                    if isinstance(m, dict):
+                        speaker, text = m.get("speaker", ""), m.get("text", "")
+                    else:
+                        speaker, text = "", str(m)
+                    if text:
+                        msgs.append(f"{date_prefix}[{speaker}] {text}")
+                        msg_conv.append(ci)
+                        msg_dt.append(_dt)
         conv_map[ci] = msgs
         all_msgs.extend(msgs)
-    return conv_map, all_msgs, None, raw, sess_date
+    return conv_map, all_msgs, None, raw, conv_first_dt, conv_last_dt, msg_conv, msg_dt
 
-conv_map, all_msgs, _dia_ids_official, data, conv_first_dt = load_messages(DATA)
+conv_map, all_msgs, _dia_ids_official, data, conv_first_dt, conv_last_dt, _msg_conv, _msg_dt = load_messages(DATA)
 print(f"LoCoMo 消息: {len(all_msgs)} 条, {len(conv_map)} 会话", flush=True)
 
 # ── 灌库 ──
@@ -182,7 +270,8 @@ if INGEST_SKIP:
         # OverGraph 直连恢复 (2026-09-02): 本地 pkl 快照不可依赖 (被误覆盖/丢失),
         # 数据本体在 OverGraph DB — EpisodeNode 全量 + 引擎 dense HNSW 即生产检索链路。
         _rows = gstore._locked_execute_gql(
-            "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content, e.created_at AS ts", {})["rows"]
+            "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content, "
+            "e.created_at AS ts, e.session_id AS session_id", {})["rows"]
         msg_by_id = {r["id"]: r.get("content", "") for r in _rows}
         faiss_id_map = {}
         episode_cache = {}
@@ -191,7 +280,8 @@ if INGEST_SKIP:
             faiss_id_map[_n] = _r["id"]
             episode_cache[_r["id"]] = {"id": _r["id"], "content": _r.get("content", ""),
                                        "created_at": _r.get("ts") or time.time(),
-                                       "source_type": "sensory", "layer": 1}
+                                       "source_type": "sensory", "layer": 1,
+                                       "session_id": _r.get("session_id")}
         blocks = []
         block_vecs = np.zeros((0, 512), dtype=np.float32)
         entity_eps = {}
@@ -223,11 +313,18 @@ else:
             midx = b_start + j
             mid = f"ep_{midx}"
             msg_by_id[mid] = m
+            # P1: 真实会话日期 → created_at (逐会话粒度; 解析失败回落原合成值并计数告警)
+            _ci = _msg_conv[midx] if midx < len(_msg_conv) else None
+            _ts = _p1_dt_to_epoch(_msg_dt[midx] if midx < len(_msg_dt) else None)
+            if _ts is None:
+                _ts = time.time() - (len(all_msgs) - midx) * 60
+                _INGEST_DT_WARN += 1
             try:
                 gstore.create_episode({
                     "id": mid, "content": m,
-                    "created_at": time.time() - (len(all_msgs) - midx) * 60,
+                    "created_at": _ts,
                     "source_type": "sensory", "layer": 1,
+                    "session_id": _ci,
                 })
             except Exception as e:
                 print(f"  graph err {mid}: {e}", flush=True)
@@ -235,13 +332,15 @@ else:
             vec_buf.append(vecs[j])
             faiss_id_map[int(midx)] = mid
             episode_cache[mid] = {
-                "id": mid, "content": m, "created_at": time.time() - (len(all_msgs) - midx) * 60,
-                "source_type": "sensory", "layer": 1,
+                "id": mid, "content": m, "created_at": _ts,
+                "source_type": "sensory", "layer": 1, "session_id": _ci,
             }
         print(f"  灌入 {min(b_start+BATCH, len(all_msgs))}/{len(all_msgs)} ({time.time()-t0:.0f}s)", flush=True)
     if vec_buf:
         faiss_index.add_with_ids(np.vstack(vec_buf), np.array(id_buf, dtype=np.int64))
-    print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s", flush=True)
+    print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s "
+          f"[P1] created_at 真实回填 {len(msg_by_id) - _INGEST_DT_WARN}/{len(msg_by_id)} "
+          f"(解析失败回落合成 {_INGEST_DT_WARN} 条)", flush=True)
 
     # ── TF-IDF ──
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -556,9 +655,10 @@ No other text."""
         pass
     return []
 
-def _fuse(q, seen, docs):
+def _fuse(q, seen, docs, session_ts=None):
     try:
-        raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=None, hyde=True)
+        # P1: session_ts = conv 级真实时间锚 (原硬编码 None 使检索器时间感知路径不可达)
+        raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=True)
     except Exception:
         return
     for r in raw:
@@ -572,6 +672,51 @@ def _fuse(q, seen, docs):
             if s[:200] not in seen:
                 seen.add(s[:200])
                 docs.append(s)
+
+def _p1_question_window(question):
+    """题面绝对时间窗 → (start_ts, end_ts) | None (P1_WINDOW_FILTER=1 时启用)。
+
+    覆盖: 'last week of <Month> <Year>' → 该月最后 7 天; '<Month> <Year>' / 'in
+    <Month> <Year>' → 整月; 'in <Year>' → 全年。无可解析绝对时间窗 → None (不改序)。
+    """
+    q = question
+    m = re.search(r'\blast week of ([A-Za-z]+)\s+(\d{4})\b', q, re.I)
+    if m:
+        _mon = _P1_MONTHS.get(m.group(1).lower()) or _P1_MONTHS.get(m.group(1).lower()[:3])
+        if _mon:
+            _y = int(m.group(2))
+            _end = datetime.datetime(_y, _mon + 1, 1) if _mon < 12 else datetime.datetime(_y + 1, 1, 1)
+            return time.mktime((_end - datetime.timedelta(days=7)).timetuple()), time.mktime(_end.timetuple()) - 1
+    m = re.search(r'\b(?:in\s+)?([A-Za-z]+)\s+(\d{4})\b', q, re.I)
+    if m:
+        _mon = _P1_MONTHS.get(m.group(1).lower()) or _P1_MONTHS.get(m.group(1).lower()[:3])
+        if _mon:
+            _y = int(m.group(2))
+            _s = datetime.datetime(_y, _mon, 1)
+            _e = datetime.datetime(_y + 1, 1, 1) if _mon == 12 else datetime.datetime(_y, _mon + 1, 1)
+            return time.mktime(_s.timetuple()), time.mktime(_e.timetuple()) - 1
+    m = re.search(r'\bin\s+((?:19|20)\d{2})\b', q)
+    if m:
+        _y = int(m.group(1))
+        return time.mktime(datetime.datetime(_y, 1, 1).timetuple()), \
+               time.mktime(datetime.datetime(_y + 1, 1, 1).timetuple()) - 1
+    return None
+
+def _p1_time_window_rerank(question, docs):
+    """零引擎改动轻量时间重排 (P1_WINDOW_FILTER=1): 题面含绝对时间窗时, content
+    '[date: ...]' 前缀日期落在窗内的证据前移 (稳定分区, 窗外/无日期项保持原相对序);
+    无窗/未启用 → 原序返回, 逐字节等价原行为。"""
+    if not docs or not P1_WINDOW_FILTER:
+        return docs
+    win = _p1_question_window(question)
+    if win is None:
+        return docs
+    _ws, _we = win
+    _inside, _rest = [], []
+    for _d in docs:
+        _dt = _p1_content_date_ts(_d)
+        (_inside if (_dt is not None and _ws <= _dt <= _we) else _rest).append(_d)
+    return _inside + _rest
 
 def _adjacent(docs, seen):
     doc_ids = []
@@ -621,14 +766,17 @@ def _graph_add(question, seen, docs):
     except Exception:
         pass
 
-def retrieve_channels(question, hitk=False):
+def retrieve_channels(question, hitk=False, session_ts=None):
     """三通道并行检索，各自独立打分（有机融合——不塞池竞争）"""
     # P2 基线: HITK 模式单查询(基础检索能力), 不含 multi_query 增强
     queries = [question] + ([] if hitk else multi_query_expand(question))
     seen_a, docs_a = set(), []
     for q in queries:
-        _fuse(q, seen_a, docs_a)
+        _fuse(q, seen_a, docs_a, session_ts)
     _adjacent(docs_a, seen_a)
+    # P1 可选: 题面含绝对时间窗 → content [date:] 日期窗内证据前移 (零引擎改动)
+    if P1_WINDOW_FILTER:
+        docs_a = _p1_time_window_rerank(question, docs_a)
     # A 通道：消息级 top-40
     ch_a = docs_a[:40]
 
@@ -802,19 +950,62 @@ Output a single search query string. No other text."""
     except Exception:
         return question
 
-conv_ts = {}
-if _dia_ids_official:
-    # Official jsonl format: use conv_first_dt from first session date_time
-    conv_ts = conv_first_dt
-else:
-    for item in data:
-        conv_ts[len(conv_ts)] = item.get("conversation", {}).get("session_1_date_time", 0)
-
 def parse_session_ts(ts):
-    try:
-        return float(ts)
-    except (ValueError, TypeError):
+    """会话时间锚 → epoch float。数字直通; ISO/自然语言 ('1:56 pm on 8 May, 2023')
+    真实解析为本地 epoch (原实现 float() 裸解析日期串必失败 → None); 无法解析 → None
+    (检索器回落墙钟, 不中断评测)。"""
+    if ts is None or ts == "":
         return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        pass
+    return _p1_dt_to_epoch(s)
+
+# ── P1: conv 级时间锚 (真实会话时间 → epoch) ──
+# 数据源优先级: ① 库内 episode.session_id + created_at 聚合 (P1 新库, 与引擎过滤对象
+#   同一数据源, PREDICT 模式 DATA=questions 也适用); ② load_messages 会话日期 (旧库
+#   无 session_id 时; 带"created_at 非合成"守卫——旧合成库时间整体晚于 2023-2024 会话
+#   日期, 此时传锚点会让 _entity_expansion 的 created_at<=at_ts 上界过滤清空, 属新旧
+#   口径混用, 应回落 None 保持原行为)。锚点 = 会话窗口末会话 (P1_ANCHOR=last, 回顾性
+#   问询时刻) 或首会话 (P1_ANCHOR=first)。
+conv_ts = {}
+_has_sid = any(_ec.get("session_id") is not None for _ec in episode_cache.values())
+if _has_sid:
+    _grp: dict = {}
+    for _ec in episode_cache.values():
+        _sid = _ec.get("session_id")
+        if _sid is None:
+            continue
+        try:
+            _t = float(_ec.get("created_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _t > 0:
+            _grp.setdefault(int(_sid), []).append(_t)
+    for _sid, _ts in _grp.items():
+        conv_ts[_sid] = (max if P1_ANCHOR == "last" else min)(_ts)
+elif conv_map:
+    _db_min = None
+    for _ec in episode_cache.values():
+        try:
+            _t = float(_ec.get("created_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        _db_min = _t if _db_min is None else min(_db_min, _t)
+    _dt_src = conv_last_dt if P1_ANCHOR == "last" else conv_first_dt
+    for _ci in conv_map:
+        _ts = parse_session_ts(_dt_src.get(_ci))
+        if _ts is not None and (_db_min is None or _db_min <= _ts + 60 * 86400):
+            conv_ts[_ci] = _ts
+if conv_ts:
+    print(f"[P1] conv 时间锚: {len(conv_ts)} 会话 (P1_ANCHOR={P1_ANCHOR}) | "
+          f"conv0={conv_ts.get(0)} conv1={conv_ts.get(1)}", flush=True)
+else:
+    print("[P1] conv 时间锚不可用 (库无 session_id 且数据无会话日期/旧合成库) → session_ts 回落 None", flush=True)
 
 qa_conv = {}
 for ci, item in enumerate(data):
@@ -830,13 +1021,16 @@ if PREDICT_QUESTIONS:
             _q = json.loads(_l)
             qa_all.append({"qa_id": _q.get("qa_id"), "question": _q.get("question"), "answer": _q.get("answer"),
                            "category": _q.get("category"),
-                           "evidence": _q.get("evidence"), "evidence_messages": _q.get("evidence_messages")})
+                           "evidence": _q.get("evidence"), "evidence_messages": _q.get("evidence_messages"),
+                           "conversation_idx": _q.get("conversation_idx")})
     _sample_map = {}
     for _ci, _item in enumerate(data):
         _sample_map[_item.get("sample_id")] = _ci
     for _q in qa_all:
         _sid = str(_q.get("qa_id", "")).split("#")[0]
-        qa_conv[id(_q)] = _sample_map.get(_sid, 0)
+        # P1: 优先官方 conversation_idx (0..9, 与灌库 session_id 同坐标); 无则回落 sample 首现偏移
+        _cvidx = _q.get("conversation_idx")
+        qa_conv[id(_q)] = int(_cvidx) if isinstance(_cvidx, (int, float)) else _sample_map.get(_sid, 0)
     if PREDICT_RANGE:
         _s, _e = PREDICT_RANGE.split(":")
         qa_all = qa_all[int(_s):int(_e)]
@@ -886,7 +1080,7 @@ for i, q in enumerate(qa_all):
 
     # 三通道检索（有机融合）+ 证据分区
     _cur_cat = str(cat)
-    channels = retrieve_channels(question, hitk=HITK_MODE)
+    channels = retrieve_channels(question, hitk=HITK_MODE, session_ts=session_ts)
     # falsification 实验 (2026-09-02): oracle 注入 = 金标证据人工置顶 (人工正确排序)
     if os.environ.get("ORACLE_INJECT") == "1":
         _ev = [e.get("text", "").strip() for e in (q.get("evidence_messages") or []) if e.get("text")]
@@ -937,7 +1131,7 @@ for i, q in enumerate(qa_all):
         results["round2_used"] += 1
         fq = followup_query(question, missing) if missing and missing != "general information about the question" else question
         # round2 定向补缺：重跑三通道，只追加缺失部分（去重）
-        ch2 = retrieve_channels(fq)
+        ch2 = retrieve_channels(fq, session_ts=session_ts)
         seen2 = {c[:200] for c in docs}
         new_docs = []
         for d in ch2["A"][:20] + ch2["B"][:8] + ch2["C"][:6]:

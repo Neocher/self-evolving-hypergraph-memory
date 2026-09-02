@@ -28,6 +28,11 @@ N = int(sys.argv[1]) if len(sys.argv) > 1 else 1382
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/hitk_report.txt"
 K_MAX = 40
 MODE = os.environ.get("HITK_MODE_CHANNEL", "vector")  # vector=纯向量 | fusion=QueryRouter 生产链路
+# P1 (2026-09-02): HITK_SESSION_TS=1 → fusion 检索传 conv 级真实时间锚 (由库内
+# episode.session_id + created_at 聚合; P1 新库才有 session_id)。HITK_ANCHOR=first|last
+# (默认 last=会话结束=回顾性问询时刻)。旧合成库无 session_id → 锚点空 → 回落 None。
+HITK_SESSION_TS = os.environ.get("HITK_SESSION_TS") == "1"
+HITK_ANCHOR = os.environ.get("HITK_ANCHOR", "last")
 
 from graph.overgraph_store import OverGraphStore
 from embedding.encoder import TextEncoder
@@ -39,10 +44,31 @@ gstore = OverGraphStore(config=cfg)
 gstore.connect()
 t0 = time.time()
 
-# 全量加载 EpisodeNode 消息文本 (id → content)
-rows = gstore._locked_execute_gql("MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content", {})
-msg_by_id = {r["id"]: r.get("content", "") for r in rows["rows"]}
-print(f"[1] OverGraph 加载: {len(msg_by_id)} 条 EpisodeNode ({time.time()-t0:.0f}s)", flush=True)
+# 全量加载 EpisodeNode 消息文本 (id → content) + 会话时间元数据
+rows = gstore._locked_execute_gql(
+    "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content, "
+    "e.created_at AS ts, e.session_id AS session_id", {})
+rows = rows["rows"]
+msg_by_id = {r["id"]: r.get("content", "") for r in rows}
+conv_ts = {}   # conversation_idx → 真实时间锚 epoch (库内 session_id 聚合)
+if HITK_SESSION_TS:
+    _grp: dict = {}
+    for r in rows:
+        _sid = r.get("session_id")
+        if _sid is None:
+            continue
+        try:
+            _t = float(r.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _t > 0:
+            _grp.setdefault(int(_sid), []).append(_t)
+    for _sid, _ts in _grp.items():
+        conv_ts[_sid] = (max if HITK_ANCHOR == "last" else min)(_ts)
+    if not conv_ts:
+        print("[P1] HITK_SESSION_TS=1 但库无 session_id (旧合成库) → session_ts 回落 None", flush=True)
+print(f"[1] OverGraph 加载: {len(msg_by_id)} 条 EpisodeNode, conv 时间锚 {len(conv_ts)} 会话"
+      f" ({time.time()-t0:.0f}s)", flush=True)
 
 # ── 2. 加载评测问题 ──
 qa_all = [json.loads(l) for l in open(DATA_PATH, encoding="utf-8") if l.strip()][:N]
@@ -96,11 +122,12 @@ if MODE == "fusion":
     print(f"[3.5] fusion 检索器就绪 (QueryRouter FUSION, hyde=False) ({time.time()-t0:.0f}s)", flush=True)
 
 
-def _retrieve_topk(question):
+def _retrieve_topk(question, conversation_idx=None):
     """返回 top-k 消息文本列表 (含 score 排序)。"""
     if MODE == "fusion":
         from retrieval.query_router import RetrievalLevel
-        raw = qr.retrieve(question, level=RetrievalLevel.FUSION, session_ts=None, hyde=False)
+        session_ts = conv_ts.get(conversation_idx) if HITK_SESSION_TS else None
+        raw = qr.retrieve(question, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=False)
         docs = []
         for r in raw:
             if isinstance(r, dict):
@@ -139,7 +166,7 @@ for i, q in enumerate(qa_all):
     c["total"] += 1
     hitk_stats["total"] += 1
 
-    topk = _retrieve_topk(q["question"])
+    topk = _retrieve_topk(q["question"], q.get("conversation_idx"))
     probes = probes_of(ev_texts)
     for kk in (1, 3, 5, 10, 20, 40):
         if any(any(p in d for d in topk[:kk]) for p in probes):
