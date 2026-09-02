@@ -36,6 +36,10 @@ PREDICT_OUT = os.environ.get("PREDICT_OUT", "/tmp/locomo_refined_predictions.jso
 PREDICT_RANGE = os.environ.get("PREDICT_RANGE", "")
 PREDICT_MAX_TOKENS = int(os.environ.get("PREDICT_MAX_TOKENS", "512"))  # 生成答案上限: 200→512 (枚举型答案截断修复)
 HITK_MODE = os.environ.get("HITK_MODE") == "1"  # 纯检索 hit@k 基线 (P2: 证据是否进 top-k docs, 不调 LLM)
+# 2026-09-03 达摩院 R1 (研究附2 建议): CTX_DUMP=1 时 PREDICT 每题落盘检索 ctx
+# (证据 top-N 文本 + 组织段) 供事后归因, 默认关不改评测口径; 最小版: 单文件 jsonl 每行一题。
+CTX_DUMP = os.environ.get("CTX_DUMP") == "1"
+CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
 print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'}", flush=True)
 
@@ -1190,6 +1194,17 @@ for i, q in enumerate(qa_all):
         ev_sec = "\n".join(f"[{j+1}] {d}" for j, d in enumerate(docs[:40]))
         ctx = (summ2 + "\n\n" + ev_sec) if summ2 else ev_sec
         ctx = ctx[:CTX_TOKENS]
+
+    # CTX_DUMP=1 (默认关): 每题落盘最终检索 ctx (round1/round2 合并后), 供事后归因
+    if CTX_DUMP:
+        try:
+            os.makedirs(os.path.dirname(CTX_DUMP_OUT), exist_ok=True)
+            with open(CTX_DUMP_OUT, "a", encoding="utf-8") as _cf:
+                _cf.write(json.dumps({"qa_id": q.get("qa_id", f"q{i}"), "category": cat,
+                                      "question": question, "n_docs": len(docs),
+                                      "ctx": ctx}, ensure_ascii=False) + "\n")
+        except Exception as _e:
+            print(f"  [CTX_DUMP err] {_e}", flush=True)
 
     prompt = f"""Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
 
