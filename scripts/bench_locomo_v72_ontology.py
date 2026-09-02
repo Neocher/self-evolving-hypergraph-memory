@@ -116,7 +116,7 @@ from embedding.encoder import TextEncoder
 gstore = OverGraphStore(config=type("cfg", (), {"database_path": DB_PATH, "dense_vector_dimension": 512,
                                                 "dense_vector_metric": "cosine", "ef_search": 64, "max_threads": 4})())
 gstore.connect()
-enc = TextEncoder(device="cpu")
+enc = TextEncoder(device=os.environ.get("SHM_ENC_DEVICE", "auto"))
 enc.load()
 
 def load_messages(path):
@@ -216,6 +216,16 @@ print(f"LoCoMo 消息: {len(all_msgs)} 条, {len(conv_map)} 会话", flush=True)
 INGEST_SKIP = os.environ.get("INGEST_LOADED") == "1"
 INGEST_ONLY = os.environ.get("INGEST_ONLY") == "1"
 INGEST_PKL = DB_PATH + "_index.pkl"
+# 2026-09-03 达摩院 R1 (round0 65.05% 错因: eval_db_v610_index.pkl 0 字节 → 评测数据面
+# 缺失, blocks/entity/ontology 组织段从 ctx 消失, cat1/cat4 回落): REBUILD_SHADOW_ONLY=1
+# 在已灌好 episode 层的评测库 (eval_db_p1, 5882 条, 勿重复写入) 上只补跑 LLM 影子段
+# (压缩记忆块/实体抽取/ontology/schema, 与 0901 同构) 并落 INGEST_PKL 评测数据面快照,
+# 跳过重复灌 episode 与 685s 消息 embedding。SKIP_SHADOW (2026-09-02) 保留且默认行为不变。
+REBUILD_SHADOW_ONLY = os.environ.get("REBUILD_SHADOW_ONLY") == "1"
+if REBUILD_SHADOW_ONLY and (INGEST_SKIP or os.environ.get("SKIP_SHADOW") == "1"):
+    print("[REBUILD_SHADOW_ONLY] 与 INGEST_LOADED/SKIP_SHADOW 互斥 — 需独立跑影子段, 退出",
+          flush=True)
+    sys.exit(2)
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -305,7 +315,8 @@ else:
     BATCH = 500
     id_buf, vec_buf = [], []
     t0 = time.time()
-    for b_start in range(0, len(all_msgs), BATCH):
+    # REBUILD_SHADOW_ONLY: 空跑灌库循环 (episode 层已在库, 零写入), 仅恢复内存态供影子段消费
+    for b_start in range(0, len(all_msgs) if not REBUILD_SHADOW_ONLY else 0, BATCH):
         batch = all_msgs[b_start:b_start + BATCH]
         # v6.5.1 提速: 超长消息截断再 embedding (16706 chars 单条会拖垮整批 padding)
         vecs = np.asarray(enc.embed_batch([m[:1500] for m in batch]), dtype=np.float32)
@@ -338,14 +349,44 @@ else:
         print(f"  灌入 {min(b_start+BATCH, len(all_msgs))}/{len(all_msgs)} ({time.time()-t0:.0f}s)", flush=True)
     if vec_buf:
         faiss_index.add_with_ids(np.vstack(vec_buf), np.array(id_buf, dtype=np.int64))
-    print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s "
-          f"[P1] created_at 真实回填 {len(msg_by_id) - _INGEST_DT_WARN}/{len(msg_by_id)} "
-          f"(解析失败回落合成 {_INGEST_DT_WARN} 条)", flush=True)
+    if REBUILD_SHADOW_ONLY:
+        # 2026-09-03 达摩院 R1: OverGraph 只读恢复 msg_by_id/episode_cache/faiss_id_map
+        # (与 INGEST_LOADED OverGraph 直连分支同构), 供影子段/blocks 展开/conv 时间锚与
+        # pkl dump 消费; faiss_vecs 留空 — 消息向量已随原灌库持久在库内 dense_vector,
+        # INGEST_LOADED pkl 恢复分支无需重复 add (空数组 add 为 no-op)。
+        _rows = gstore._locked_execute_gql(
+            "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content, "
+            "e.created_at AS ts, e.session_id AS session_id", {})["rows"]
+        msg_by_id = {r["id"]: r.get("content", "") for r in _rows}
+        for _r in _rows:
+            _n = int(_r["id"].split("_")[1])
+            faiss_id_map[_n] = _r["id"]
+            episode_cache[_r["id"]] = {"id": _r["id"], "content": _r.get("content", ""),
+                                       "created_at": _r.get("ts") or time.time(),
+                                       "source_type": "sensory", "layer": 1,
+                                       "session_id": _r.get("session_id")}
+        print(f"[REBUILD_SHADOW_ONLY] OverGraph 恢复 {len(msg_by_id)} 条 episode "
+              f"(零写入, {time.time()-t0:.0f}s), 补跑 LLM 影子段", flush=True)
+    else:
+        print(f"灌入完成: {len(msg_by_id)} 条, {time.time()-t0:.0f}s "
+              f"[P1] created_at 真实回填 {len(msg_by_id) - _INGEST_DT_WARN}/{len(msg_by_id)} "
+              f"(解析失败回落合成 {_INGEST_DT_WARN} 条)", flush=True)
 
     # ── TF-IDF ──
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
     tfidf_index.fit(list(msg_by_id.values()))
+
+    # 2026-09-02 P1 后评测口径: INGEST_LOADED + pkl 不可用 → OverGraph 直连恢复,
+    # 评测链路只消费 EpisodeNode + 引擎向量 + TF-IDF; blocks/entity/schema 影子
+    # (LLM 块压缩 ~392 次 + 实体抽取 ~52 次调用) 仅写入 pkl, 评测不读。
+    # SKIP_SHADOW=1 (灌库专用): episode + 向量 + TF-IDF 落库后即退出, 跳过 LLM 影子段。
+    if os.environ.get("SKIP_SHADOW") == "1":
+        print("[SKIP_SHADOW] 跳过 LLM 影子段 (评测口径无需 blocks/entity; 仅 EpisodeNode+向量)",
+              flush=True)
+        if INGEST_ONLY:
+            print("[INGEST_ONLY] 灌库完成, 退出 (SKIP_SHADOW)", flush=True)
+            sys.exit(0)
 
     # ═══ A. LLM 压缩记忆块（MindMemOS）═══
     _BLOCK_PROMPT = """Compress the following conversation messages into a memory block that preserves ALL key facts for later retrieval.
@@ -525,9 +566,13 @@ Output only the FACTS/ENTITIES block. No preamble."""
     _top_classes = sorted(_schema_classes.items(), key=lambda x: -len(x[1]))[:15]
     # 注: faiss add 已在灌库循环内完成, 这里只 dump
     import pickle as _pkl
+    # REBUILD_SHADOW_ONLY 跳过消息 embedding → faiss_vecs/ids 空 (库内 dense_vector
+    # 已持久, INGEST_LOADED 恢复分支 add 空数组为 no-op, 检索仍走库内 HNSW)
+    _faiss_vecs = np.vstack(vec_buf) if vec_buf else np.zeros((0, 512), dtype=np.float32)
+    _faiss_ids = np.array(id_buf, dtype=np.int64) if id_buf else np.zeros((0,), dtype=np.int64)
     with open(INGEST_PKL, "wb") as _f:
-        _pkl.dump({"faiss_id_map": faiss_id_map, "faiss_vecs": np.vstack(vec_buf),
-                   "faiss_ids": np.array(id_buf, dtype=np.int64),
+        _pkl.dump({"faiss_id_map": faiss_id_map, "faiss_vecs": _faiss_vecs,
+                   "faiss_ids": _faiss_ids,
                    "msg_by_id": msg_by_id, "episode_cache": episode_cache,
                    "blocks": blocks, "block_vecs": block_vecs,
                    "entity_eps": entity_eps, "entity_co": entity_co,
@@ -536,8 +581,9 @@ Output only the FACTS/ENTITIES block. No preamble."""
                    "schema_classes": _schema_classes, "top_classes": _top_classes,
                    "tfidf_index": tfidf_index}, _f)
     print(f"[INGEST_DONE] 索引已存: {INGEST_PKL}", flush=True)
-    if INGEST_ONLY:
-        print("[INGEST_ONLY] 灌库完成, 退出", flush=True)
+    if INGEST_ONLY or REBUILD_SHADOW_ONLY:
+        print(f"[{'INGEST_ONLY' if INGEST_ONLY else 'REBUILD_SHADOW_ONLY'}] 完成, 退出",
+              flush=True)
         sys.exit(0)
 
 config = QueryRouterConfig()
