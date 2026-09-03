@@ -11,6 +11,7 @@ sys.path.insert(0, os.environ.get("SHM_ROOT", "/home/admin/shm"))
 
 import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
+from rag_v4_common import append_predict_error, ctx_composition
 
 DATA = os.environ.get("DATA_PATH", "/home/admin/shm/data/bench/locomo10.json")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
@@ -33,15 +34,41 @@ JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "meta-llama/llama-3.3-70b-instruct")
 PREDICT_MODE = os.environ.get("PREDICT_MODE") == "1"
 PREDICT_QUESTIONS = os.environ.get("PREDICT_QUESTIONS", "")
 PREDICT_OUT = os.environ.get("PREDICT_OUT", "/tmp/locomo_refined_predictions.jsonl")
+# R2-0 工程纪律: 重试耗尽后仍失败的预测题错误行 (qa_id + 原因) 落盘, 不静默 skip
+PREDICT_ERR_OUT = os.environ.get("PREDICT_ERR_OUT", "/tmp/locomo_refined_predict_errors.jsonl")
 PREDICT_RANGE = os.environ.get("PREDICT_RANGE", "")
 PREDICT_MAX_TOKENS = int(os.environ.get("PREDICT_MAX_TOKENS", "512"))  # 生成答案上限: 200→512 (枚举型答案截断修复)
 HITK_MODE = os.environ.get("HITK_MODE") == "1"  # 纯检索 hit@k 基线 (P2: 证据是否进 top-k docs, 不调 LLM)
-# 2026-09-03 达摩院 R1 (研究附2 建议): CTX_DUMP=1 时 PREDICT 每题落盘检索 ctx
-# (证据 top-N 文本 + 组织段) 供事后归因, 默认关不改评测口径; 最小版: 单文件 jsonl 每行一题。
-CTX_DUMP = os.environ.get("CTX_DUMP") == "1"
+# 2026-09-03 达摩院 R2-0 (round2 工程纪律): CTX_DUMP 默认开 — 每题检索 ctx 落盘供事后
+# 归因 (round1 默认关 → 72.43% 错因分析缺每题证据现场, 翻转不可归因; 研究 §7 R2-0 行
+# "CTX_DUMP=1 纳入所有后续评测默认开"); 显式 CTX_DUMP=0 可关回零开销。
+CTX_DUMP = os.environ.get("CTX_DUMP", "1") != "0"
 CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
+
+
+def _eval_log_header_suffix():
+    """R2-0 (轻量): 评测日志头记录 repo commit + 检索 pkl md5 — 翻转归因需锁定数据面快照。"""
+    info = {"commit": "n/a", "pkl_md5": "n/a"}
+    try:
+        import subprocess
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, cwd=os.path.dirname(os.path.abspath(__file__)))
+        info["commit"] = (out.stdout.strip() or "n/a")
+    except Exception:
+        pass
+    try:
+        import hashlib
+        _pkl = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71") + "_index.pkl"
+        if os.path.exists(_pkl):
+            with open(_pkl, "rb") as _f:
+                info["pkl_md5"] = hashlib.md5(_f.read()).hexdigest()[:12]
+    except Exception:
+        pass
+    return f"commit={info['commit']} pkl_md5={info['pkl_md5']}"
+
+
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -1195,13 +1222,15 @@ for i, q in enumerate(qa_all):
         ctx = (summ2 + "\n\n" + ev_sec) if summ2 else ev_sec
         ctx = ctx[:CTX_TOKENS]
 
-    # CTX_DUMP=1 (默认关): 每题落盘最终检索 ctx (round1/round2 合并后), 供事后归因
+    # CTX_DUMP 默认开 (R2-0): 每题落盘最终检索 ctx + 组成 (raw 证据条数/blocks 摘要/
+    # entity 段/各来源字符占比), 供翻转归因与 R-CTX 诊断 (round1 缺此现场)
     if CTX_DUMP:
         try:
             os.makedirs(os.path.dirname(CTX_DUMP_OUT), exist_ok=True)
             with open(CTX_DUMP_OUT, "a", encoding="utf-8") as _cf:
                 _cf.write(json.dumps({"qa_id": q.get("qa_id", f"q{i}"), "category": cat,
                                       "question": question, "n_docs": len(docs),
+                                      "ctx_comp": ctx_composition(ctx),
                                       "ctx": ctx}, ensure_ascii=False) + "\n")
         except Exception as _e:
             print(f"  [CTX_DUMP err] {_e}", flush=True)
@@ -1216,8 +1245,14 @@ Answer:"""
     try:
         pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.2)
     except Exception as e:
-        print(f"  [gen err] {e}", flush=True)
+        # R2-0: llm_generate 内已 2×retry (总 3 次, 超时预算递增) — 仍失败才到此处:
+        # 错误行落盘 (qa_id + 原因), 不静默 skip (round1 32B 83% 失败即此路径)
+        print(f"  [gen err] qa={q.get('qa_id', f'q{i}')} 重试耗尽: {e}", flush=True)
         results["errors"] += 1
+        try:
+            append_predict_error(PREDICT_ERR_OUT, q.get("qa_id", f"q{i}"), e)
+        except Exception as _we:
+            print(f"  [ERR_WRITE fail] {_we}", flush=True)
         continue
     if PREDICT_MODE:
         with open(PREDICT_OUT, "a") as _pf:
