@@ -49,9 +49,12 @@ CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 # 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
 # 判卷规约约束输出: 日期锚换算 (A 类 35-45%) + 粒度纪律 (B 类 20-25%, 含 17/118 时刻越界)
 # + 计数/枚举报数 (cat1 ~45%) + 范围纪律 (cat4 overreach ~40%)。禁长度压缩 (研究 §6:
-# 'short answer' 式指令 oracle 实测伤分 cat1 46.7% vs 56.7%)。PROMPT_V2 默认开 (A/B 评测
-# 侧用 PROMPT_V2=0 回落 v1 原文, 零回归)。
-PROMPT_V2 = os.environ.get("PROMPT_V2", "1") != "0"
+# 'short answer' 式指令 oracle 实测伤分 cat1 46.7% vs 56.7%)。
+# 2026-09-03 22:05 R2c A/B 实测 (240题×2臂, 同库同判卷): PROMPT_V2 全面负向 —
+#   v2 57.9% vs v1 66.2% (cat1 -8.3/cat2 -7.0/cat4 -10.0), 门控 FAIL。
+#   密集纪律(日期换算/粒度/枚举/范围 + 3 few-shot)对 qwen3-14b 规则过载, 反致失焦/越界。
+#   → 默认翻转回 v1 (PROMPT_V2=0 语义); v2 保留可测但非默认。
+PROMPT_V2 = os.environ.get("PROMPT_V2", "0") == "1"
 _READER_PROMPT_V1 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
 
 Conversation snippets:
