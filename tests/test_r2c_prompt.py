@@ -62,7 +62,9 @@ def test_v2_format_placeholders_intact():
 
 
 def test_v1_prompt_unchanged_v2_toggle_present():
-    """PROMPT_V2 env 切换存在且默认开; v1 原文保留 (A/B 零回归臂)。"""
-    assert 'os.environ.get("PROMPT_V2", "1") != "0"' in TEXT
+    """PROMPT_V2 env 切换存在且默认关 (v1 默认, v6.14.1 R2c A/B FAIL 翻转); v2 保留可测。"""
+    assert 'os.environ.get("PROMPT_V2", "0") == "1"' in TEXT
+    assert "PROMPT_V2" in TEXT
+    assert "R2c A/B 实测" in TEXT
     assert "_READER_PROMPT_V1" in TEXT
     assert "_READER_PROMPT_V2" in TEXT
