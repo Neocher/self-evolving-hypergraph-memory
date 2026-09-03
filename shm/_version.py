@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.14.1"
-__version_info__ = (6, 14, 1)
-__version_name__ = "R2OutputProtocol"
-__release_date__ = "2026-09-03"
+__version__ = "6.15.0"
+__version_info__ = (6, 15, 0)
+__version_name__ = "R4OracleDb"
+__release_date__ = "2026-09-04"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.15.0 (2026-09-04) R4OracleDb:
+  • 达摩院 R4A oracle DB 同形注入 (round2b 决策 §3 R4 行) — ORACLE_INJECT=1 时
+    ORACLE_MODE=db (默认) 按 evidence dia_id → 灌库 DB 同形 content (带 '[date:
+    <会话日期>] [speaker] text' 前缀的原文整条) 置顶 channels A; 修复旧裸文本
+    (evidence .text 无 [date:]) 对 cat2 的人为去锚失效 (r0 研究: oracle 26.5% <
+    生产 43.1%)。无 dia_id 或映射失败 → content 去前缀反查回落, 仍找不到整题跳过
+    注入并汇总计数。ORACLE_MODE=legacy 保留旧裸文本注入 (逐字节等价回归)。
+
 v6.14.1 (2026-09-03) R2OutputProtocol:
   • 达摩院 R2-0 工程纪律 — llm_generate 瞬态失败自动重试 (2×, 总 3 次, 超时预算递增
     MAAS 300/600/900s) + 预测失败错误行落盘 (qa_id+原因, 不再静默 skip) + CTX_DUMP
