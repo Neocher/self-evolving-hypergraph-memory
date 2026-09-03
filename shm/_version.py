@@ -1,7 +1,7 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
 __version__ = "6.14.1"
-__version_info__ = (6, 14, 0)
+__version_info__ = (6, 14, 1)
 __version_name__ = "R2OutputProtocol"
 __release_date__ = "2026-09-03"
 
