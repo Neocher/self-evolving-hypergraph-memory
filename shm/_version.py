@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.13.0"
-__version_info__ = (6, 13, 0)
-__version_name__ = "DataPlaneRestore"
+__version__ = "6.14.0"
+__version_info__ = (6, 14, 0)
+__version_name__ = "R2OutputProtocol"
 __release_date__ = "2026-09-03"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.14.0 (2026-09-03) R2OutputProtocol:
+  • 达摩院 R2-0 工程纪律 — llm_generate 瞬态失败自动重试 (2×, 总 3 次, 超时预算递增
+    MAAS 300/600/900s) + 预测失败错误行落盘 (qa_id+原因, 不再静默 skip) + CTX_DUMP
+    默认开 (每题 ctx 组成: raw 证据/blocks/entity 段/来源占比, 供翻转归因)
+  • 达摩院 R2c 输出协议 prompt v2 (reader 侧, 默认开) — 日期锚显式日历换算 + 粒度纪律
+    (禁时刻/弱化词, 范围保范围) + 计数/枚举后报数 + 范围纪律 + 3 few-shot;
+    PROMPT_V2=0 回落 v1 原文 (A/B 用 env 切换); 禁长度压缩 (oracle 实测伤分)
+
 v6.13.0 (2026-09-03) DataPlaneRestore:
   • 达摩院 R1A 评测数据面重建 — REBUILD_SHADOW_ONLY=1 在已灌 episode 层
     的评测库 (eval_db_p1) 补跑 LLM 影子段 (压缩记忆块/实体抽取/ontology/
