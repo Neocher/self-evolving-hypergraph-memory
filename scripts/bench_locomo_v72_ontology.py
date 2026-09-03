@@ -55,6 +55,15 @@ CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 #   密集纪律(日期换算/粒度/枚举/范围 + 3 few-shot)对 qwen3-14b 规则过载, 反致失焦/越界。
 #   → 默认翻转回 v1 (PROMPT_V2=0 语义); v2 保留可测但非默认。
 PROMPT_V2 = os.environ.get("PROMPT_V2", "0") == "1"
+# 2026-09-04 达摩院 R4A (round2b 决策 §3 R4 行 + r0 研究定论): oracle 注入证据形态 —
+#   db (默认): 金标 evidence 按 dia_id 映射灌库 DB 同形 content (带 '[date: <会话日期>]
+#     [speaker] text' 前缀的原文整条)。旧裸 evidence text (无 [date:]) 注入正是 r0 作废的
+#     cat2 去锚失效形态 (oracle 26.5% < 生产 43.1%), R4 上限复核必须注入 DB 同形。
+#   legacy: 旧裸文本注入 (v6.14.1 L1223-1226 行为, 保留作对照回归)。
+ORACLE_MODE = os.environ.get("ORACLE_MODE", "db")
+if os.environ.get("ORACLE_INJECT") == "1" and ORACLE_MODE not in ("db", "legacy"):
+    print(f"[ORACLE] ORACLE_MODE 非法: {ORACLE_MODE!r} (可选 db|legacy), 退出", flush=True)
+    sys.exit(2)
 _READER_PROMPT_V1 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
 
 Conversation snippets:
@@ -1208,6 +1217,46 @@ if PREDICT_MODE and os.environ.get("RESUME") == "1" and os.path.exists(PREDICT_O
     except Exception as _e:
         print(f"[RESUME] 读取已有预测失败, 从头跑: {_e}", flush=True)
 
+# ── R4A oracle DB 同形注入辅助 (ORACLE_INJECT=1 + ORACLE_MODE=db) ──
+# 映射源: q.evidence_messages[].dia_id → _dia_to_ep (dia_id → ep_N, pkl 恢复时有)
+# → episode_cache[ep_N].content / msg_by_id[ep_N] (灌库 DB 同形原文, 带
+# '[date: <会话日期>] [speaker] text' 前缀)。无 dia_id 或映射失败 → content 去前缀后
+# == evidence text 反查回落; 仍找不到 → 整题跳过注入 (计数, 不注入部分证据防污染 oracle 点)。
+
+def _oracle_strip_db_prefix(content):
+    """去掉 DB content 前缀 '[date: <会话日期>] [speaker] ' → 裸消息文本 (与 evidence text 对齐)。"""
+    s = (content or "").strip()
+    s = re.sub(r"^\[date:[^\]]*\]\s*", "", s)   # 可选 [date: ...]
+    s = re.sub(r"^\[[^\]]*\]\s*", "", s)        # [speaker]
+    return s.strip()
+
+_db_text_rev = None
+
+def _oracle_ep_by_text(text):
+    """evidence text (裸, 无前缀) → ep_N: content 去前缀反查表 (首次调用惰性构建)。"""
+    global _db_text_rev
+    if _db_text_rev is None:
+        _db_text_rev = {}
+        for _ep, _c in msg_by_id.items():
+            _k = _oracle_strip_db_prefix(_c)
+            if _k:
+                _db_text_rev.setdefault(_k, _ep)
+    return _db_text_rev.get((text or "").strip())
+
+def _oracle_db_content(evidence_msg):
+    """单条 evidence → DB 同形 content 整条; 定位不到返回 '' (调用方整题跳过注入)。"""
+    _did = (evidence_msg.get("dia_id") or "").strip()
+    _ep = _dia_to_ep.get(_did, "") if _did else ""
+    _content = ""
+    if _ep:
+        _content = (episode_cache.get(_ep, {}).get("content") or "").strip() or (msg_by_id.get(_ep) or "").strip()
+    if not _content:
+        _content = (msg_by_id.get(_oracle_ep_by_text(evidence_msg.get("text", ""))) or "").strip()
+    return _content
+
+_oracle_db_ok = 0     # db 同形注入成功题数 (该题全部 evidence 均映射到 DB content)
+_oracle_db_skip = 0   # evidence 无映射被整题跳过注入的题数
+
 for i, q in enumerate(qa_all):
     qid = id(q)
     if PREDICT_MODE and q.get("qa_id") in _done_qids:
@@ -1220,10 +1269,34 @@ for i, q in enumerate(qa_all):
     _cur_cat = str(cat)
     channels = retrieve_channels(question, hitk=HITK_MODE, session_ts=session_ts)
     # falsification 实验 (2026-09-02): oracle 注入 = 金标证据人工置顶 (人工正确排序)
+    # R4A (v6.15.0): ORACLE_MODE=db (默认) 注入 DB 同形证据 (dia_id → 灌库 content, 含
+    # '[date:]' 前缀) — 修复旧裸文本 (evidence .text 无前缀) 对 cat2 的人为去锚失效
+    # (r0 研究: oracle 26.5% < 生产 43.1%); ORACLE_MODE=legacy 保留旧形态作对照回归。
     if os.environ.get("ORACLE_INJECT") == "1":
-        _ev = [e.get("text", "").strip() for e in (q.get("evidence_messages") or []) if e.get("text")]
-        _seen = {c[:200] for c in channels["A"]}
-        channels["A"] = [e for e in _ev if e[:200] not in _seen] + channels["A"]
+        if ORACLE_MODE == "db":
+            _ev_msgs = q.get("evidence_messages") or []
+            _got = []
+            for _e in _ev_msgs:
+                _c = _oracle_db_content(_e)
+                if not _c:
+                    break  # 该题有 evidence 定位不到 DB 同形 → 整题跳过注入
+                _got.append(_c)
+            if _ev_msgs and len(_got) == len(_ev_msgs):
+                _oracle_db_ok += 1
+                _seen = {c[:200] for c in channels["A"]}
+                _inj = []
+                for _c in _got:
+                    if _c[:200] not in _seen:
+                        _seen.add(_c[:200])
+                        _inj.append(_c)
+                channels["A"] = _inj + channels["A"]
+            elif _ev_msgs:
+                _oracle_db_skip += 1
+            # _ev_msgs 为空 → 无证据可注入, 不改通道 (与 legacy 空注入同义)
+        else:  # ORACLE_MODE=legacy: 旧裸文本注入 (v6.14.1 行为逐字节等价)
+            _ev = [e.get("text", "").strip() for e in (q.get("evidence_messages") or []) if e.get("text")]
+            _seen = {c[:200] for c in channels["A"]}
+            channels["A"] = [e for e in _ev if e[:200] not in _seen] + channels["A"]
     ctx, docs = build_ctx(question, channels, rerank_top=40)
 
     # P2 hit@k 基线: evidence 消息文本是否进入 top-k docs (纯检索, 不调 LLM)
@@ -1339,6 +1412,13 @@ for i, q in enumerate(qa_all):
     if (i + 1) % 10 == 0 or i == len(qa_all) - 1:
         acc = results["correct"] / max(1, results["total"]) * 100
         print(f"  {i+1}/{len(qa_all)} acc={acc:.1f}% ({results['correct']}/{results['total']}) round2={results['round2_used']} elapsed={time.time()-t0:.0f}s", flush=True)
+
+# R4A: oracle DB 同形注入汇总 (ORACLE_INJECT=1 + ORACLE_MODE=db)
+if os.environ.get("ORACLE_INJECT") == "1" and ORACLE_MODE == "db":
+    _db_total = _oracle_db_ok + _oracle_db_skip
+    if _db_total:
+        print(f"ORACLE db 同形注入: {_oracle_db_ok}/{_db_total} 题成功 "
+              f"({_oracle_db_skip} 题 evidence 无映射跳过)", flush=True)
 
 acc = results["correct"] / max(1, results["total"]) * 100
 print(f"\n=== v72 本体论核心融合评测 {SAMPLE_N}问 ===", flush=True)
