@@ -45,6 +45,64 @@ HITK_MODE = os.environ.get("HITK_MODE") == "1"  # 纯检索 hit@k 基线 (P2: �
 CTX_DUMP = os.environ.get("CTX_DUMP", "1") != "0"
 CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 
+# 2026-09-03 达摩院 R2c (研究 §7 R2c 行 + §2 cat2 错因 + §6 协议, 附1: 判卷粒度规则原文
+# 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
+# 判卷规约约束输出: 日期锚换算 (A 类 35-45%) + 粒度纪律 (B 类 20-25%, 含 17/118 时刻越界)
+# + 计数/枚举报数 (cat1 ~45%) + 范围纪律 (cat4 overreach ~40%)。禁长度压缩 (研究 §6:
+# 'short answer' 式指令 oracle 实测伤分 cat1 46.7% vs 56.7%)。PROMPT_V2 默认开 (A/B 评测
+# 侧用 PROMPT_V2=0 回落 v1 原文, 零回归)。
+PROMPT_V2 = os.environ.get("PROMPT_V2", "1") != "0"
+_READER_PROMPT_V1 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
+
+Conversation snippets:
+{ctx}
+
+Question: {question}
+Answer:"""
+
+_READER_PROMPT_V2 = """Answer the question using ONLY the conversation snippets below. Each snippet is a real message and begins with its true session date in square brackets, e.g. "[date: 4:33 pm on 12 July, 2023] [Caroline] ..." — that bracketed date is the message date, NOT the date of any event the message talks about.
+
+DATE ANCHOR RULES
+- When the question or a snippet uses a relative time expression (yesterday, last week, last month, two weeks ago, two weekends later, last Monday, this week, the other day, ...), convert it against the [date: ...] anchor of the message that contains it: do the calendar arithmetic and state the actual absolute date or period that expression points to.
+- Never report a message's own [date: ...] date as the date of an event that the message says happened earlier or later. Example: a message dated "[date: 9 June 2023]" saying "my school event last week" means the event was in the week before 9 June 2023 — NOT on 9 June 2023. A message dated "[date: 28 August 2023]" saying "I took my kids to a park yesterday" means the park trip was on 27 August 2023.
+
+GRANULARITY RULES (the grader enforces exact time-unit matching)
+- State the date at the unit the snippets actually pin down: if they only support a year, answer the year; only a month, answer the month; only a day, answer the day. Never add precision the snippets do not support.
+- Never append a clock time (hour/minute) to a date; never write answers like "23 August 2023 at 3:31 pm".
+- If the snippets only support a week or a range (e.g. "the week before <date>", "the weekend of ..."), keep the range expression and also give its absolute range when computable, e.g. "the week before 9 June 2023 (May 29, 2023 to June 4, 2023)". Never collapse a week or a weekend into one invented day.
+- Do not hedge: never use likely, around, approximately, about, maybe, probably, roughly, almost, presumably, or similar qualifiers before a date or fact. State the answer directly.
+
+ENUMERATION AND COUNT RULES
+- For count/list questions ("how many", "which ones", "what all"), list every item the snippets support and then state the count explicitly, e.g. "3 items: A, B and C" or "Two: the first one and the second one". Answer the whole question even when the answer spans several snippets.
+- Before attributing an item to a person or to an event, confirm the snippet's speaker and its session: the same name can appear in different conversations, so do not merge items that belong to different people or sessions.
+- Do not refuse with "cannot determine" when the snippets contain the answer; if evidence is genuinely absent, say so in one clause and stop.
+
+SCOPE RULE
+- Answer exactly what the question asks. Do not add facts, extra lists, guesses, or follow-up suggestions the question did not ask for — the grader marks extra claims as wrong.
+
+Examples:
+
+Conversation snippets:
+[date: 11:02 am on 9 June, 2023] [Caroline] Hey Melanie! I wanted to tell you about my school event last week. It was awesome! I talked about my transgender journey and encouraged students.
+Question: When did Caroline give a speech at a school?
+Answer: The week before 9 June 2023 (May 29, 2023 to June 4, 2023).
+
+Conversation snippets:
+[date: 6:10 pm on 17 July, 2023] [Melanie] Hey Caroline! I had a quiet weekend after we went camping with my fam two weekends ago. It was great to unplug and hang with the kids.
+Question: When did Melanie go camping in July?
+Answer: Two weekends before 17 July 2023 (July 8, 2023 to July 9, 2023).
+
+Conversation snippets:
+[date: 9:12 am on 3 March, 2023] [Alex] I finally finished writing my second screenplay last night; the first one (a jazz pianist story) is still my favorite though.
+Question: How many screenplays has Alex written?
+Answer: 2 items: the first screenplay (a jazz pianist story) and the second screenplay Alex finished on 2 March, 2023.
+
+Conversation snippets:
+{ctx}
+
+Question: {question}
+Answer:"""
+
 
 def _eval_log_header_suffix():
     """R2-0 (轻量): 评测日志头记录 repo commit + 检索 pkl md5 — 翻转归因需锁定数据面快照。"""
@@ -68,7 +126,7 @@ def _eval_log_header_suffix():
 
 
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} | {_eval_log_header_suffix()}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -1235,13 +1293,9 @@ for i, q in enumerate(qa_all):
         except Exception as _e:
             print(f"  [CTX_DUMP err] {_e}", flush=True)
 
-    prompt = f"""Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
-
-Conversation snippets:
-{ctx}
-
-Question: {question}
-Answer:"""
+    # R2c 输出协议 prompt v2 (reader prompt 区): 默认 v2 (日期锚/粒度/计数/范围纪律
+    # + 3 few-shot), PROMPT_V2=0 回落 v1 原文 (评测侧 A/B 用 env 切换)
+    prompt = (_READER_PROMPT_V2 if PROMPT_V2 else _READER_PROMPT_V1).format(ctx=ctx, question=question)
     try:
         pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.2)
     except Exception as e:
