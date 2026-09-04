@@ -12,6 +12,7 @@ sys.path.insert(0, os.environ.get("SHM_ROOT", "/home/admin/shm"))
 import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 from rag_v4_common import append_predict_error, ctx_composition
+import time_anchors  # P0-b 确定性时间层: 纯 regex+datetime 日历算术, 零 LLM (同目录)
 
 DATA = os.environ.get("DATA_PATH", "/home/admin/shm/data/bench/locomo10.json")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
@@ -60,6 +61,22 @@ CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 SESSION_SCOPE = os.environ.get("SESSION_SCOPE", "0") == "1"
 SESSION_SCOPE_URI = os.environ.get("SESSION_SCOPE_URI", "1") == "1"  # URI 标注独立开关 (仅 on 消费)
 SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 候选池加深深度
+
+# 2026-09-04 达摩院 P0-b (round3 研究 §3 P0-b 行 + §6 设计 + M5/M6 语料): 确定性时间层 —
+#   零 LLM 相对时间词 → 绝对区间注解 (cat2 顽固错 35-45% 是相对词推算错: yesterday→答
+#   消息日而非前一天 / last week 事件→答消息日; R4 已证证据在场 14B 也不做日历算术 —
+#   cat2 oracle 61.2% < 生产 65.0%; R2c prompt 教算术 -8.3pp 覆辙 → 算术下沉确定性层,
+#   与 semantica TemporalNormalizer 同哲学)。TIME_ANCHORS=1: ctx 装配层注解 (纯 regex +
+#   datetime, 无 LLM 调用, 消息 [date:] 前缀为锚 → 精确绝对区间), 原文逐字不变, reader
+#   prompt V1 原文不动。呈现两形态/两路径同效 (M3: round2 ~72% 平铺):
+#     (a) ontology_organize 路径 → ctx 内 [DIRECT EVIDENCE] 段后新增 [TIME ANCHORS] 段
+#         (引用 DIRECT EVIDENCE 消息编号);
+#     (b) round2 平铺路径 → 每条 raw 消息行后内联 '[time: <相对词> -> <绝对区间>]'。
+#   开关语义 (报告注明): TIME_ANCHORS 独立 env, 默认 "0" (off) — 与 P0-a SESSION_SCOPE
+#   默认 off 同源对齐 → 双 off 时与 v6.16.0 逐字节等价 (A/B 基线); TIME_ANCHORS=1 可独立
+#   于 SESSION_SCOPE A/B (四象限: scope×anchors); scope=on 时注解只落在会话内消息
+#   (DIRECT EVIDENCE 已引擎限定, 污染池上注解是次优的 — 报告 §61/§2 口径)。
+TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
 
 # 2026-09-03 达摩院 R2c (研究 §7 R2c 行 + §2 cat2 错因 + §6 协议, 附1: 判卷粒度规则原文
 # 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
@@ -154,7 +171,7 @@ def _eval_log_header_suffix():
 
 
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} | {_eval_log_header_suffix()}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} TIME_ANCHORS={'on' if TIME_ANCHORS else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -1139,6 +1156,25 @@ def build_ctx(question, channels, rerank_top=40, scope=None):
     """v72 本体论核心：ontology_organize（保留接口兼容; scope=ci → 会话作用域组织段）"""
     return ontology_organize(question, channels, scope)
 
+
+def _time_anchor_final_ctx(ctx):
+    """P0-b 确定性时间注解装配 (TIME_ANCHORS=1 才调用; 两条路径同效 — M3)。
+
+    - 组织路径 (ctx 含 '[DIRECT EVIDENCE]' 段): 段尾追加 '[TIME ANCHORS]' 汇总段,
+      引用 ctx 内编号 raw 消息行 (DIRECT EVIDENCE / ROUND2 SUPPLEMENTAL 编号连续,
+      1..N 与正文 [N] 同号, reader 可对照摘取) — 任务书路径 (a);
+    - round2 平铺路径 (无组织段, ctx = 块摘要 + 编号 raw 行): 每条 raw 消息行后
+      内联一行 '[time: <相对词> -> <绝对区间>]' — 任务书路径 (b)。
+    注解放 ctx 截断之后追加/内联 (不挤占 raw 证据预算, 设计失效条件 ④); 只对前
+    max_docs 条注解控预算; 消息原文逐字不变 (AC3); scope=on 时 ctx 内编号 raw 行
+    已由 P0-a 引擎限定为会话内消息 → 注解天然只落在会话内 (任务书约束 4)。
+    """
+    if not TIME_ANCHORS or not ctx:
+        return ctx
+    if "[DIRECT EVIDENCE]" in ctx:
+        return time_anchors.append_anchor_block(ctx, max_docs=30)
+    return "\n".join(time_anchors.inline_numbered_lines(ctx.splitlines(), max_docs=20))
+
 # ═══ D. agentic 两轮（EverOS）═══
 def suff_check(question, docs_top):
     ctx = "\n".join(f"[{j+1}] {d[:120]}" for j, d in enumerate(docs_top[:10]))
@@ -1559,6 +1595,11 @@ for i, q in enumerate(qa_all):
             ctx = (summ2 + "\n\n" + ev_sec) if summ2 else ev_sec
             ctx = ctx[:CTX_TOKENS]
 
+    # P0-b 确定性时间注解装配 (TIME_ANCHORS=1; 两路径同效): 组织段 → 尾部 [TIME ANCHORS]
+    # 段引用编号; round2 平铺 → 每条 raw 消息行后内联 [time: ...]。原文逐字不变, 不改
+    # reader prompt (V1 原样), scope=on 时编号行已引擎限定为会话内 → 注解即会话内。
+    ctx = _time_anchor_final_ctx(ctx)
+
     # CTX_DUMP 默认开 (R2-0): 每题落盘最终检索 ctx + 组成 (raw 证据条数/blocks 摘要/
     # entity 段/各来源字符占比), 供翻转归因与 R-CTX 诊断 (round1 缺此现场)
     if CTX_DUMP:
@@ -1652,6 +1693,28 @@ print(f"round2: {results['round2_used']} | 错误: {results['errors']} | 耗时:
 # P0-a 汇总: SESSION_SCOPE 状态 + round2 触发率 + 会话内命中率 (过程验证指标)
 print(f"[P0-a] SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} | "
       f"round2 触发率: {results['round2_used']}/{_processed_q} = {results['round2_used']/max(1, _processed_q)*100:.1f}%", flush=True)
+if TIME_ANCHORS:
+    # P0-b 过程指标: 双路径注解装配状态 (组织段 [TIME ANCHORS] / 平铺内联), 供 A/B 归因
+    _ta_org = _ta_inl = 0
+    if os.path.exists(CTX_DUMP_OUT):
+        try:
+            with open(CTX_DUMP_OUT, encoding="utf-8", errors="ignore") as _tf:
+                for _tl in _tf:
+                    _tl = _tl.strip()
+                    if not _tl:
+                        continue
+                    try:
+                        _tc = json.loads(_tl).get("ctx", "")
+                    except Exception:
+                        continue
+                    if "[TIME ANCHORS" in _tc:
+                        _ta_org += 1
+                    if "\n[time: " in _tc:
+                        _ta_inl += 1
+        except Exception:
+            pass
+    print(f"[P0-b] TIME_ANCHORS=on | ctx 含 [TIME ANCHORS] 段题数: {_ta_org} | "
+          f"ctx 含内联 [time:] 行题数: {_ta_inl}", flush=True)
 if _scope_stats["q"]:
     _hit_rate = _scope_stats["in_scope"] / max(1, _scope_stats["raw"]) * 100
     _poll_q = _scope_stats["polluted_q"] / max(1, _scope_stats["q"]) * 100

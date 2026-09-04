@@ -1,12 +1,30 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.16.0"
-__version_info__ = (6, 16, 0)
-__version_name__ = "P0aSessionScope"
+__version__ = "6.17.0"
+__version_info__ = (6, 17, 0)
+__version_name__ = "P0bTimeAnchors"
 __release_date__ = "2026-09-04"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.17.0 (2026-09-04) P0bTimeAnchors:
+  • 达摩院 P0-b 确定性时间层 (round3 研究 §2 P0-b 行 + §3 设计 + §6 校验; M5 语料
+    ~40 种有界模式 last week 108/yesterday 67/last friday 40/next month 36…,
+    M6 299 题中 186 题证据含相对词、101 题 gold 为绝对日期/区间; R4 已证证据在场
+    14B 也不做日历算术 — cat2 oracle 61.2% < 生产 65.0%, R2c prompt 教算术 -8.3pp
+    覆辙) — 零 LLM 时间锚注解下沉确定性层 (scripts/time_anchors.py, 纯 regex +
+    datetime 日历算术): 以消息 [date:] 前缀为锚解析相对时间词 → 精确绝对区间,
+    双形态渲染 (自然相对短语原文 + '29 May 2023 to 4 June 2023' 绝对区间),
+    消息原文逐字不变 (判卷近重复敏感); 真日历 oracle 单测 (2023-07-23 周日 →
+    last Friday = 21 日; 周一起始/周末/月底语义; 语料覆盖率统计)。呈现双路径同效
+    (M3: round2 ~72% 平铺): 组织 ctx 段尾 [TIME ANCHORS] 段引用 DIRECT EVIDENCE
+    消息编号 / round2 平铺 ctx 每条 raw 消息后内联 '[time: 相对词 → 绝对区间]';
+    注解放 ctx 截断后追加不挤占 raw 证据 (失效条件 ④), reader prompt V1 原文不动
+    (AC4 diff=空, 禁说教); scope=on 时注解只落在会话内消息 (DIRECT EVIDENCE 已
+    引擎限定, 污染池上注解次优)。开关 TIME_ANCHORS 独立 env (默认 0, 与 P0-a
+    SESSION_SCOPE 默认 off 同源 → 双 off 与 v6.16.0 逐字节等价; 四象限可 A/B),
+    汇总打印 TIME_ANCHORS 状态 + 注解装配题数。只改任务相关文件, 不读 gold/
+    evidence 反推, 不改判卷/题/答案文本。
 v6.16.0 (2026-09-04) P0aSessionScope:
   • 达摩院 P0-a 会话作用域下沉引擎 (round3 研究 §2 P0-a 行 + §5 设计; M1 跨会话
     污染 324/451 题 ctx 含异会话 raw 消息 ~17%, M2 重名 John×3/Luna×3/Max×5,
