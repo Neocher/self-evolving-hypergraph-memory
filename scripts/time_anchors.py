@@ -266,6 +266,46 @@ _RE_RECENTLY = re.compile(r"\brecently\b", re.IGNORECASE)
 
 _UNIT_DELTAS = {"day": "days", "week": "weeks", "month": "months", "year": "years"}
 
+# ── R6-B 粒度标签 (2026-09-05): pattern 名 → 解析粒度 ──────────────────────
+# 让 reader 对齐 gold 粒度 (REL-gold 判卷禁换算, 粒度越界 RANGE 17/MONTH 9/
+# YEAR 4 是 cat2 95 错主因之一 — 达摩院 r5 研究 §cat2): 结构层标签而非 prompt
+# 说教 (R2c 覆辙)。粒度枚举: day|week|month|year|range。
+_GRANULARITY_BY_PATTERN = {
+    "day before yesterday": "day",
+    "yesterday": "day",
+    "today": "day",
+    "tonight": "day",
+    "this morning/afternoon/evening": "day",
+    "last night": "day",
+    "last <weekday>": "day",
+    "next <weekday>": "day",
+    "the week before D": "week",
+    "the week of D": "week",
+    "last week": "week",
+    "this week": "week",
+    "next week": "week",
+    "last month": "month",
+    "this month": "month",
+    "next month": "month",
+    "last year": "year",
+    "this year": "year",
+    "next year": "year",
+    "N weekends ago": "range",   # 周末 = 周六+周日两天块, 非整周
+    "last weekend": "range",
+    "this weekend": "range",
+    "next weekend": "range",
+}
+_UNIT_GRANULARITY = {"day": "day", "week": "week", "month": "month", "year": "year"}
+
+
+def granularity_of(pattern: str, match: Optional[re.Match] = None) -> str:
+    """解析结果的粒度标签; 有界单位型 (N unit ago / in N unit) 按捕获单位定。
+    无表项 (模糊词等) → 'range' 兜底 (不会渲染, 仅统计路径可达)。"""
+    if pattern in ("N unit ago", "in N unit") and match is not None:
+        u = ((match.group("u") or "") if isinstance(match, re.Match) else "").lower()
+        return _UNIT_GRANULARITY.get(u, "range")
+    return _GRANULARITY_BY_PATTERN.get(pattern, "range")
+
 
 def _shift_units(d: datetime.date, n: int, unit: str, sign: int
                  ) -> Tuple[datetime.date, datetime.date]:
@@ -370,15 +410,23 @@ def _week_before_span(d: datetime.date, m: re.Match
 # ── 对外 API ───────────────────────────────────────────────────────────────
 
 class TimeAnchor:
-    """一条解析出的时间锚注解: 原文相对短语 + 绝对区间 (双形态)。"""
+    """一条解析出的时间锚注解: 原文相对短语 + 绝对区间 (双形态)。
 
-    __slots__ = ("phrase", "start", "end", "pattern")
+    R6-B (2026-09-05): 新增粒度标签 (granularity) 与消息日期污染防御
+    (predates_msg) — 行格式 原文短语在前 → 解析区间在后, reader 可回显
+    REL-gold 原文短语。"""
+    __slots__ = ("phrase", "start", "end", "pattern", "granularity", "predates_msg")
 
     def __init__(self, phrase: str, span: Tuple[datetime.date, datetime.date],
-                 pattern: str):
+                 pattern: str, match: Optional[re.Match] = None,
+                 anchor_date: Optional[datetime.date] = None):
         self.phrase = phrase          # 形态一: 原文相对短语 (逐字)
         self.start, self.end = span   # 精确绝对区间 (形态二)
         self.pattern = pattern
+        self.granularity = granularity_of(pattern, match)
+        # 消息日期污染防御: 事件区间整体早于消息自身 [date:] → 该相对词指向前
+        # 一消息日期 (reader 若把消息日期当事件日期即污染 — cat2 消息日期污染)。
+        self.predates_msg = bool(anchor_date is not None and self.end < anchor_date)
 
     @property
     def absolute(self) -> str:
@@ -419,7 +467,8 @@ def find_anchors(text: str, anchor_date: Optional[datetime.date] = None
             span = fn(anchor_date, m)
             if span is None:
                 continue
-            out.append(TimeAnchor(m.group(0).strip(), span, name))
+            out.append(TimeAnchor(m.group(0).strip(), span, name,
+                                  match=m, anchor_date=anchor_date))
     return _dedup(sorted(out, key=lambda a: body.lower().find(a.phrase.lower())))
 
 
@@ -427,12 +476,19 @@ def inline_annotation(text: str, anchor_date: Optional[datetime.date] = None
                       ) -> Optional[str]:
     """单条消息 → 内联注解行 '[time: <相对词> → <绝对区间>]' (多词分号连接)。
 
+    R6-B: 行尾追加粒度标签 '[granularity: day|week|month|year|range]';
+    事件区间整体早于消息日期 (相对词指向前一消息日期) → 追加 '[predates msg
+    date]' 污染防御标注。原文短语保持在前 (reader 可回显 REL-gold)。
     无锚/无注解 → None (调用方原样保留消息行, 原文逐字不变)。"""
     anchors = find_anchors(text, anchor_date)
     if not anchors:
         return None
     joined = "; ".join(f"{a.phrase} -> {a.absolute}" for a in anchors)
-    return f"[time: {joined}]"
+    granularity = ", ".join(a.granularity for a in anchors)
+    line = f"[time: {joined}] [granularity: {granularity}]"
+    if any(a.predates_msg for a in anchors):
+        line += " [predates msg date]"
+    return line
 
 
 def numbered_anchor_block(numbered_docs: Iterable[Tuple[int, str]],
@@ -440,14 +496,20 @@ def numbered_anchor_block(numbered_docs: Iterable[Tuple[int, str]],
     """[TIME ANCHORS] 段 (组织路径 (a)): 引用 DIRECT EVIDENCE 消息编号。
 
     入参编号文档 [(N, content), ...] (N 与 DIRECT EVIDENCE 段 '[N]' 同号);
-    只含可解析锚的消息; 无注解 → 返回 '' (不输出空段)。组织段文本只陈述事实。"""
+    只含可解析锚的消息; 无注解 → 返回 '' (不输出空段)。组织段文本只陈述事实。
+    R6-B: 行格式 = 原文相对短语置前 + 解析区间置后 (reader 可回显 REL-gold,
+    判卷禁换算 — cat2 REL-gold 29/29 被答成绝对日期是 r5 主错因之一);
+    行尾带粒度标签 [granularity: ...]; 事件早于消息日期 → [predates msg date]。"""
     lines = []
     for n, content in numbered_docs:
         anchors = find_anchors(content)
         if not anchors:
             continue
         for a in anchors[:3]:  # 单条消息至多 3 条, 控 ctx 预算
-            lines.append(f"[{n}] {a.phrase} -> {a.absolute}")
+            line = f"[{n}] {a.phrase} -> {a.absolute} [granularity: {a.granularity}]"
+            if a.predates_msg:
+                line += " [predates msg date]"
+            lines.append(line)
         if len(anchors) > 3:
             lines.append(f"[{n}] ... ({len(anchors) - 3} more)")
     if not lines:
