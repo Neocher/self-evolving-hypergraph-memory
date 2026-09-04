@@ -228,6 +228,13 @@ class QueryRouterConfig:
     fusion_vector_topk: int = 100  # FUSION 向量通道 FAISS 检索深度
     fusion_bm25_topk: int = 100  # FUSION BM25 通道候选深度
     fusion_entity_topk: int = 100  # FUSION 实体通道候选深度（LIMIT 走 k*2）
+    # 【达摩院 P0-a】会话作用域检索引擎能力（默认关零回归）：retrieve(scope=ci)
+    # 传入时，FUSION 候选池先加深到 session_scope_pool 再按 episode.session_id == ci
+    # 过滤（跨会话证据不进 ctx / rerank 在会话内做 — M1 根治；无 session 归属的
+    # 聚合节点——社区摘要/MESA/视觉/schema——按 session_scope_drop_unattributed 丢弃，
+    # 防全库块摘要含异会话人物 M4）。None → v6.15.0 全库检索逐字节等价（A/B 基线）。
+    session_scope_pool: int = 500  # scoped 候选池加深深度（与评测 SESSION_SCOPE_POOL 对齐）
+    session_scope_drop_unattributed: bool = True  # scoped 时无会话归属节点丢弃（fail-closed）
     # 【P0 达摩院收敛】扩池后跨通道近重复去重：文本归一化后字符 bigram Jaccard
     # ≥ fusion_dedup_threshold 判近重复，贪心保留融合分最高代表项——防近重复项
     # 把有效证据挤出 top-40（仅 FUSION 生效；任何异常静默降级原列表）
@@ -293,6 +300,11 @@ class QueryRouterConfig:
             raise ValueError(
                 f"QueryRouterConfig.fusion_dedup_min_len={self.fusion_dedup_min_len} 必须 >= 1"
             )
+        # 【达摩院 P0-a】会话作用域候选池深度校验：0/负数会让 scoped 通道静默空返回。
+        if self.session_scope_pool < 1:
+            raise ValueError(
+                f"QueryRouterConfig.session_scope_pool={self.session_scope_pool} 必须 >= 1"
+            )
 
 
 @dataclass
@@ -356,6 +368,7 @@ class QueryRouter:
         episode_cache: Optional[dict] = None,
         services=None,
         attr_aliases: Optional[dict] = None,
+        session_index: Optional[dict] = None,
     ) -> None:
         """
         Args:
@@ -369,6 +382,10 @@ class QueryRouter:
                 512→384 投影，保证视觉 query 与写路径同空间）
             attr_aliases: 属性别名归一表 {canonical: [alias...]}（【v5.50.0 P2】；
                 空表 → 属性通道检索逐字节等价零回归）
+            session_index: 会话归属预计算索引 {node_id: session_id}（【达摩院 P0-a】。
+                与 episode_cache 同坐标——episode.session_id == 官方 conversation_idx；
+                缺省 None → 从 episode_cache 惰性读 session_id；两者都无归属 → 该节点
+                视为不可归因（scoped 检索按 session_scope_drop_unattributed 丢弃））
         """
         self.graph_store = graphlite_store
         self.faiss_index = faiss_index
@@ -386,6 +403,9 @@ class QueryRouter:
         self._episode_cache = episode_cache if episode_cache is not None else {}
         # 【M4】CJK 通道跳过一次性标志（进程内首次 warning，不刷屏）
         self._cjk_warned = False
+        # 【达摩院 P0-a】会话作用域索引（node_id → session_id）。显式注入优先，
+        # 缺省回落 episode_cache（与评测灌库同坐标：episode.session_id）。
+        self._session_index = session_index if session_index is not None else {}
         self.config = config or QueryRouterConfig()
         self._time_keywords = [
             "最近",
@@ -1323,6 +1343,81 @@ class QueryRouter:
             r["score"] = round(r["score"] * boost, 6)
         return results
 
+    # ──────────────────────────────
+    # 【达摩院 P0-a】会话作用域检索原语（node_id → episode.session_id 直判路由）
+    # ──────────────────────────────
+    @staticmethod
+    def _norm_session(value) -> Optional[int]:
+        """会话坐标归一化：官方 conversation_idx / 灌库 session_id 为 0..9 int。
+
+        int/数字字符串 → int；不可解析 → 原样字符串（不误归一）；None → None。
+        bool 是 int 子类，先排除防 True→1 误判。
+        """
+        if value is None or isinstance(value, bool):
+            return value if value is None else str(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    def _session_of(self, node_id: str) -> Optional[int]:
+        """node_id → 归属会话 idx（session_index 优先，回落 episode_cache.session_id）。
+
+        只消费节点自身的会话坐标（灌库 session_id / 官方 conversation_idx 同坐标），
+        不读题面/evidence 反推归属（round3 研究 §11 红线 7）。无归属 → None。
+        """
+        if not node_id:
+            return None
+        sid = None
+        if isinstance(self._session_index, dict) and node_id in self._session_index:
+            sid = self._session_index.get(node_id)
+        if sid is None:
+            cache = self._episode_cache
+            ep = None
+            if isinstance(cache, dict):
+                ep = cache.get(node_id)
+            elif cache is not None and hasattr(cache, "get"):
+                try:
+                    ep = cache.get(node_id)
+                except Exception:
+                    ep = None
+            if ep is not None and isinstance(ep, dict):
+                sid = ep.get("session_id")
+        return self._norm_session(sid)
+
+    def _filter_to_session(self, results: list[dict], scope: Optional[int]) -> list[dict]:
+        """会话作用域后置过滤：只保留归属 scope 的 episode 节点。
+
+        - scope is None → 原列表（off = v6.15.0 逐字节等价基线）。
+        - 无会话归属节点（社区摘要/MESA 合成/视觉/schema 蒸馏/PropertyVerNode 等
+          跨会话聚合文本）在 scoped 下按 session_scope_drop_unattributed 丢弃
+          （M1 污染源头：全库块摘要含异会话人物 M4；fail-closed）。
+        - 过滤在 rerank 之前 → bge-reranker 只在会话内候选池打分（rerank 在会话内）。
+        """
+        if scope is None:
+            return results
+        drop_unattr = self.config.session_scope_drop_unattributed
+        out = []
+        kept_by_channel: dict[str, int] = {}
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            sess = self._session_of(r.get("node_id") or "")
+            if sess == scope:
+                out.append(r)
+                ch = r.get("_source") or r.get("level") or "unknown"
+                kept_by_channel[ch] = kept_by_channel.get(ch, 0) + 1
+            elif sess is None and not drop_unattr:
+                out.append(r)  # 显式保留不可归因节点（宽松模式）
+        # 可观测：scope 过滤后各通道返回数 + 会话内命中率（供日志/过程指标）
+        logger.info(
+            "Session scope filter",
+            scope=scope, kept=len(out), total=len(results),
+            in_session_rate=round(len(out) / max(1, len(results)), 4),
+            by_channel=kept_by_channel,
+        )
+        return out
+
     def _fuse_results(
         self,
         vector_results: list[dict],
@@ -1410,12 +1505,28 @@ class QueryRouter:
         session_ts: Optional[float] = None,
         rerank: Optional[bool] = None,
         hyde: Optional[bool] = None,
+        scope: Optional[int | str] = None,
     ) -> list[dict]:
         """多信号检索融合入口。
 
         支持两种模式：
           - 降级链模式（HYPERGRAPH/VECTOR/KEYWORD）— 向后兼容
           - 融合模式（FUSION）— 三路并行融合（向量+BM25+实体匹配）
+
+        【达摩院 P0-a】会话作用域（scope）：
+          - None → 全库检索（v6.15.0 逐字节等价基线，A/B off 臂）。
+          - int / 数字字符串（官方 conversation_idx，与灌库 episode.session_id
+            同坐标）→ 引擎级会话作用域：FUSION 三通道候选池先加深
+            （config.session_scope_pool）再按 node_id → session_id 过滤，rerank
+            在会话内候选池做（bge-reranker 只面对本会话证据，M1 异会话污染根治）；
+            无会话归属的聚合节点（社区摘要/MESA/视觉/schema 蒸馏等）默认丢弃
+            （M4 全库块摘要含异会话人物）。agentic 追加检索路径（agentic_enabled）
+            同样注入 scope（每轮候选池加深 + 会话内过滤，round2 追加检索带 scope）。
+          路由只消费节点自身 session_id / 官方 conversation_idx，不读题面/evidence
+          反推会话归属（round3 研究 §11 红线 7）。scope 过滤在引擎统一出口
+          （_finish/agentic 每轮）对所有检索级别一致生效；候选池加深仅 FUSION
+          融合通道（非 FUSION 级联为逐级降级链，同出口过滤无池加深）。
+          None → 各路径调用形态与 v6.15.0 一致（零回归，A/B off 臂）。
 
         Args:
             query: 查询文本
@@ -1431,6 +1542,7 @@ class QueryRouter:
                 （默认关）；仅 level==FUSION 时生效；True 时 LLM 生成假设段落
                 参与检索（dual 双路合并 / replace 仅假设向量），生成失败静默
                 降级现状单路；False 显式关闭（逐字节等价旧行为）。
+            scope: 会话作用域坐标（None → 全库；int/数字字符串 → 仅该会话；仅 FUSION）
 
         Returns:
             检索结果列表 [...]
@@ -1438,6 +1550,9 @@ class QueryRouter:
         # 查询归一化：中文标点统一 + 中文技术术语→英文
         raw_query = query  # 保留原始查询（BM25 通道需要未归一化的中文原文）
         query = self._normalize_query(query)
+        # 【达摩院 P0-a】会话作用域坐标归一（仅 FUSION 生效；None → 全库基线零回归）
+        scope = self._norm_session(scope)
+        scope_pool = self.config.session_scope_pool if scope is not None else None
 
         def _finish(results: list[dict]) -> list[dict]:
             # 【Core-Boost】统一出口应用 core 轨 ×1.1 boost + 去重排序——
@@ -1479,6 +1594,12 @@ class QueryRouter:
             # AtomicFactNode → 事实文本（subject/predicate/object/time）直接进
             # 上下文（事实级证据，EverOS 93.05 核心）；默认关（fact_channel_enabled）
             results = self._fact_retrieve(results, query, raw_query, now_ts=session_ts)
+            # 【达摩院 P0-a】会话作用域：去重/boost 前按 session_id 后置过滤（rerank 在
+            # 会话内候选池做）。scoped 时聚合增强通道（community/MESA/视觉/schema 等
+            # 无 session 归属）在此按 session_scope_drop_unattributed 丢弃——异会话文本
+            # 不进 ctx（M1 根治），全库块摘要含异会话人物不入池（M4）。
+            if scope is not None:
+                results = self._filter_to_session(results, scope)
             if not include_archived:
                 results = self._filter_archived(results)
             sorted_results = self._deduplicate_and_sort(results)
@@ -1506,14 +1627,24 @@ class QueryRouter:
         # 【P0-2 Agentic】多步锚点检索编排（默认关）：agentic_enabled=True 且
         # level==FUSION 才走新路径（【P1-4】不再劫持 HYPERGRAPH/VECTOR/KEYWORD），
         # 首轮 = _route_channels(plan) + 三路融合（现有 FUSION 全路径）；False 时
-        # 完全走下方既有单轮路径，字节级等价。
+        # 完全走下方既有单轮路径，字节级等价。P0-a：scope 透传每轮 fusion
+        # 与追加检索（round2 同会话限定）。
         if self.config.agentic_enabled and level == RetrievalLevel.FUSION:
             return self._agentic_retrieve(
                 query, raw_query, query_embedding, session_ts, include_archived,
+                scope=scope,
             )
 
         # F — 三路并行融合（向量 + BM25 + 实体匹配）
         if level == RetrievalLevel.FUSION:
+            # P0-a：候选池加深只发生在 scoped 调用（scope_pool 非 None），
+            # off 路径调用形态与 v6.15.0 一致（零回归 / mock 兼容）。
+            def _fusion_call(q: str, emb, rq: Optional[str]):
+                if scope_pool is not None:
+                    return self._fusion_retrieve(
+                        q, emb, rq, now_ts=session_ts, pool_k=scope_pool)
+                return self._fusion_retrieve(q, emb, rq, now_ts=session_ts)
+
             # 【P3b】HyDE 假设文档增强（默认关零回归）：仅 FUSION 生效；
             # hyde=None → 读 config.hyde_enabled；生成失败/未启用 → 现状单路。
             hyde_enabled = self.config.hyde_enabled if hyde is None else hyde
@@ -1523,15 +1654,12 @@ class QueryRouter:
                     hypo_emb = self._encode_query(hypo)
                     if hypo_emb is not None:
                         if self.config.hyde_mode == "dual":
-                            base = self._fusion_retrieve(
-                                query, query_embedding, raw_query, now_ts=session_ts)
-                            extra = self._fusion_retrieve(
-                                hypo, hypo_emb, raw_query, now_ts=session_ts)
+                            base = _fusion_call(query, query_embedding, raw_query)
+                            extra = _fusion_call(hypo, hypo_emb, raw_query)
                             return _finish(base + extra)  # _deduplicate_and_sort 天然去重合并
                         # replace：单路，query_embedding 替换为假设向量
-                        return _finish(self._fusion_retrieve(
-                            query, hypo_emb, raw_query, now_ts=session_ts))
-            return _finish(self._fusion_retrieve(query, query_embedding, raw_query, now_ts=session_ts))
+                        return _finish(_fusion_call(query, hypo_emb, raw_query))
+            return _finish(_fusion_call(query, query_embedding, raw_query))
 
         # 从指定级别开始，逐级尝试（空结果自动级联）
         results: list[dict] = []
@@ -1540,18 +1668,18 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
                 self._tag_degraded(r, level="l1_circuit_breaker")
                 return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
                 self._tag_degraded(r, level="l1_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
             self._tag_degraded(r, level="l1_empty")
             return r
 
@@ -1560,13 +1688,13 @@ class QueryRouter:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L2 empty, cascading to L3")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
             self._tag_degraded(r, level="l2_empty")
             return r
 
@@ -1590,6 +1718,7 @@ class QueryRouter:
         query_embedding: Optional[np.ndarray] = None,
         raw_query: Optional[str] = None,
         now_ts: Optional[float] = None,
+        pool_k: Optional[int] = None,
     ) -> list[dict]:
         """三路并行融合检索。
 
@@ -1600,10 +1729,16 @@ class QueryRouter:
         结果合并逻辑（_fuse_results）不变。【M4】CJK 跳过实体通道逻辑不破坏：
         CJK 查询不提交 entity 任务（省一次全表扫描），一次性 warning 标志保留。
 
+        【达摩院 P0-a】pool_k（可选）：会话作用域候选池加深深度。scope 非空时
+        retrieve() 传 config.session_scope_pool——三通道候选先加深再过滤，防
+        top-40/100 截断在会话内丢召回（AC2 会话内 hit@k 不降）。None → 沿用
+        config.fusion_*_topk 现状（off 逐字节等价基线）。
+
         Args:
             query: 归一化后的查询文本
             query_embedding: 预计算的查询向量（None 则通过 encoder 编码）
             raw_query: 未归一化的原始查询（语料为原始中文，BM25 通道必须用它）
+            pool_k: 候选池深度覆盖（None → config.fusion_*_topk；scoped → session_scope_pool）
 
         Returns:
             融合检索结果列表
@@ -1619,19 +1754,23 @@ class QueryRouter:
         vector_results: list[dict] = []
         bm25_results: list[dict] = []
         entity_results: list[dict] = []
+        # 【达摩院 P0-a】会话作用域单变量：仅加深候选池深度，通道检索/排序参数不变
+        v_k = self.config.session_scope_pool if pool_k is not None else self.config.fusion_vector_topk
+        b_k = self.config.session_scope_pool if pool_k is not None else self.config.fusion_bm25_topk
+        e_k = self.config.session_scope_pool if pool_k is not None else self.config.fusion_entity_topk
 
         def _run_vector():
             # 【P0 达摩院收敛】FUSION 路径向量通道用独立扩池深度（fusion_vector_topk），
             # 与级联 L2 的 top_k_vector 解耦——rank 21+ 证据不再在候选阶段被截断。
-            return self._vector_retrieve(query, query_embedding, k=self.config.fusion_vector_topk)
+            return self._vector_retrieve(query, query_embedding, k=v_k)
 
         def _run_bm25():
             # BM25 通道用未归一化的原始查询：语料为原始中文，归一化后无交集
             bm25_query = raw_query if raw_query is not None else query
-            return self._bm25_search(bm25_query, self.config.fusion_bm25_topk)
+            return self._bm25_search(bm25_query, b_k)
 
         def _run_entity():
-            return self._entity_match(query, self.config.fusion_entity_topk)
+            return self._entity_match(query, e_k)
 
         fusion_channel_skipped = False
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -1925,6 +2064,7 @@ class QueryRouter:
         session_ts: Optional[float],
         include_archived: bool,
         at_ts: Optional[float] = None,
+        scope: Optional[int] = None,
     ) -> list[dict]:
         """单轮检索：三路融合（基础）+ 路由补充通道（property_temporal/hypergraph）。
 
@@ -1933,8 +2073,19 @@ class QueryRouter:
         （单点 boost，避免多轮双重放大）。"entity" 通道已由三路融合的实体匹配覆盖。
         at_ts：编排器已解析的时间锚（plan.at_ts / 证据时间锚），透传给
         _property_temporal_retrieve 不重算。
+
+        scope（达摩院 P0-a）：会话作用域坐标。非 None 时本轮 fusion 候选池先加深
+        （config.session_scope_pool）再在轮内按 node_id → session_id 过滤——追加
+        检索（round2）同样只在同会话证据内补缺（M1 根治）；None → 现状全库。
         """
-        results = self._fusion_retrieve(query, query_embedding, raw_query, now_ts=session_ts)
+        # P0-a：scoped 轮 fusion 候选池加深（off 调用形态不变 → mock/零回归兼容）
+        if scope is not None:
+            pool_k = self.config.session_scope_pool
+            results = self._fusion_retrieve(
+                query, query_embedding, raw_query, now_ts=session_ts, pool_k=pool_k)
+        else:
+            results = self._fusion_retrieve(
+                query, query_embedding, raw_query, now_ts=session_ts)
         if "property_temporal" in channels:
             results = self._property_temporal_retrieve(
                 results, query, raw_query, now_ts=session_ts, at_ts=at_ts,
@@ -1953,6 +2104,9 @@ class QueryRouter:
         results = self._attribute_expansion(results, query, raw_query, now_ts=session_ts)
         if not include_archived:
             results = self._filter_archived(results)
+        # P0-a：轮内统一出口按会话过滤（rerank/去重在编排器末尾，scoped 无聚合节点漏入）
+        if scope is not None:
+            results = self._filter_to_session(results, scope)
         return results
 
     def _agentic_retrieve(
@@ -1962,6 +2116,7 @@ class QueryRouter:
         query_embedding: Optional[np.ndarray],
         session_ts: Optional[float],
         include_archived: bool,
+        scope: Optional[int] = None,
     ) -> list[dict]:
         """P0-2 多步锚点检索编排器（agentic_enabled=True 且 level=FUSION 时替代单轮）。
 
@@ -1972,6 +2127,9 @@ class QueryRouter:
 
         首轮 = _route_channels(plan)（cat=2 时间锚注入 + cat=1 意图分流），
         后续轮 = _channels_from_anchors（证据消息锚点 refine）。
+
+        scope（达摩院 P0-a）：会话作用域坐标，透传每轮 _agentic_round
+        （fusion 池加深 + 轮内按会话过滤）——追加检索（round2）同样限定本会话。
         """
         plan = self._classify_intent(query, session_ts)
         seen: set[str] = set()
@@ -1988,7 +2146,7 @@ class QueryRouter:
             at_ts = plan.at_ts if step == 1 else (anchors.time_anchor if anchors else None)
             round_results = self._agentic_round(
                 channels, query, query_embedding, raw_query, session_ts,
-                include_archived, at_ts=at_ts,
+                include_archived, at_ts=at_ts, scope=scope,
             )
             # 三重防护 1：去已见节点（防跨轮重复累积）
             fresh = [r for r in round_results if r.get("node_id") not in seen]
@@ -2011,7 +2169,7 @@ class QueryRouter:
                 if channels:
                     round_results = self._agentic_round(
                         channels, query, query_embedding, raw_query, session_ts,
-                        include_archived, at_ts=plan.at_ts,
+                        include_archived, at_ts=plan.at_ts, scope=scope,
                     )
                     fresh = [r for r in round_results if r.get("node_id") not in seen]
                     results.extend(fresh)
