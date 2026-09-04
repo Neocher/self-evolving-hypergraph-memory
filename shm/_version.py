@@ -1,12 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.15.0"
-__version_info__ = (6, 15, 0)
-__version_name__ = "R4OracleDb"
+__version__ = "6.16.0"
+__version_info__ = (6, 16, 0)
+__version_name__ = "P0aSessionScope"
 __release_date__ = "2026-09-04"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.16.0 (2026-09-04) P0aSessionScope:
+  • 达摩院 P0-a 会话作用域下沉引擎 (round3 研究 §2 P0-a 行 + §5 设计; M1 跨会话
+    污染 324/451 题 ctx 含异会话 raw 消息 ~17%, M2 重名 John×3/Luna×3/Max×5,
+    M3 round2 71.7-72.7% 触发且整体替换组织段, M4 全库块摘要含异会话人物) —
+    引擎 QueryRouter.retrieve(scope=conversation_idx): FUSION 三通道候选池先加深
+    (config.session_scope_pool 默认 500, SESSION_SCOPE_POOL 可调) 再在引擎统一出口
+    按 episode.session_id == ci 过滤 (rerank 在会话内; agentic 每轮/round2 追加检索
+    同会话限定; 无归属聚合节点 fail-closed 丢弃), off (scope=None) → v6.15.0
+    逐字节等价基线。harness 直传 scope 不再后过滤检索结果; 块摘要/展开只保留与会话
+    相交的块区间; 组织段 (ENTITY/RELATIONS/FACT TYPES/GLOBAL CONTEXT) 只输出本会话
+    dia_id 事实; 实体标识标注 conv 作用域 URI 前缀 (SESSION_SCOPE_URI, 跨会话同名
+    永不合并); round2 触发时不再整体替换组织段 → "组织段 + 追加证据" 拼接
+    (标记段 [ROUND2 SUPPLEMENTAL EVIDENCE]); 汇总打印 SESSION_SCOPE 状态 + round2
+    触发率 + 会话内命中率 (过程指标)。路由直用 conversation_idx, 不读 gold/evidence
+    反推归属; 不改判卷/题/答案文本。
 v6.15.0 (2026-09-04) R4OracleDb:
   • 达摩院 R4A oracle DB 同形注入 (round2b 决策 §3 R4 行) — ORACLE_INJECT=1 时
     ORACLE_MODE=db (默认) 按 evidence dia_id → 灌库 DB 同形 content (带 '[date:

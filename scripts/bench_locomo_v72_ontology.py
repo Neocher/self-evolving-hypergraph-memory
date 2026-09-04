@@ -45,6 +45,22 @@ HITK_MODE = os.environ.get("HITK_MODE") == "1"  # 纯检索 hit@k 基线 (P2: �
 CTX_DUMP = os.environ.get("CTX_DUMP", "1") != "0"
 CTX_DUMP_OUT = os.environ.get("CTX_DUMP_OUT", "/tmp/ctx_dump/ctx.jsonl")
 
+# 2026-09-04 达摩院 P0-a (round3 研究 §2 P0-a 行 + §5 设计 + §11/§12 红线): 会话作用域
+#   检索与组织 — LoCoMo 10 会话 5882 条共享一库 (episode.session_id == conversation_idx,
+#   0..9 同坐标), 无域检索时题属会话外证据可进 ctx (实测 M1: 451 去重题中 72% ctx 含
+#   异会话 raw 消息, 平均 ~17%; M2 重名 John×3/Luna×3/Max×5; M3 round2 71.7-72.7% 触发
+#   且整体替换 ontology_organize 组织段; M4 全库块摘要含异会话人物)。SESSION_SCOPE=1
+#   单变量臂: 会话作用域下沉引擎 — A 通道 (fusion) 经 QueryRouter.retrieve(scope=ci)
+#   在引擎内按 conversation_idx 过滤 (候选池加深 + rerank 会话内), harness 不再对
+#   检索结果后过滤; B 块/C 图通道在 harness 层按会话相交; 组织段 (ENTITY/RELATIONS/
+#   FACT TYPES/GLOBAL CONTEXT) 只输出本会话 dia_id 事实; round2 不再整体替换组织段
+#   → "组织段 + 追加证据" 拼接; 实体标识加 conv 作用域 URI 前缀 (会话内共指、跨会话
+#   永不合并)。路由直用官方 conversation_idx, 不读 gold/evidence 反推归属。
+#   off (默认) → 与 v6.15.0 行为逐字节等价 (A/B 基线)。
+SESSION_SCOPE = os.environ.get("SESSION_SCOPE", "0") == "1"
+SESSION_SCOPE_URI = os.environ.get("SESSION_SCOPE_URI", "1") == "1"  # URI 标注独立开关 (仅 on 消费)
+SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 候选池加深深度
+
 # 2026-09-03 达摩院 R2c (研究 §7 R2c 行 + §2 cat2 错因 + §6 协议, 附1: 判卷粒度规则原文
 # 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
 # 判卷规约约束输出: 日期锚换算 (A 类 35-45%) + 粒度纪律 (B 类 20-25%, 含 17/118 时刻越界)
@@ -138,7 +154,7 @@ def _eval_log_header_suffix():
 
 
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} | {_eval_log_header_suffix()}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -697,9 +713,21 @@ config.mesa_max_nodes = 5
 qr = QueryRouter(graphlite_store=gstore, faiss_index=faiss_index, tfidf_index=tfidf_index,
                  encoder=enc, config=config, faiss_id_map=faiss_id_map, episode_cache=episode_cache)
 
-def extract_query_entities(question):
-    """从问题提取实体（与 entity_eps 键匹配：直接词匹配 + LLM 兜底）"""
-    found = [e for e in entity_eps if e.lower() in question.lower() and len(e) > 2][:5]
+# ── P0-a SESSION_SCOPE=1: 引擎会话作用域候选池加深 (off 零改动) ──
+# 引擎 retrieve(scope=ci) 内部按 config.session_scope_pool 加深 FUSION 三通道
+# 候选池再按 episode.session_id 过滤 (统一出口); harness 只把 env 旋钮映射到
+# 引擎 config, 不再直接改 fusion_*_topk / 后过滤检索结果 (AC3)。
+if SESSION_SCOPE:
+    qr.config.session_scope_pool = SESSION_SCOPE_POOL
+
+def extract_query_entities(question, scope=None):
+    """从问题提取实体（与会话作用域词汇匹配：直接词匹配 + LLM 兜底）。
+
+    scope=None → 全库 entity_eps 词汇 (v6.15.0 原行为); scope=ci → 仅该会话实体词汇
+    (会话内抽取的实体在另一会话同名/同题出现也不跨会话拉取 — M2 重名防合并)。
+    """
+    vocab = entity_eps if scope is None else _conv_entity_eps.get(scope, {})
+    found = [e for e in vocab if e.lower() in question.lower() and len(e) > 2][:5]
     if found:
         return found
     try:
@@ -710,24 +738,28 @@ No other text."""
         s, e = raw.find("["), raw.rfind("]")
         if s >= 0 and e > s:
             arr = json.loads(raw[s:e + 1])
-            return [str(x) for x in arr if x and x.strip() in entity_eps][:5]
+            return [str(x) for x in arr if x and x.strip() in vocab][:5]
     except Exception:
         pass
     return []
 
-def graph_walk(question):
-    """semantica 图遍历：query 实体 → 属性关系 episode（加权）→ 共现实体 episode → top-k"""
-    ents = extract_query_entities(question)
+def graph_walk(question, scope=None):
+    """semantica 图遍历：query 实体 → 属性关系 episode（加权）→ 共现实体 episode → top-k
+
+    scope=ci → 在该会话的 entity/co 子图上走 (entity_eps/entity_co 跨会话事实不进图)。"""
+    _ee = entity_eps if scope is None else _conv_entity_eps.get(scope, {})
+    _eco = entity_co if scope is None else _conv_entity_co.get(scope, {})
+    ents = extract_query_entities(question, scope)
     if not ents:
         return []
     cand = {}
     for e in ents:
         # 属性关系（直接 MENTIONS 加权 1.0）
-        for ep, sc in entity_eps.get(e, {}).items():
+        for ep, sc in _ee.get(e, {}).items():
             cand[ep] = cand.get(ep, 0) + sc
         # 共现实体（2 跳：实体 A → 同 episode 的实体 B → B 的 episode，加权 0.5）
-        for co, cnt in sorted(entity_co.get(e, {}).items(), key=lambda x: -x[1])[:3]:
-            for ep2, sc2 in entity_eps.get(co, {}).items():
+        for co, cnt in sorted(_eco.get(e, {}).items(), key=lambda x: -x[1])[:3]:
+            for ep2, sc2 in _ee.get(co, {}).items():
                 cand[ep2] = cand.get(ep2, 0) + 0.5 * sc2
     ranked = sorted(cand.items(), key=lambda x: -x[1])[:GRAPH_TOP]
     out = []
@@ -802,10 +834,18 @@ No other text."""
         pass
     return []
 
-def _fuse(q, seen, docs, session_ts=None):
+def _fuse(q, seen, docs, session_ts=None, scope=None):
     try:
         # P1: session_ts = conv 级真实时间锚 (原硬编码 None 使检索器时间感知路径不可达)
-        raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=True)
+        # P0-a SESSION_SCOPE=1: 会话作用域下沉引擎 — 检索结果过滤在 QueryRouter
+        # 引擎内做 (retrieve(scope=ci): FUSION 候选池加深 + episode.session_id == ci
+        # 统一出口过滤 + rerank 会话内); harness 层不再对检索结果后过滤 (AC3)。
+        # off (scope=None) → 调 retrieve 不带 scope, v6.15.0 全库逐字节等价基线。
+        if scope is not None:
+            raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts,
+                              hyde=True, scope=scope)
+        else:
+            raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=True)
     except Exception:
         return
     for r in raw:
@@ -865,11 +905,12 @@ def _p1_time_window_rerank(question, docs):
         (_inside if (_dt is not None and _ws <= _dt <= _we) else _rest).append(_d)
     return _inside + _rest
 
-def _adjacent(docs, seen):
+def _adjacent(docs, seen, scope=None):
+    """邻接 ±3 消息补全 (scope=ci → 只补同会话邻接, 跨会话边界邻接不进池)。"""
     doc_ids = []
     for c in docs:
         for mid, content in msg_by_id.items():
-            if content[:200] == c[:200]:
+            if content[:200] == c[:200] and (scope is None or _ep_session.get(mid) == scope):
                 doc_ids.append(mid)
                 break
     extra = []
@@ -881,6 +922,8 @@ def _adjacent(docs, seen):
                 continue
             for nb in range(max(0, n - 3), n + 4):
                 nb_mid = f"ep_{nb}"
+                if scope is not None and _ep_session.get(nb_mid) != scope:
+                    continue
                 if nb_mid in msg_by_id and msg_by_id[nb_mid][:200] not in seen:
                     seen.add(msg_by_id[nb_mid][:200])
                     extra.append(msg_by_id[nb_mid])
@@ -913,32 +956,47 @@ def _graph_add(question, seen, docs):
     except Exception:
         pass
 
-def retrieve_channels(question, hitk=False, session_ts=None):
-    """三通道并行检索，各自独立打分（有机融合——不塞池竞争）"""
+def retrieve_channels(question, hitk=False, session_ts=None, scope=None):
+    """三通道并行检索，各自独立打分（有机融合——不塞池竞争）
+
+    scope=ci (SESSION_SCOPE=1) → A 通道经 qr.retrieve(scope=ci) 在引擎内按会话
+    (episode.session_id == ci) 过滤 (FUSION 候选池加深 + rerank 会话内); B/C 通道
+    (块/图为 bench 侧数据面) 在 harness 层做会话相交过滤。None → v6.15.0 全库
+    检索逐字节等价。
+    """
     # P2 基线: HITK 模式单查询(基础检索能力), 不含 multi_query 增强
     queries = [question] + ([] if hitk else multi_query_expand(question))
     seen_a, docs_a = set(), []
     for q in queries:
-        _fuse(q, seen_a, docs_a, session_ts)
-    _adjacent(docs_a, seen_a)
+        _fuse(q, seen_a, docs_a, session_ts, scope)
+    _adjacent(docs_a, seen_a, scope)
     # P1 可选: 题面含绝对时间窗 → content [date:] 日期窗内证据前移 (零引擎改动)
     if P1_WINDOW_FILTER:
         docs_a = _p1_time_window_rerank(question, docs_a)
-    # A 通道：消息级 top-40
-    ch_a = docs_a[:40]
+    # A 通道：消息级 top-40。scope=ci 时 docs_a 已仅含本会话消息 → 会话内候选池:
+    # 加深到 RERANK_POOL (200) 再让 DIRECT EVIDENCE rerank 在会话内从深池选 top-30 —
+    # 防 40 截断在会话内丢召回 (AC2 hit@40 不降); off 保持 40 逐字节等价。
+    ch_a = docs_a[:RERANK_POOL] if scope is not None else docs_a[:40]
 
     # B 通道：LLM 记忆块（块摘要 + 展开消息）
+    # P0-a SESSION_SCOPE=1: 块候选加深到全量再按块 [start,end) 消息区间与会话相交过滤;
+    # 展开只取本会话消息 (393 块在全库切分可能跨界 — M4 全库块摘要含异会话人物)。
     ch_b_sum, ch_b_msg, seen_b = [], [], set()
     try:
         qv = np.asarray(enc.embed(question), dtype=np.float32).reshape(1, -1)
         qv = qv / np.linalg.norm(qv, axis=1, keepdims=True)
-        scores, bidx = idx_blk.search(qv, BLOCK_TOP)
+        scores, bidx = idx_blk.search(qv, len(blocks) if scope is not None else BLOCK_TOP)
         for bi in bidx[0]:
             blk = blocks[bi]
+            if scope is not None and not any(
+                    _ep_session.get(f"ep_{j}") == scope for j in range(blk[1], min(blk[2], len(msg_by_id)))):
+                continue  # 块区间与本会话不相交 → 摘要与展开都不进 ctx
             if blk[3][:300] not in seen_b:
                 seen_b.add(blk[3][:300])
                 ch_b_sum.append(blk[3])
             for j in range(blk[1], blk[2]):
+                if scope is not None and _ep_session.get(f"ep_{j}") != scope:
+                    continue  # 跨界块只展开本会话消息
                 c = msg_by_id.get(f"ep_{j}", "")
                 if c and c[:200] not in seen_b:
                     seen_b.add(c[:200])
@@ -947,10 +1005,10 @@ def retrieve_channels(question, hitk=False, session_ts=None):
         pass
     ch_b = (ch_b_sum[:5] + ch_b_msg)[:15]  # 块摘要优先 + 消息展开
 
-    # C 通道：图遍历（实体关系）
+    # C 通道：图遍历（实体关系）(scope=ci → 会话内图子图)
     ch_c = []
     try:
-        for c in graph_walk(question):
+        for c in graph_walk(question, scope):
             if c[:200] not in seen_a and c[:200] not in seen_b:
                 ch_c.append(c)
     except Exception:
@@ -987,46 +1045,62 @@ def light_rerank(query, docs, top_k=30):
 _cur_cat = "0"  # 当前问题类别（RERANK_MODE=auto 分类路由用）
 
 
-def ontology_organize(question, channels):
-    """本体论核心融合：实体/属性/关系/事实/动态schema 五维度组织（非排名平铺）"""
-    ents = extract_query_entities(question)
+def ontology_organize(question, channels, scope=None):
+    """本体论核心融合：实体/属性/关系/事实/动态schema 五维度组织（非排名平铺）
+
+    scope=ci (SESSION_SCOPE=1) → 组织段只输出该会话 dia_id 的事实 (ENTITY/RELATIONS/
+    FACT TYPES 取会话级 triple/schema/图视图, 块线索只列与会话相交的块 — M4 修复),
+    实体标识标注 conv 作用域 URI 前缀 ('conv-<sample>/<名>', 会话内共指、跨会话同名
+    永不合并 — M2); None → v6.15.0 全库组织段逐字节等价。
+    """
+    ents = extract_query_entities(question, scope)
     parts = []
+    _facts_map = _ontology_facts if scope is None else _conv_facts.get(scope, {})
+    _topc = _top_classes if scope is None else _conv_top_classes.get(scope, [])
+    _blocks_it = blocks if scope is None else _conv_blocks.get(scope, [])
+    _co_map = entity_co if scope is None else _conv_entity_co.get(scope, {})
+
+    def _disp(e):
+        """P0-a 稳定 URI 最小版: 组织段/实体段实体名标注会话归属前缀 (仅 scoped 消费)。"""
+        if scope is not None and SESSION_SCOPE_URI:
+            return f"{_conv_label.get(scope, 'conv-%d' % scope)}/{e}"
+        return e
 
     # 1. 实体事实簇（本体属性——按动态 schema 类分组展示）
     for e in ents[:3]:
-        facts = _ontology_facts.get(e, [])
+        facts = _facts_map.get(e, [])
         if not facts:
             continue
         # 属性按 schema 类分组（自进化结果）
         cls_lines = []
-        for cls, vals in _top_classes:
+        for cls, vals in _topc:
             evs = [v for v in vals if v.lower() in " ".join(facts).lower()]
             if evs and len(evs) <= 3:
                 cls_lines.append(f"  · {cls}: {evs[0][:150]}")
-        lines = [f"- {f}" for f in facts[:8]]
+        lines = [f"- {_disp(e)}{f[len(e):]}" if f.startswith(e) else f"- {f}" for f in facts[:8]]
         if cls_lines:
             lines = cls_lines + ["  · (full facts below)"] + lines[:6]
-        # 实体相关块摘要（全局记忆）
-        for blk in blocks:
+        # 实体相关块摘要（本会话记忆; off = 全库全局记忆）
+        for blk in _blocks_it:
             if e.lower() in blk[3].lower():
                 lines.append(f"- [block] {blk[3][:200]}")
                 break
-        parts.append(f"[ENTITY: {e}]\n" + "\n".join(lines))
+        parts.append(f"[ENTITY: {_disp(e)}]\n" + "\n".join(lines))
 
     # 2. 关系证据（实体间共现/关联）
     if len(ents) >= 2:
         rel_parts = []
         for i in range(len(ents)):
             for j in range(i + 1, len(ents)):
-                cnt = entity_co.get(ents[i], {}).get(ents[j], 0)
+                cnt = _co_map.get(ents[i], {}).get(ents[j], 0)
                 if cnt > 0:
-                    rel_parts.append(f"- {ents[i]} — {ents[j]}: co-occur in {cnt} fact(s)")
+                    rel_parts.append(f"- {_disp(ents[i])} — {_disp(ents[j])}: co-occur in {cnt} fact(s)")
         if rel_parts:
             parts.append("[RELATIONS]\n" + "\n".join(rel_parts))
 
-    # 3. 事实全景（全局 triples 精华——按动态 schema 类组织）
+    # 3. 事实全景（本会话 triples 精华——按动态 schema 类组织; off = 全库）
     fact_lines = []
-    for cls, vals in _top_classes[:10]:
+    for cls, vals in _topc[:10]:
         fact_lines.append(f"- [{cls}] {vals[0][:150]}")
     if fact_lines:
         parts.append("[FACT TYPES (auto-discovered schema)]\n" + "\n".join(fact_lines))
@@ -1061,9 +1135,9 @@ def ontology_organize(question, channels):
     ctx = "\n\n".join(parts)
     return ctx[:CTX_TOKENS], direct
 
-def build_ctx(question, channels, rerank_top=40):
-    """v72 本体论核心：ontology_organize（保留接口兼容）"""
-    return ontology_organize(question, channels)
+def build_ctx(question, channels, rerank_top=40, scope=None):
+    """v72 本体论核心：ontology_organize（保留接口兼容; scope=ci → 会话作用域组织段）"""
+    return ontology_organize(question, channels, scope)
 
 # ═══ D. agentic 两轮（EverOS）═══
 def suff_check(question, docs_top):
@@ -1154,6 +1228,114 @@ if conv_ts:
 else:
     print("[P1] conv 时间锚不可用 (库无 session_id 且数据无会话日期/旧合成库) → session_ts 回落 None", flush=True)
 
+# ── P0-a 会话作用域索引 ──
+# 坐标: episode.session_id == 官方 conversation_idx (0..9, 与 P1 灌库同坐标); 会话标签
+# (sample_id 'conv-41') 作稳定 URI 前缀。检索/块/组织段按此处映射路由, 全程不读 gold。
+# _ep_session/_content_sessions 两臂都建 (会话内命中率过程指标, 消费方只在 scoped 生效,
+# off 引用方不触发 → 行为零差); 其余会话级大映射仅 SESSION_SCOPE=1 建。
+_ep_session = {}    # ep_N → 会话 idx (灌库 session_id 直读)
+_conv_label = {}    # 会话 idx → 官方会话标签 (如 'conv-41'), 缺省回落 'conv-<idx>'
+_conv_triples = {}  # 会话 idx → 本会话 dia_id 的 triples
+_conv_facts = {}    # 会话 idx → {entity: [fact_text]} (triples_by_entity_map 同构)
+_conv_entity_eps = {}  # 会话 idx → {entity: {ep: score}}
+_conv_entity_co = {}   # 会话 idx → {entity: {co_entity: count}}
+_conv_top_classes = {}  # 会话 idx → 动态 schema top-15 (discover_schema 同构)
+_conv_blocks = {}    # 会话 idx → [块] 与该会话消息区间相交 (按块 [start,end) ∩ 会话)
+_content_sessions = {}  # msg_by_id content → 所属会话集合 (ctx raw 行归属判定的反查表)
+_scope_stats = {"q": 0, "raw": 0, "in_scope": 0, "polluted_q": 0}  # 会话内命中率过程指标
+for _ep, _ec in episode_cache.items():
+    _sid = _ec.get("session_id")
+    if _sid is None:
+        continue
+    try:
+        _ep_session[_ep] = int(_sid)
+    except (TypeError, ValueError):
+        pass
+# 兜底: 旧 pkl 无 session_id 但 load_messages msg_conv 并行数组可用
+if not _ep_session and _msg_conv:
+    for _j, _cj in enumerate(_msg_conv):
+        if _cj is not None:
+            try:
+                _ep_session[f"ep_{_j}"] = int(_cj)
+            except (TypeError, ValueError):
+                pass
+if _ep_session:
+    # ctx raw 行 → 会话归属反查 (M1 污染率/会话内命中率; 精确 content 匹配)
+    for _ep, _c in msg_by_id.items():
+        _sid = _ep_session.get(_ep)
+        if _sid is None:
+            continue
+        _content_sessions.setdefault(_c, set()).add(_sid)
+if SESSION_SCOPE:
+    for _item in data:
+        _sid = _item.get("sample_id")
+        _cvi = _item.get("conversation_idx")
+        if isinstance(_sid, str) and _sid.startswith("conv-") and isinstance(_cvi, int):
+            _conv_label[_cvi] = _sid
+
+    def _scope_triples_by_entity(tris):
+        """与会话级 triples → {entity: [fact_text]} (与灌库 triples_by_entity_map 同构)。"""
+        m = {}
+        for _t in tris:
+            _e = (_t.get("entity") or "").strip()
+            _a = (_t.get("attribute") or "").strip()
+            _v = (_t.get("value") or "").strip()
+            if _e and _a and _v:
+                m.setdefault(_e, []).append(f"{_e} {_a}: {_v}")
+        return m
+
+    def _scope_discover_top(tris, min_support=3, top=15):
+        """会话级动态 schema: 高频属性模式 → (cls, vals) top (与灌库 discover_schema 同构)。"""
+        attr_cnt, attr_vals = {}, {}
+        for _t in tris:
+            _a = (_t.get("attribute") or "").strip()
+            _v = (_t.get("value") or "").strip()
+            if _a and _v:
+                attr_cnt[_a] = attr_cnt.get(_a, 0) + 1
+                attr_vals.setdefault(_a, []).append(_v)
+        _cls = {a: v for a, v in attr_vals.items() if attr_cnt[a] >= min_support}
+        return sorted(_cls.items(), key=lambda x: -len(x[1]))[:top]
+
+    # 本会话 triples: dia_id → ep (灌库 dia_to_ep) → session
+    for _t in _triples_all:
+        _ep = _dia_to_ep.get((_t.get("dia_id") or "").strip(), "")
+        _ci = _ep_session.get(_ep)
+        if _ci is None:
+            continue
+        _conv_triples.setdefault(_ci, []).append(_t)
+    for _ci, _tris in _conv_triples.items():
+        _ee, _eco = {}, {}
+        for _t in _tris:
+            _e = (_t.get("entity") or "").strip()
+            _ep = _dia_to_ep.get((_t.get("dia_id") or "").strip(), "")
+            if not _e or not _ep:
+                continue
+            _ee.setdefault(_e, {})
+            _ee[_e][_ep] = _ee[_e].get(_ep, 0) + 1.0
+            for _t2 in _tris:
+                _e2 = (_t2.get("entity") or "").strip()
+                _ep2 = _dia_to_ep.get((_t2.get("dia_id") or "").strip(), "")
+                if _e2 and _e2 != _e and _ep2 == _ep:
+                    _eco.setdefault(_e, {})
+                    _eco[_e][_e2] = _eco[_e].get(_e2, 0) + 1
+        _conv_entity_eps[_ci] = _ee
+        _conv_entity_co[_ci] = _eco
+        _conv_facts[_ci] = _scope_triples_by_entity(_tris)
+        _conv_top_classes[_ci] = _scope_discover_top(_tris)
+    # 会话相交块: 块 [start,end) 消息区间 ∩ 会话消息 (跨界块只保留相交部分展开)
+    for _ci in sorted(set(_ep_session.values())):
+        _hit = []
+        for _blk in blocks:
+            _intersect = any(_ep_session.get(f"ep_{_j}") == _ci
+                             for _j in range(_blk[1], min(_blk[2], len(msg_by_id))))
+            if _intersect:
+                _hit.append(_blk)
+        _conv_blocks[_ci] = _hit
+
+    print(f"[P0-a] SESSION_SCOPE=on: 会话数={len(set(_ep_session.values()))} "
+          f"池深={SESSION_SCOPE_POOL} 标签={len(_conv_label)} 会话相交块={sum(len(v) for v in _conv_blocks.values())} "
+          f"URI标注={'on' if SESSION_SCOPE_URI else 'off'}", flush=True)
+
 qa_conv = {}
 for ci, item in enumerate(data):
     for q in item.get("qa", []):
@@ -1195,6 +1377,7 @@ if SAMPLE_N > 0:
 print(f"评测规模: {len(qa_all)} 问", flush=True)
 
 results = {"total": 0, "correct": 0, "errors": 0, "by_cat": {}, "round2_used": 0}
+_processed_q = 0  # 到达 suff_check 决策点的问题数 (round2 触发率分母; 含 PREDICT 模式)
 hitk_stats = {"total": 0, "by_cat": {}}  # P2 hit@k 基线
 t0 = time.time()
 
@@ -1264,10 +1447,13 @@ for i, q in enumerate(qa_all):
     ci = qa_conv.get(qid, 0)
     question, gold, cat = q["question"], q["answer"], q.get("category", 0)
     session_ts = parse_session_ts(conv_ts.get(ci))
+    # P0-a: 路由直用官方 conversation_idx (与灌库 session_id 同坐标); 不用题面实体/
+    # 证据反推会话归属 (§11 红线 7)
+    _scope = ci if SESSION_SCOPE else None
 
     # 三通道检索（有机融合）+ 证据分区
     _cur_cat = str(cat)
-    channels = retrieve_channels(question, hitk=HITK_MODE, session_ts=session_ts)
+    channels = retrieve_channels(question, hitk=HITK_MODE, session_ts=session_ts, scope=_scope)
     # falsification 实验 (2026-09-02): oracle 注入 = 金标证据人工置顶 (人工正确排序)
     # R4A (v6.15.0): ORACLE_MODE=db (默认) 注入 DB 同形证据 (dia_id → 灌库 content, 含
     # '[date:]' 前缀) — 修复旧裸文本 (evidence .text 无前缀) 对 cat2 的人为去锚失效
@@ -1297,7 +1483,7 @@ for i, q in enumerate(qa_all):
             _ev = [e.get("text", "").strip() for e in (q.get("evidence_messages") or []) if e.get("text")]
             _seen = {c[:200] for c in channels["A"]}
             channels["A"] = [e for e in _ev if e[:200] not in _seen] + channels["A"]
-    ctx, docs = build_ctx(question, channels, rerank_top=40)
+    ctx, docs = build_ctx(question, channels, rerank_top=40, scope=_scope)
 
     # P2 hit@k 基线: evidence 消息文本是否进入 top-k docs (纯检索, 不调 LLM)
     if HITK_MODE:
@@ -1320,12 +1506,19 @@ for i, q in enumerate(qa_all):
             ok = any(any(p in d for d in topk) for p in probes)
             if ok:
                 c[f"k{kk}"] += 1
+        # P0-a 诊断 (HITK_DIAG=1): 逐题 hit@40 + 通道规模, 供会话作用域召回对比用
+        if os.environ.get("HITK_DIAG") == "1":
+            print(f"[HITK-DIAG] {q.get('qa_id')} cat={cat} hit40="
+                  f"{any(any(p in d for d in docs[:40]) for p in probes)} "
+                  f"ndocs={len(docs)} chA={len(channels['A'])} chB={len(channels['B'])} "
+                  f"chC={len(channels['C'])}", flush=True)
         if (i + 1) % 50 == 0 or i == len(qa_all) - 1:
             print(f"  [HITK] {i+1}/{len(qa_all)} elapsed={time.time()-t0:.0f}s", flush=True)
             json.dump(hitk_stats, open("/tmp/locomo_v72_hitk.json", "w"), ensure_ascii=False, indent=2)  # checkpoint 防中断丢数据
         continue
 
     # agentic 协同：sufficiency 基于分区后完整证据（保守触发——v71 教训 76% 太高）
+    _processed_q += 1
     enough = True
     if len(docs) >= 10:
         try:
@@ -1341,8 +1534,8 @@ for i, q in enumerate(qa_all):
     if not enough:
         results["round2_used"] += 1
         fq = followup_query(question, missing) if missing and missing != "general information about the question" else question
-        # round2 定向补缺：重跑三通道，只追加缺失部分（去重）
-        ch2 = retrieve_channels(fq, session_ts=session_ts)
+        # round2 定向补缺：重跑三通道，只追加缺失部分（去重）(SESSION_SCOPE=1 同会话限定)
+        ch2 = retrieve_channels(fq, session_ts=session_ts, scope=_scope)
         seen2 = {c[:200] for c in docs}
         new_docs = []
         for d in ch2["A"][:20] + ch2["B"][:8] + ch2["C"][:6]:
@@ -1351,10 +1544,20 @@ for i, q in enumerate(qa_all):
                 new_docs.append(d)
         if new_docs:
             docs = docs + new_docs[:20]
-        summ2 = "\n".join(f"[MEMORY BLOCK {j+1}] {s[:400]}" for j, s in enumerate(ch2["B_sum"][:2]))
-        ev_sec = "\n".join(f"[{j+1}] {d}" for j, d in enumerate(docs[:40]))
-        ctx = (summ2 + "\n\n" + ev_sec) if summ2 else ev_sec
-        ctx = ctx[:CTX_TOKENS]
+        if SESSION_SCOPE:
+            # P0-a M3 修复: 触发时不再整体替换组织段 (v6.15.0 round2 用 summ2+ev_sec 整
+            # 体重写 ctx, ontology_organize 的 ENTITY/RELATIONS/FACT TYPES/GLOBAL CONTEXT
+            # 段在 ~72% 问题上不生效) → 保留组织段 + 追加证据拼接 (标记新增证据段)
+            _n0 = max(0, len(docs) - min(len(new_docs), 20))
+            _supp = "\n".join(f"[{_n0 + j + 1}] {d}" for j, d in enumerate(docs[_n0:]))
+            if _supp:
+                ctx = ctx + "\n\n[ROUND2 SUPPLEMENTAL EVIDENCE]\n" + _supp
+            ctx = ctx[:CTX_TOKENS]
+        else:
+            summ2 = "\n".join(f"[MEMORY BLOCK {j+1}] {s[:400]}" for j, s in enumerate(ch2["B_sum"][:2]))
+            ev_sec = "\n".join(f"[{j+1}] {d}" for j, d in enumerate(docs[:40]))
+            ctx = (summ2 + "\n\n" + ev_sec) if summ2 else ev_sec
+            ctx = ctx[:CTX_TOKENS]
 
     # CTX_DUMP 默认开 (R2-0): 每题落盘最终检索 ctx + 组成 (raw 证据条数/blocks 摘要/
     # entity 段/各来源字符占比), 供翻转归因与 R-CTX 诊断 (round1 缺此现场)
@@ -1368,6 +1571,28 @@ for i, q in enumerate(qa_all):
                                       "ctx": ctx}, ensure_ascii=False) + "\n")
         except Exception as _e:
             print(f"  [CTX_DUMP err] {_e}", flush=True)
+        # P0-a 过程指标: ctx raw 行会话归属 (M1 污染率; 仅当归属反查表可用——库有
+        # session_id 时两臂都计, scoped 臂应 0 异会话 — AC1)
+        if _content_sessions:
+            _raw_n = _raw_in = 0
+            _poll = False
+            for _ln in ctx.splitlines():
+                _mm = re.match(r"^\[\d+\] (.*)$", _ln)
+                if not _mm:
+                    continue
+                _sess = _content_sessions.get(_mm.group(1))
+                if _sess is None:
+                    continue  # 非 raw 消息行 (块摘要/组织段文本), 不计入 M1 raw 池
+                _raw_n += 1
+                if ci in _sess:
+                    _raw_in += 1
+                else:
+                    _poll = True
+            _scope_stats["q"] += 1
+            _scope_stats["raw"] += _raw_n
+            _scope_stats["in_scope"] += _raw_in
+            if _poll:
+                _scope_stats["polluted_q"] += 1
 
     # R2c 输出协议 prompt v2 (reader prompt 区): 默认 v2 (日期锚/粒度/计数/范围纪律
     # + 3 few-shot), PROMPT_V2=0 回落 v1 原文 (评测侧 A/B 用 env 切换)
@@ -1424,6 +1649,14 @@ acc = results["correct"] / max(1, results["total"]) * 100
 print(f"\n=== v72 本体论核心融合评测 {SAMPLE_N}问 ===", flush=True)
 print(f"准确率: {acc:.1f}% ({results['correct']}/{results['total']})", flush=True)
 print(f"round2: {results['round2_used']} | 错误: {results['errors']} | 耗时: {time.time()-t0:.0f}s", flush=True)
+# P0-a 汇总: SESSION_SCOPE 状态 + round2 触发率 + 会话内命中率 (过程验证指标)
+print(f"[P0-a] SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} | "
+      f"round2 触发率: {results['round2_used']}/{_processed_q} = {results['round2_used']/max(1, _processed_q)*100:.1f}%", flush=True)
+if _scope_stats["q"]:
+    _hit_rate = _scope_stats["in_scope"] / max(1, _scope_stats["raw"]) * 100
+    _poll_q = _scope_stats["polluted_q"] / max(1, _scope_stats["q"]) * 100
+    print(f"[P0-a] 会话内命中率: {_hit_rate:.1f}% ({_scope_stats['in_scope']}/{_scope_stats['raw']} raw 消息行属本会话) "
+          f"| 含异会话 raw 消息题占比: {_poll_q:.1f}% ({_scope_stats['polluted_q']}/{_scope_stats['q']} 题)", flush=True)
 for cat in sorted(results["by_cat"]):
     d = results["by_cat"][cat]
     print(f"  cat={cat}: {d['c']}/{d['t']} = {d['c']/max(1,d['t'])*100:.1f}%", flush=True)
