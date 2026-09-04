@@ -13,6 +13,8 @@ import numpy as np
 from rag_v4_common import llm_generate, llm_judge, rerank, get_reranker
 from rag_v4_common import append_predict_error, ctx_composition
 import time_anchors  # P0-b 确定性时间层: 纯 regex+datetime 日历算术, 零 LLM (同目录)
+import fact_clusters  # R6-A 确定性事实簇聚合: 实体-谓词完整列表 + 事件窗口去重 (同目录)
+import neg_clean     # R6-C 摘要清洁: 否定句过滤 + 组织段题面实体优先 (同目录)
 
 DATA = os.environ.get("DATA_PATH", "/home/admin/shm/data/bench/locomo10.json")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
@@ -77,6 +79,27 @@ SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 
 #   于 SESSION_SCOPE A/B (四象限: scope×anchors); scope=on 时注解只落在会话内消息
 #   (DIRECT EVIDENCE 已引擎限定, 污染池上注解是次优的 — 报告 §61/§2 口径)。
 TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
+
+# 2026-09-05 达摩院 R6 (round5 实证研究 §cat1/cat2/cat4 + new_wrong 主回退; 任务书
+#   R6-task.md): 证据形态三改造 — 全部 ctx 装配层附加/过滤, 原文消息逐字不变,
+#   reader prompt V1 原文不动, 组织段文本只陈述事实无祈使 (R2c 覆辙红线)。
+#   R6-A FACT_CLUSTERS=1: ctx 尾部追加 [FACT CLUSTERS] 段 — 确定性正则实体-谓词
+#    聚合 (cat1 计数/枚举漏项 46.6% + cat4 list-gold 溢出): 同类事实汇聚为带消息号
+#    引用的完整列表 (3 pets: Toby, Sara, X), 事件实例同实体+同日期窗口只计一次
+#     (conv-42#q0042 同一拒信数两次修复); 零 LLM, 同 time_anchors 哲学。
+#   R6-B 随 TIME_ANCHORS (不新开关): TIME ANCHORS 行 = 原文相对短语置前 + 解析区间
+#     置后 (reader 可回显 REL-gold, 判卷禁换算 — cat2 REL-gold 29/29 全被改坏),
+#     行尾粒度标签 [granularity: day|week|month|year|range] (粒度越界 RANGE 17/
+#     MONTH 9/YEAR 4), 事件早于消息日期 → [predates msg date] (消息日期污染防御)。
+#   R6-C NEG_CLEAN=1: 装配层摘要否定句过滤 (块摘要 'unspecified/无证据/cannot be
+#     determined' 式表述整句剔除 → 拒答修复, cat4 拒答 29 + new_wrong ~43% 主回退;
+#     不改 LLM 摘要生成 prompt — 那是 prompt 层, 这是结构层) + 组织段题面实体
+#     优先排列 (cat4 选错事件 ~20)。
+#   开关语义 (报告注明): FACT_CLUSTERS/NEG_CLEAN 独立 env 默认 "0" (off) — 默认
+#   全 off 时与 v6.17.0 逐字节等价 (A/B 基线); 各自可独立于 SESSION_SCOPE/TIME_
+#   ANCHORS A/B。
+FACT_CLUSTERS = os.environ.get("FACT_CLUSTERS", "0") == "1"
+NEG_CLEAN = os.environ.get("NEG_CLEAN", "0") == "1"
 
 # 2026-09-03 达摩院 R2c (研究 §7 R2c 行 + §2 cat2 错因 + §6 协议, 附1: 判卷粒度规则原文
 # 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
@@ -171,7 +194,7 @@ def _eval_log_header_suffix():
 
 
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} TIME_ANCHORS={'on' if TIME_ANCHORS else 'off'} | {_eval_log_header_suffix()}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} TIME_ANCHORS={'on' if TIME_ANCHORS else 'off'} FACT_CLUSTERS={'on' if FACT_CLUSTERS else 'off'} NEG_CLEAN={'on' if NEG_CLEAN else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -1168,12 +1191,31 @@ def _time_anchor_final_ctx(ctx):
     注解放 ctx 截断之后追加/内联 (不挤占 raw 证据预算, 设计失效条件 ④); 只对前
     max_docs 条注解控预算; 消息原文逐字不变 (AC3); scope=on 时 ctx 内编号 raw 行
     已由 P0-a 引擎限定为会话内消息 → 注解天然只落在会话内 (任务书约束 4)。
+    R6-B (2026-09-05): 行格式 = 原文相对短语置前 + 解析区间置后 (reader 可回显
+    REL-gold, 判卷禁换算), 行尾粒度标签 + 事件早于消息日期标注 — 全部在
+    time_anchors 渲染层, 此处仅透传 (不新开关, 随 TIME_ANCHORS)。
     """
     if not TIME_ANCHORS or not ctx:
         return ctx
     if "[DIRECT EVIDENCE]" in ctx:
         return time_anchors.append_anchor_block(ctx, max_docs=30)
     return "\n".join(time_anchors.inline_numbered_lines(ctx.splitlines(), max_docs=20))
+
+
+def _r6_evidence_forms_ctx(ctx, question):
+    """R6 证据形态装配 (FACT_CLUSTERS=1 / NEG_CLEAN=1 才分别生效; 默认全 off →
+    v6.17.0 逐字节等价零回归)。装配在 P0-b TIME ANCHORS 之后同路径:
+    - R6-A: ctx 尾部追加 '[FACT CLUSTERS]' 段 (确定性聚合, 引用编号消息行);
+    - R6-C: 摘要否定句过滤 (块摘要/MEMORY BLOCK/组织段事实行) + 组织段题面实体
+      优先排列 ([ENTITY: ...] 段按题面专名前置)。
+    均为附加/过滤, 原文消息行逐字不变 (AC4); reader prompt V1 原文不动 (AC5)。
+    """
+    if FACT_CLUSTERS:
+        ctx = fact_clusters.append_fact_clusters(ctx, max_docs=30)
+    if NEG_CLEAN:
+        ctx = neg_clean.clean_ctx(ctx)
+        ctx = neg_clean.entity_first_ctx(ctx, question)
+    return ctx
 
 # ═══ D. agentic 两轮（EverOS）═══
 def suff_check(question, docs_top):
@@ -1600,6 +1642,10 @@ for i, q in enumerate(qa_all):
     # reader prompt (V1 原样), scope=on 时编号行已引擎限定为会话内 → 注解即会话内。
     ctx = _time_anchor_final_ctx(ctx)
 
+    # R6 证据形态三改造装配 (FACT_CLUSTERS=1 / NEG_CLEAN=1; 默认全 off → v6.17.0 等价):
+    # R6-A [FACT CLUSTERS] 聚合段 / R6-C 摘要否定句过滤 + 题面实体优先。原文逐字不变。
+    ctx = _r6_evidence_forms_ctx(ctx, question)
+
     # CTX_DUMP 默认开 (R2-0): 每题落盘最终检索 ctx + 组成 (raw 证据条数/blocks 摘要/
     # entity 段/各来源字符占比), 供翻转归因与 R-CTX 诊断 (round1 缺此现场)
     if CTX_DUMP:
@@ -1715,6 +1761,28 @@ if TIME_ANCHORS:
             pass
     print(f"[P0-b] TIME_ANCHORS=on | ctx 含 [TIME ANCHORS] 段题数: {_ta_org} | "
           f"ctx 含内联 [time:] 行题数: {_ta_inl}", flush=True)
+if FACT_CLUSTERS or NEG_CLEAN:
+    # R6 过程指标: [FACT CLUSTERS] 聚合段 / 摘要清洁装配状态 (供 A/B 归因)
+    _r6_fc = _r6_mb = _r6_neg = 0
+    if os.path.exists(CTX_DUMP_OUT):
+        try:
+            with open(CTX_DUMP_OUT, encoding="utf-8", errors="ignore") as _rf:
+                for _rl in _rf:
+                    _rl = _rl.strip()
+                    if not _rl:
+                        continue
+                    try:
+                        _rc = json.loads(_rl).get("ctx", "")
+                    except Exception:
+                        continue
+                    if "[FACT CLUSTERS]" in _rc:
+                        _r6_fc += 1
+                    if "[MEMORY BLOCK" in _rc:
+                        _r6_mb += 1
+        except Exception:
+            pass
+    print(f"[R6] FACT_CLUSTERS={'on' if FACT_CLUSTERS else 'off'} NEG_CLEAN={'on' if NEG_CLEAN else 'off'} | "
+          f"ctx 含 [FACT CLUSTERS] 段题数: {_r6_fc} | ctx 含 [MEMORY BLOCK] 题数: {_r6_mb}", flush=True)
 if _scope_stats["q"]:
     _hit_rate = _scope_stats["in_scope"] / max(1, _scope_stats["raw"]) * 100
     _poll_q = _scope_stats["polluted_q"] / max(1, _scope_stats["q"]) * 100

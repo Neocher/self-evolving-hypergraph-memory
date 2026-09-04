@@ -1,12 +1,37 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.17.0"
-__version_info__ = (6, 17, 0)
-__version_name__ = "P0bTimeAnchors"
-__release_date__ = "2026-09-04"
+__version__ = "6.18.0"
+__version_info__ = (6, 18, 0)
+__version_name__ = "R6EvidenceForms"
+__release_date__ = "2026-09-05"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.18.0 (2026-09-05) R6EvidenceForms:
+  • 达摩院 R6 证据形态三改造 (round5 实证研究 r5: cat1 计数/枚举漏项 46.6% +
+    追加超集 26.1%, cat2 REL-gold 29/29 100% 被答成绝对日期 + 粒度越界 RANGE 17/
+    MONTH 9/YEAR 4 + 消息日期污染, cat4 拒答/未覆盖 55.6% 含拒答标记 29 +
+    overreach 23%, new_wrong 主回退 ~43%) — 三改造均为 ctx 装配层附加/过滤,
+    原文消息逐字不变, reader prompt V1 原文不动, 组织段文本只陈述事实无祈使
+    (R2c prompt 说教覆辙红线)。
+    R6-A [FACT CLUSTERS] 聚合 (scripts/fact_clusters.py, 纯 regex 零 LLM):
+      确定性实体-谓词聚合 (宠物/孩子拥有 + 拒信/申请/出行事件) → 带消息号引用的
+      完整列表 ('owns_pet: 3 pets: Toby (msg 1), Sara (msg 2), Mango (msg 3)'),
+      服务计数/枚举题; 事件实例同实体+同谓词+同日期窗口 (周归一, 回指表述并入
+      既有实例) 只计一次 (conv-42#q0042 同一拒信数两次修复); 开关 FACT_CLUSTERS
+      独立 env 默认 0 (与 SESSION_SCOPE/TIME_ANCHORS 正交 A/B)。
+    R6-B TIME ANCHORS 形态修正 (随 TIME_ANCHORS, 不新开关): 行 = 原文相对短语
+      置前 + 解析区间置后 (reader 可回显 REL-gold, 判卷禁换算), 行尾粒度标签
+      [granularity: day|week|month|year|range] (对齐 gold 粒度防越界), 事件区间
+      整体早于消息日期 → [predates msg date] 标注 (消息日期污染防御)。
+    R6-C 摘要清洁 (scripts/neg_clean.py): 装配层过滤块摘要/组织段事实行中的
+      否定式表述整句 ('unspecified/无证据/cannot be determined/未提及' 等 →
+      拒答修复), 无事实可说 → 空段而非否定句 (不改 LLM 摘要生成 prompt —
+      那是 prompt 层, 这是结构层); 组织段 [ENTITY: ...] 段按题面专名前置排列
+      (选错事件修复); 开关 NEG_CLEAN 独立 env 默认 0。
+    默认全 off 与 v6.17.0 逐字节等价 (零回归锚点); 汇总打印 FACT_CLUSTERS/
+    NEG_CLEAN 状态 + 装配题数。只改任务相关文件, 不读 gold/evidence, 不改判卷/
+    题/答案文本。
 v6.17.0 (2026-09-04) P0bTimeAnchors:
   • 达摩院 P0-b 确定性时间层 (round3 研究 §2 P0-b 行 + §3 设计 + §6 校验; M5 语料
     ~40 种有界模式 last week 108/yesterday 67/last friday 40/next month 36…,
