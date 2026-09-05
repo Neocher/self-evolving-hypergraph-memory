@@ -1685,7 +1685,7 @@ for i, q in enumerate(qa_all):
     # + 3 few-shot), PROMPT_V2=0 回落 v1 原文 (评测侧 A/B 用 env 切换)
     prompt = (_READER_PROMPT_V2 if PROMPT_V2 else _READER_PROMPT_V1).format(ctx=ctx, question=question)
     try:
-        pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.2)
+        pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.0)
     except Exception as e:
         # R2-0: llm_generate 内已 2×retry (总 3 次, 超时预算递增) — 仍失败才到此处:
         # 错误行落盘 (qa_id + 原因), 不静默 skip (round1 32B 83% 失败即此路径)
