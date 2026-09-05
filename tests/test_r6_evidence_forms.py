@@ -229,3 +229,49 @@ def test_ac5_reader_prompt_v1_unchanged():
     assert "NEG_CLEAN" not in _READER_PROMPT_V1_SNAPSHOT
     for banned in ("please aggregate", "please clean", "请聚合", "请过滤"):
         assert banned not in TEXT
+
+
+# ── R7-1 极性守卫 (达摩院 R6 FAIL 研究 §7, 2026-09-05) ──
+# NEG_CLEAN 重写: 只剔"认识论退却"帧 (cannot be determined/无法判断/unspecified),
+# 保留事实性否定与缺席断言 ("no evidence that X moved" / "X didn't mention Y" —
+# 这些是 Yes/No 与缺席类 gold 的正确依据, conv-44#q0045 反面教材)。
+
+_EPISTEMIC_DROP = [
+    "The date cannot be determined from the conversation.",
+    "It is unclear whether Caroline attended.",
+    "Insufficient evidence to answer this question.",
+    "The pet's name is unspecified.",
+    "The date is unspecified.",
+    "无法确定具体时间。",
+    "信息不足, 无从得知。",
+    "Jon's location is not clear from the context.",
+    "She could not be determined to have moved.",
+]
+
+_FACTUAL_KEEP = [
+    "There is no evidence that Alex moved to Seattle.",
+    "No evidence that she adopted a pet.",
+    "Sara did not mention any pets.",
+    "John never said he liked basketball.",
+    "She didn't mention Y at all.",
+    "未提及任何宠物。",
+    "The dog's name was not mentioned by Toby.",
+]
+
+_EPISTEMIC_DROP_EXTRA = [
+    "No evidence about the trip date.",  # 泛化缺席(无事实宾语) → 剔
+    "There is no evidence in the conversation.",  # 泛化 → 剔
+]
+
+
+def test_r71_polarity_guard_drops_epistemic_retreat():
+    """认识论退却帧 → 剔 (is_negative=True): 诱导拒答的元认知退却。"""
+    for s in _EPISTEMIC_DROP + _EPISTEMIC_DROP_EXTRA:
+        assert nc.is_negative(s), f"应剔认识论退却: {s}"
+
+
+def test_r71_polarity_guard_keeps_factual_negation():
+    """事实性否定/缺席断言 → 保留 (is_negative=False): Yes/No 题的正确答案依据。"""
+    for s in _FACTUAL_KEEP:
+        assert not nc.is_negative(s), f"应保留事实否定: {s}"
+

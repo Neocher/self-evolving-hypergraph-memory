@@ -20,17 +20,28 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
-# 否定式表述标记 (整句剔除; 特征化短语, 不误伤 'not' 正常否定叙事)
-_NEG_MARKERS = [
+# 认识论退却帧标记 (整句剔除 — 元认知退却, 诱导 reader 拒答; R7-1 极性守卫:
+# 只剔"无法确定"类退却, 保留事实性否定/缺席断言 — "no evidence that X moved" /
+# "X didn't mention Y" 是 Yes/No 与缺席类 gold 的正确依据, conv-44#q0045 反面教材)
+_EPISTEMIC_RETREAT_MARKERS = [
+    # 元认知退却 (可确定/可推断性否定 → 诱导拒答)
     r"cannot\s+be\s+determined", r"cannot\s+determine",
     r"unable\s+to\s+determine", r"could\s+not\s+be\s+determined",
-    r"not\s+mentioned", r"not\s+specified", r"unspecified",
-    r"no\s+evidence", r"not\s+available", r"not\s+stated",
-    r"not\s+indicated", r"does\s+not\s+say", r"did\s+not\s+mention",
-    r"没有提到", r"未提及", r"无证据", r"无法确定", r"未指定",
-    r"无法判断", r"无从得知", r"不清楚",
+    r"cannot\s+be\s+inferred", r"cannot\s+be\s+ascertained",
+    r"cannot\s+confirm", r"unable\s+to\s+confirm",
+    r"cannot\s+be\s+verified", r"cannot\s+be\s+known",
+    r"not\s+enough\s+information", r"insufficient\s+(?:evidence|information)",
+    r"no\s+information\s+available", r"not\s+enough\s+context",
+    r"not\s+specified", r"unspecified", r"未指定",
+    r"no\s+evidence\s+(?:about|of|for|regarding|concerning)",  # 泛化缺席(无事实宾语)
+    r"no\s+evidence\s+in\s+the\s+(?:conversation|text|context)",
+    r"it\s+is\s+(?:unclear|not\s+clear|unknown)\s+(?:whether|if|which|who|when|where|how|what)",
+    r"not\s+clear\s+from\s+the\s+(?:conversation|context|provided)",
+    r"无法确定", r"无法判断", r"无法确认", r"无法得知",
+    r"无从得知", r"不清楚", r"未能确定", r"不能确定", r"不得而知",
+    r"信息不足", r"证据不足", r"没有足够的信息",
 ]
-_NEG_RE = re.compile("|".join(_NEG_MARKERS), re.IGNORECASE)
+_NEG_RE = re.compile("|".join(_EPISTEMIC_RETREAT_MARKERS), re.IGNORECASE)
 # 摘要行前缀 (标题行/内容行; raw 编号行 '[N]' 除外)
 _MEMORY_BLOCK_RE = re.compile(r"^\[MEMORY BLOCK (\d+)\]\s*(.*)$")
 # 组织段通用标题 (ENTITY/RELATIONS/FACT TYPES/GLOBAL CONTEXT/DIRECT EVIDENCE/
