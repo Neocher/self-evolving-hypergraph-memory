@@ -321,6 +321,13 @@ def load_messages(path):
                     did = m.get("dia_id") or f"D{si}:{m.get('message_index', '')}"
                     if text:
                         fm = f"{date_prefix}[{speaker}] {text}"
+                        # R7-3 (2026-09-05 用户特批方案 B): 图像消息附加 blip_caption —
+                        # 多模态内容 (海报文字/照片/画作) 作为证据文本进入灌库/检索/ctx,
+                        # 修复"caption 在 DB 被丢弃 → reader 永远看不到图像答案"的通道缺口
+                        # (r5 全量 12-17 题 cat4 上界; 仅追加 [img: ...] 行, 消息原文不变)。
+                        _cap = m.get("blip_caption") or ""
+                        if m.get("images") and _cap:
+                            fm = f"{fm} [img: {_cap}]"
                         msgs.append(fm)
                         dia_ids.append(did)
                         msg_conv.append(ci)
