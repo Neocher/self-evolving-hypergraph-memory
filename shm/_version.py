@@ -1,13 +1,13 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.18.0"
-__version_info__ = (6, 18, 0)
-__version_name__ = "R6EvidenceForms"
-__release_date__ = "2026-09-05"
+__version__ = "6.19.0"
+__version_info__ = (6, 19, 0)
+__version_name__ = "MultiModalCaption"
+__release_date__ = "2026-09-08"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v6.18.0 (2026-09-05) R6EvidenceForms:
+v6.19.0 (2026-09-08) MultiModalCaption:
   • 达摩院 R6 证据形态三改造 (round5 实证研究 r5: cat1 计数/枚举漏项 46.6% +
     追加超集 26.1%, cat2 REL-gold 29/29 100% 被答成绝对日期 + 粒度越界 RANGE 17/
     MONTH 9/YEAR 4 + 消息日期污染, cat4 拒答/未覆盖 55.6% 含拒答标记 29 +
