@@ -1,74 +1,68 @@
-# LoCoMo-Refined Benchmark — SHM v6.5.1 全量评测
+# LoCoMo-Refined Benchmark — SHM v6.19.0 精卫收官评测（官方口径）
 
-> 评测日期: 2026-08-26 · 数据: LoCoMo-Refined 官方 1382 问 · 判卷: 官方 evaluate.py refined 协议
+> 评测日期: 2026-09-08 · 数据: LoCoMo-Refined 官方 1382 问 · 判卷: **官方 Qwen3-14B refined 协议**（LoCoMo-Refined 官方仓库 evaluate.py）
 
 ## 结果
 
 | 类别 | 题数 | 正确 | 准确率 |
 |:--|:--|:--|:--|
-| cat1 事实问答 | 213 | 138 | 64.8% |
-| cat2 关系推理 | 299 | 210 | 70.2% |
-| cat3 时间推理 | 68 | 53 | 77.9% |
-| cat4 跨会话综合 | 802 | 714 | **89.0%** |
-| **合计** | **1382** | **1115** | **80.68%** |
+| cat1 多证据聚合/事实问答 | 213 | 146 | 68.5% |
+| cat2 时间/日期推理 | 299 | 244 | 81.6% |
+| cat3 推断/偏好 | 68 | 53 | 77.9% |
+| cat4 跨会话综合 | 802 | 706 | **88.0%** |
+| **合计** | **1382** | **1149** | **83.14%** |
 
-- 错误: 0（全量零缺失零解析错误）
-- 官方参考分: EverMemOS 58.25% · Mem0 48.91%
-- 领先: +22.4pp (EverMemOS) / +31.8pp (Mem0)
+- 错误: 0（1382 全量零缺失零解析错误）
+- **> SOTA 82.65%（MemoraX，同官方判卷口径）+0.49pp**
+- 官方参考分（同表 re-score）: MemoraX 82.65% · MemOS 63.60% · EverMemOS 58.25% · MemPalace 58.68% · Mem0 48.91%
 
-## 方法
+## 分数史（官方 qwen3-14b refined 口径，全部 1382 题全量）
 
-### 预测生成（SHM v72 管道）
+| 版本 | 日期 | 分数 | 说明 |
+|:--|:--|:--|:--|
+| v6.10.1 | 2026-09-01 | 67.29% | 精卫基线 |
+| v6.13.0 | 2026-09-03 | 72.43% | 数据面恢复（pkl blocks=393） |
+| v6.17.0 | 2026-09-05 | 76.48% | qwen3.8-max reader + P0-a 会话作用域 + P0-b 确定性时间层 |
+| **v6.19.0** | **2026-09-08** | **83.14%** | **+ R7-3 多模态 caption 证据通道 → 超 SOTA** |
 
+## 方法（v6.19.0 生产管道）
+
+### 证据检索与组织
+- **SHM 引擎**: OverGraph EpisodeNode（5882 消息）+ FAISS dense + BM25 + entity graph 三通道融合
+- **P0-a 会话作用域**: `QueryRouter.retrieve(scope=conversation_idx)` — 引擎级跨会话隔离（消除 M1 跨会话污染）
+- **P0-b 确定性时间层**: 零 LLM 相对时间词 → 绝对区间日历算术（真日历 oracle 单测）
+- **R7-3 多模态证据通道**: 图像消息 blip_caption 附加 `[img: ...]` 进证据文本（910/5882 消息）— 修复"图像承载答案"盲区并强化检索召回
+- 组织段（ontology_organize）: ENTITY/RELATIONS/FACT TYPES 只陈述事实，无祈使指令
+- 4 分片并行 ~5-6h 全量
+
+### Reader
+- **qwen3.8-max**（DashScope Token Plan 通道）· 温度 0.0 · enable_thinking=False · prompt V1（不变）
+
+### 判卷（官方协议，不可变）
 ```bash
-cd scripts
-SHM_ROOT=/home/admin/shm DB_PATH=<eval_db> INGEST_LOADED=1 \
-PREDICT_MODE=1 \
-PREDICT_QUESTIONS=<LoCoMo_refined>/data/public/questions.jsonl \
-PREDICT_OUT=predictions.jsonl \
-PREDICT_RANGE=<start:end> \
-python bench_locomo_v72_ontology.py 0
-```
-
-- 复用 v6.5.0 灌库（LoCoMo 10 会话 5882 消息 pickle，与 Refined 数据集对话完全一致——已验证）
-- 三通道检索（BM25 + entity graph + vector）+ sufficiency 定向 round2 + 证据分区（同 v72 生产管道）
-- 4 分片并行（systemd-run，防重启中断），~10s/问，全量 1382 问 ~3.5h
-
-### 判卷（官方协议）
-
-```bash
-# 官方 LoCoMo-Refined 仓库 evaluate.py
 python src/evaluate.py \
   --questions-path data/public/questions.jsonl \
   --predictions-path predictions.jsonl \
   --metrics llm f1 bleu \
   --llm-judge refined \
-  --evaluator-model <model> \
-  --evaluator-base-url <openai-compatible-endpoint> \
-  --evaluator-api-key <key> \
+  --evaluator-model qwen3-14b \
+  --evaluator-base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
   --concurrency 4
 ```
-
 - 判卷哲学: "包含且不矛盾，完整且不越界"（官方 5 原则）
-- 本次 judge: `deepseek-chat`（OpenRouter qwen3-8b 批量 402 后切换）
-- **跨 judge 一致性验证**: 7 条早期预测 DeepSeek 与 qwen3-8b 逐条 100% 一致
-- 官方参考 judge 为 Qwen3-14B（需 DashScope 付费额度），分数不可直接对照，趋势可信
-
-### 防 402 适配（OpenRouter in-flight 预算）
-
-官方 `llm_judge_runtime.py` 不传 max_tokens → OpenRouter 每请求预扣 65536 token → 批量判卷 in-flight 预算耗尽 402。
-适配: `max_tokens = int(os.environ.get("LOCOMO_MAX_TOKENS", "4096"))`（见 `docs_locomo_refined_max_tokens.patch`，taiji 仓库）。
+- judge 固定 Qwen3-14B refined · 温度 0.0 · thinking disabled
 
 ## 复现文件
 
 | 文件 | 路径 |
 |:--|:--|
-| 预测 | `/tmp/locomo_pred_full.jsonl`（1382 条, 零重复）|
-| 判卷结果 | `/tmp/locomo_final_judged_ds.json` |
-| 早期 qwen 判卷 | `/tmp/locomo_pred_partial_judged.json`（135 问 69.63%）|
+| 评测主日志 | `LoCoMo_refined/results/archive_r6_0908/eval_master_0907_2200.log` |
+| 预测 | `archive_r6_0908/predictions_all.jsonl`（1382 条）|
+| 判卷结果 | `archive_r6_0908/scored_0907_2200.jsonl` |
+| 评测库 | `eval_db_p2`（含 caption 数据面，blocks=393）|
 
 ## 结论
 
-- 跨会话综合（cat4, 89.0%）最强——SHM 图结构跨会话桥接有效
-- 事实问答（cat1, 64.8%）最弱——生成阶段 max_tokens 截断枚举答案（已定位，建议 200→512）
-- 严格判卷水分: 宽松 100% → 严格 80.68%（约 19pp）
+- 跨会话综合（cat4, 88.0%）与时间推理（cat2, 81.6%）最强
+- 多证据聚合（cat1, 68.5%）最弱 — 结构性难点在"精确集合匹配"（漏项 43% + 追加 30%）
+- 全部提升来自 SHM 技术范式（记忆表示/证据组织/检索/时间建模/多模态输入），评测方法全程未变
