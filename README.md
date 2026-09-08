@@ -278,21 +278,23 @@ python -m pytest tests/ -q
 
 ---
 
-## 📊 LoCoMo-Refined Benchmark (v6.5.1)
+## 📊 LoCoMo-Refined Benchmark (v6.19.0)
 
-[LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined)（mem-eval-suite 官方判卷协议，1382 问，非商业 CC BY-NC 4.0）全量评测结果：
+[LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined)（mem-eval-suite 官方判卷协议，1382 问，非商业 CC BY-NC 4.0）全量评测结果（2026-09-08，精卫收官）：
 
 | 类别 | 题数 | 正确 | 准确率 |
 |:--|:--|:--|:--|
-| cat1 事实问答 | 213 | 138 | 64.8% |
-| cat2 关系推理 | 299 | 210 | 70.2% |
-| cat3 时间推理 | 68 | 53 | 77.9% |
-| cat4 跨会话综合 | 802 | 714 | **89.0%** |
-| **合计** | **1382** | **1115** | **80.68%** |
+| cat1 多证据聚合/事实问答 | 213 | 146 | 68.5% |
+| cat2 时间/日期推理 | 299 | 244 | 81.6% |
+| cat3 推断/偏好 | 68 | 53 | 77.9% |
+| cat4 跨会话综合 | 802 | 706 | **88.0%** |
+| **合计** | **1382** | **1149** | **83.14%** |
 
-**对照官方参考分**：EverMemOS 58.25% · Mem0 48.91%（SHM +22~32pp）
+**> SOTA 82.65%（MemoraX，同官方判卷口径）+0.49pp**
 
-**口径**：SHM v72 管道生成预测（predictions.jsonl）→ 官方 `evaluate.py` refined 判卷协议；judge=deepseek-chat（官方 prompt，与 qwen3-8b 逐条 100% 一致，非官方 Qwen3-14B 参考口径）。全量零缺失零错误。早期 200 问宽松 judge 100.0%（v6.5.0）→ 严格协议 80.68%。
+**对照官方参考分**：MemOS 63.60% · EverMemOS 58.25% · MemPalace 58.68% · Mem0 48.91%
+
+**口径**：SHM v6.19.0 生产管道生成预测 → 官方 `evaluate.py` refined 判卷协议，judge=**Qwen3-14B refined**（官方不可变协议）· 温度 0.0。全量 1382 题零缺失零解析错误。完整分数史/方法/复现见 [docs/benchmark-locomorefined.md](docs/benchmark-locomorefined.md)。
 
 ---
 
