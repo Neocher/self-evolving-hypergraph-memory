@@ -1,0 +1,55 @@
+{
+ "_comment": "R8 Step2 映射层 oracle 夹具: 真实官方证据行 (conversations.jsonl), 校验归因(会话/时点)与原文可达; q0035=状态更新形状(q0139同), q0001=槽枚举形状, q0139=实例描述形状",
+ "facts": [
+  {
+   "sample_id": "conv-44",
+   "dia_id": "D19:12",
+   "session_dt": "5:53 pm on 24 September, 2023",
+   "speaker": "Audrey",
+   "entity": "Audrey",
+   "slot": "dog_breed",
+   "value": "Jack Russell mixes",
+   "snippet": "They're all mutts. Two of them are Jack Russell mixes and the other two are Chihuahua mixes. And yea, I believe so! Some"
+  },
+  {
+   "sample_id": "conv-44",
+   "dia_id": "D26:13",
+   "session_dt": "2:36 pm on 28 October, 2023",
+   "speaker": "Audrey",
+   "entity": "Audrey",
+   "slot": "dog_breed",
+   "value": "Lab mixes",
+   "snippet": "Thanks! They're all mutts, but Pepper and Panda are Lab mixes, and Precious and Pixie are Chihuahua mixes. I really need"
+  },
+  {
+   "sample_id": "conv-50",
+   "dia_id": "D1:3",
+   "session_dt": "11:53 am on 23 March, 2023",
+   "speaker": "Calvin",
+   "entity": "Calvin",
+   "slot": "purchase_item",
+   "value": "mansion",
+   "snippet": "That event sounds great! Something really exciting happened to me - I just had a big life change! Here's my new mansion "
+  },
+  {
+   "sample_id": "conv-50",
+   "dia_id": "D2:1",
+   "session_dt": "4:45 pm on 26 March, 2023",
+   "speaker": "Calvin",
+   "entity": "Calvin",
+   "slot": "purchase_item",
+   "value": "luxury car",
+   "snippet": "Hey Dave, been a few days, so I wanted to let you in on some cool news.  I just got a new car and it's amazing! Finally "
+  },
+  {
+   "sample_id": "conv-50",
+   "dia_id": "D16:19",
+   "session_dt": "2:55 pm on 31 August, 2023",
+   "speaker": "Dave",
+   "entity": "Calvin",
+   "slot": "guitar_style",
+   "value": "shiny purple guitar",
+   "snippet": "That guitar has a gorgeous purple hue. Why did you make it so shiny?"
+  }
+ ]
+}

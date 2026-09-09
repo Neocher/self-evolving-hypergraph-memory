@@ -74,7 +74,9 @@ def test_ac1_harness_wiring_fact_clusters():
     """bench 装配层存在: FACT_CLUSTERS env 开关 (默认 off) + _r6_evidence_forms_ctx
     接线 + append_fact_clusters 调用 (R6-A 在 ctx 装配层, 同 P0-b TIME ANCHORS 路径)。"""
     assert 'FACT_CLUSTERS = os.environ.get("FACT_CLUSTERS", "0") == "1"' in TEXT
-    assert "def _r6_evidence_forms_ctx(ctx, question):" in TEXT
+    # R8 Step3b (规格 data/r8/r8-step3b-spec.md): _r6_evidence_forms_ctx 签名扩展 —
+    # 追加 qa_id/conv_msgs/q2slot/slot_triggers 供 R8_SLOT 分支装配 [SLOT EVIDENCE] 段。
+    assert "def _r6_evidence_forms_ctx(ctx, question, qa_id=None, conv_msgs=None," in TEXT
     assert "ctx = _r6_evidence_forms_ctx(ctx, question)" in TEXT
     assert "fact_clusters.append_fact_clusters(ctx, max_docs=30)" in TEXT
     assert "import fact_clusters" in TEXT

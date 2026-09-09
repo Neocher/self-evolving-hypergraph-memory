@@ -1,12 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.19.0"
-__version_info__ = (6, 19, 0)
-__version_name__ = "MultiModalCaption"
-__release_date__ = "2026-09-08"
+__version__ = "6.20.0"
+__version_info__ = (6, 20, 0)
+__version_name__ = "StateSemantics"
+__release_date__ = "2026-09-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.20.0 (2026-09-09) StateSemantics:
+  • R8 引擎语义不变量四件套 (达摩院 deep 评审 + 67 题 T1-T4 重标驱动; 评测只当
+    探照灯, 引擎能力真升级, 数据面/判卷/judge/prompt V1 零改动, 红线外)。
+    E1' 状态时点裁决 (core/state_projection.py, resolve latest-wins + 否定行 +
+    timeline 全链掩码, 语义与 query_router _property_temporal_retrieve 同构)。
+    E3 实例身份 key (core/instance_key.py, sha1(entity|type|iso_week|obj|obj_desc),
+    obj_desc 修饰语维分离同实例 (q0139 双吉他), normalize_alias 别名归一)。
+    E2 模态五值闭域 (core/modality_rules.py, actual/planned/wish/inferred/in_talks,
+    纯规则, 谓词语义门 did/plan/offer 装配时生效)。
+    E4 槽位确定性检索 (retrieval/slot_facts.py SlotIndex 全集检索+值去重契约 +
+    retrieval/slot_extract.py 原文槽证据抽取 + QueryRouter.retrieve_slot/set_slot_index
+    env 门 R8_CTX=1; 评测装配 scripts/slot_assembly.py [SLOT EVIDENCE] 段 env 门
+    R8_SLOT=1)。词表 data/r8/ (q2slot-v1 / slot-triggers-v1 / fixtures-r8-oracle, 46 可修题
+    映射, 详见 data/r8/specs/)。默认全 off 与 v6.19.0 逐字节等价; 全量 pytest 1320
+    零回归。A/B 与 G4 全量评测待精卫轮 (官方 v6.19.0 83.14% 口径不变)。
 v6.19.0 (2026-09-08) MultiModalCaption:
   • 达摩院 R6 证据形态三改造 (round5 实证研究 r5: cat1 计数/枚举漏项 46.6% +
     追加超集 26.1%, cat2 REL-gold 29/29 100% 被答成绝对日期 + 粒度越界 RANGE 17/

@@ -1,0 +1,327 @@
+{
+ "conv-26#q0036": {
+  "entities": [
+   "Caroline"
+  ],
+  "slot": "supporter",
+  "gate": "did"
+ },
+ "conv-26#q0055": {
+  "entities": [
+   "Melanie"
+  ],
+  "slot": "book_read",
+  "gate": "did"
+ },
+ "conv-26#q0128": {
+  "entities": [
+   "Melanie"
+  ],
+  "slot": "book_read",
+  "gate": "did"
+ },
+ "conv-30#q0018": {
+  "entities": [
+   "Jon"
+  ],
+  "slot": "event_promoted",
+  "gate": "did"
+ },
+ "conv-41#q0026": {
+  "entities": [
+   "John"
+  ],
+  "slot": "outdoor_activity",
+  "gate": "did"
+ },
+ "conv-41#q0029": {
+  "entities": [
+   "Maria"
+  ],
+  "slot": "vacation_state",
+  "gate": "did"
+ },
+ "conv-42#q0027": {
+  "entities": [
+   "Joanna"
+  ],
+  "slot": "book_recommended",
+  "gate": "did"
+ },
+ "conv-42#q0050": {
+  "entities": [
+   "Nate"
+  ],
+  "slot": "video_game",
+  "gate": "did"
+ },
+ "conv-42#q0065": {
+  "entities": [
+   "Nate"
+  ],
+  "slot": "skill_taught",
+  "gate": "did"
+ },
+ "conv-43#q0006": {
+  "entities": [
+   "John"
+  ],
+  "slot": "sport_played",
+  "gate": "did"
+ },
+ "conv-43#q0028": {
+  "entities": [
+   "Tim"
+  ],
+  "slot": "fiction_written",
+  "gate": "did"
+ },
+ "conv-44#q0013": {
+  "entities": [
+   "Audrey"
+  ],
+  "slot": "plan_hike",
+  "gate": "plan"
+ },
+ "conv-44#q0018": {
+  "entities": [
+   "Andrew"
+  ],
+  "slot": "adoption_problem",
+  "gate": "did"
+ },
+ "conv-44#q0043": {
+  "entities": [
+   "Audrey"
+  ],
+  "slot": "dog_item",
+  "gate": "did"
+ },
+ "conv-47#q0003": {
+  "entities": [
+   "John",
+   "James"
+  ],
+  "slot": "favorite_game",
+  "gate": "did"
+ },
+ "conv-47#q0026": {
+  "entities": [
+   "John"
+  ],
+  "slot": "job_situation",
+  "gate": "did"
+ },
+ "conv-47#q0036": {
+  "entities": [
+   "John"
+  ],
+  "slot": "gaming_gear",
+  "gate": "did"
+ },
+ "conv-47#q0038": {
+  "entities": [
+   "John"
+  ],
+  "slot": "game_new",
+  "gate": "did"
+ },
+ "conv-47#q0042": {
+  "entities": [
+   "James"
+  ],
+  "slot": "family_visited",
+  "gate": "did"
+ },
+ "conv-48#q0012": {
+  "entities": [
+   "Deborah"
+  ],
+  "slot": "mother_hobby",
+  "gate": "did"
+ },
+ "conv-48#q0017": {
+  "entities": [
+   "Jolene"
+  ],
+  "slot": "france_visit",
+  "gate": "did"
+ },
+ "conv-48#q0022": {
+  "entities": [
+   "Deborah"
+  ],
+  "slot": "yoga_pose",
+  "gate": "did"
+ },
+ "conv-49#q0002": {
+  "entities": [
+   "Evan"
+  ],
+  "slot": "roadtrip_place",
+  "gate": "did"
+ },
+ "conv-49#q0006": {
+  "entities": [
+   "Evan"
+  ],
+  "slot": "roadtrip_event",
+  "gate": "did"
+ },
+ "conv-49#q0016": {
+  "entities": [
+   "Evan"
+  ],
+  "slot": "healthy_food_suggested",
+  "gate": "did"
+ },
+ "conv-50#q0001": {
+  "entities": [
+   "Calvin"
+  ],
+  "slot": "purchase_item",
+  "gate": "did"
+ },
+ "conv-50#q0026": {
+  "entities": [
+   "Dave"
+  ],
+  "slot": "music_genre",
+  "gate": "did"
+ },
+ "conv-50#q0047": {
+  "entities": [
+   "Dave"
+  ],
+  "slot": "travel_city",
+  "gate": "did"
+ },
+ "conv-50#q0050": {
+  "entities": [
+   "Calvin"
+  ],
+  "slot": "gift_received",
+  "gate": "did"
+ },
+ "conv-43#q0036": {
+  "entities": [
+   "John"
+  ],
+  "slot": "book_reading",
+  "gate": "did"
+ },
+ "conv-44#q0035": {
+  "entities": [
+   "Audrey"
+  ],
+  "slot": "dog_breed",
+  "gate": "did"
+ },
+ "conv-44#q0045": {
+  "entities": [
+   "Andrew"
+  ],
+  "slot": "apartment_moved",
+  "gate": "did"
+ },
+ "conv-49#q0061": {
+  "entities": [
+   "Evan"
+  ],
+  "slot": "post_wedding_activity",
+  "gate": "did"
+ },
+ "conv-41#q0014": {
+  "entities": [
+   "John"
+  ],
+  "slot": "yoga_partner",
+  "gate": "did"
+ },
+ "conv-42#q0014": {
+  "entities": [
+   "Joanna"
+  ],
+  "slot": "trail_found",
+  "gate": "did"
+ },
+ "conv-42#q0047": {
+  "entities": [
+   "Nate",
+   "Joanna"
+  ],
+  "slot": "animal_liked",
+  "gate": "did"
+ },
+ "conv-43#q0016": {
+  "entities": [
+   "Tim",
+   "John"
+  ],
+  "slot": "sports_collectible",
+  "gate": "did"
+ },
+ "conv-44#q0023": {
+  "entities": [
+   "Audrey"
+  ],
+  "slot": "dog_dressup_item",
+  "gate": "did"
+ },
+ "conv-50#q0139": {
+  "entities": [
+   "Calvin"
+  ],
+  "slot": "guitar_style",
+  "gate": "did"
+ },
+ "conv-44#q0033": {
+  "entities": [
+   "Audrey"
+  ],
+  "slot": "dog_benefit",
+  "gate": "did"
+ },
+ "conv-49#q0001": {
+  "entities": [
+   "Evan"
+  ],
+  "slot": "broken_item",
+  "gate": "did"
+ },
+ "conv-50#q0010": {
+  "entities": [
+   "Calvin"
+  ],
+  "slot": "mishap",
+  "gate": "did"
+ },
+ "conv-43#q0004": {
+  "entities": [
+   "John"
+  ],
+  "slot": "endorsement_offer",
+  "gate": "offer"
+ },
+ "conv-43#q0009": {
+  "entities": [
+   "Tim"
+  ],
+  "slot": "writing_kind",
+  "gate": "did"
+ },
+ "conv-47#q0012": {
+  "entities": [
+   "John"
+  ],
+  "slot": "charity_tournament",
+  "gate": "did"
+ },
+ "conv-48#q0076": {
+  "entities": [
+   "Jolene"
+  ],
+  "slot": "engineering_project",
+  "gate": "did"
+ }
+}

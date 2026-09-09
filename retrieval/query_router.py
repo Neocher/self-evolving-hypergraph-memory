@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -40,6 +41,7 @@ from config.settings import (
 from core.schema_distiller import extract_terms
 from graph.common import CircuitBreakerOpen
 from retrieval.hyde import generate_hypothesis
+from retrieval.slot_facts import SlotFact, SlotIndex
 from retrieval.vector_store import VisualVectorStore
 
 from observability.logger import get_logger
@@ -4319,3 +4321,30 @@ class QueryRouter:
             }
         except Exception:
             return {}
+
+    # 【R8 E4】槽位原文检索 — env 总闸 R8_CTX=1 默认 off; off/缺省逐字节等价 v6.19.0。
+    # 只追加本方法与 set_slot_index, 不改既有检索逻辑。
+    def set_slot_index(self, idx: Optional[SlotIndex]) -> None:
+        """注入/清除槽位确定性检索引擎实例 (置 None 可清除)。
+
+        Args:
+            idx: SlotIndex (retrieval.slot_facts) 或 None (清除注入, 回退 []).
+        """
+        self._r8_slot_index = idx
+
+    def retrieve_slot(self, entity: str, slot: str,
+                      session_ts=None, scope=None) -> list[SlotFact]:
+        """(entity×slot) 成员全集确定性检索 (R8_CTX 总闸默认 off)。
+
+        env 门: os.environ["R8_CTX"] == "1" 才走槽位引擎;
+        off / 缺省 → [] (v6.19.0 逐字节等价哨兵);
+        on 但索引未注入 (self._r8_slot_index 缺省 None) → [] + 日志。
+        """
+        if os.environ.get("R8_CTX") != "1":
+            logger.info("retrieve_slot disabled: R8_CTX not '1', returning []")
+            return []
+        idx = getattr(self, "_r8_slot_index", None)
+        if idx is None:
+            logger.info("retrieve_slot: R8_CTX on but slot index not injected, returning []")
+            return []
+        return idx.query(entity, slot, session_ts=session_ts, scope=scope)

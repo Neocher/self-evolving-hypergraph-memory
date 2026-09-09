@@ -3,6 +3,8 @@ build/
 .cache/
 data/*
 !data/entity_aliases.json
+!data/r8/
+!data/r8/*
 data.bak.*/
 # Data & Cache
 dist/

@@ -101,6 +101,30 @@ TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
 FACT_CLUSTERS = os.environ.get("FACT_CLUSTERS", "0") == "1"
 NEG_CLEAN = os.environ.get("NEG_CLEAN", "0") == "1"
 
+# 2026-09-09 达摩院 R8 Step3b: 槽位确定性证据装配接线 — R8_SLOT=1 时 _r6_evidence_forms_ctx
+#   尾部追加 '[SLOT EVIDENCE]' 段 (qa_id → data/r8 词表得 entity/slot; Step3a 抽取管线
+#   从本会话原文消息构建 SlotIndex, query 行全量时间序, 零 LLM), 供 reader 完整枚举。
+#   开关语义 (报告注明): R8_SLOT 独立 env 默认 off (缺省 == "0") — off 时与 v6.17.0
+#   逐字节等价零回归 (与 FACT_CLUSTERS/NEG_CLEAN 同模式)。装配模块 scripts/slot_assembly.py
+#   纯函数零 IO 零 LLM (retrieval 惰性导入); 词表 data/r8/q2slot-v1.json +
+#   slot-triggers-v1.json 仅 R8_SLOT=1 时惰性只读加载 (off 不加载)。
+import slot_assembly  # noqa: E402 — scripts 同目录纯装配模块 (L1654 R8_SLOT 分支消费)
+R8_SLOT = os.environ.get("R8_SLOT", "0") == "1"
+_r8_q2slot = None
+_r8_slot_triggers = None
+
+
+def _r8_load_slot_lexicon():
+    """R8_SLOT=1 时惰性只读加载 data/r8 词表 (首次调用加载, 幂等; off 永不调用)。"""
+    global _r8_q2slot, _r8_slot_triggers
+    if _r8_q2slot is None:
+        _spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data/r8")
+        with open(os.path.join(_spec, "q2slot-v1.json"), encoding="utf-8") as _f:
+            _r8_q2slot = json.load(_f)
+        with open(os.path.join(_spec, "slot-triggers-v1.json"), encoding="utf-8") as _f:
+            _r8_slot_triggers = json.load(_f)
+    return _r8_q2slot, _r8_slot_triggers
+
 # 2026-09-03 达摩院 R2c (研究 §7 R2c 行 + §2 cat2 错因 + §6 协议, 附1: 判卷粒度规则原文
 # 见 LoCoMo_refined llm_judge.py refined prompt): reader prompt v2 — 生成侧按 refined
 # 判卷规约约束输出: 日期锚换算 (A 类 35-45%) + 粒度纪律 (B 类 20-25%, 含 17/118 时刻越界)
@@ -1209,14 +1233,21 @@ def _time_anchor_final_ctx(ctx):
     return "\n".join(time_anchors.inline_numbered_lines(ctx.splitlines(), max_docs=20))
 
 
-def _r6_evidence_forms_ctx(ctx, question):
-    """R6 证据形态装配 (FACT_CLUSTERS=1 / NEG_CLEAN=1 才分别生效; 默认全 off →
-    v6.17.0 逐字节等价零回归)。装配在 P0-b TIME ANCHORS 之后同路径:
+def _r6_evidence_forms_ctx(ctx, question, qa_id=None, conv_msgs=None,
+                           q2slot=None, slot_triggers=None):
+    """R6 证据形态装配 (FACT_CLUSTERS=1 / NEG_CLEAN=1 / R8_SLOT=1 才分别生效; 默认
+    全 off → v6.17.0 逐字节等价零回归)。装配在 P0-b TIME ANCHORS 之后同路径:
+    - R8 (Step3b, R8_SLOT=1): ctx 尾部追加 '[SLOT EVIDENCE]' 段 — 每 entity:
+      SlotIndex.query 行全量时间序 (qa_id → data/r8 词表得 entity/slot, Step3a
+      抽取管线从本会话原文消息构建索引); 无词条/零命中 → ctx 原样不追加空段;
     - R6-A: ctx 尾部追加 '[FACT CLUSTERS]' 段 (确定性聚合, 引用编号消息行);
     - R6-C: 摘要否定句过滤 (块摘要/MEMORY BLOCK/组织段事实行) + 组织段题面实体
       优先排列 ([ENTITY: ...] 段按题面专名前置)。
     均为附加/过滤, 原文消息行逐字不变 (AC4); reader prompt V1 原文不动 (AC5)。
     """
+    if R8_SLOT and qa_id and conv_msgs:
+        ctx = slot_assembly.append_slot_evidence(ctx, question, qa_id, conv_msgs,
+                                                 q2slot, slot_triggers)
     if FACT_CLUSTERS:
         ctx = fact_clusters.append_fact_clusters(ctx, max_docs=30)
     if NEG_CLEAN:
@@ -1651,7 +1682,25 @@ for i, q in enumerate(qa_all):
 
     # R6 证据形态三改造装配 (FACT_CLUSTERS=1 / NEG_CLEAN=1; 默认全 off → v6.17.0 等价):
     # R6-A [FACT CLUSTERS] 聚合段 / R6-C 摘要否定句过滤 + 题面实体优先。原文逐字不变。
-    ctx = _r6_evidence_forms_ctx(ctx, question)
+    # R8 Step3b (R8_SLOT=1; off → 与上行完全原路径零回归): 该会话原文消息 → msgs →
+    # _r6_evidence_forms_ctx 尾部追加 [SLOT EVIDENCE] 段 (reader 前)。词表仅 R8_SLOT 时加载。
+    if R8_SLOT:
+        _r8_qa_id = q.get("qa_id")
+        _r8_conv_msgs = []
+        if _r8_qa_id:
+            # 本会话消息 = episode_cache.session_id == 官方 conversation_idx (ci) 的条目;
+            # 顺序 = msg_by_id 灌库序 = 会话内出现序。ts 取逐消息真实 created_at (P1 回填)。
+            _r8_eps = [eid for eid in msg_by_id
+                       if (episode_cache.get(eid) or {}).get("session_id") == ci]
+            if _r8_eps:
+                _r8_conv_msgs = slot_assembly.build_msgs_from_cache(
+                    {eid: msg_by_id[eid] for eid in _r8_eps}, episode_cache, {})
+        _r8_q2, _r8_tr = _r8_load_slot_lexicon()
+        ctx = _r6_evidence_forms_ctx(ctx, question, qa_id=_r8_qa_id,
+                                     conv_msgs=_r8_conv_msgs,
+                                     q2slot=_r8_q2, slot_triggers=_r8_tr)
+    else:
+        ctx = _r6_evidence_forms_ctx(ctx, question)
 
     # CTX_DUMP 默认开 (R2-0): 每题落盘最终检索 ctx + 组成 (raw 证据条数/blocks 摘要/
     # entity 段/各来源字符占比), 供翻转归因与 R-CTX 诊断 (round1 缺此现场)

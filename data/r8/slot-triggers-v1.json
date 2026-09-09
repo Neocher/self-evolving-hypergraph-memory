@@ -1,0 +1,361 @@
+{
+ "supporter": [
+  "support",
+  "helped me",
+  "there for",
+  "mentor",
+  "family",
+  "friends"
+ ],
+ "book_read": [
+  "read",
+  "reading",
+  "book",
+  "novel"
+ ],
+ "event_promoted": [
+  "fair",
+  "networking",
+  "event",
+  "promote",
+  "participated"
+ ],
+ "outdoor_activity": [
+  "hiking",
+  "hike",
+  "mountaineer",
+  "climb",
+  "outdoor",
+  "trail"
+ ],
+ "vacation_state": [
+  "vacation",
+  "visited",
+  "went to",
+  "trip",
+  "travel"
+ ],
+ "book_recommended": [
+  "recommend",
+  "suggest",
+  "book",
+  "series",
+  "little women"
+ ],
+ "video_game": [
+  "play",
+  "game",
+  "valorant",
+  "counter strike",
+  "xenoblade",
+  "cyberpunk",
+  "street fighter",
+  "gaming"
+ ],
+ "skill_taught": [
+  "helped",
+  "taught",
+  "learn",
+  "show",
+  "how to",
+  "recipe",
+  "tips"
+ ],
+ "sport_played": [
+  "surf",
+  "sport",
+  "play",
+  "basketball"
+ ],
+ "fiction_written": [
+  "write",
+  "writing",
+  "novel",
+  "story",
+  "fiction",
+  "fantasy"
+ ],
+ "plan_hike": [
+  "plan",
+  "hike",
+  "hiking"
+ ],
+ "adoption_problem": [
+  "adopt",
+  "toby",
+  "dog",
+  "apartment",
+  "find",
+  "pet-friendly",
+  "open space"
+ ],
+ "dog_item": [
+  "dog",
+  "tags",
+  "toy",
+  "bed",
+  "collar",
+  "bought",
+  "made",
+  "dress"
+ ],
+ "favorite_game": [
+  "favorite",
+  "game",
+  "csgo",
+  "apex",
+  "play"
+ ],
+ "job_situation": [
+  "job",
+  "quit",
+  "work",
+  "employ",
+  "career",
+  "aspire",
+  "esports",
+  "organizer"
+ ],
+ "gaming_gear": [
+  "headphone",
+  "mouse",
+  "desk",
+  "gear",
+  "buy",
+  "refurbish",
+  "sennheiser",
+  "logitech"
+ ],
+ "game_new": [
+  "start",
+  "new game",
+  "play",
+  "valhalla",
+  "witcher",
+  "fifa",
+  "dungeons"
+ ],
+ "family_visited": [
+  "visit",
+  "came",
+  "family",
+  "mother",
+  "sister",
+  "brother"
+ ],
+ "mother_hobby": [
+  "mother",
+  "mom",
+  "hobby",
+  "read",
+  "travel",
+  "art",
+  "cook",
+  "knit"
+ ],
+ "france_visit": [
+  "france",
+  "paris",
+  "visit",
+  "trip",
+  "went"
+ ],
+ "yoga_pose": [
+  "yoga",
+  "pose",
+  "warrior",
+  "dancer",
+  "tree"
+ ],
+ "roadtrip_place": [
+  "roadtrip",
+  "rockies",
+  "jasper",
+  "drive",
+  "travel",
+  "visit"
+ ],
+ "roadtrip_event": [
+  "roadtrip",
+  "may",
+  "trip",
+  "went",
+  "drive"
+ ],
+ "healthy_food_suggested": [
+  "healthy",
+  "suggest",
+  "seltzer",
+  "chocolate",
+  "popcorn",
+  "fruit",
+  "veggie",
+  "sandwich"
+ ],
+ "purchase_item": [
+  "bought",
+  "buy",
+  "purchase",
+  "got",
+  "new",
+  "mansion",
+  "car"
+ ],
+ "music_genre": [
+  "music",
+  "listen",
+  "rock",
+  "japanese",
+  "genre",
+  "song"
+ ],
+ "travel_city": [
+  "travel",
+  "visit",
+  "city",
+  "san francisco",
+  "detroit",
+  "flew"
+ ],
+ "gift_received": [
+  "gift",
+  "received",
+  "gave me",
+  "gold chain",
+  "guitar"
+ ],
+ "book_reading": [
+  "reading",
+  "read",
+  "book",
+  "alchemist"
+ ],
+ "dog_breed": [
+  "breed",
+  "dog",
+  "mix",
+  "lab",
+  "chihuahua",
+  "jack russell",
+  "puppy"
+ ],
+ "apartment_moved": [
+  "move",
+  "apartment",
+  "new place",
+  "living"
+ ],
+ "post_wedding_activity": [
+  "wedding",
+  "honeymoon",
+  "bride",
+  "married",
+  "snow",
+  "ski",
+  "snowshoe",
+  "canada"
+ ],
+ "yoga_partner": [
+  "yoga",
+  "rob",
+  "colleague",
+  "class",
+  "with"
+ ],
+ "trail_found": [
+  "trail",
+  "found",
+  "hike",
+  "discover",
+  "route"
+ ],
+ "animal_liked": [
+  "like",
+  "love",
+  "animal",
+  "turtle",
+  "dog",
+  "cat",
+  "pet"
+ ],
+ "sports_collectible": [
+  "collectible",
+  "signed",
+  "basketball",
+  "jersey",
+  "memorabilia"
+ ],
+ "dog_dressup_item": [
+  "dress",
+  "wear",
+  "hat",
+  "costume",
+  "outfit"
+ ],
+ "guitar_style": [
+  "guitar",
+  "purple",
+  "octopus",
+  "yellow",
+  "shiny",
+  "custom"
+ ],
+ "dog_benefit": [
+  "dog",
+  "companionship",
+  "love",
+  "joy",
+  "company"
+ ],
+ "broken_item": [
+  "broke",
+  "broken",
+  "accident",
+  "prius",
+  "car",
+  "repair",
+  "crash"
+ ],
+ "mishap": [
+  "mishap",
+  "accident",
+  "flood",
+  "crash",
+  "broke",
+  "emergency",
+  "trouble"
+ ],
+ "endorsement_offer": [
+  "endorse",
+  "offer",
+  "sponsor",
+  "nike",
+  "gatorade",
+  "deal",
+  "brand"
+ ],
+ "writing_kind": [
+  "write",
+  "writing",
+  "article",
+  "novel",
+  "fantasy",
+  "character",
+  "study"
+ ],
+ "charity_tournament": [
+  "charity",
+  "tournament",
+  "organize",
+  "raise",
+  "fund"
+ ],
+ "engineering_project": [
+  "engineer",
+  "project",
+  "robot",
+  "water",
+  "surveillance",
+  "purifier"
+ ]
+}
