@@ -396,6 +396,18 @@ def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
     except Exception:
         logger.exception("TF-IDF fit failed (non-fatal)")
 
+    # [VRAM 2026-09-10] 归还重建峰值占用的 CUDA 缓存块 — 6GB 卡需与其它 GPU 服务
+    # (Magnitude/llama-server) 共存; 编码器权重不受影响, 仅释放 caching allocator
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+            _free, _total = _torch.cuda.mem_get_info()
+            logger.info("CUDA cache released after rebuild (free=%.2fGB/%.2fGB)",
+                        _free / 1e9, _total / 1e9)
+    except Exception:
+        logger.debug("empty_cache skipped", exc_info=True)
+
     return {
         "status": "ok",
         "indexed_count": indexed,

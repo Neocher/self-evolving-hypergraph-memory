@@ -309,6 +309,13 @@ class TextEncoder:
             try:
                 from sentence_transformers import SentenceTransformer
                 self._model = SentenceTransformer(m3_snapshot, device=self.device)
+                # [fp16 2026-09-10] CUDA 下转 fp16: 6GB 卡给重建/共存腾显存 (~1.1GB)
+                if self.device == "cuda":
+                    try:
+                        self._model.half()
+                        logger.info("BGE-M3 fp16 on cuda (VRAM save)")
+                    except Exception as _e:
+                        logger.warning("fp16 conversion skipped: %s", _e)
                 self._truncate_dim = _TRUNCATE_DIM
                 self.model_name = _BGE_M3_MODEL
                 logger.info("BGE-M3 ST loaded: dim=%d (truncate=%d)", self.dimension, self._truncate_dim)
@@ -429,8 +436,14 @@ class TextEncoder:
                 chunk_vecs.append(raw / norms)
             encoded = np.concatenate(chunk_vecs, axis=0)
         else:
-            # Tier 3: Local sentence-transformers
-            encoded = np.asarray(self._model.encode(unique_texts), dtype=np.float32)
+            # Tier 3: Local sentence-transformers (分块编码, 峰值显存可控)
+            import os as _os2
+            _bs = max(1, int(_os2.environ.get("SHM_ENC_BATCH", "8")))
+            _chunks: list[np.ndarray] = []
+            for _s in range(0, len(unique_texts), _bs):
+                _part = unique_texts[_s:_s + _bs]
+                _chunks.append(np.asarray(self._model.encode(_part, batch_size=_bs), dtype=np.float32))
+            encoded = np.concatenate(_chunks, axis=0) if _chunks else np.empty((0, self.dimension), dtype=np.float32)
         encoded = self._maybe_truncate(encoded)  # 【v6.1】bge-m3 MRL 截断 512
 
         # 组装原序矩阵 + populate 缓存（LRU 512）

@@ -1,12 +1,24 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.20.0"
-__version_info__ = (6, 20, 0)
+__version__ = "6.20.1"
+__version_info__ = (6, 20, 1)
 __version_name__ = "StateSemantics"
-__release_date__ = "2026-09-09"
+__release_date__ = "2026-09-10"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.20.1 (2026-09-10) StateSemantics:
+  • 6GB 卡 GPU 共存 + 启动重建提速 (服务重启后向量索引重建不再 OOM):
+    - embedding/encoder.py: CUDA 下 bge-m3 编码器转 fp16 (省 ~1.1GB); 本地
+      sentence-transformers 路径改分块编码 (SHM_ENC_BATCH 默认 8, 峰值显存可控),
+      替代一次性 encode 全量 (实测峰值 3.29GB → 分块后 <1GB)。
+    - api/routes/system.py: 索引重建完成后 torch.cuda.empty_cache() 归还峰值缓存
+      (实测 5.3GB→1.5GB 常驻, GPU 空闲 4.2GB, 与 Magnitude 等服务共存)。
+    - systemd: shm-server drop-in 10-alloc.conf (PYTORCH_CUDA_ALLOC_CONF=
+      expandable_segments:True, SHM_ENC_BATCH=8); unit env SHM_EMBEDDING__DEVICE
+      由 auto 改显式 cuda (auto 在重建期会解析成 cuda 但覆盖配置文件, 曾致重建
+      OOM 两连与"配置文件改了不生效"的排查弯路)。
+    全量 pytest 1320 零回归; 索引重建 6946 向量 ~2.5 分钟 (原 CPU 路径 90+ 分钟)。
 v6.20.0 (2026-09-09) StateSemantics:
   • R8 引擎语义不变量四件套 (达摩院 deep 评审 + 67 题 T1-T4 重标驱动; 评测只当
     探照灯, 引擎能力真升级, 数据面/判卷/judge/prompt V1 零改动, 红线外)。
