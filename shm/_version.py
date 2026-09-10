@@ -1,12 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.20.2"
-__version_info__ = (6, 20, 2)
+__version__ = "6.20.3"
+__version_info__ = (6, 20, 3)
 __version_name__ = "StateSemantics"
-__release_date__ = "2026-09-10"
+__release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.20.3 (2026-09-11) StateSemantics:
+  • 修复 R8-SLOT-SCOPE-1 (R8_SLOT=1 装配静默零注入):
+    - retrieval/slot_extract.py::build_slot_index: conv 前缀裁剪假设 session_id 为
+      "conv-26-s1" 标签串, 而评测链路 (bench _r8_conv_msgs ← 评测库 e.session_id)
+      传 int conversation_idx (0..9) → 前缀裁剪恒空 → 抽取 0 条 → append_slot_evidence
+      静默返回原 ctx (无日志无异常)。修复: 前缀命中为空时回落调用方传入的 msgs_all
+      (bench 已按本题会话裁剪, 回落等价本题会话范围, 不引入跨会话误归); 标签串形态
+      行为不变 (原防跨会话意图保留)。
+    - 影响面: R8_SLOT=1 的装配在 v6.20.0~v6.20.2 及历次 A/B 中从未真正生效 → 两臂
+      实为等价 (分数差为判卷噪声); 本版起装配真实生效。
+    - tests/retrieval/test_slot_scope_forms.py (T1~T5, 先红后绿: 回退修复时 T1/T5 失败):
+      int session_id 抽取+注入 / 标签串只取本 conv / 跨会话混杂不越界 / 无 # 前缀用全量。
+    验证: 全量 pytest 1338 passed 零回归; 离线门 (真实库 eval_db_p2) facts 非空 46/46 题、
+    装配生成段 46/46 题; 真实 bench 单题冒烟 (R8_SLOT=1) ctx dump 落 [SLOT EVIDENCE] 段。
 v6.20.2 (2026-09-10) StateSemantics:
   • 启动直接加载已落库向量 (重启不再全量重编码):
     - graph/overgraph_store.py: iter_persisted_vectors() 只读分页读取节点

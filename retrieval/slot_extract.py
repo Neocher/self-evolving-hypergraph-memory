@@ -113,10 +113,18 @@ def build_slot_index(
             conv = qkey.partition("#")[0]
         for entity in item.get("entities") or []:
             if conv is not None:
-                scope_msgs = [
+                scoped = [
                     m for m in msgs_all
                     if str(m.get("session_id") or "").startswith(conv + "-")
                 ]
+                # [R8-SLOT-SCOPE-1 2026-09-11] session_id 两种真实形态:
+                #   ① 标签串 "conv-26-s1" (旧测试/标签化调用方) → 前缀裁剪有效, 行为不变;
+                #   ② int conversation_idx 0..9 (评测链路: bench _r8_conv_msgs ← 评测库
+                #      e.session_id) → "0".startswith("conv-26-") 恒 False → 前缀裁剪恒空。
+                # 曾因此静默零注入 (R8_SLOT=1 的 A/B ON 臂与 OFF 逐字节等价, 无日志无异常)。
+                # 命中为空时回落调用方传入的 msgs_all: bench L1693-1697 已按本题会话裁剪
+                # (episode_cache.session_id == ci), 故回落 == "本题会话范围", 不引入跨会话误归。
+                scope_msgs = scoped if scoped else list(msgs_all)
             else:
                 scope_msgs = list(msgs_all)
             all_facts.extend(
