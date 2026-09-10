@@ -109,6 +109,10 @@ LABEL_ONTOLOGY_ENTITY = "OntologyEntity"
 # 每 (entity_id, attr_name) 属性版本上限（与 GraphLiteStore PROPERTY_MAX_VERSIONS 对齐）
 PROPERTY_MAX_VERSIONS = 8
 
+# 已持久化向量分页读取页大小（启动加载路径防大库一次性物化：每个 view 含
+# 512d dense_vector，整表读取会瞬时抬高峰值内存）
+VECTOR_LOAD_PAGE = 1000
+
 
 def _now() -> float:
     return time.time()
@@ -1941,6 +1945,55 @@ class OverGraphStore:
                 return [str(v.key) for v in views]
             views = self._db.get_nodes([int(i) for i in internal_ids])
             return [str(v.key) for v in views if v is not None]
+
+    def iter_persisted_vectors(self, labels: list[str] | None = None) -> list[dict]:
+        """读取已持久化向量（启动加载路径，纯只读）→ [{"node_id","embedding","label"}]。
+
+        向量已随节点 dense_vector 落库（batch_upsert_embeddings），重启时可直接
+        加载而无需全量重编码（实测 6946 节点 GPU fp16 约 2.5 分钟）。
+        labels 默认 [LABEL_EPISODE, LABEL_COMMUNITY]（主检索通道覆盖的两类节点，
+        见 retrieval.vector_index._SEARCH_LABELS）；跳过无 dense_vector / 空向量
+        的节点。分页读取（引擎提供 get_nodes_by_labels_paged 时）防止大库一次性
+        物化，缺失分页 API 的旧引擎回落整表读取。
+        """
+        lbls = list(labels) if labels else [LABEL_EPISODE, LABEL_COMMUNITY]
+
+        def _views(label: str):
+            paged = getattr(self._db, "get_nodes_by_labels_paged", None)
+            if paged is None:
+                yield from self._db.get_nodes_by_labels(label)
+                return
+            offset = 0
+            while True:
+                try:
+                    batch = paged(label, limit=VECTOR_LOAD_PAGE, offset=offset)
+                except TypeError:  # 分页签名不符（旧引擎）→ 回落整表
+                    yield from self._db.get_nodes_by_labels(label)
+                    return
+                if not batch:
+                    return
+                yield from batch
+                if len(batch) < VECTOR_LOAD_PAGE:
+                    return
+                offset += len(batch)
+
+        out: list[dict] = []
+        with self._session_lock:
+            assert self._db is not None
+            for label in lbls:
+                for view in _views(label):
+                    vec = getattr(view, "dense_vector", None)
+                    if vec is None or len(vec) == 0:
+                        continue  # 未建向量 / 空向量 → 不参与加载
+                    key = str(getattr(view, "key", "") or "")
+                    if not key:
+                        continue
+                    out.append({
+                        "node_id": key,
+                        "embedding": _as_float32(vec),
+                        "label": label,
+                    })
+        return out
 
     def get_node_internal_id(self, node_id: str, label: str = LABEL_EPISODE) -> int | None:
         """elementKey → 引擎内部 ID(int)（scope_start_node_id 需 int，D9）。"""

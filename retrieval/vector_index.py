@@ -166,3 +166,20 @@ class VectorIndexAdapter:
         )
         self._count = count
         return count
+
+    def load_persisted(self, rows: list[dict]) -> int:
+        """启动加载：用已落库向量重建内存映射 —— 只读，不调 encoder、不写库。
+
+        镜像 rebuild() 的内存侧结构（faiss_id_map in-place clear/update +
+        计数同步），差异仅在**不**调用 store.batch_upsert_embeddings：向量
+        已在库中，加载路径不得产生任何写入（HNSW/图数据不动）。
+        rows: [{"node_id": str, "embedding": vec, "label": str}]
+        （store.iter_persisted_vectors() 输出）。返回加载数。
+        """
+        self.faiss_id_map.clear()
+        self.faiss_id_map.update(
+            {faiss_id(r["node_id"]): str(r["node_id"])
+             for r in rows if r.get("node_id")}
+        )
+        self._count = len(self.faiss_id_map)
+        return self._count

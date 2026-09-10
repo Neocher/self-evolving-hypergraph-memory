@@ -1,12 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.20.1"
-__version_info__ = (6, 20, 1)
+__version__ = "6.20.2"
+__version_info__ = (6, 20, 2)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-10"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.20.2 (2026-09-10) StateSemantics:
+  • 启动直接加载已落库向量 (重启不再全量重编码):
+    - graph/overgraph_store.py: iter_persisted_vectors() 只读分页读取节点
+      dense_vector (VECTOR_LOAD_PAGE=1000), 跳过空向量, 默认 Episode+Community。
+    - retrieval/vector_index.py: VectorIndexAdapter.load_persisted() 用已存向量
+      重建内存映射 (镜像 rebuild() 的内存侧, 不调 encoder、不写库、不动 HNSW)。
+    - api/routes/system.py: _load_index_from_store() (命中判据 = 已存向量 ≥
+      max(1, 0.5×待索引节点数)); rebuild_index 路由按 env SHM_INDEX_LOAD (默认 1)
+      先试加载, 未命中/异常自动回落原全量编码路径 (语义不变, =0 为回滚开关);
+      GQL 抽取抽公共 _fetch_index_items() 供两条路径共用。
+    实测: 重启就绪 9.2s (原 ~2.5 分钟 GPU / 90+ 分钟 CPU), 日志
+    `Index loaded from store: N vectors (encoding skipped)`, 零重编码;
+    覆盖度核验 101/101 episodes + 6851/6851 communities 全带向量, 无缺失漂移。
+    新增 tests/api/test_index_load.py 12 用例; 全量 pytest 1332 passed 零回归。
 v6.20.1 (2026-09-10) StateSemantics:
   • 6GB 卡 GPU 共存 + 启动重建提速 (服务重启后向量索引重建不再 OOM):
     - embedding/encoder.py: CUDA 下 bge-m3 编码器转 fp16 (省 ~1.1GB); 本地

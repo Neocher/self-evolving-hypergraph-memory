@@ -2,6 +2,7 @@
 系统路由 (health, metrics, audit, index, procedural, conceptual)
 """
 
+import os
 import threading
 
 from api.routes._deps import (
@@ -27,6 +28,47 @@ _HEALTH_STATS_TTL: float = 5.0
 # 分号拼接（"; ".join）在 GraphLite 会静默截断只执行第一条 / QUERY_ERROR，
 # 启动时多批失败会打满熔断窗口 → 全库假死（v5.31.1 修复）。
 HEBBIAN_BATCH = 20
+
+# 待索引节点文本 GQL（rebuild 编码路径与启动加载路径共用，保证两条路径看到
+# 同一批节点；CommunityNode 以 summary 为文本源，见 D8 向量退化修复）。
+_EP_CONTENT_GQL = (
+    "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content LIMIT 10000"
+)
+_COMM_CONTENT_GQL = (
+    "MATCH (c:CommunityNode) RETURN c.id AS id, c.summary AS content LIMIT 10000"
+)
+
+# 启动加载命中判据：已存向量条数 ≥ max(1, _INDEX_LOAD_MIN_RATIO × 期望节点数)。
+# 0.5 为「大部分向量已落库」的保守线——低于此值说明索引不完整，全量重建更安全。
+_INDEX_LOAD_MIN_RATIO = 0.5
+
+
+def _fetch_node_rows(store, gql: str) -> list[tuple[str, str]]:
+    """GQL 行 → [(node_id, content)]（dict/tuple 两种返回形态，空内容丢弃）。"""
+    rows = store.query_cypher(gql)
+    out: list[tuple[str, str]] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            nid = str(row.get("id", "") or "")
+            content = str(row.get("content", "") or "")
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            nid = str(row[0]) if row[0] is not None else ""
+            content = str(row[1]) if row[1] is not None else ""
+        else:
+            continue
+        if nid and content.strip():
+            out.append((nid, content))
+    return out
+
+
+def _fetch_index_items(store) -> list[tuple[str, str, str]]:
+    """待索引节点文本项 [(node_id, content, label)]（纯 GQL 读，不触发编码）。"""
+    items: list[tuple[str, str, str]] = []
+    for nid, content in _fetch_node_rows(store, _EP_CONTENT_GQL):
+        items.append((nid, content, "EpisodeNode"))
+    for nid, content in _fetch_node_rows(store, _COMM_CONTENT_GQL):
+        items.append((nid, content, "CommunityNode"))
+    return items
 
 
 def _flush_hebbian_batch(store, pairs: list) -> bool:
@@ -299,46 +341,18 @@ def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
     store = deps.graph_store
     start = _now()
 
-    def _fetch_rows(gql: str) -> list[tuple[str, str]]:
-        rows = store.query_cypher(gql)
-        out: list[tuple[str, str]] = []
-        for row in rows or []:
-            if isinstance(row, dict):
-                nid = str(row.get("id", "") or "")
-                content = str(row.get("content", "") or "")
-            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                nid = str(row[0]) if row[0] is not None else ""
-                content = str(row[1]) if row[1] is not None else ""
-            else:
-                continue
-            if nid and content.strip():
-                out.append((nid, content))
-        return out
-
-    ep_items = _fetch_rows(
-        "MATCH (e:EpisodeNode) RETURN e.id AS id, e.content AS content LIMIT 10000"
-    )
-    comm_items = _fetch_rows(
-        "MATCH (c:CommunityNode) RETURN c.id AS id, c.summary AS content LIMIT 10000"
-    )
-    if not ep_items and not comm_items:
+    items = _fetch_index_items(store)
+    if not items:
         return {"status": "ok", "indexed_count": 0, "message": "No episodes found"}
 
-    node_ids: list[str] = []
-    contents: list[str] = []
-    labels: list[str] = []
-    for nid, content in ep_items:
-        node_ids.append(nid)
-        contents.append(content)
-        labels.append("EpisodeNode")
-    for nid, content in comm_items:
-        node_ids.append(nid)
-        contents.append(content)
-        labels.append("CommunityNode")
+    node_ids: list[str] = [it[0] for it in items]
+    contents: list[str] = [it[1] for it in items]
+    labels: list[str] = [it[2] for it in items]
+    ep_count = sum(1 for lbl in labels if lbl == "EpisodeNode")
 
     logger.info("Rebuilding OverGraph vectors: encoding %d nodes "
                 "(%d episodes + %d communities)", len(contents),
-                len(ep_items), len(comm_items))
+                ep_count, len(contents) - ep_count)
     embeddings = deps.encoder.embed_batch(contents)
     nodes = [{"node_id": nid, "embedding": vec, "label": lbl}
              for nid, vec, lbl in zip(node_ids, embeddings, labels)]
@@ -417,6 +431,57 @@ def _rebuild_index_overgraph(deps: Services, adapter) -> dict:
     }
 
 
+def _load_index_from_store(deps: Services, adapter) -> dict | None:
+    """启动优先加载已落库向量（命中即跳过全量重编码）——只读路径。
+
+    命中判据：已存向量条数 ≥ max(1, 0.5 × 期望节点数)；期望数 = 待索引节点
+    文本条数（与 rebuild 同一 GQL 统计）。未命中返回 None → 调用方回落现有
+    全量编码路径（语义不变）。加载路径不调 encoder、不写库（不动 HNSW/图数据），
+    仅内存映射 + TF-IDF fit（文本取自 GQL 读，非编码）。
+    """
+    store = deps.graph_store
+    loader = getattr(store, "iter_persisted_vectors", None)
+    if loader is None:
+        return None
+
+    contents = [c for _, c, _ in _fetch_index_items(store)]
+    expected = len(contents)
+    if expected == 0:
+        return None
+
+    try:
+        rows = loader()
+    except Exception:
+        # 加载失败绝不阻断启动 —— 回落全量编码（与优化前行为一致）
+        logger.exception("Index load failed → full rebuild")
+        return None
+    if len(rows) < max(1, int(_INDEX_LOAD_MIN_RATIO * expected)):
+        logger.info("Index load miss (no persisted vectors) → full rebuild")
+        return None
+
+    loaded = adapter.load_persisted(rows)
+
+    # 复用 rebuild 的 TF-IDF fit 逻辑（文本源同一 GQL，不触发编码）
+    try:
+        tfidf = getattr(deps, "tfidf_index", None)
+        if tfidf is not None and hasattr(tfidf, "fit") and contents:
+            tfidf.fit(contents)
+            logger.info("TF-IDF index fitted with %d texts", len(contents))
+    except Exception:
+        logger.exception("TF-IDF fit failed (non-fatal)")
+
+    logger.info("Index loaded from store: %d vectors (encoding skipped)", loaded)
+    return {
+        "status": "ok",
+        "loaded_count": loaded,
+        # 兼容启动日志（api/app.py 读 indexed_count 打印 auto-build 计数）
+        "indexed_count": loaded,
+        "total_nodes": expected,
+        "mode": "load",
+        "dimension": getattr(adapter, "dimension", 0),
+    }
+
+
 @router.post("/index/rebuild", summary="重建 FAISS 索引")
 async def rebuild_index(
     deps: Services = Depends(get_services),
@@ -439,7 +504,15 @@ async def rebuild_index(
     # v6.0.0 OverGraph 分支（D8）：batch_upsert dense_vector + Hebbian 改 vector_search
     from retrieval.vector_index import VectorIndexAdapter
     if isinstance(getattr(deps, "faiss_index", None), VectorIndexAdapter):
-        return _rebuild_index_overgraph(deps, deps.faiss_index)
+        adapter = deps.faiss_index
+        # 【启动向量加载 2026-09-10】优先加载已落库向量（命中跳过全量编码）；
+        # SHM_INDEX_LOAD=0 强制走原全量重建路径（回滚开关）。
+        if os.environ.get("SHM_INDEX_LOAD", "1") == "1":
+            loaded = _load_index_from_store(deps, adapter)
+            if loaded is not None:
+                record_request("POST", "/index/rebuild", "200", _now() - start)
+                return loaded
+        return _rebuild_index_overgraph(deps, adapter)
 
     # graphlite 回滚分支（真 FAISS 重建：IVFFlat/FlatL2 + Hebbian 循环）已随
     # faiss-cpu 移除（报告 3.2 / 4.1-2）。backend 恒为 overgraph → 此处不可达；
