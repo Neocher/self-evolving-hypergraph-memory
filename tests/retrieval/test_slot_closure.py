@@ -14,9 +14,9 @@ sys.path.insert(0, str(REPO))
 
 import slot_assembly  # noqa: E402
 from retrieval.slot_closure import (  # noqa: E402
-    clean_members, detect_value_type, is_count_question, is_noise_value, is_set_question,
-    load_value_types, normalize_value, render_closure, route_question, score_member,
-    split_enumeration, type_match,
+    _np_after_trigger, _trigger_span, clean_members, detect_value_type, extract_objects_v2,
+    is_count_question, is_noise_value, is_set_question, load_value_types, normalize_value,
+    render_closure, route_question, score_member, split_enumeration, type_match,
 )
 from retrieval.slot_facts import SlotFact  # noqa: E402
 
@@ -221,3 +221,38 @@ def test_clean_members_typed_filter_keeps_only_typed():
     members = clean_members(pairs, question="What states has Maria vacationed at?", entity="Maria")
     vals = [m["value"] for m in members]
     assert vals == ["Oregon"], vals   # 非州名的从句被类型门剔除
+
+
+# ── A) 谓词论元抽取 (宾语 NP) ────────────────────────────────────────────
+def test_trigger_span_word_boundary():
+    """回归: 触发词必须词边界匹配 (曾用 str.find 命中单词内部 → 产出 "ed Italy" 碎片)。"""
+    sp = _trigger_span("We visited Italy last year.", "visit")
+    assert sp is not None
+    assert "We visited Italy last year."[sp[0]:sp[1]].lower() == "visited"
+    assert _trigger_span("He is visiting Rome.", "visit") is not None
+    assert _trigger_span("She has a visitor badge.", "visit") is not None   # visitor 也算屈折
+    assert _trigger_span("Nothing here.", "visit") is None
+
+
+def test_np_after_trigger_skips_determiners_and_stops():
+    assert _np_after_trigger("I just bought a mansion last week.", "bought") == "mansion"
+    assert _np_after_trigger("We visited Florida last year.", "visited") == "Florida"
+    assert _np_after_trigger("I am playing basketball with friends.", "playing") == "basketball"
+    assert _np_after_trigger("She bought a mansion and a car.", "bought") == "mansion"
+    assert _np_after_trigger("I bought it yesterday.", "bought") in (None, "yesterday")
+
+
+def test_extract_objects_v2_end_to_end():
+    msgs = [{"dia": "ep_1", "session_id": 0, "speaker": "Maria", "ts": "2023-05-01",
+             "text": "I went on a road trip to Oregon."},
+             {"dia": "ep_2", "session_id": 0, "speaker": "Maria", "ts": "2023-06-01",
+              "text": "We visited Florida last year."},
+             {"dia": "ep_3", "session_id": 0, "speaker": "John", "ts": "2023-07-01",
+              "text": "Maria visited Canada."}]
+    rows = extract_objects_v2(msgs, "Maria", "vacation_state",
+                              ["visited", "went to", "trip", "vacation"], gate="did",
+                              question="What states has Maria vacationed at?")
+    vals = {getattr(r, "value", "") for r in rows}
+    assert "Florida" in vals, vals
+    assert any("Oregon" in v for v in vals), vals
+    assert not any(v.lower().startswith(("ed ", "ing ")) for v in vals), f"不得出现屈折碎片: {vals}"

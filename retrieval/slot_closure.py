@@ -121,6 +121,103 @@ def _tokens(s: str) -> set:
     return {t for t in re.findall(r"[a-z0-9']+", (s or "").lower()) if len(t) > 2}
 
 
+# ── A) 谓词论元抽取 (v2 专用; 修 generic 题的子句碎片值) ──────────────────
+# 现场缺口: v1 抽取取"触发词后 8-token 窗再切分" → 产出子句碎片
+# ("group has made me feel accepted"). 本实现取**触发词支配的宾语 NP**:
+# 触发词命中 → 跳过限定词/前置介词 → 取 1..N 个 token 直至停用词 (介词/连词/代词/助动词/标点)。
+
+_NP_STOP = {
+    "in", "on", "at", "for", "to", "from", "with", "about", "of", "during", "after", "before",
+    "by", "into", "over", "under", "near", "around", "through", "across", "than", "as",
+    "and", "or", "but", "so", "because", "then", "also", "if", "when", "while", "that",
+    "is", "are", "was", "were", "be", "been", "am", "do", "does", "did", "has", "have", "had",
+    "can", "could", "will", "would", "should", "might", "may", "must", "not", "no",
+    "i", "you", "we", "he", "she", "they", "it", "me", "us", "him", "her", "them",
+    "my", "your", "our", "his", "their", "its", "this", "these", "those", "there", "here",
+}
+_NP_DET = {"a", "an", "the", "some", "any", "another", "each", "every", "my", "your", "his",
+           "her", "their", "our", "its", "this", "that", "these", "those"}
+_NP_TIME = {"last", "next", "this", "year", "years", "week", "weeks", "day", "days", "month",
+            "months", "time", "times", "ago", "today", "yesterday", "tomorrow", "soon", "later",
+            "again", "now", "recently", "lately", "already", "still", "ever", "never"}
+_MAX_NP_TOKENS = 4
+
+
+def _trigger_span(sentence: str, trigger: str):
+    """句内触发词出现位 (词边界起, 允许词尾屈折: visit→visited) → (start, end) 或 None。
+
+    2026-09-11 实测教训: 用 str.find 会命中单词内部 ("visit" 命中 "visited" 的中段),
+    产出 "ed Italy"/"ing basketball" 这类碎片; 必须词边界匹配并把屈折尾一起吃进 span。
+    """
+    if not sentence or not trigger:
+        return None
+    m = re.search(r"\b" + re.escape(str(trigger)) + r"\w{0,4}\b", sentence, re.I)
+    return (m.start(), m.end()) if m else None
+
+
+def _np_after_trigger(sentence: str, trigger: str) -> Optional[str]:
+    """句子 + 触发词 → 触发词支配的宾语 NP (None = 无可取)。"""
+    s = (sentence or "").strip()
+    span = _trigger_span(s, trigger)
+    if span is None:
+        return None
+    tail = s[span[1]:]
+    toks = re.findall(r"[A-Za-z0-9'’\-]+|[.,;:!?]", tail)
+    out: List[str] = []
+    for tok in toks:
+        if re.fullmatch(r"[.,;:!?]", tok):
+            break
+        lw = tok.lower()
+        if not out:
+            if lw in _NP_DET or lw in _NP_STOP:      # 先跳过限定词/前置介词
+                continue
+            out.append(tok)
+            continue
+        if lw in _NP_STOP or lw in _NP_TIME:
+            break
+        out.append(tok)
+        if len(out) >= _MAX_NP_TOKENS:
+            break
+    if not out:
+        return None
+    return normalize_value(" ".join(out))
+
+
+def extract_objects_v2(
+    msgs: Sequence[Mapping[str, Any]],
+    entity: str,
+    slot: str,
+    triggers: Sequence[str],
+    gate: str = "did",
+    question: str = "",
+) -> List[Dict[str, Any]]:
+    """会话消息 → 宾语 NP 事实 [{value, ts, msg_ref}] (v2 抽取, 纯规则)。"""
+    import types as _types
+    from retrieval.slot_extract import _attributed, _modality_gated, _split_sentences
+    out: List[Any] = []
+    for msg in msgs:
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = msg.get("speaker") or ""
+        ts = msg.get("ts")
+        dia = msg.get("dia")
+        for sent in _split_sentences(text):
+            if not _attributed(sent, speaker, entity):
+                continue
+            low = sent.lower()
+            for trig in triggers or []:
+                if not trig or _trigger_span(sent, str(trig)) is None:
+                    continue
+                if _modality_gated(sent, gate):
+                    continue
+                np = _np_after_trigger(sent, str(trig))
+                if not np or is_noise_value(np):
+                    continue
+                out.append(_types.SimpleNamespace(value=np, ts=ts, msg_ref=dia, trigger=str(trig)))
+    return out
+
+
 # ── P1 类型化值校验 (题面推断期望类型 → 只保留同类型成员) ────────────────
 # 资源: data/r8/value-types.json (封闭词表, 通用; 不读 qa_id — 红线)
 

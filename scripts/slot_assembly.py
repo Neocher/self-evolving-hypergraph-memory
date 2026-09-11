@@ -188,17 +188,20 @@ def render_slot_block_v2(
     if not entries:
         return ctx
 
-    build_slot_index = _lazy_build_slot_index()
+    from retrieval.slot_closure import clean_members, extract_objects_v2, render_closure
     blocks: List[str] = []
     for entry in entries:
-        qkey = qa_id or f"{entry.get('via', 'route')}#0"
-        idx = build_slot_index(list(msgs), {qkey: entry}, triggers or {})
+        slot = (entry.get("slot") or "").strip()
+        trigs = list((triggers or {}).get(slot, []) or [])
+        gate = entry.get("gate") or "did"
         for ent in entry.get("entities") or []:
-            slot = (entry.get("slot") or "").strip()
-            if not ent or not slot:
+            if not ent or not slot or not trigs:
                 continue
-            seg = render_closure_for_entry(idx.query(ent, slot), ent, slot, question,
-                                           budget_chars=budget_chars, max_members=max_members)
+            rows = extract_objects_v2(msgs, ent, slot, trigs, gate=gate, question=question)
+            members = clean_members([(getattr(r, "value", "") or "", r) for r in rows],
+                                    question=question, entity=ent)
+            seg = render_closure(members, ent, slot, budget_chars=budget_chars,
+                                 max_members=max_members)
             if seg:
                 blocks.append(seg)
     if not blocks:

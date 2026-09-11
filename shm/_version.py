@@ -1,12 +1,27 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.21.1"
-__version_info__ = (6, 21, 1)
+__version__ = "6.21.2"
+__version_info__ = (6, 21, 2)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.21.2 (2026-09-11) StateSemantics:
+  • A) 谓词论元抽取 (v2 闭包专用; 修 generic 题的子句碎片值):
+    - retrieval/slot_closure.py: _trigger_span (词边界 + 屈折尾匹配) · _np_after_trigger
+      (跳过限定词/前置介词 → 取触发词支配的宾语 NP, 停用词=介词/连词/代词/助动词/时间状语)
+      · extract_objects_v2 (会话消息 → 宾语 NP 事实)
+    - scripts/slot_assembly.py: v2 装配改用 NP 抽取 (v1 build_slot_index 路径不动)
+    - 单测抓出的两个真缺陷并修: ① 触发词用 str.find 命中单词内部 → "ed Italy"/"ing basketball"
+      碎片; ② NP 越界取到时间状语 ("Florida last year")
+    - 实测负向并回退: 槽锚词共现门 (precision 0.071→0.054, recall 0.245→0.070) — 按测量结果丢弃
+    确定性门 (46 题, 渲染后真实注入内容):
+      指标            v1(append)   v2迭代1   v2+NP抽取
+      precision       0.032        0.061     0.071  (2.2x vs v1)
+      recall          0.399        0.205     0.249
+      段均字符         5,028        1,610     1,426  (-72%)
+    25 用例; 全量 pytest 1363 passed 零回归。
 v6.21.1 (2026-09-11) StateSemantics:
   • P1 类型化值校验 (P2 闭包 v2 的精度杠杆, 仍默认 off / env R8_SLOT_V2=1):
     - retrieval/slot_closure.py: detect_value_type (题面推断期望类型: count/us_state/country/
