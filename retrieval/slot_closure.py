@@ -54,9 +54,23 @@ def is_count_question(question: str) -> bool:
     return bool(_COUNT_RE.match((question or "").strip()))
 
 
+_QUOTED_RE = re.compile(r"[""\u201c\u2018]([^""\u201d\u2019]{2,60})[""\u201d\u2019]")
+
+
+def _quoted_span(value: str) -> Optional[str]:
+    """值中的引号片段 (书名/名称常被引号包裹) → 片段; 无则 None。"""
+    m = _QUOTED_RE.search(value or "")
+    if not m:
+        m = re.search(r"\"([^\"]{2,60})\"", value or "")
+    return m.group(1).strip() if m else None
+
+
 def normalize_value(value: str) -> str:
     """值规范化: 去图像标记/引号/前介词/尾标点, 折叠空白。"""
     v = _IMAGE_MARKER.sub(" ", value or "")
+    qs = _quoted_span(value or "")
+    if qs:
+        return qs
     v = v.strip().strip("\"'“”‘’")
     v = re.sub(r"\s+", " ", v).strip()
     v = _LEADING_FILLER.sub("", v)
@@ -107,6 +121,95 @@ def _tokens(s: str) -> set:
     return {t for t in re.findall(r"[a-z0-9']+", (s or "").lower()) if len(t) > 2}
 
 
+# ── P1 类型化值校验 (题面推断期望类型 → 只保留同类型成员) ────────────────
+# 资源: data/r8/value-types.json (封闭词表, 通用; 不读 qa_id — 红线)
+
+_VT_PATH = None
+_VT_CACHE: Optional[Dict[str, Any]] = None
+
+_TYPE_PATTERNS = (
+    ("count", re.compile(r"^\s*how (many|often|much)\b", re.I)),
+    ("us_state", re.compile(r"\bstates?\b|\bprovinces?\b", re.I)),
+    ("country", re.compile(r"\b(countr(y|ies)|nations?)\b|\babroad\b", re.I)),
+    ("place", re.compile(r"\b(cit(y|ies)|place|places|location|locations|where)\b", re.I)),
+    ("work_book", re.compile(r"\b(books?|novels?|reading list|literature)\b", re.I)),
+    ("work_media", re.compile(r"\b(movies?|films?|shows?|series|songs?|albums?|podcasts?)\b", re.I)),
+    ("activity", re.compile(r"\b(activit(y|ies)|hobb(y|ies)|sports?|exercises?|things to do)\b", re.I)),
+)
+
+
+def detect_value_type(question: str) -> str:
+    """题面 → 期望值类型 (确定性, 无 LLM): count/us_state/country/place/work_book/work_media/activity/generic。"""
+    q = (question or "").strip()
+    for name, pat in _TYPE_PATTERNS:
+        if pat.search(q):
+            return name
+    return "generic"
+
+
+def load_value_types(path: Optional[str] = None) -> Dict[str, Any]:
+    """惰性加载类型资源 (data/r8/value-types.json); 缺失时返回空表 (退化为形态过滤)。"""
+    global _VT_CACHE, _VT_PATH
+    import json as _json
+    import pathlib as _pl
+    if _VT_CACHE is not None and path is None:
+        return _VT_CACHE
+    if path is None:
+        path = str(_pl.Path(__file__).resolve().parents[1] / "data" / "r8" / "value-types.json")
+    try:
+        data = _json.loads(_pl.Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if path is None or _VT_PATH in (None, path):
+        _VT_CACHE, _VT_PATH = data, path
+    return data
+
+
+def type_match(value: str, vtype: str, resources: Mapping[str, Any]) -> bool:
+    """值是否属于期望类型 (封闭词表/形态规则)。generic → 一律通过 (由形态过滤负责)。"""
+    if vtype in ("", "generic"):
+        return True
+    v = normalize_value(value)
+    if not v:
+        return False
+    low = v.lower()
+    def _in(key, item):
+        return any(item == x.lower() for x in (resources.get(key) or []))
+    def _contains(key, item):
+        return any(re.search(r"\b" + re.escape(x.lower()) + r"\b", item) for x in (resources.get(key) or []))
+    if vtype == "count":
+        return bool(re.search(r"\b\d+\b|\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", low))
+    if vtype == "us_state":
+        return _in("us_states", low) or _contains("us_states", low)
+    if vtype == "country":
+        return _in("countries", low) or _contains("countries", low)
+    if vtype == "place":
+        if _in("cities", low) or _in("us_states", low) or _in("countries", low):
+            return True
+        # 所有格 ("Charlotte's Web") 与长 NP 不得仅凭包含判为地名 —— 城市名与
+        # 人名大量撞名 (Charlotte/Austin/Orlando…), 2026-09-11 单测抓出的假阳性源
+        if "'s" in low or "’s" in low:
+            return False
+        words = low.split()
+        if len(words) <= 3:
+            return _contains("cities", low) or _contains("us_states", low) or _contains("countries", low)
+        return False
+    if vtype in ("work_book", "work_media"):
+        if v[:1] in "\"'“”" or '"' in value:
+            return True
+        words = v.split()
+        titled = len(words) >= 2 and sum(1 for w in words if w[:1].isupper()) >= max(2, len(words) - 1)
+        return bool(titled or _in("media_words", words[-1].lower().strip(".,")))
+    if vtype == "activity":
+        if _in("activities", low):
+            return True
+        words = low.split()
+        if len(words) <= 3 and words and re.match(r"^\w+ing$", words[0]):
+            return True
+        return _contains("activities", low) and len(words) <= 2
+    return True
+
+
 def score_member(value: str, question: str) -> int:
     """确定性打分: 题面词重合 + NP 形态 + 专名 + 长度适中。"""
     s = 0
@@ -126,17 +229,25 @@ def clean_members(
     pairs: Sequence[Tuple[str, Any]],
     question: str = "",
     entity: str = "",
+    vtype: Optional[str] = None,
+    resources: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """(value, fact) 对 → 规范化/去噪/去重/排序后的成员列表。
 
     pairs: [(value, fact)] — fact 至少有 .ts / .msg_ref (SlotFact 兼容)。
     返回: [{"value","ts","msg_ref","score"}] 按 (score desc, ts asc, value) 稳定排序。
     """
+    vt = vtype if vtype is not None else detect_value_type(question)
+    if resources is None and vt not in ("", "generic"):
+        resources = load_value_types()
     out: Dict[str, Dict[str, Any]] = {}
     for value, fact in pairs:
         for part in split_enumeration(value or ""):
             if is_noise_value(part):
                 continue
+            if vt and vt != "generic" and resources is not None:
+                if not type_match(part, vt, resources):
+                    continue
             key = part.lower()
             if key in out:
                 continue

@@ -1,12 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.21.0"
-__version_info__ = (6, 21, 0)
+__version__ = "6.21.1"
+__version_info__ = (6, 21, 1)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.21.1 (2026-09-11) StateSemantics:
+  • P1 类型化值校验 (P2 闭包 v2 的精度杠杆, 仍默认 off / env R8_SLOT_V2=1):
+    - retrieval/slot_closure.py: detect_value_type (题面推断期望类型: count/us_state/country/
+      place/work_book/work_media/activity/generic) · load_value_types (封闭词表资源) ·
+      type_match (类型门) · 引号片段抽取 (书名/名称) · activity 收紧 (禁长从句当活动)
+    - data/r8/value-types.json (新): 50 州 + 148 国家 + 139 城市 + 63 活动 (通用资源, 非评测专属)
+    - 单测抓出并修: 城市名与人名撞名假阳性 ("Charlotte's Web" 被判地名) → 所有格/长 NP 不得
+      仅凭包含判为地名
+    确定性门实测 (46 题, 同一把尺, 渲染后的真实注入内容):
+      指标           v1(append)   v2(closure)   v2+类型化
+      成员 precision  0.032        0.026         0.061  (1.9x)
+      成员 recall     0.399        0.209         0.205
+      段均字符        5,028        1,931         1,610  (-68%)
+      垃圾值/问句值    54 / 12.8%   0 / 0.0%      0 / 0.0%
+      封闭类型精度     —            —             us_state 1.00 (2/2)
+    ⚠ 诚实记录: 精度提升但仍远低于可用线 (0.061); 绑定约束=generic 题的抽取仍是子句碎片
+      (需谓词论元抽取, 下一增量)。tests 22 用例; 全量 pytest 1360 passed 零回归。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v6.21.0 (2026-09-11) StateSemantics:
   • P2 槽位闭包 v2 脚手架 (默认 off, env R8_SLOT_V2=1) — 按"改进工作方法论"四段模板立项:

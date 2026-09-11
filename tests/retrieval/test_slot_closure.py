@@ -14,8 +14,9 @@ sys.path.insert(0, str(REPO))
 
 import slot_assembly  # noqa: E402
 from retrieval.slot_closure import (  # noqa: E402
-    clean_members, is_count_question, is_noise_value, is_set_question,
-    normalize_value, render_closure, route_question, score_member, split_enumeration,
+    clean_members, detect_value_type, is_count_question, is_noise_value, is_set_question,
+    load_value_types, normalize_value, render_closure, route_question, score_member,
+    split_enumeration, type_match,
 )
 from retrieval.slot_facts import SlotFact  # noqa: E402
 
@@ -170,3 +171,53 @@ def test_v2_append_when_no_entity_segment():
 # ── v1 路径不受影响 (off 等价) ───────────────────────────────────────────
 def test_v1_append_unchanged_for_empty_lexicon():
     assert slot_assembly.append_slot_evidence("X", "q", "unknown#q0", _MSGS, {}, _TRIG) == "X"
+
+
+# ── P1 类型化值校验 ──────────────────────────────────────────────────────
+def test_detect_value_type():
+    assert detect_value_type("What states has Maria vacationed at?") == "us_state"
+    assert detect_value_type("Which countries did he visit?") == "country"
+    assert detect_value_type("What books has Melanie read?") == "work_book"
+    assert detect_value_type("What activities has John done?") == "activity"
+    assert detect_value_type("How many times did Jon visit?") == "count"
+    assert detect_value_type("What did Caroline buy?") == "generic"
+
+
+def test_type_match_closed_vocab():
+    res = load_value_types()
+    assert type_match("Oregon", "us_state", res)
+    assert not type_match("photo album", "us_state", res)
+    assert type_match("Florida", "us_state", res)
+    assert not type_match("mansion", "us_state", res)
+
+
+def test_type_match_places_and_activities():
+    res = load_value_types()
+    assert type_match("France", "country", res)
+    assert type_match("London", "place", res)
+    assert not type_match("Charlotte's Web", "place", res)
+    assert type_match("hiking", "activity", res)
+    assert type_match("surfing", "activity", res)
+    assert not type_match("cherishing the time we", "activity", res), "长从句不得算活动"
+
+
+def test_type_match_generic_passthrough():
+    assert type_match("anything at all", "generic", {})
+
+
+def test_normalize_extracts_quoted_span():
+    assert normalize_value('He read "Charlotte\'s Web" as a kid') == "Charlotte's Web"
+    assert normalize_value('"Becoming Nicole"') == "Becoming Nicole"
+    assert normalize_value("mansion") == "mansion"
+
+
+def test_clean_members_typed_filter_keeps_only_typed():
+    from retrieval.slot_facts import SlotFact
+    pairs = [("to Oregon.", SlotFact(session_id=0, ep_id=1, ts="2023-05-01", entity="Maria",
+                                     slot="vacation_state", value="to Oregon.", msg_ref="ep_1")),
+             ("group has made me feel accepted",
+              SlotFact(session_id=0, ep_id=2, ts="2023-05-02", entity="Maria",
+                       slot="vacation_state", value="group has made me feel accepted", msg_ref="ep_2"))]
+    members = clean_members(pairs, question="What states has Maria vacationed at?", entity="Maria")
+    vals = [m["value"] for m in members]
+    assert vals == ["Oregon"], vals   # 非州名的从句被类型门剔除
