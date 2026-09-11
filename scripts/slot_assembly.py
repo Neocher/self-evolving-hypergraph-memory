@@ -113,6 +113,99 @@ def build_msgs_from_cache(
     return out
 
 
+# ── P2 槽位闭包 v2: 路由 + 去噪排序 + 替换式装配 (2026-09-11) ─────────────
+# 依据: studies/r8-p2-taskbook.md 【新增能力】2/3/4。默认不启用 (bench env R8_SLOT_V2)。
+
+_SEG_HEAD_RE = re.compile(r"^\[(GLOBAL CONTEXT|DIRECT EVIDENCE|MEMORY BLOCK|SLOT EVIDENCE|"
+                          r"TIME ANCHORS|FACT CLUSTERS|ENTITY:|RELATIONS)")
+
+
+def _replace_entity_segment(ctx: str, replacement: str) -> str:
+    """把 [ENTITY: ...] 组织段整体替换为 replacement —— 原文消息行逐字不动 (红线)。
+
+    段边界: 从 "[ENTITY:" 行起, 到空行或下一个 section 头 (非 "- " 开头) 为止。
+    无 [ENTITY:] 段 → 追加到尾部 (与 v1 行为一致)。
+    """
+    lines = ctx.splitlines()
+    out: List[str] = []
+    i, done = 0, False
+    while i < len(lines):
+        ln = lines[i]
+        if not done and ln.startswith("[ENTITY:"):
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() == "" or _SEG_HEAD_RE.match(nxt):
+                    break
+                i += 1
+            if replacement:
+                out.append(replacement)
+            done = True
+            continue
+        out.append(ln)
+        i += 1
+    if not done and replacement:
+        return ctx + "\n\n" + replacement
+    return "\n".join(out)
+
+
+def render_slot_block_v2(
+    ctx: str,
+    question: str,
+    qa_id: Optional[str],
+    msgs: Sequence[Mapping[str, Any]],
+    lexicon: Optional[Mapping[str, Mapping[str, Any]]],
+    triggers: Optional[Mapping[str, Sequence[str]]] = None,
+    budget_chars: int = 1800,
+    max_members: int = 80,   # 实测: 60→R .355 / 无上限→.384, 取 80 折中
+    route_first: bool = True,
+) -> str:
+    """P2 闭包 v2 装配: 仅集合/计数题注入; 槽位闭包替换 [ENTITY:] 段。
+
+    路由: route_first=True 时先走题面现场路由 (P6-lite), 未命中再回落词表 (记录 via)。
+    非集合题 / 无词条 / 零命中 → 原样返回 ctx (不注入, 消除噪声面)。
+    """
+    from retrieval.slot_closure import (is_set_question, render_closure_for_entry,
+                                        route_question)
+    if not is_set_question(question):
+        return ctx
+    if not msgs:
+        return ctx
+
+    entries: List[Dict[str, Any]] = []
+    if route_first:
+        speakers = sorted({str(m.get("speaker") or "") for m in msgs if m.get("speaker")})
+        for r in route_question(question, speakers=speakers, triggers=triggers, max_slots=2):
+            if r.get("entity") and r.get("slot"):
+                entries.append({"entities": [r["entity"]], "slot": r["slot"],
+                                "gate": "did", "via": r.get("via", "route")})
+    if not entries and qa_id:
+        entry = (lexicon or {}).get(qa_id)
+        if entry:
+            e = dict(entry)
+            e["via"] = "lexicon"
+            entries.append(e)
+    if not entries:
+        return ctx
+
+    build_slot_index = _lazy_build_slot_index()
+    blocks: List[str] = []
+    for entry in entries:
+        qkey = qa_id or f"{entry.get('via', 'route')}#0"
+        idx = build_slot_index(list(msgs), {qkey: entry}, triggers or {})
+        for ent in entry.get("entities") or []:
+            slot = (entry.get("slot") or "").strip()
+            if not ent or not slot:
+                continue
+            seg = render_closure_for_entry(idx.query(ent, slot), ent, slot, question,
+                                           budget_chars=budget_chars, max_members=max_members)
+            if seg:
+                blocks.append(seg)
+    if not blocks:
+        return ctx
+    return _replace_entity_segment(ctx, "\n\n".join(blocks))
+
+
 # ── 前缀剥离 / 说话人解析 (G1 ⑦ ⑧) ────────────────────────────────────────
 
 def _split_prefixes(raw: str) -> tuple:

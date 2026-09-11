@@ -1,12 +1,32 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.20.3"
-__version_info__ = (6, 20, 3)
+__version__ = "6.21.0"
+__version_info__ = (6, 21, 0)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.21.0 (2026-09-11) StateSemantics:
+  • P2 槽位闭包 v2 脚手架 (默认 off, env R8_SLOT_V2=1) — 按"改进工作方法论"四段模板立项:
+    - retrieval/slot_closure.py (新): 集合/计数问法路由 (确定性规则) · 值规范化/去噪
+      (问句/代词/从句碎片/纯标点) · 枚举切分 · 成员去重与打分排序 · 预算渲染
+    - scripts/slot_assembly.py: render_slot_block_v2() 替换式装配 ([ENTITY:] 组织段被槽位
+      闭包替换, 原文消息行逐字不变) + 题面现场路由 route_question() (不读 qa_id, 避红线)
+    - scripts/bench_locomo_v72_ontology.py: R8_SLOT_V2 独立 env 接线 (off 时与 v6.20.3 等价)
+    确定性门实测 (46 题, 真实库 eval_db_p2, 同一把尺):
+      指标           v1 (append)   v2 (closure)
+      问句值占比      12.8%         0.0%
+      垃圾值          54            0
+      段均字符        5,028         1,931 (-62%)
+      成员 precision  0.032         0.026
+      成员 recall     0.399         0.209
+      路由质量        —             slot 44/46 · entity 46/46 · 零候选 0 题
+    ⚠ 诚实记录: 噪声与体量达标, 但**精度未提升、recall 被预算砍半** → G-A2 门未过,
+    不启动 10.7h 的 LLM 级 A/B; 绑定约束是"按类型选择值"(P1), 为下一增量。
+    tests/retrieval/test_slot_closure.py 16 用例 (含红线断言: 原文行不变/非集合题不注入);
+    全量 pytest 1354 passed 零回归。
 v6.20.3 (2026-09-11) StateSemantics:
   • 修复 R8-SLOT-SCOPE-1 (R8_SLOT=1 装配静默零注入):
     - retrieval/slot_extract.py::build_slot_index: conv 前缀裁剪假设 session_id 为

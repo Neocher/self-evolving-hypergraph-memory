@@ -110,6 +110,8 @@ NEG_CLEAN = os.environ.get("NEG_CLEAN", "0") == "1"
 #   slot-triggers-v1.json 仅 R8_SLOT=1 时惰性只读加载 (off 不加载)。
 import slot_assembly  # noqa: E402 — scripts 同目录纯装配模块 (L1654 R8_SLOT 分支消费)
 R8_SLOT = os.environ.get("R8_SLOT", "0") == "1"
+# 2026-09-11 P2 闭包 v2 (路由+去噪+替换式+预算): 独立 env, 默认 off → v1/v6.17.0 逐字节等价
+R8_SLOT_V2 = os.environ.get("R8_SLOT_V2", "0") == "1"
 _r8_q2slot = None
 _r8_slot_triggers = None
 
@@ -1684,7 +1686,7 @@ for i, q in enumerate(qa_all):
     # R6-A [FACT CLUSTERS] 聚合段 / R6-C 摘要否定句过滤 + 题面实体优先。原文逐字不变。
     # R8 Step3b (R8_SLOT=1; off → 与上行完全原路径零回归): 该会话原文消息 → msgs →
     # _r6_evidence_forms_ctx 尾部追加 [SLOT EVIDENCE] 段 (reader 前)。词表仅 R8_SLOT 时加载。
-    if R8_SLOT:
+    if R8_SLOT_V2 or R8_SLOT:
         _r8_qa_id = q.get("qa_id")
         _r8_conv_msgs = []
         if _r8_qa_id:
@@ -1696,9 +1698,14 @@ for i, q in enumerate(qa_all):
                 _r8_conv_msgs = slot_assembly.build_msgs_from_cache(
                     {eid: msg_by_id[eid] for eid in _r8_eps}, episode_cache, {})
         _r8_q2, _r8_tr = _r8_load_slot_lexicon()
-        ctx = _r6_evidence_forms_ctx(ctx, question, qa_id=_r8_qa_id,
-                                     conv_msgs=_r8_conv_msgs,
-                                     q2slot=_r8_q2, slot_triggers=_r8_tr)
+        if R8_SLOT_V2:
+            # P2: 仅集合/计数题; 题面现场路由优先 (无 qa_id 查表); 闭包替换 [ENTITY:] 段
+            ctx = slot_assembly.render_slot_block_v2(
+                ctx, question, _r8_qa_id, _r8_conv_msgs, _r8_q2, _r8_tr)
+        else:
+            ctx = _r6_evidence_forms_ctx(ctx, question, qa_id=_r8_qa_id,
+                                         conv_msgs=_r8_conv_msgs,
+                                         q2slot=_r8_q2, slot_triggers=_r8_tr)
     else:
         ctx = _r6_evidence_forms_ctx(ctx, question)
 
