@@ -324,7 +324,11 @@ def typed_scan_candidates(
         text = (msg.get("text") or "").strip()
         if not text:
             continue
-        if entity and not _attributed(text, msg.get("speaker") or "", entity):
+        # 2026-09-11 实测修正: 集合题的证据常由**别的说话人**提供
+        # (如好友对 John 说 "I saw that you had \"The Alchemist\""), 严格归属门会丢掉真 gold。
+        # 类型过滤 (type_match) 已是精度守门 → 类型扫描不再做说话人归属裁剪。
+        # 例外: 题面类型为人时 (family_member) 仍要求归属, 避免把别人的亲属计入。
+        if entity and vtype == "family_member" and not _attributed(text, msg.get("speaker") or "", entity):
             continue
         if vtype in ("us_state", "country"):
             keys = ("us_states",) if vtype == "us_state" else ("countries",)

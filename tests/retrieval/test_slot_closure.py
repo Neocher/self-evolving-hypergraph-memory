@@ -146,8 +146,13 @@ def test_v2_non_set_question_no_injection():
 
 
 def test_v2_zero_members_no_injection():
-    """零命中不注入 (用 route_first=False 走词表路径, 隔离路由影响)。"""
-    q = "What states has Maria vacationed at?"
+    """零命中不注入 (类型无关题 + 词表实体无命中 → 不注入, 隔离路由影响)。
+
+    2026-09-11 语义更新: 类型题 (us_state 等) 走**类型锚定通道**, 同会话内
+    该类型的成员不再要求说话人归属 → 类型题总能注入 (实测 r@10 0.191→0.207);
+    因此"零命中不注入"的用例改用类型无关题来断言。
+    """
+    q = "What did Nobody say about the project?"
     empty_lex = {"conv-41#q0029": {"entities": ["Nobody"], "slot": "vacation_state", "gate": "did"}}
     out = slot_assembly.render_slot_block_v2(_CTX, q, "conv-41#q0029", _MSGS, empty_lex, _TRIG,
                                              route_first=False)
@@ -256,3 +261,17 @@ def test_extract_objects_v2_end_to_end():
     assert "Florida" in vals, vals
     assert any("Oregon" in v for v in vals), vals
     assert not any(v.lower().startswith(("ed ", "ing ")) for v in vals), f"不得出现屈折碎片: {vals}"
+
+
+def test_typed_scan_ignores_speaker_attribution():
+    """类型通道不裁剪说话人归属 —— 集合题证据常由他人提供。
+
+    依据 (2026-09-11 实测): "I saw that you had \"The Alchemist\"…" 这类句子
+    由对话伙伴说出, 却是 gold 证据; 严格归属门会丢掉真 gold。
+    """
+    q = "What states has Maria vacationed at?"
+    # 词表实体为 Nobody (触发词通道零命中), 类型通道仍应扫出州名
+    lex = {"conv-41#q0029": {"entities": ["Nobody"], "slot": "vacation_state", "gate": "did"}}
+    out = slot_assembly.render_slot_block_v2(_CTX, q, "conv-41#q0029", _MSGS, lex, _TRIG,
+                                             route_first=False)
+    assert "[SLOT EVIDENCE]" in out and "Oregon" in out

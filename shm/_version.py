@@ -1,12 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.5"
-__version_info__ = (6, 22, 5)
+__version__ = "6.22.6"
+__version_info__ = (6, 22, 6)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.6 (2026-09-11) StateSemantics:
+  • 类型通道放开说话人归属门 (抽取覆盖修复):
+    集合题/枚举题的证据常由**对话伙伴**提供 (如好友对 John 说 "I saw that you had
+    \"The Alchemist\"") → 严格归属门 (只认当事人自述) 会丢掉真 gold。
+    类型过滤 (type_match) 已是精度守门, 故类型扫描不再裁说话人 (family_member 例外,
+    仍需归属以免把他人亲属计入)。
+    实测: 读数 recall@5 0.142→0.158 / @10 0.191→0.207 / @15 0.213→0.221;
+          闭包 precision 0.100→0.103, recall 0.312→0.323; 题级达标 5→6。
+  • 实测否掉: "called/named X" 实例抽取仅 +0.8pp r@10 且全 gold 入块不变 (8/41) → 不实现。
+  • 用例更新: "零命中不注入" 改用类型无关题断言; 新增 "类型通道不裁归属" 用例。
 v6.22.5 (2026-09-11) StateSemantics:
   • A 方案选择/过滤 (读数块有界化) + gold 缺口精确分解:
     - 注入块上限 max_members 80 → 15: 实测零 gold 损失 (无预算口径 r@10 0.258 不变; 候选均值 30.1 → 7.7),
