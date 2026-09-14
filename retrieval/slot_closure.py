@@ -214,7 +214,8 @@ def extract_objects_v2(
                 np = _np_after_trigger(sent, str(trig))
                 if not np or is_noise_value(np):
                     continue
-                out.append(_types.SimpleNamespace(value=np, ts=ts, msg_ref=dia, trigger=str(trig)))
+                out.append(_types.SimpleNamespace(value=np, ts=ts, msg_ref=dia, trigger=str(trig),
+                                                 ctx=sent))
     return out
 
 
@@ -268,12 +269,13 @@ def typed_scan_candidates(
     out: List[Any] = []
     seen = set()
 
-    def _add(value: str, ts, ref):
+    def _add(value: str, ts, ref, ctx=""):
         k = (value or "").lower()
         if not value or k in seen:
             return
         seen.add(k)
-        out.append(_types.SimpleNamespace(value=value, ts=ts, msg_ref=ref, trigger="type-scan"))
+        out.append(_types.SimpleNamespace(value=value, ts=ts, msg_ref=ref, trigger="type-scan",
+                                          ctx=ctx))
 
     for msg in msgs:
         text = (msg.get("text") or "").strip()
@@ -294,12 +296,12 @@ def typed_scan_candidates(
         for key in keys:
             for name in res.get(key) or []:
                 if re.search(r"\b" + re.escape(str(name)) + r"\b", text, re.I):
-                    _add(str(name), msg.get("ts"), msg.get("dia"))
+                    _add(str(name), msg.get("ts"), msg.get("dia"), ctx=text)
         if vtype in ("work_book", "work_media"):
             for s in _quoted_spans(text):
-                _add(s, msg.get("ts"), msg.get("dia"))
+                _add(s, msg.get("ts"), msg.get("dia"), ctx=text)
             for s in _title_runs(text):
-                _add(s, msg.get("ts"), msg.get("dia"))
+                _add(s, msg.get("ts"), msg.get("dia"), ctx=text)
     return out
 
 
@@ -372,7 +374,7 @@ def extract_anchor_mentions(
             if _modality_gated(sent, gate):
                 continue
             out.append(_types.SimpleNamespace(value=hit, ts=msg.get("ts"), msg_ref=msg.get("dia"),
-                                              trigger=hit))
+                                              trigger=hit, ctx=sent))
     return out
 
 
@@ -510,6 +512,14 @@ def score_member(value: str, question: str) -> int:
     return s
 
 
+def _question_terms(question: str, entity: str = "") -> set:
+    """题面内容词 (去停用词/去实体名) — 用于判断"证据句是否与问题同域"。"""
+    ents = {entity.lower()} if entity else set()
+    return {w for w in re.findall(r"[a-z]{3,}", (question or "").lower())
+            if w not in _NP_STOP and w not in _NP_TIME and w not in ents
+            and w not in _STOP_TOKENS}
+
+
 def clean_members(
     pairs: Sequence[Tuple[str, Any]],
     question: str = "",
@@ -522,6 +532,7 @@ def clean_members(
     pairs: [(value, fact)] — fact 至少有 .ts / .msg_ref (SlotFact 兼容)。
     返回: [{"value","ts","msg_ref","score"}] 按 (score desc, ts asc, value) 稳定排序。
     """
+    q_terms = _question_terms(question, entity)
     vt = vtype if vtype is not None else detect_value_type(question)
     if resources is None and vt not in ("", "generic"):
         resources = load_value_types()
@@ -534,15 +545,25 @@ def clean_members(
                 if not type_match(part, vt, resources):
                     continue
             key = part.lower()
+            ctx0 = str(getattr(fact, "ctx", "") or "")
             if key in out:
+                out[key]["mentions"] += 1
+                if q_terms & _tokens(ctx0):
+                    out[key]["ctx_hit"] = 1
                 continue
+            ctx = str(getattr(fact, "ctx", "") or "")
+            ctx_hit = 1 if (q_terms & _tokens(ctx)) else 0
             out[key] = {
                 "value": part,
                 "ts": getattr(fact, "ts", None),
                 "msg_ref": getattr(fact, "msg_ref", "") or "",
                 "score": score_member(part, question),
+                "mentions": 1,
+                "ctx_hit": ctx_hit,
             }
     members = list(out.values())
+    # 排序: 保持 score 主键 (2026-09-11 实测: "题面同域证据共现"加权反而变差 — recall@10 0.169→0.148,
+    # 因枚举题的 gold 证据句常不含题面词, 而噪声句含 → 该信号与 gold 反相关, 已回退)
     members.sort(key=lambda m: (-m["score"], str(m["ts"] or ""), m["value"]))
     return members
 

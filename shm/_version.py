@@ -1,12 +1,23 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.2"
-__version_info__ = (6, 22, 2)
+__version__ = "6.22.3"
+__version_info__ = (6, 22, 3)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.3 (2026-09-11) StateSemantics:
+  • 读数排序实验 + 负结果固化 (A 方案第二步):
+    - 抽取事实增加 ctx (证据句) 与 mentions/ctx_hit 仪表面, 供后续选择/排序研究。
+    - 实测负结果 (62 题, 无预算口径 recall@5/@10/@15):
+        基线 (-score, ts, value)        0.135 / 0.229 / 0.265  ← 最优
+        mentions 优先                   0.105 / 0.185 / 0.246
+        score+mentions                  0.125 / 0.206 / 0.257
+        题面同域证据加权 (ctx_hit)       0.113 / 0.148 / 0.189  ← 显著更差, 已回退
+      结论: 枚举题的 gold 证据句常不含题面词, 而噪声句含 → "题面同域"与 gold 反相关;
+      排序不是杠杆, 读数门受 (抽取召回 0.334 + 候选量 21>15) 双重约束。
+      下一杠杆应是"选择/过滤"(减候选而不丢 gold), 非排序。
 v6.22.2 (2026-09-11) StateSemantics:
   • 类型锚定抽取 (A 方案落地) — retrieval/slot_closure.py::typed_scan_candidates /
     _quoted_spans / _title_runs; scripts/slot_assembly.py 对类型题 (us_state/country/place/
