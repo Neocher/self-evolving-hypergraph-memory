@@ -165,7 +165,8 @@ def render_slot_block_v2(
     路由: route_first=True 时先走题面现场路由 (P6-lite), 未命中再回落词表 (记录 via)。
     非集合题 / 无词条 / 零命中 → 原样返回 ctx (不注入, 消除噪声面)。
     """
-    from retrieval.slot_closure import (is_set_question, render_closure_for_entry,
+    from retrieval.slot_closure import (is_count_question, is_set_question,
+                                        render_closure_for_entry, route_count_question,
                                         route_question)
     if not is_set_question(question):
         return ctx
@@ -173,12 +174,17 @@ def render_slot_block_v2(
         return ctx
 
     entries: List[Dict[str, Any]] = []
+    is_count = is_count_question(question)
     if route_first:
         speakers = sorted({str(m.get("speaker") or "") for m in msgs if m.get("speaker")})
-        for r in route_question(question, speakers=speakers, triggers=triggers, max_slots=2):
+        router = route_count_question if is_count else route_question
+        for r in router(question, speakers=speakers, triggers=triggers, max_slots=2):
             if r.get("entity") and r.get("slot"):
-                entries.append({"entities": [r["entity"]], "slot": r["slot"],
-                                "gate": "did", "via": r.get("via", "route")})
+                e = {"entities": [r["entity"]], "slot": r["slot"],
+                     "gate": "did", "via": r.get("via", "route")}
+                if r.get("terms"):
+                    e["terms"] = list(r["terms"])
+                entries.append(e)
     if not entries and qa_id:
         entry = (lexicon or {}).get(qa_id)
         if entry:
@@ -188,22 +194,37 @@ def render_slot_block_v2(
     if not entries:
         return ctx
 
-    from retrieval.slot_closure import clean_members, extract_objects_v2, render_closure
+    from retrieval.slot_closure import (clean_members, count_instances, extract_anchor_mentions,
+                                        extract_objects_v2, render_closure)
     blocks: List[str] = []
+    all_facts: List[Any] = []
     for entry in entries:
         slot = (entry.get("slot") or "").strip()
-        trigs = list((triggers or {}).get(slot, []) or [])
         gate = entry.get("gate") or "did"
         for ent in entry.get("entities") or []:
-            if not ent or not slot or not trigs:
+            if not ent or not slot:
                 continue
-            rows = extract_objects_v2(msgs, ent, slot, trigs, gate=gate, question=question)
-            members = clean_members([(getattr(r, "value", "") or "", r) for r in rows],
+            if slot.startswith("anchor:"):
+                terms = entry.get("terms") or [slot.split("anchor:", 1)[1]]
+                facts = extract_anchor_mentions(msgs, terms, entity=ent, gate=gate)
+            else:
+                trigs = list((triggers or {}).get(slot, []) or [])
+                if not trigs:
+                    continue
+                facts = extract_objects_v2(msgs, ent, slot, trigs, gate=gate, question=question)
+            all_facts.extend(facts)
+            members = clean_members([(getattr(r, "value", "") or "", r) for r in facts],
                                     question=question, entity=ent)
             seg = render_closure(members, ent, slot, budget_chars=budget_chars,
                                  max_members=max_members)
             if seg:
                 blocks.append(seg)
+    if is_count and all_facts:
+        ent0 = (entries[0].get("entities") or [""])[0]
+        n_inst = count_instances(all_facts)
+        n_distinct = len({(getattr(f, "value", "") or "").lower() for f in all_facts})
+        blocks.append(f"[SLOT COUNT] {ent0} | {entries[0].get('slot', '')}: "
+                      f"n={n_inst} (distinct_members={n_distinct})")
     if not blocks:
         return ctx
     return _replace_entity_segment(ctx, "\n\n".join(blocks))

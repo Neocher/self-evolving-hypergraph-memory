@@ -1,12 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.0"
-__version_info__ = (6, 22, 0)
+__version__ = "6.22.1"
+__version_info__ = (6, 22, 1)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.1 (2026-09-11) StateSemantics:
+  • 计数题路径 v1 (P3 第一步: 符号读出) — retrieval/slot_closure.py: count_anchor_terms /
+    extract_anchor_mentions / count_instances / route_count_question; scripts/slot_assembly.py:
+    计数题追加 `[SLOT COUNT] <entity> | <slot>: n=<实例数> (distinct_members=<去重值数>)`。
+    确定性门 (gate_count.py, 20 道 how many 题):
+      路由零候选   6/20 → **0/20**  (硬门通过)
+      G-C1 证据覆盖 34/59=58% → 38/59=64%  (硬门 ≥80% 未过)
+      G-C2 计数命中 0/18 → 1/18  (进阶门 ≥3/18 未过)
+    关键诊断: 计数题分两族 — 事件计数 (how many times, 6 题) 需事件实例聚类;
+      对象计数 (how many <noun>, 14 题) 需**类型化实体枚举** (3 children/3 turtles/7 tournaments),
+      当前锚词把锚词本身当值 → 必然数错。下一步 = 对象族的名字/实例抽取 (E3 方向)。
+    11 新用例; 全量 pytest 1393 passed 零回归。
+    ⚠ 三体通道: 本增量的编码臂空转 (改既有文件类任务 28s/156 字符即退, 新文件类任务正常),
+      Codex 审核正确拦截; 按分流规则改由 Hermes 直改并亲验。
 v6.22.0 (2026-09-11) StateSemantics:
   • core/instance_dedup.py (新, P3 基础件): 成员规范化 / 实例去重 / ISO 周分桶 / 同实例合并
     (merge_same_instance window_days=7) — 补 "同一事件算两次 / 两次行程被合并成一次" 主错型

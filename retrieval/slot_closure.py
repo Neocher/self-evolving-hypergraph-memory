@@ -218,6 +218,109 @@ def extract_objects_v2(
     return out
 
 
+# ── 计数题路径 v1 (P3 第一步: 符号读出; 2026-09-11) ────────────────────────
+# 现场缺口: 20 道 how many 题里 6 道连槽位候选都没有 (route 返回空), 且计数的输入
+# 是"值"而非"事件实例" → 同一事件多次提及被重复计数 (gold=3 却 distinct=105)。
+
+_COUNT_ANCHOR_STOP = _NP_STOP | _NP_TIME | {
+    "many", "much", "times", "time", "did", "does", "do", "has", "have", "had",
+    "year", "years", "month", "months", "week", "weeks", "day", "days",
+}
+_ENTITY_LIKE = re.compile(r"^[A-Z][a-z]+$")
+
+
+def count_anchor_terms(question: str, speakers: Sequence[str] = ()) -> List[str]:
+    """how many 题 → 内容锚词 (含单复数变体), 用于无槽位命中时的伪槽抽取。
+
+    规则 (确定): 取题面里长度≥3 的词, 去掉停用词/说话人名/纯数字, 最多 4 个;
+    "how many times …" 的 times 属停用词 → 锚词落到真正的对象名词 (如 beach)。
+    """
+    q = question or ""
+    if not q:
+        return []
+    spk = {s.lower() for s in speakers if s}
+    out: List[str] = []
+    for w in re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", q):
+        lw = w.lower()
+        if lw in _COUNT_ANCHOR_STOP or lw in spk:
+            continue
+        if _ENTITY_LIKE.match(w) and w not in ("How", "What", "Which", "When", "Where"):
+            continue          # 专名 (人名/地名) 已是 entity 维度, 不做锚
+        if lw not in out:
+            out.append(lw)
+        if len(out) >= 4:
+            break
+    forms: List[str] = []
+    for w in out:
+        forms.append(w)
+        if not w.endswith("s"):
+            forms.append(w + "s")
+    return forms
+
+
+def extract_anchor_mentions(
+    msgs: Sequence[Mapping[str, Any]],
+    anchors: Sequence[str],
+    entity: str = "",
+    gate: str = "did",
+) -> List[Any]:
+    """锚词提及 → 事实 (value=锚词原形, ts=消息 ts) — 供无槽位的计数题使用。
+
+    值取锚词本身: 计数题要的是"事件出现次数", 由 count_instances 按时间窗聚类。
+    """
+    import types as _types
+    from retrieval.slot_extract import _attributed, _modality_gated, _split_sentences
+    norm_anchors = [a for a in anchors if a]
+    out: List[Any] = []
+    for msg in msgs:
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = msg.get("speaker") or ""
+        for sent in _split_sentences(text):
+            low = sent.lower()
+            hit = next((a for a in norm_anchors if re.search(r"\b" + re.escape(a.lower()) + r"\b", low)), None)
+            if not hit:
+                continue
+            if entity and not _attributed(sent, speaker, entity):
+                continue
+            if _modality_gated(sent, gate):
+                continue
+            out.append(_types.SimpleNamespace(value=hit, ts=msg.get("ts"), msg_ref=msg.get("dia"),
+                                              trigger=hit))
+    return out
+
+
+def count_instances(facts: Sequence[Any], window_days: int = 7) -> int:
+    """事实 → 实例数 (同一成员 + 时间窗内相邻提及 → 1 个实例)。"""
+    from core.instance_dedup import merge_same_instance
+    items = [f for f in facts if getattr(f, "value", "")]
+    if not items:
+        return 0
+    return len(merge_same_instance(items, window_days=window_days))
+
+
+def route_count_question(
+    question: str,
+    speakers: Sequence[str] = (),
+    triggers: Optional[Mapping[str, Sequence[str]]] = None,
+    max_slots: int = 2,
+) -> List[Dict[str, Any]]:
+    """how many 题候选: 既有槽位路由 ∪ 锚词伪槽 (保证无触发词命中时仍有候选)。"""
+    cands = list(route_question(question, speakers=speakers, triggers=triggers, max_slots=max_slots))
+    if cands:
+        return cands
+    anchors = count_anchor_terms(question, speakers=speakers)
+    if not anchors:
+        return []
+    q = (question or "").strip()
+    proper = [t for t in re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", q) if t.lower() not in _STOP_TOKENS]
+    spk = {s for s in speakers if s}
+    ent = next((t for t in proper if t in spk), proper[0] if proper else "")
+    return [{"entity": ent, "slot": "anchor:" + anchors[0], "score": 1.0,
+             "via": "route:anchor", "terms": anchors}]
+
+
 # ── P1 类型化值校验 (题面推断期望类型 → 只保留同类型成员) ────────────────
 # 资源: data/r8/value-types.json (封闭词表, 通用; 不读 qa_id — 红线)
 
