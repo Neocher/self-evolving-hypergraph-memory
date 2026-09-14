@@ -157,7 +157,8 @@ def render_slot_block_v2(
     lexicon: Optional[Mapping[str, Mapping[str, Any]]],
     triggers: Optional[Mapping[str, Sequence[str]]] = None,
     budget_chars: int = 1800,
-    max_members: int = 80,   # 实测: 60→R .355 / 无上限→.384, 取 80 折中
+    max_members: int = 15,   # 2026-09-11 选择/过滤实测: 上限 15 零 gold 损失 (无预算口径 r@10 0.258 不变),
+                             #                       且把块变为有界 (子串合并实测丢 gold, 已否掉)
     route_first: bool = True,
 ) -> str:
     """P2 闭包 v2 装配: 仅集合/计数题注入; 槽位闭包替换 [ENTITY:] 段。
