@@ -162,7 +162,8 @@ def _np_after_trigger(sentence: str, trigger: str) -> Optional[str]:
     if span is None:
         return None
     tail = s[span[1]:]
-    toks = re.findall(r"[A-Za-z0-9'’\-]+|[.,;:!?]", tail)
+    # 2026-09-11: 词内冒号不得切断 ("CS:GO" → 旧实现切出 "CS" 后被长度门丢弃)
+    toks = re.findall(r"[A-Za-z0-9'’\-]+(?::[A-Za-z0-9'’\-]+)*|[.,;!?]", tail)
     out: List[str] = []
     for tok in toks:
         if re.fullmatch(r"[.,;:!?]", tok):
@@ -225,6 +226,10 @@ def extract_objects_v2(
 # 原理: 集合型问题的答案成员是**类型的实例**(州名/书名/活动), 与句子里是否
 # 出现槽触发词无关 —— 触发词通道漏掉大量 gold, 类型通道不依赖措辞。
 
+_GAME_TRIGGERS = ("playing", "play", "played", "started playing", "picked up", "favorite game",
+                  "games like", "game is", "downloaded", "got into", "backlog", "console",
+                  "beat", "finished", "logged")
+
 _MEDIA_CTX = ("book", "books", "novel", "novels", "read", "reading", "series", "movie",
               "movies", "film", "films", "song", "songs", "album", "podcast", "author")
 
@@ -254,6 +259,36 @@ def _title_runs(text: str) -> List[str]:
     return out
 
 
+_TITLE_BAD = {
+    "it", "its", "this", "that", "these", "those", "a", "an", "the", "my", "your", "his", "her",
+    "our", "their", "called", "named", "afterward", "just", "really", "very", "so", "and", "or",
+    "but", "was", "is", "are", "were", "be", "been", "has", "have", "had", "do", "does", "did",
+    "after", "before", "then", "also", "too", "now", "still", "game", "games", "playing", "play",
+    "favorite", "new", "old", "one", "some", "any", "like", "about", "into", "with", "for",
+}
+
+
+def _looks_like_title(value: str) -> bool:
+    """题名/游戏名形态 (严格): ≤5 词 · 无小词/代词/动词 · 无分隔破折号 · 含专名或数字。
+
+    2026-09-11 实测收紧依据: 宽松版会产出 "Catan - it's a" / "Chess afterward just"
+    这类 NP 越界值 (真正的题名是 "AC Valhalla" / "Witcher 3" / "CS:GO" / "FIFA 23")。
+    """
+    v = (value or "").strip()
+    if len(v) < 3 or v.lower() in _STOP_VALUES:
+        return False
+    if re.search(r"\s[-\u2013\u2014]\s", v):          # " - " 分隔符 → NP 越界
+        return False
+    words = v.split()
+    if not words or len(words) > 5:
+        return False
+    for w in words:
+        core = w.strip(".,!?()\"\u201c\u201d'\u2018\u2019").lower()
+        if core in _TITLE_BAD:
+            return False
+    return any(w[0].isupper() for w in words if w) or bool(re.search(r"\d", v))
+
+
 def typed_scan_candidates(
     msgs: Sequence[Mapping[str, Any]],
     vtype: str,
@@ -277,6 +312,14 @@ def typed_scan_candidates(
         out.append(_types.SimpleNamespace(value=value, ts=ts, msg_ref=ref, trigger="type-scan",
                                           ctx=ctx))
 
+    if vtype == "game_title":
+        # 游戏名: 用专用触发词走既有 NP 抽取 (比宽松 Title Case 干净: 实测候选 185→个位数)
+        for f in extract_objects_v2(msgs, entity, "game_title", _GAME_TRIGGERS, question=""):
+            if _looks_like_title(getattr(f, "value", "") or ""):
+                _add(str(f.value), getattr(f, "ts", None), getattr(f, "msg_ref", ""),
+                     ctx=getattr(f, "ctx", ""))
+        return out
+
     for msg in msgs:
         text = (msg.get("text") or "").strip()
         if not text:
@@ -291,6 +334,12 @@ def typed_scan_candidates(
             keys = ()
         elif vtype == "activity":
             keys = ("activities",)
+        elif vtype == "family_member":
+            keys = ("family_members",)
+        elif vtype == "event":
+            keys = ("events",)
+        elif vtype == "music_genre":
+            keys = ("music_genres",)
         else:
             keys = ()
         for key in keys:
@@ -418,6 +467,12 @@ _TYPE_PATTERNS = (
     ("count", re.compile(r"^\s*how (many|often|much)\b", re.I)),
     ("us_state", re.compile(r"\bstates?\b|\bprovinces?\b", re.I)),
     ("country", re.compile(r"\b(countr(y|ies)|nations?)\b|\babroad\b", re.I)),
+    # 2026-09-11 A 方案扩类型: 先于 place/activity 匹配 (更专指)
+    ("game_title", re.compile(r"\b(video ?games?|games?|gaming|console)\b", re.I)),
+    ("music_genre", re.compile(r"\b(music|genres?|bands?|listen(ing)? to)\b", re.I)),
+    ("family_member", re.compile(r"\b(family members?|relatives?|parents?|siblings?|in-?laws?)\b", re.I)),
+    ("event", re.compile(r"\b(events?|conferences?|conventions?|fairs?|festivals?|workshops?|"
+                         r"meetups?|fundraisers?|summits?|expos?|part(y|ies))\b", re.I)),
     ("place", re.compile(r"\b(cit(y|ies)|place|places|location|locations|where)\b", re.I)),
     ("work_book", re.compile(r"\b(books?|novels?|reading list|literature)\b", re.I)),
     ("work_media", re.compile(r"\b(movies?|films?|shows?|series|songs?|albums?|podcasts?)\b", re.I)),
@@ -463,7 +518,9 @@ def type_match(value: str, vtype: str, resources: Mapping[str, Any]) -> bool:
     def _in(key, item):
         return any(item == x.lower() for x in (resources.get(key) or []))
     def _contains(key, item):
-        return any(re.search(r"\b" + re.escape(x.lower()) + r"\b", item) for x in (resources.get(key) or []))
+        # 复数容错: "networking events" 应命中 "networking event" (单测抓出)
+        return any(re.search(r"\b" + re.escape(x.lower()) + r"(?:s|es)?\b", item)
+                   for x in (resources.get(key) or []))
     if vtype == "count":
         return bool(re.search(r"\b\d+\b|\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", low))
     if vtype == "us_state":
@@ -487,6 +544,14 @@ def type_match(value: str, vtype: str, resources: Mapping[str, Any]) -> bool:
         words = v.split()
         titled = len(words) >= 2 and sum(1 for w in words if w[:1].isupper()) >= max(2, len(words) - 1)
         return bool(titled or _in("media_words", words[-1].lower().strip(".,")))
+    if vtype == "family_member":
+        return _in("family_members", low)
+    if vtype == "event":
+        return _in("events", low) or _contains("events", low)
+    if vtype == "music_genre":
+        return _in("music_genres", low) or _contains("music_genres", low)
+    if vtype == "game_title":
+        return _looks_like_title(v)
     if vtype == "activity":
         if _in("activities", low):
             return True

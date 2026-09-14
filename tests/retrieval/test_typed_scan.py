@@ -66,3 +66,58 @@ def test_typed_scan_dedups_and_keeps_msg_ref():
     vals = [f.value for f in facts]
     assert vals.count("Oregon") == 1, vals
     assert facts[0].msg_ref == "ep_1"
+
+
+# ── 扩类型 (2026-09-11): family_member / event / music_genre / game_title ──────────
+from retrieval.slot_closure import (  # noqa: E402
+    _looks_like_title, detect_value_type, type_match, load_value_types,
+)
+
+
+def test_type_detection_new_types():
+    assert detect_value_type("Which of James's family members have visited him?") == "family_member"
+    assert detect_value_type("Which events has Jon participated in?") == "event"
+    assert detect_value_type("What kind of music does Dave listen to?") == "music_genre"
+    assert detect_value_type("What are John and James' favorite games?") == "game_title"
+    assert detect_value_type("What video games does Nate play?") == "game_title"
+    # 既有类型不被抢走
+    assert detect_value_type("What states has Maria vacationed at?") == "us_state"
+    assert detect_value_type("What books has Melanie read?") == "work_book"
+
+
+def test_scan_family_and_event_and_music():
+    msgs = [_m("ep_1", "James", "My mother and my sister visited me last month."),
+            _m("ep_2", "Jon", "I attended a fair and a networking event for my business."),
+            _m("ep_3", "Dave", "I mostly listen to classic rock and some jazz.")]
+    fam = {f.value for f in typed_scan_candidates(msgs, "family_member", entity="James")}
+    ev = {f.value for f in typed_scan_candidates(msgs, "event", entity="Jon")}
+    mu = {f.value for f in typed_scan_candidates(msgs, "music_genre", entity="Dave")}
+    assert {"mother", "sister"} <= fam, fam
+    assert {"fair", "networking event"} <= ev, ev
+    assert {"classic rock", "jazz"} <= mu, mu
+
+
+def test_game_title_uses_dedicated_triggers_and_rejects_np_overflow():
+    msgs = [_m("ep_1", "John", "My favorite game is CS:GO and I also started playing AC Valhalla.")]
+    got = {f.value for f in typed_scan_candidates(msgs, "game_title", entity="John")}
+    assert any("CS:GO" in v for v in got), got
+    assert any("AC Valhalla" in v for v in got), got
+
+
+def test_looks_like_title_strict_rules():
+    assert _looks_like_title("AC Valhalla") and _looks_like_title("Witcher 3")
+    assert _looks_like_title("CS:GO") and _looks_like_title("FIFA 23")
+    assert not _looks_like_title("Catan - it's a")       # 分隔破折号 → NP 越界
+    assert not _looks_like_title("Chess afterward just")  # 小词/副词
+    assert not _looks_like_title("playing the game")      # 小词
+    assert not _looks_like_title("a")                     # 过短
+
+
+def test_type_match_new_types():
+    res = load_value_types()
+    assert type_match("mother", "family_member", res)
+    assert not type_match("Mansion", "family_member", res)
+    assert type_match("networking events", "event", res)   # 复数形态
+    assert type_match("classic rock", "music_genre", res)
+    assert type_match("Witcher 3", "game_title", res)
+    assert not type_match("Catan - it's a", "game_title", res)

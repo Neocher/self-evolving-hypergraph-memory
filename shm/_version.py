@@ -1,12 +1,25 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.3"
-__version_info__ = (6, 22, 3)
+__version__ = "6.22.4"
+__version_info__ = (6, 22, 4)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.4 (2026-09-11) StateSemantics:
+  • A 方案扩类型覆盖 (抬抽取召回天花板): 新增 4 类端到端 (题面识别 + 扫描 + 类型校验)
+    family_member / event / music_genre / game_title。
+    - family_member / event / music_genre: 封闭词表扫描 (实测覆盖 1.00 / 1.00 / 0.50, 候选 3–6)。
+    - game_title: 专用触发词 + 既有 NP 抽取器 + 严格题名形态 (_looks_like_title):
+      宽松 Title Case 实测候选 185 → 严格后个位数。
+    - 单测抓出并修复 2 个真缺陷: ① 分词器在冒号处切断题名 ("CS:GO" → "CS" 后被长度门丢弃)
+      ② 词表包含判定复制数失配 ("networking events" 不命中 "networking event")。
+  • 确定性门 (同一把尺, 量渲染后的真实块):
+      G-D recall@5  0.114 → 0.142 | @10 0.169 → 0.191 | @15 0.191 → 0.213
+      读数候选均值   20.9  → 16.3 (目标 ≤15, 尚差 1.3)
+      G-A2 precision 0.057 → 0.089 (+56%) | recall 0.334 → 0.351 | 段均字符 1605 → 1279
+  • 13 新用例; 全量 pytest 1406 passed 零回归。
 v6.22.3 (2026-09-11) StateSemantics:
   • 读数排序实验 + 负结果固化 (A 方案第二步):
     - 抽取事实增加 ctx (证据句) 与 mentions/ctx_hit 仪表面, 供后续选择/排序研究。
