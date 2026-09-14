@@ -194,8 +194,9 @@ def render_slot_block_v2(
     if not entries:
         return ctx
 
-    from retrieval.slot_closure import (clean_members, count_instances, extract_anchor_mentions,
-                                        extract_objects_v2, render_closure)
+    from retrieval.slot_closure import (clean_members, count_instances, detect_value_type,
+                                        extract_anchor_mentions, extract_objects_v2,
+                                        render_closure, typed_scan_candidates)
     blocks: List[str] = []
     all_facts: List[Any] = []
     for entry in entries:
@@ -212,6 +213,9 @@ def render_slot_block_v2(
                 if not trigs:
                     continue
                 facts = extract_objects_v2(msgs, ent, slot, trigs, gate=gate, question=question)
+            vt0 = detect_value_type(question) if is_count is not None else "generic"
+            if vt0 not in ("", "generic", "count"):
+                facts = list(facts) + typed_scan_candidates(msgs, vt0, entity=ent)
             all_facts.extend(facts)
             members = clean_members([(getattr(r, "value", "") or "", r) for r in facts],
                                     question=question, entity=ent)

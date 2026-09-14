@@ -218,6 +218,91 @@ def extract_objects_v2(
     return out
 
 
+# ── 类型锚定抽取 (A 方案落地: 不用触发词, 按类型扫会话) ─────────────────────
+# 实测 (2026-09-11, 真实库): gold 覆盖率 0.249 (触发词) → 0.494 (类型锚定);
+# 分类型: us_state 1.00 / activity 0.88 / work_book 0.72 / place 0.25。
+# 原理: 集合型问题的答案成员是**类型的实例**(州名/书名/活动), 与句子里是否
+# 出现槽触发词无关 —— 触发词通道漏掉大量 gold, 类型通道不依赖措辞。
+
+_MEDIA_CTX = ("book", "books", "novel", "novels", "read", "reading", "series", "movie",
+              "movies", "film", "films", "song", "songs", "album", "podcast", "author")
+
+
+def _quoted_spans(text: str) -> List[str]:
+    out = []
+    for m in re.finditer('["\u201c\u2018]([^"\u201d\u2019]{2,60})["\u201d\u2019]', text or ""):
+        s = m.group(1).strip()
+        if s and not s.lower() in _STOP_VALUES:
+            out.append(s)
+    return out
+
+
+def _title_runs(text: str) -> List[str]:
+    """Title Case 连串 (2–5 词), 且须邻近书籍/影视语境词 (压掉 153→个位数候选)。"""
+    out = []
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", text or "")
+    low = [w.lower() for w in words]
+    for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})\b", text or ""):
+        title = m.group(1)
+        if title.lower() in _STOP_VALUES or len(title.split()) > 5:
+            continue
+        i = m.start()
+        ctx = low[max(0, i // 6 - 8): i // 6 + 10]
+        if any(c in _MEDIA_CTX for c in ctx):
+            out.append(title)
+    return out
+
+
+def typed_scan_candidates(
+    msgs: Sequence[Mapping[str, Any]],
+    vtype: str,
+    resources: Optional[Mapping[str, Any]] = None,
+    entity: str = "",
+) -> List[Any]:
+    """会话消息 → 该类型的候选实例 (value/ts/msg_ref), 不依赖触发词。"""
+    import types as _types
+    from retrieval.slot_extract import _attributed
+    if vtype in ("", "generic", "count"):
+        return []
+    res = resources if resources is not None else load_value_types()
+    out: List[Any] = []
+    seen = set()
+
+    def _add(value: str, ts, ref):
+        k = (value or "").lower()
+        if not value or k in seen:
+            return
+        seen.add(k)
+        out.append(_types.SimpleNamespace(value=value, ts=ts, msg_ref=ref, trigger="type-scan"))
+
+    for msg in msgs:
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        if entity and not _attributed(text, msg.get("speaker") or "", entity):
+            continue
+        if vtype in ("us_state", "country"):
+            keys = ("us_states",) if vtype == "us_state" else ("countries",)
+        elif vtype == "place":
+            keys = ("us_states", "countries", "cities")
+        elif vtype in ("work_book", "work_media"):
+            keys = ()
+        elif vtype == "activity":
+            keys = ("activities",)
+        else:
+            keys = ()
+        for key in keys:
+            for name in res.get(key) or []:
+                if re.search(r"\b" + re.escape(str(name)) + r"\b", text, re.I):
+                    _add(str(name), msg.get("ts"), msg.get("dia"))
+        if vtype in ("work_book", "work_media"):
+            for s in _quoted_spans(text):
+                _add(s, msg.get("ts"), msg.get("dia"))
+            for s in _title_runs(text):
+                _add(s, msg.get("ts"), msg.get("dia"))
+    return out
+
+
 # ── 计数题路径 v1 (P3 第一步: 符号读出; 2026-09-11) ────────────────────────
 # 现场缺口: 20 道 how many 题里 6 道连槽位候选都没有 (route 返回空), 且计数的输入
 # 是"值"而非"事件实例" → 同一事件多次提及被重复计数 (gold=3 却 distinct=105)。

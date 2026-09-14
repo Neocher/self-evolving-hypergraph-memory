@@ -1,12 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.1"
-__version_info__ = (6, 22, 1)
+__version__ = "6.22.2"
+__version_info__ = (6, 22, 2)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.2 (2026-09-11) StateSemantics:
+  • 类型锚定抽取 (A 方案落地) — retrieval/slot_closure.py::typed_scan_candidates /
+    _quoted_spans / _title_runs; scripts/slot_assembly.py 对类型题 (us_state/country/place/
+    activity/work_book/work_media) 在触发词通道之外**另走类型扫描通道**: 集合题的答案是
+    "类型的实例", 与句子是否含槽触发词无关 → 触发词通道系统性漏召。
+    实测 (真实库): gold 覆盖 0.249 (触发词) → **0.494** (类型锚定); 分类型 us_state 1.00 /
+      activity 0.88 / work_book 0.72 (收紧前 153 候选 → 加书籍语境约束)。
+    接线上线后确定性门: 闭包 recall 0.205 → **0.334** (+63%); 符号读出候选均值 36.0 → 20.9;
+      recall@10 0.162 → 0.169 (聚合受 generic 题拖累, 未过门)。
+    8 新用例; 全量 pytest 1401 passed 零回归。
 v6.22.1 (2026-09-11) StateSemantics:
   • 计数题路径 v1 (P3 第一步: 符号读出) — retrieval/slot_closure.py: count_anchor_terms /
     extract_anchor_mentions / count_instances / route_count_question; scripts/slot_assembly.py:
