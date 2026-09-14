@@ -1,12 +1,19 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.21.2"
-__version_info__ = (6, 21, 2)
+__version__ = "6.22.0"
+__version_info__ = (6, 22, 0)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-09-11"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.0 (2026-09-11) StateSemantics:
+  • core/instance_dedup.py (新, P3 基础件): 成员规范化 / 实例去重 / ISO 周分桶 / 同实例合并
+    (merge_same_instance window_days=7) — 补 "同一事件算两次 / 两次行程被合并成一次" 主错型
+    的地基 (core/instance_key.py 此前是孤儿)。纯标准库, 零 IO/LLM/系统钟; 兼容属性与 dict 形态、
+    接受生成器。交付方=三体协奏 (CC 578s 计划 → OpenCode 343s 实现 → Codex 审核), Hermes 亲验:
+    确定性门 G1..G9 全过 · 新测试 19 passed · 全量 pytest 1382 passed / 2 skipped / 0 failed ·
+    白名单干净 (git diff 为空, 仅 2 个新文件)。
 v6.21.2 (2026-09-11) StateSemantics:
   • A) 谓词论元抽取 (v2 闭包专用; 修 generic 题的子句碎片值):
     - retrieval/slot_closure.py: _trigger_span (词边界 + 屈折尾匹配) · _np_after_trigger

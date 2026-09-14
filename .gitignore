@@ -59,3 +59,7 @@ api/data
 .codex/
 .taiji/
 *.bak.*
+
+# 三体派单工作目录 (规格/运行时产物, 2026-09-11)
+.tri-spec/
+.trio/
