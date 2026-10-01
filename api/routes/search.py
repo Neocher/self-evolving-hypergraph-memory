@@ -160,16 +160,25 @@ async def retrieve(
     # 当所有上游检索都返回空时，直接 Cypher 兜底
     if not results_raw and deps.graph_store is not None:
         try:
-            words = [w.strip().lower() for w in req.query.split() if len(w.strip()) > 1]
+            # 【P2b】惰性 import 复用 gateway_api 的 CJK 分词/打分纯函数（零复制）：
+            # 顶部 import 会与 gateway_api.py:22 的反向 import 形成循环依赖
+            # （search 先被加载 → gateway_api 反向 import _level_from_strategy 时
+            # 该名尚未定义 → ImportError）。运行时此处 import 时 search 已完整加载，
+            # 反向依赖的四个名字均在；gateway_api 顶部依赖已进 sys.modules，成本≈0。
+            from gateway.gateway_api import _fallback_tokens, _fallback_score
+
+            words = _fallback_tokens(req.query)
             if words:
-                params = {f"w{i}": w for i, w in enumerate(words[:5])}
+                params = {f"w{i}": w for i, w in enumerate(words)}
                 # 【P0-3】中文 CONTAINS 不可用：GraphLite b64 编码无子串保持性，
                 # 中文查询的 Cypher 兜底不保证命中；依赖向量/BM25 主通道。
-                conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words[:5])))
+                # 【P2b】CJK 2-gram 短串可部分命中；逐行匹配度打分 + 排序把兜底
+                # 从"恒 0.5 无判别"升级为"可达 + 可排序"（复用 gateway 纯函数）。
+                conditions = " OR ".join(f"e.content CONTAINS $w{i}" for i in range(len(words)))
                 cypher = (f"MATCH (e:EpisodeNode) WHERE ({conditions}) "
                           "AND (e.quarantine IS NULL OR e.quarantine = false) "
                           "AND (e.archived IS NULL OR e.archived = false) "
-                          f"RETURN e.id AS node_id, e.content AS content LIMIT 10")
+                          f"RETURN e.id AS node_id, e.content AS content, e.created_at AS created_at LIMIT 10")
                 # 【H2】【H2-a】Cypher 兜底移入线程池 + 套 wait_for：
                 # GraphLite 卡死时超时即跳过兜底，不再无限挂起
                 # 【P1-2】degraded 置位于 wait_for 之前（对齐 gateway_api.py:491）：
@@ -185,17 +194,34 @@ async def retrieve(
                     logger.warning("Cypher fallback timed out after %.1fs, skipping",
                                    _DEGRADE_TIMEOUT)
                     fallback_rows = []
+                scored: list[tuple[float, float, str, str]] = []
                 for row in fallback_rows:
                     if isinstance(row, (list, tuple)):
                         nid, content = row[0], row[1] if len(row) > 1 else ""
+                        created_at = row[2] if len(row) > 2 else 0.0
                     elif isinstance(row, dict):
                         nid, content = row.get("node_id", ""), row.get("content", "")
+                        created_at = row.get("created_at", 0.0)
                     else:
                         continue
+                    # 【P2b】created_at 防御式解析：GraphLite 缺字段可能回 'Null' 字符串
+                    try:
+                        created_ts = float(created_at)
+                    except (TypeError, ValueError):
+                        created_ts = 0.0
+                    scored.append((
+                        _fallback_score(words, str(content)),
+                        created_ts,
+                        str(nid),
+                        str(content),
+                    ))
+                # 【P2b】按 score（≡ hits）降序、tie 用 created_at DESC（对齐 gateway 副本）
+                scored.sort(key=lambda x: (-x[0], -x[1]))
+                for score, _ts, nid, content in scored:
                     results_raw.append({
-                        "node_id": str(nid),
-                        "content": str(content),
-                        "score": 0.5,
+                        "node_id": nid,
+                        "content": content,
+                        "score": score,
                         "level": "graphlite_fallback",
                     })
                 logger.info("Cypher fallback provided %d results", len(results_raw))

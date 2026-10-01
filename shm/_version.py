@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.7"
-__version_info__ = (6, 22, 7)
+__version__ = "6.22.8"
+__version_info__ = (6, 22, 8)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-10-01"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.8 (2026-10-01) StateSemantics:
+  • P2b REST 兜底 CJK 修复 — 把 v6.22.7 的 CJK 兜底修复同步到生产主路径
+    api/routes/search.py 的 Cypher 兜底块（此前仅 gateway_api.py，A2A 路径；
+    REST /memories/retrieve 仍跑旧副本：中文整句 split() 整句 CONTAINS ≈0 +
+    score 0.5 硬编码无判别力）。改为函数内惰性 import 复用 gateway_api 的
+    _fallback_tokens/_fallback_score 纯函数（零复制两份函数体），cypher RETURN
+    增 e.created_at，逐行打分 + (-score, -created_at) 排序；保留 quarantine +
+    archived 双 WHERE 业务差异。9 新用例；全量 pytest 1433 passed（基线 1424 不降）。
 v6.22.7 (2026-10-01) StateSemantics:
   • P2 CJK 兜底修复 — gateway_api.py Cypher 兜底段 query.split() 使中文整句变
     一个 word、CONTAINS 整句匹配命中≈0，且 score: 0.5 硬编码无判别力。
