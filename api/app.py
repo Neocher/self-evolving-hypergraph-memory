@@ -423,6 +423,9 @@ def _init_services() -> Services:
         except Exception as e:
             logger.warning("LLMClient init skipped (dreams will use TF-IDF fallback): %s", e)
 
+        # 【P1b】LLMClient 注入 Services（写路径事实抽取复用；None 也赋值保持语义）
+        svc.llm_client = llm_client
+
         # 7b-1. Schema 自演化（v5.38.0 Ontology-Evolution）— 构造演化器 + 注入 DreamPipeline
         ontology_evolution = None
         try:

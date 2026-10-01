@@ -133,6 +133,8 @@ class Services:
     # 【M5】检索侧 episode 内容缓存（EpisodeCache: OrderedDict LRU + TTL）。
     # 由 app.py 注入 query_router 共享引用；flush_faiss_buffer 是本缓存唯一写入方。
     _episode_cache: Any = None
+    # 【P1b】LLM 客户端（app.py 注入；写路径事实抽取复用，None 时只走规则路）
+    llm_client: Any = None
 
 
 _services: Optional[Services] = None

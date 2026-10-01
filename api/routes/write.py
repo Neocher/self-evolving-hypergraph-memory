@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -499,6 +500,38 @@ async def write_multimodal(
     )
 
 
+# ─── 【P1b】写后懒抽取 ─────────────────────────────────────
+
+
+def _fact_extract_enabled() -> bool:
+    """SHM_FACT_EXTRACT："0"/"false"/"" → False，默认 True。
+
+    与 core.fact_extract._enabled 语义一致但独立实现：写路径不能顶层
+    import core.fact_extract（防循环依赖），本地读 env 门控。
+    """
+    return os.getenv("SHM_FACT_EXTRACT", "1").lower() not in ("0", "false", "")
+
+
+async def _extract_facts_bg(deps: Services, episode_id: str, content: str) -> None:
+    """后台抽取 + 落库（fire-and-forget task 体）。
+
+    惰性 import core.fact_extract（防循环依赖）→ await extract_facts →
+    逐条 create_atomic_fact 经 qsubmit(priority="low") 入队。整函数 try/except
+    吞异常，绝不向 create_task 抛出。
+    """
+    try:
+        from core.fact_extract import extract_facts
+        facts = await asyncio.wait_for(
+            extract_facts(deps.llm_client, content), timeout=15)
+        for f in facts:
+            await qsubmit(deps, deps.graph_store.create_atomic_fact,
+                          f["subject"], f["predicate"], f["object"],
+                          f.get("valid_time", ""),
+                          source_episode=episode_id, priority="low")
+    except Exception:
+        logger.debug("fact extract bg failed for %s", episode_id, exc_info=True)
+
+
 @router.post("/memories/episodes", summary="直接创建情节节点 (Layer2)")
 async def create_episode(
     req: EpisodeCreate,
@@ -850,6 +883,16 @@ async def create_episode(
                               session_node_id, episode_id)
     except Exception:
         logger.exception("Session memory link failed for episode %s", episode_id)
+
+    # 【P1b】写后懒抽取：后台低优先级，失败静默，SHM_FACT_EXTRACT=0 关
+    try:
+        if deps.graph_store is not None and _fact_extract_enabled():
+            _content_full = req.content   # 完整 content，非 [:200]
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_extract_facts_bg(deps, episode_id, _content_full))
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+    except Exception:
+        logger.debug("fact extract schedule skipped for %s", episode_id, exc_info=True)
 
     record_request("POST", "/memories/episodes", "200", _now() - start)
     return EpisodeResponse(

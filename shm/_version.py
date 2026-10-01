@@ -1,12 +1,17 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.8"
-__version_info__ = (6, 22, 8)
+__version__ = "6.22.9"
+__version_info__ = (6, 22, 9)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-10-01"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.9 (2026-10-01) StateSemantics:
+  • P1b 写路径接入事实抽取 — episode 写入成功后经 create_task 后台低优先级
+    抽取 SPO 事实落库（AtomicFactNode + FACT_MENTIONS 边），失败静默不阻塞
+    201；llm_client 注入 Services（None 时只走规则路）；SHM_FACT_EXTRACT=0
+    一键关。新 tests/test_fact_extract_wiring.py。
 v6.22.8 (2026-10-01) StateSemantics:
   • P2b REST 兜底 CJK 修复 — 把 v6.22.7 的 CJK 兜底修复同步到生产主路径
     api/routes/search.py 的 Cypher 兜底块（此前仅 gateway_api.py，A2A 路径；
