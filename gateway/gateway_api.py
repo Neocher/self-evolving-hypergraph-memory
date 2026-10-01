@@ -67,6 +67,62 @@ def _scan_credentials(content: str) -> list[str]:
     return findings
 
 
+# ── Cypher 兜底分词（P2 CJK 修复）──
+
+_CJK_RUN_PATTERN = r"[\u4e00-\u9fff]+|[^\u4e00-\u9fff]+"
+
+
+def _fallback_tokens(query: str) -> list[str]:
+    """【P2-1】CJK 感知的确定性兜底分词（零依赖、可单测）。
+
+    连续 CJK 段（\\u4e00-\\u9fff）→ char 2-gram（与仓库 BM25 通道
+    `TfidfVectorizer(analyzer="char_wb", ngram_range=(2,4))` 下限口径一致；
+    段长 1 时保留单字，单字 CONTAINS 仍有意义）；非 CJK 段按空白切词 →
+    lower + 去首尾非字母数字 + 长度 ≥2 保留（英文旧 split() 路径超集）；
+    去重保序；上限 8 个 token 控查询计划。
+    """
+    import re
+    if not query:
+        return []
+    tokens: list[str] = []
+    seen: set = set()
+    for run in re.findall(_CJK_RUN_PATTERN, query):
+        if "\u4e00" <= run[0] <= "\u9fff":
+            grams = [run] if len(run) == 1 else [run[i:i + 2] for i in range(len(run) - 1)]
+        else:
+            grams = []
+            for w in run.split():
+                w = w.lower()
+                w = re.sub(r"^[^a-z0-9]+", "", w)
+                w = re.sub(r"[^a-z0-9]+$", "", w)
+                if len(w) >= 2:
+                    grams.append(w)
+        for g in grams:
+            if g not in seen:
+                seen.add(g)
+                tokens.append(g)
+                if len(tokens) >= 8:
+                    return tokens
+    return tokens
+
+
+def _fallback_score(tokens: list[str], content: str) -> float:
+    """【P2-2】匹配度判别打分替代硬编码 0.5。
+
+    score = 0.05 + 0.45 * (hits / len(tokens))，hits = content（小写）中
+    含 token 子串（Python `in`，大小写不敏感）的 token 数。落在 [0.05, 0.5]：
+    上界 0.5（与"降级结果低于主通道"语义兼容，永不越过）；下界为噪声地板 0.05
+    （hits=0 时恰为 0.05，仍 > 0）——0-hit 行即"库侧 CONTAINS 命中但解码后无
+    token 子串"的边缘场景（GraphLite b64 遗留），给地板分而非丢弃。
+    对 hits 严格单调 → 按 score 降序 ≡ 按 hits 降序。空 tokens 防御返回 0.05。
+    """
+    if not tokens:
+        return 0.05
+    content_lower = content.lower()
+    hits = sum(1 for t in tokens if t in content_lower)
+    return 0.05 + 0.45 * (hits / len(tokens))
+
+
 class GatewayAPI:
     """统一的 SHM 核心接口 — 所有协议适配器都通过它访问 SHM。
 
@@ -485,18 +541,22 @@ class GatewayAPI:
         # Cypher 兜底
         if not results_raw and self._svc.graph_store is not None:
             try:
-                words = [w.strip().lower() for w in query.split() if len(w.strip()) > 1]
-                if words:
-                    params = {f"w{i}": w for i, w in enumerate(words[:5])}
-                    # 【P0-3】中文 CONTAINS 不可用：GraphLite b64 编码无子串保持性。
-                    # 中文查询的 Cypher 兜底不保证命中；依赖向量/BM25 主通道。
+                # 【P2-1】CJK 感知分词：中文整句经 query.split() 会变成一个 "word"，
+                # CONTAINS 变整句匹配（命中≈0）。改 char 2-gram 后短串可命中，
+                # 英文词 lower + 去首尾非字母数字（旧 split() 路径超集）；上限 8 控查询计划。
+                tokens = _fallback_tokens(query)
+                if tokens:
+                    params = {f"w{i}": w for i, w in enumerate(tokens)}
+                    # 【P0-3】中文 CONTAINS 在 b64 编码下无子串保持性（整句必空）；
+                    # 2-gram 短串可部分命中，即便命中率有限，打分 + 排序把兜底
+                    # 从"恒 0.5 无判别"升级为"可达 + 可排序"。
                     conditions = " OR ".join(
-                        f"e.content CONTAINS $w{i}" for i in range(len(words[:5]))
+                        f"e.content CONTAINS $w{i}" for i in range(len(tokens))
                     )
                     archived_clause = "" if include_archived else " AND (e.archived IS NULL OR e.archived = false)"
                     cypher = (
                         f"MATCH (e:EpisodeNode) WHERE ({conditions}){archived_clause} "
-                        f"RETURN e.id AS node_id, e.content AS content LIMIT 10"
+                        f"RETURN e.id AS node_id, e.content AS content, e.created_at AS created_at LIMIT 10"
                     )
                     # 【P1-2】degraded 置位于 wait_for 之前：超时/异常跳 except 时该行已执行，
                     # 确保 Cypher 兜底超时/异常 → 空结果 + degraded=True（对齐 REST 语义）。
@@ -505,17 +565,34 @@ class GatewayAPI:
                         asyncio.to_thread(self._svc.graph_store.query_cypher, cypher, params),
                         timeout=_DEGRADE_TIMEOUT,
                     )
+                    scored: list[tuple[float, float, str, str]] = []
                     for row in fallback_rows:
                         if isinstance(row, (list, tuple)):
                             nid, c = row[0], row[1] if len(row) > 1 else ""
+                            created_at = row[2] if len(row) > 2 else 0.0
                         elif isinstance(row, dict):
                             nid, c = row.get("node_id", ""), row.get("content", "")
+                            created_at = row.get("created_at", 0.0)
                         else:
                             continue
+                        # 【P2-3】created_at 防御式解析：GraphLite 缺字段可能回 'Null' 字符串
+                        try:
+                            created_ts = float(created_at)
+                        except (TypeError, ValueError):
+                            created_ts = 0.0
+                        scored.append((
+                            _fallback_score(tokens, str(c)),
+                            created_ts,
+                            str(nid),
+                            str(c),
+                        ))
+                    # 【P2-3】按 score（≡ hits）降序、tie 用 created_at DESC（失效条件 3 处方）
+                    scored.sort(key=lambda x: (-x[0], -x[1]))
+                    for score, _ts, nid, c in scored:
                         results_raw.append({
-                            "node_id": str(nid),
-                            "content": str(c),
-                            "score": 0.5,
+                            "node_id": nid,
+                            "content": c,
+                            "score": score,
                             "level": "graphlite_fallback",
                         })
             except asyncio.TimeoutError:

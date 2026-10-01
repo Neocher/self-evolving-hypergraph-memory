@@ -1,12 +1,26 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.6"
-__version_info__ = (6, 22, 6)
+__version__ = "6.22.7"
+__version_info__ = (6, 22, 7)
 __version_name__ = "StateSemantics"
-__release_date__ = "2026-09-11"
+__release_date__ = "2026-10-01"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.22.7 (2026-10-01) StateSemantics:
+  • P2 CJK 兜底修复 — gateway_api.py Cypher 兜底段 query.split() 使中文整句变
+    一个 word、CONTAINS 整句匹配命中≈0，且 score: 0.5 硬编码无判别力。
+    改为 CJK char 2-gram 分词（_fallback_tokens，与 BM25 char_wb 口径一致，
+    段长 1 保单字、英文词 lower+去首尾非字母数字、去重保序、上限 8）+ 匹配度
+     判别打分（_fallback_score = 0.05 + 0.45*hits/len，∈[0.05,0.5]，永不越 0.5
+     与"降级结果低于主通道"语义兼容；0-hit 行为噪声地板 0.05）。兜底行按 score
+     降序（≡ hits 降序）、tie 用 created_at DESC（RETURN 增 e.created_at +
+     防御式 float 解析 'Null'）。真实案例: 2026-10-01 "心跳线程日志 0 条 主线程
+     持锁饿死 heartbeat" 走此路径。按失效条件 2 仅改 gateway_api.py（MCP 走
+     路径）；api/routes/search.py:160-203 与 retrieval/query_router.py:3870-3929
+     两个独立副本另开任务，本版不碰。
+     16 新用例（含真实 OverGraphStore created_at 投影冒烟 + 0-hit 边界断言）;
+     全量 pytest 1424 passed / 1 skipped 零回归（基线 1406+ 不降）。
 v6.22.6 (2026-09-11) StateSemantics:
   • 类型通道放开说话人归属门 (抽取覆盖修复):
     集合题/枚举题的证据常由**对话伙伴**提供 (如好友对 John 说 "I saw that you had
