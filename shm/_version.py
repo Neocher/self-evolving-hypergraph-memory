@@ -1,12 +1,22 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.22.9"
-__version_info__ = (6, 22, 9)
+__version__ = "6.23.0"
+__version_info__ = (6, 23, 0)
 __version_name__ = "StateSemantics"
 __release_date__ = "2026-10-01"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.23.0 (2026-10-01) StateSemantics:
+  • P3 AtomicFact bi-temporal supersession — 闭合"同 (subject, predicate) 新值
+    来了旧值仍 active、检索可能注入旧值"缺口。写侧 create_atomic_fact 落库前查
+    同 (S,P) active fact（superseded_at IS NULL），object 不同 → 旧 fact 打
+    superseded_at + superseded_by（旧→新 fid）、新 fact 记 supersedes（最近旧 fid，
+    血缘可回溯）；object 相同纯幂等不作废。新增 get_active_facts_by_sp（active-only
+    + include_superseded）；get_atomic_facts_by_subject 默认排除已作废（include_
+    superseded 参数）。检索侧 _fact_retrieve 仲裁退化为同 S+P 去重（store 已只回
+    active，不再依赖 valid_time 比较）。SHM_FACT_SUPERSEDE 默认开（"0"/"false"/
+    "" 关）。新增 tests/test_fact_supersede.py。
 v6.22.9 (2026-10-01) StateSemantics:
   • P1b 写路径接入事实抽取 — episode 写入成功后经 create_task 后台低优先级
     抽取 SPO 事实落库（AtomicFactNode + FACT_MENTIONS 边），失败静默不阻塞

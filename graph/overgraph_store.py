@@ -118,6 +118,16 @@ def _now() -> float:
     return time.time()
 
 
+def _fact_supersede_enabled() -> bool:
+    """【P3】fact supersession 开关（SHM_FACT_SUPERSEDE，默认开；"0"/"false"/"" 关）。
+
+    与 api/routes/write._fact_extract_enabled 语义对齐，但独立实现于 store 层
+    （不 import api 模块防循环依赖）。关闭后 create_atomic_fact 退化为纯 sha1
+    幂等，不做作废（同 (S,P) 新旧值并存，旧值不标记 superseded_at）。
+    """
+    return os.getenv("SHM_FACT_SUPERSEDE", "1").strip().lower() not in ("0", "false", "")
+
+
 def _as_float32(vec) -> np.ndarray:
     """向量统一转 float32 ndarray（typed API 输入契约）。"""
     if isinstance(vec, np.ndarray):
@@ -736,6 +746,28 @@ class OverGraphStore:
         p["confidence"] = float(confidence)
         p.setdefault("archived", False)
         p.setdefault("created_at", _now())
+        # 【P3】bi-temporal supersession：落库前查同 (subject, predicate) 的 active
+        # fact（superseded_at IS NULL）；object 不同的旧值打 superseded_at +
+        # superseded_by（旧→新 fid），新 fact 记 supersedes=最近一条旧 fid（血缘
+        # 可回溯，多条旧 fact 只取 created_at 最大那条记 supersedes）；object 相同
+        # 纯幂等，不作废。注意 _locked_upsert_node 是全量覆盖 props（非 merge），
+        # 改旧 fact 必须先取回完整 props（get_active_facts_by_sp 返回整包）再
+        # merge superseded_at/superseded_by，否则丢 subject/predicate/object/... 字段。
+        if _fact_supersede_enabled():
+            superseded = [
+                old for old in self.get_active_facts_by_sp(subj, pred)
+                if str(old.get("object", "")).strip() != obj
+            ]
+            if superseded:
+                now = _now()
+                for old in superseded:
+                    merged = dict(old)
+                    merged["superseded_at"] = now
+                    merged["superseded_by"] = fid
+                    self._locked_upsert_node(
+                        LABEL_FACT, str(old.get("id", "")), merged)
+                newest = max(superseded, key=lambda f: float(f.get("created_at") or 0.0))
+                p["supersedes"] = str(newest.get("id", ""))
         self._locked_upsert_node(LABEL_FACT, fid, p)
         if source_episode:
             try:
@@ -771,12 +803,16 @@ class OverGraphStore:
             return []
 
     def get_atomic_facts_by_subject(self, subject: str, limit: int = 50,
-                                    at_year: int | None = None) -> list[dict]:
+                                    at_year: int | None = None,
+                                    include_superseded: bool = False) -> list[dict]:
         """按 subject 查 AtomicFactNode（检索候选定位）。
 
         at_year: 非 None 时只返回 valid_time 归一化后等于该年份的事实（cat=2 时间
         推理根治：查询含年份/相对时间词时过滤掉其他时间版本）；None → 行为与
         既有完全一致（零回归）。
+        include_superseded: 【P3】False（默认）时排除已作废 fact（superseded_at 非
+        空）→ active only；True 返回全部（含作废，审计/单测用）。旧调用方不传参
+        行为 = active only。
         """
         subj = (subject or "").strip()
         if not subj:
@@ -787,13 +823,18 @@ class OverGraphStore:
                 f"OR f.subject CONTAINS '{subj.lower()}' "
                 f"AND (f.archived IS NULL OR f.archived = false) "
                 f"RETURN f.id AS id, f.subject AS subject, f.predicate AS predicate, "
-                f"f.object AS object, f.valid_time AS valid_time "
+                f"f.object AS object, f.valid_time AS valid_time, "
+                f"f.superseded_at AS superseded_at "
                 f"LIMIT {int(limit)}"
             )
             rows = (result or {}).get("rows", [])
             out = []
             for r in rows:
                 if isinstance(r, dict):
+                    # 【P3】默认排除已作废 fact（superseded_at 非空 → 旧值）；
+                    # 属性缺省时 OverGraph 返回 None（=active，is not None 天然安全）。
+                    if not include_superseded and r.get("superseded_at") is not None:
+                        continue
                     vt = str(r.get("valid_time", ""))
                     if at_year is not None and self._normalize_year(vt) != at_year:
                         continue
@@ -805,6 +846,31 @@ class OverGraphStore:
                         "valid_time": str(r.get("valid_time", "")),
                     })
             return out
+        except Exception:
+            return []
+
+    def get_active_facts_by_sp(self, subject: str, predicate: str,
+                               include_superseded: bool = False) -> list[dict]:
+        """【P3】精确 (subject, predicate) 查 AtomicFactNode（supersession 写侧用）。
+
+        默认 active only（superseded_at IS NULL）；include_superseded=True 返回全部
+        （含作废，审计/单测用）。返回完整 props（含 superseded_at/superseded_by/
+        supersedes），供 create_atomic_fact 作废旧 fact 时全量覆盖 upsert 使用。
+        整体 try/except 返回 []（与 get_atomic_facts_by_subject 静默降级一致，且
+        兼容 test_atomic_fact 用 __new__ 跳过 __init__ 的 mock store）。
+        """
+        subj = (subject or "").strip()
+        pred = (predicate or "").strip()
+        if not subj or not pred:
+            return []
+        try:
+            where = f"f.subject = '{subj}' AND f.predicate = '{pred}'"
+            if not include_superseded:
+                where += " AND (f.superseded_at IS NULL)"
+            result = self._locked_execute_gql(
+                f"MATCH (f:{LABEL_FACT}) WHERE {where} RETURN f"
+            )
+            return [self._flatten_row(r, "f") for r in (result or {}).get("rows", [])]
         except Exception:
             return []
 

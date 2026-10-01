@@ -3430,12 +3430,13 @@ class QueryRouter:
             existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
             # 【P0-③ Phase A2 注入纪律】D-MEM 批判路由器借鉴：事实注入前按
             # 「相关性 + 时间冲突」批判——只注入与查询实体/谓词/时间匹配的事实；
-            # 同 subject+predicate 多版本取 valid_time 最新（最新事实优先，防旧
-            # 事实与最新状态冲突稀释 judge 注意力——CC 塞池风险 + v68 教训）。
+            # 【P3】同 subject+predicate 的作废由 store 层 supersession 保证（store
+            # 只回 active fact，已排除 superseded），检索侧只做同 S+P 去重取一——
+            # 不再依赖 valid_time 比较（规则路 fact 的 valid_time 基本空串）。
             q_lower = q_text.lower()
             extra: list[dict] = []
             seen_facts: set[str] = set()
-            # subject → 候选事实（同 subject+predicate 保留最新 valid_time）
+            # subject → 候选事实（同 subject+predicate 去重取一；作废由 store 层保证）
             best_by_sp: dict[tuple[str, str], dict] = {}
             # 【方案 D】提取查询中的年份/相对时间词 → at_year 过滤事实 (cat=2 时间推理)
             at_year = None
@@ -3492,10 +3493,10 @@ class QueryRouter:
                         [pred.lower(), obj.lower(), pred_obj] if len(tok) >= 3
                     ):
                         continue
-                    # 时间冲突仲裁：同 subject+predicate → 保留最新 valid_time
+                    # 【P3】作废由 store 层 supersession 保证（store 只回 active fact，
+                    # 已排除 superseded），检索侧仅做同 subject+predicate 去重取一。
                     key = (subj.lower(), pred.lower())
-                    cur = best_by_sp.get(key)
-                    if cur is None or (vt and (not cur.get("valid_time") or vt > cur["valid_time"])):
+                    if key not in best_by_sp:
                         best_by_sp[key] = {
                             "id": fid, "subject": subj, "predicate": pred,
                             "object": obj, "valid_time": vt,
