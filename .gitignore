@@ -63,3 +63,7 @@ api/data
 # 三体派单工作目录 (规格/运行时产物, 2026-09-11)
 .tri-spec/
 .trio/
+
+# 评测噪声源分离探针脚本 (非 SHM 组件; 规范位置 /home/user/.hermes/cache/scratch/, 不入库)
+hyde_probe_arm.sh
+hyde_r2_arm.sh
