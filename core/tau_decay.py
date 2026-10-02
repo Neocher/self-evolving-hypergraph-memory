@@ -104,12 +104,22 @@ class TauDecayConfig:
     enable_learnable: bool = False
     decay_learning_rate: float = 0.01
     decay_target_window: int = 10
-    
+
+    # v6.24.0 τ 衰减形式 A/B（默认 exp 完全向后兼容）
+    tau_form: str = "exp"          # "exp" | "pow" | "frac"
+    alpha: float = 0.5             # pow 专用，幂律强度 (0,1]，越小长记忆越强
+    frac_K: int = 8                # frac 专用，指数模式数
+    frac_scale_factor: float = 10.0  # frac 专用，对数间隔相邻指数模式尺度倍数（每档 ×这个倍数）
+
     def validate(self) -> None:
         """校验配置合理性"""
         assert 0 < self.tau_initial <= 1.0, "tau_initial must be in (0, 1]"
         assert self.tau_decay_seconds > 0, "tau_decay_seconds must be positive"
         assert 0 < self.decay_threshold < 1.0, "decay_threshold must be in (0, 1)"
+        assert self.tau_form in ("exp", "pow", "frac")
+        assert 0.0 < self.alpha <= 1.0
+        assert self.frac_K >= 1
+        assert self.frac_scale_factor > 1.0
 
 
 @dataclass
@@ -121,6 +131,7 @@ class NodeMemoryInfo:
     importance: float = 0.5  # 重要性 [0, 1]，v2.0
     access_count: int = 0     # 访问次数，v2.0
     tau_decay_custom: Optional[float] = None  # 自定义衰减常数，v2.0
+    alpha_custom: Optional[float] = None  # 自定义幂律α，v6.24.0（pow 模式 AdaMem）
 
 
 class AdaptiveDecayLearner:
@@ -158,11 +169,21 @@ class AdaptiveDecayLearner:
             info = engine._node_info.get(node_id)
             if info is None:
                 continue
-            current = info.tau_decay_custom or self.config.tau_decay_seconds
             lr = self.config.decay_learning_rate
-            updated = current + lr * (tau_target - current)
-            engine.set_custom_decay(node_id, updated)
-            updates[node_id] = updated
+            if self.config.tau_form == "pow":
+                # pow 模式：SGD 更新 alpha_custom（tau_target 复用为 alpha_target，
+                # 最小改动接入；不触碰 tau_decay_custom）
+                current_a = info.alpha_custom if info.alpha_custom is not None \
+                    else self.config.alpha
+                updated_a = max(0.1, min(1.0, current_a + lr * (tau_target - current_a)))
+                engine.set_custom_alpha(node_id, updated_a)
+                updates[node_id] = updated_a
+            else:
+                # exp 模式：既有 tau_decay_custom 路径不变（alpha_custom 保持 None）
+                current = info.tau_decay_custom or self.config.tau_decay_seconds
+                updated = current + lr * (tau_target - current)
+                engine.set_custom_decay(node_id, updated)
+                updates[node_id] = updated
         return updates
 
 
@@ -211,6 +232,21 @@ class TauDecayEngine:
             self._node_info[node_id].tau_decay_custom = max(
                 self.config.tau_decay_min, min(self.config.tau_decay_max, tau_decay)
             )
+
+    def set_custom_alpha(self, node_id: str, alpha: float) -> None:
+        """设置自定义幂律 α（v6.24.0，pow 模式 AdaMem 学 alpha）。
+
+        仿照 set_custom_decay，钳在 [0.1, 1.0]。
+        """
+        if node_id in self._node_info:
+            self._node_info[node_id].alpha_custom = max(0.1, min(1.0, alpha))
+
+    def _effective_alpha(self, node_id: str) -> float:
+        """有效幂律 α：优先节点自定义值，否则配置默认；结果钳在 [0.1, 1.0]。"""
+        info = self._node_info.get(node_id)
+        alpha = info.alpha_custom if (info and info.alpha_custom is not None) \
+            else self.config.alpha
+        return max(0.1, min(1.0, alpha))
 
     def _get_effective_tau_decay(self, node_id: str, fact_track: str = "active") -> float:
         """计算有效衰减常数（v2.0 自适应）
@@ -276,10 +312,40 @@ class TauDecayEngine:
         now = force_now or time.time()
         dt = max(0, now - created)
         tau_decay = self._get_effective_tau_decay(node_id, fact_track=fact_track)
-        exponent = -dt / tau_decay
-        if exponent < -700:
-            return 0.0
-        return self.config.tau_initial * math.exp(exponent)
+        if self.config.tau_form == "pow":
+            # TODO(P2-12): refresh_on_access 是既有死代码（独立任务），本次不修，
+            # pow 分支与 exp 保持一致的 refresh 语义（A/B 控制变量）。
+            alpha = self._effective_alpha(node_id)
+            # τ₀·(1 + dt/τc)^(-α)：α∈(0,1] 越小 → 指数越接近 0 → 长记忆越强
+            return self.config.tau_initial * (1.0 + dt / tau_decay) ** (-alpha)
+        elif self.config.tau_form == "frac":
+            return self._frac_decay(node_id, dt, tau_decay)
+        else:  # exp — 默认，完全向后兼容
+            exponent = -dt / tau_decay
+            if exponent < -700:      # underflow 哨兵只在 exp 分支生效（风险 1 保守处理）
+                return 0.0
+            return self.config.tau_initial * math.exp(exponent)
+
+    def _frac_decay(self, node_id: str, dt: float, tau_decay: float) -> float:
+        """Frac 近似：K 个对数间隔指数模式加权求和（重尾核近似）。
+
+        尺度按"每档 ×frac_scale_factor"对数间隔排列（sf^0, sf^1, ..., sf^(K-1)），
+        共跨 K 个 decade——只有跨多 decade 才能真正逼近重尾幂律核；旧的一档跨度
+        （sf^(k/(K-1))）实际退化为单指数、无长尾。
+
+        注意：结果乘以 config.tau_initial —— MISSION 片段遗漏此乘子，但 AC 要求
+        K=1 时对任意 tau_initial 都与 exp 完全一致，故必须乘。
+        """
+        K = self.config.frac_K
+        sf = self.config.frac_scale_factor
+        if K == 1:
+            return self.config.tau_initial * math.exp(-dt / tau_decay)
+        scales = [tau_decay * (sf ** k) for k in range(K)]
+        weights = [1.0 / (k + 1) for k in range(K)]
+        W = sum(weights)
+        return self.config.tau_initial * sum(
+            w * math.exp(-dt / s) for w, s in zip(weights, scales)
+        ) / W
 
     def compute_strength(self, created_at: float, node_id: Optional[str] = None,
                          fact_track: str = "active") -> float:

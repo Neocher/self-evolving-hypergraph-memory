@@ -37,6 +37,10 @@ class TauConfig:
     tau_decay_seconds: float = 1800.0
     decay_threshold: float = 0.1
     refresh_on_access: bool = True
+    tau_form: str = "exp"          # "exp" | "pow" | "frac"
+    alpha: float = 0.5             # pow 专用，幂律强度 (0,1]
+    frac_K: int = 8                # frac 专用，指数模式数
+    frac_scale_factor: float = 10.0  # frac 专用，对数间隔最大尺度倍数
 
 
 @dataclass
