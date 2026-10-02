@@ -5,6 +5,13 @@
 **分支**：`exp/tau-form-ab`（从 main 拉）
 **版本**：改完四处同步 bump（`shm/_version.py` + `pyproject.toml` + `VERSION` + `README.md`），建议 `v7.0.0-alpha` 或 `v6.24.0`（视改动规模自定，CI 断言一致）。
 
+> ⚠️ **提交信息与实际交付差异清单（2026-10-02 审核补记，见 commit `c001ce6`）**
+> `c001ce6` 的提交信息与代码现实有三处不符，为免误导未来读者在此显式记录：
+> 1. 「AdaMem 双路：衰减路×频次保护路（≥freq_threshold 且 recency<recency_window）取 max、24h 分桶」**未实现**——实际交付是「pow 模式 `AdaptiveDecayLearner` SGD 学 `alpha_custom`（钳 [0.1,1.0]），exp 模式仍学 `tau_decay_custom`，两路不混」。
+> 2. 「`SHM_TAU_FORM=exp SHM_TAU_ADAMEM=0`」变量名错误——实际 env 为 `SHM_TAU__TAU_FORM`（双下划线，`_env_override` 按 `split("__")` 解析），且 `SHM_TAU_ADAMEM` 全库不存在。
+> 3. 「frac=离散分步(floor+shift, 2^(−k)+floor)」不实——实际是 `_frac_decay` 用 K 个对数间隔指数模式（sf^0..sf^(K-1)）加权求和近似重尾核。
+> 4. （任务书⑤）「非法值 fallback exp」不实——非法 `tau_form` 触发 `TauDecayConfig.validate()` 的 `assert`，在 `TauDecayEngine.__init__` 抛 `AssertionError` 崩溃，非静默回退。
+
 ---
 
 ## 【缺口】现状实证
