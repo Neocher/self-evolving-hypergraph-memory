@@ -7,6 +7,10 @@ tau:
   tau_decay_seconds: 1800        # 衰减时间常数（秒），30分钟
   decay_threshold: 0.1           # 修剪阈值 (0, 1)
   refresh_on_access: true        # 访问时是否刷新 τ
+  tau_form: exp                  # 衰减形式: exp（默认）| pow | frac
+  alpha: 0.5                     # pow 专用，幂律强度 (0, 1]，越小长记忆越强
+  frac_K: 8                      # frac 专用，指数模式数
+  frac_scale_factor: 10.0        # frac 专用，对数间隔相邻指数模式尺度倍数（每档 ×这个倍数，跨 K decade）
 
 hebbian:
   k_sparsity: 8                  # 每节点保留的最强连接数 (DNC 经验值)

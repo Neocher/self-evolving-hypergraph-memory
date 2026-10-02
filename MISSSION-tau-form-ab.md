@@ -34,7 +34,7 @@ return self.config.tau_initial * math.exp(exponent)   # ← 纯指数衰减
 ```python
 tau_form: str = "exp"   # "exp" | "pow" | "frac"
 # "exp":  现状，τ₀·exp(-dt/τc)（默认，完全向后兼容）
-# "pow":  τ₀·(1 + dt/τc)^(-1/α)，幂律长记忆
+# "pow":  τ₀·(1 + dt/τc)^(-α)，幂律长记忆
 # "frac": Frac 近似，K 个对数间隔的指数模式求和（重尾核近似）
 
 # pow 模式专用
@@ -59,7 +59,9 @@ def compute_tau(self, node_id, created_at=None, force_now=None, fact_track="acti
     tau_decay = self._get_effective_tau_decay(node_id, fact_track=fact_track)
     if self.config.tau_form == "pow":
         alpha = self._effective_alpha(node_id)  # 支持 AdaMem 学 alpha
-        return self.config.tau_initial * (1.0 + dt/tau_decay) ** (-1.0/alpha)
+        # τ₀·(1 + dt/τc)^(-α)：α∈(0,1] 越小 → 指数越接近 0 → 衰减越慢 → 长记忆越强
+        # （注意：不是 -1/α —— 那个方向下 α 越小反而衰减更快，与"长记忆"语义相反）
+        return self.config.tau_initial * (1.0 + dt/tau_decay) ** (-alpha)
     elif self.config.tau_form == "frac":
         return self._frac_decay(node_id, dt, tau_decay)
     else:  # exp（默认）
@@ -71,11 +73,14 @@ def compute_tau(self, node_id, created_at=None, force_now=None, fact_track="acti
 def _frac_decay(self, node_id, dt, tau_decay):
     K = self.config.frac_K
     sf = self.config.frac_scale_factor
-    # 对数间隔的 τc 尺度：tau_decay 到 tau_decay*sf
-    scales = [tau_decay * (sf ** (k/(K-1))) for k in range(K)]
+    # 对数间隔的 τc 尺度：每档 ×sf，共跨 K 个 decade（sf^0, sf^1, ..., sf^(K-1)）
+    # 必须跨多 decade 才能逼近重尾幂律核；只跨 1 个 decade（sf^(k/(K-1))）退化为单指数无长尾
+    if K == 1:
+        return self.tau_initial * math.exp(-dt / tau_decay)  # 乘 tau_initial 保证 K=1 与 exp 完全一致
+    scales = [tau_decay * (sf ** k) for k in range(K)]
     weights = [1.0/(k+1) for k in range(K)]
     W = sum(weights)
-    return sum(w * math.exp(-dt/s) for w, s in zip(weights, scales)) / W
+    return self.tau_initial * sum(w * math.exp(-dt/s) for w, s in zip(weights, scales)) / W
 ```
 
 **pow 模式下 AdaMem 学 α 而不是学 τc**（最小改动接入点）：

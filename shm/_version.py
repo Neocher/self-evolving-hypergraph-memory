@@ -1,12 +1,25 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.23.0"
-__version_info__ = (6, 23, 0)
-__version_name__ = "StateSemantics"
-__release_date__ = "2026-10-01"
+__version__ = "6.24.0"
+__version_info__ = (6, 24, 0)
+__version_name__ = "PowerLaw-Tau"
+__release_date__ = "2026-10-02"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.24.0 (2026-10-02) PowerLaw-Tau:
+  • τ 衰减形式 A/B 开关 — TauConfig/TauDecayConfig 新增 tau_form（默认 "exp"
+    逐点向后兼容 | "pow" 幂律长记忆 τ₀·(1+dt/τc)^(-α) | "frac" K 个对数间隔
+    指数模式加权求和近似重尾核），并加 alpha/frac_K/frac_scale_factor 参数；
+    config/defaults.yaml 同步，env SHM_TAU__TAU_FORM 经泛型覆盖生效；api/app.py
+    把字段透传 TauDecayEngine。
+  • compute_tau 三分支；AdaMem 在 pow 模式 SGD 学 alpha_custom（钳 [0.1,1.0]），
+    exp 模式仍学 tau_decay_custom 且 alpha_custom 恒 None（两路不混）。
+  • 风险保守处理：underflow 哨兵 exponent<-700 仅 exp 分支生效；
+    decay_threshold 与 refresh_on_access 均不改，pow/frac 分支留
+    TODO(P2-12)，与 exp 保持 refresh 控制变量。
+  • 新增 tests/test_tau_form_ab.py（9 用例）+ scripts/tau_form_sim.py 离线仿真
+    （真实 DB 抽样，pow/frac 在 3d+ 长尾显著 > exp）。
 v6.23.0 (2026-10-01) StateSemantics:
   • P3 AtomicFact bi-temporal supersession — 闭合"同 (subject, predicate) 新值
     来了旧值仍 active、检索可能注入旧值"缺口。写侧 create_atomic_fact 落库前查

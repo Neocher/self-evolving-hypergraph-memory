@@ -312,6 +312,10 @@ def _init_services() -> Services:
             tau_decay_seconds=tcfg.tau_decay_seconds,
             decay_threshold=tcfg.decay_threshold,
             refresh_on_access=tcfg.refresh_on_access,
+            tau_form=tcfg.tau_form,
+            alpha=tcfg.alpha,
+            frac_K=tcfg.frac_K,
+            frac_scale_factor=tcfg.frac_scale_factor,
         )
         svc.tau_engine = TauDecayEngine(config=tau_cfg)
         logger.info("TauEngine initialized", decay_seconds=cfg.tau.tau_decay_seconds)
