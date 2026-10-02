@@ -137,6 +137,10 @@ def _r8_load_slot_lexicon():
 #   密集纪律(日期换算/粒度/枚举/范围 + 3 few-shot)对 qwen3-14b 规则过载, 反致失焦/越界。
 #   → 默认翻转回 v1 (PROMPT_V2=0 语义); v2 保留可测但非默认。
 PROMPT_V2 = os.environ.get("PROMPT_V2", "0") == "1"
+# 2026-10-01 cat2 方向性 A/B 开关: V3 (V1+单条粒度规则) 优先于 V2; QA_FILTER=逗号分隔 qa_id 子集
+PROMPT_V3 = os.environ.get("PROMPT_V3", "0") == "1"
+PROMPT_V4 = os.environ.get("PROMPT_V4", "0") == "1"
+QA_FILTER = os.environ.get("QA_FILTER", "")          # 逗号分隔, 如 "conv-26#q0018,conv-26#q0056"
 # 2026-09-04 达摩院 R4A (round2b 决策 §3 R4 行 + r0 研究定论): oracle 注入证据形态 —
 #   db (默认): 金标 evidence 按 dia_id 映射灌库 DB 同形 content (带 '[date: <会话日期>]
 #     [speaker] text' 前缀的原文整条)。旧裸 evidence text (无 [date:]) 注入正是 r0 作废的
@@ -147,6 +151,35 @@ if os.environ.get("ORACLE_INJECT") == "1" and ORACLE_MODE not in ("db", "legacy"
     print(f"[ORACLE] ORACLE_MODE 非法: {ORACLE_MODE!r} (可选 db|legacy), 退出", flush=True)
     sys.exit(2)
 _READER_PROMPT_V1 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
+
+Conversation snippets:
+{ctx}
+
+Question: {question}
+Answer:"""
+
+# 2026-10-01 cat2 方向性 A/B: V3 = V1 原文 + 单条"时间粒度"规则 (刻意轻量,
+# 避开 V2 密集纪律对弱 reader 的过载教训 R2c: v2 57.9% < v1 66.2%)。
+# 只针对 refined judge 铁律 "粒度须精确匹配, 年级 gold 不得用具体月/日答, 月级不得用日答"
+# 的粒度过冲 (gold=月→g4答日 / gold=年→g4答全年区间)。不碰相对↔绝对 (另一维, 先单变量)。
+# PROMPT_V3=1 启用; V3 与 V2 互斥 (V3 优先)。
+_READER_PROMPT_V3 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
+
+TIME GRANULARITY: Answer at exactly the time unit the question asks for — if it asks for a year, give only the year; if a month, only the month; if a specific day, the day. Do not add finer precision than the question requests (do not expand a year into a full date range, and do not give a specific day when the question asks for a month or a year).
+
+Conversation snippets:
+{ctx}
+
+Question: {question}
+Answer:"""
+
+# 2026-10-01 V4: V3 单臂 A/B 后发现"粒度欠冲"副作用 (free-form when 题被一刀砍到月:
+# gold "June 18-19 2022"→"June 2022", "March 10 2023"→"March 2023"). V4 改双向对称:
+# 该精确精确到底 (证据可算出具体日就给日, 别粗化到月/年) + 问粗才粗 (问年/月别加精度)
+# + 不附小时 (除非问时间). 仍是单条规则块, 刻意轻量 (V2 密集纪律对弱 reader 过载教训)
+_READER_PROMPT_V4 = """Answer the question based on the conversation snippets below. Reason across snippets if needed (e.g., infer dates from session timestamps).
+
+TIME GRANULARITY: Match your time answer to the precision the question and the conversation support — no more, no less. For a specific event, give the exact day (or the exact span of days) when the conversation lets you work one out; never coarsen a known day into just a month or a year. Do not attach an hour or time of day unless the question asks for the time. When the question asks for a coarser unit (e.g. 'what year' or 'what month'), give only that unit — no specific day, no hour, and do not expand a year into a full date range.
 
 Conversation snippets:
 {ctx}
@@ -220,7 +253,7 @@ def _eval_log_header_suffix():
 
 
 print(f"v72 配置: pool={RERANK_POOL} top={RERANK_TOP} ctx={CTX_TOKENS} block_size={BLOCK_SIZE} graph_top={GRAPH_TOP}", flush=True)
-print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} TIME_ANCHORS={'on' if TIME_ANCHORS else 'off'} FACT_CLUSTERS={'on' if FACT_CLUSTERS else 'off'} NEG_CLEAN={'on' if NEG_CLEAN else 'off'} | {_eval_log_header_suffix()}", flush=True)
+print(f"judge: {JUDGE_PROVIDER} ({JUDGE_MODEL}) | CAT_FILTER={CAT_FILTER or '全部'} | CTX_DUMP={'on' if CTX_DUMP else 'off'} PROMPT_V3={'on' if PROMPT_V3 else 'off'} PROMPT_V4={'on' if PROMPT_V4 else 'off'} PROMPT_V2={'on' if PROMPT_V2 else 'off'} SESSION_SCOPE={'on' if SESSION_SCOPE else 'off'} TIME_ANCHORS={'on' if TIME_ANCHORS else 'off'} FACT_CLUSTERS={'on' if FACT_CLUSTERS else 'off'} NEG_CLEAN={'on' if NEG_CLEAN else 'off'} | {_eval_log_header_suffix()}", flush=True)
 
 # ═══ P1 cat3 时间戳回填 (2026-09-02) ═══
 # 根因: 评测灌库 created_at 原为 time.time()-(N-midx)*60 (合成均匀回拨, 与真实
@@ -1488,8 +1521,12 @@ else:
 qa_all = [q for q in qa_all if q.get("category") != 5 and q.get("answer")]
 if CAT_FILTER:
     cats = {int(c) for c in CAT_FILTER.split(",") if c.strip().isdigit()}
-    qa_all = [q for q in qa_all if q.get("category", 0) in cats]
+    qa_all = [q for q in qa_all if int(q.get("category", 0)) in cats]
     print(f"类别过滤: {sorted(cats)} → {len(qa_all)} 问", flush=True)
+if QA_FILTER:
+    qids = {s.strip() for s in QA_FILTER.split(",") if s.strip()}
+    qa_all = [q for q in qa_all if q.get("qa_id") in qids]
+    print(f"QA 子集过滤: {len(qa_all)}/{len(qids)} 问 (QA_FILTER)", flush=True)
 if SAMPLE_N > 0:
     qa_all = qa_all[:SAMPLE_N]
 print(f"评测规模: {len(qa_all)} 问", flush=True)
@@ -1746,7 +1783,7 @@ for i, q in enumerate(qa_all):
 
     # R2c 输出协议 prompt v2 (reader prompt 区): 默认 v2 (日期锚/粒度/计数/范围纪律
     # + 3 few-shot), PROMPT_V2=0 回落 v1 原文 (评测侧 A/B 用 env 切换)
-    prompt = (_READER_PROMPT_V2 if PROMPT_V2 else _READER_PROMPT_V1).format(ctx=ctx, question=question)
+    prompt = (_READER_PROMPT_V4 if PROMPT_V4 else _READER_PROMPT_V3 if PROMPT_V3 else _READER_PROMPT_V2 if PROMPT_V2 else _READER_PROMPT_V1).format(ctx=ctx, question=question)
     try:
         pred = llm_generate(prompt, max_tokens=PREDICT_MAX_TOKENS, temperature=0.0)
     except Exception as e:
