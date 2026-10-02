@@ -51,8 +51,8 @@ def test_fusion_channel_pool_deepened_then_filtered():
     assert "qr.config.session_scope_pool = SESSION_SCOPE_POOL" in TEXT
     # scoped 分支调 retrieve 带 scope=scope (直传引擎); off 分支不带 scope (v6.15.0 基线)
     assert "qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts," in TEXT
-    assert "hyde=True, scope=scope)" in TEXT
-    assert "raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=True)" in TEXT
+    assert "hyde=HYDE_ON, scope=scope)" in TEXT
+    assert "raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=HYDE_ON)" in TEXT
     # 无 harness 层结果后过滤: _fuse 检索后段不再出现 node_id → session 判异会话
     assert "_ep_session.get(_nid) != scope" not in TEXT
 

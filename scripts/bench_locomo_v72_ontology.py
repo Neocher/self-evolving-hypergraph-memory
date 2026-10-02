@@ -79,8 +79,8 @@ SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 
 #   于 SESSION_SCOPE A/B (四象限: scope×anchors); scope=on 时注解只落在会话内消息
 #   (DIRECT EVIDENCE 已引擎限定, 污染池上注解是次优的 — 报告 §61/§2 口径)。
 TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
-HYDE_ON = os.environ.get("HYDE", "1") == "1"
-ROUND2_ON = os.environ.get("ROUND2", "1") == "1"  # 2026-10-02: suff/round2 agentic 臂开关 (默认 on 零回归)  # 2026-10-02: HyDE 检索臂开关 (默认 on 零回归; off 隔离候选池漂移变量)
+HYDE_ON = os.environ.get("HYDE", "1") == "1"  # 2026-10-02: HyDE 检索臂开关 (默认 on 零回归; off 隔离候选池漂移变量)
+ROUND2_ON = os.environ.get("ROUND2", "1") == "1"  # 2026-10-02: suff/round2 agentic 臂开关 (默认 on 零回归)
 
 # 2026-09-05 达摩院 R6 (round5 实证研究 §cat1/cat2/cat4 + new_wrong 主回退; 任务书
 #   R6-task.md): 证据形态三改造 — 全部 ctx 装配层附加/过滤, 原文消息逐字不变,
