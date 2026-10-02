@@ -73,6 +73,29 @@ def _sanitize_timeout(timeout: float) -> float:
     return t if t > 0 else 2.0
 
 
+def _sticky_file_dir() -> Optional[str]:
+    """【STICKY 文件级】跨 run 落盘目录：$STICKY_CACHE_DIR/{STICKY_RUN_ID}。
+
+    HYDE_STICKY=1 但未设 STICKY_RUN_ID → None（回落进程内 dict 语义）。
+    目录创建失败 → None（静默回落，不阻断检索路径）。
+    """
+    run_id = (os.environ.get("STICKY_RUN_ID") or "").strip()
+    base = (os.environ.get("STICKY_CACHE_DIR") or "/tmp/sticky_cache").strip()
+    if not run_id:
+        return None
+    d = os.path.join(base, run_id)
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        return None
+
+
+def _sticky_file_path(fdir: str, q: str) -> str:
+    import hashlib
+    return os.path.join(fdir, "hyde_" + hashlib.sha1(q.encode("utf-8", "replace")).hexdigest()[:12] + ".txt")
+
+
 def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
     """生成查询的假设文档段落；任何失败 → None（检索路径零回归）。
 
@@ -90,15 +113,37 @@ def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
     q = (query or "").strip()
     if not q:
         return None
+    # 【STICKY】粘性缓存开关：HYDE_STICKY=1 时缓存命中忽略 TTL（sticky 项不过期，
+    # 消除评测 run 间由假设文档重生成注入的候选池漂移；=0 零回归）。失败项（hypo=None）
+    # 不写缓存、_PERM_FAILED/_last_fail_ts 熔断与 single-flight 语义均不变。
+    # 【2026-10-02 AC-4 修正】跨 run（独立进程）语义需文件级落盘：HYDE_STICKY=1 且
+    # 设 STICKY_RUN_ID 时，假设文档按 run-id 落盘 ($STICKY_CACHE_DIR/{run_id}/hyde_{sha1(q)[:12]}.txt)，
+    # run1 写盘、run2 同 run-id 直接读盘命中不触网；未设 STICKY_RUN_ID 时回落进程内
+    # dict 语义（单测用）。不同 run-id 互不影响。
+    _sticky = os.environ.get("HYDE_STICKY", "0") == "1"
+    _sticky_fdir = _sticky_file_dir() if _sticky else None
     now = time.time()
     if _PERM_FAILED or now - _last_fail_ts < _COOLDOWN_S:
         return None
 
     def _cache_hit(q: str) -> Optional[str]:
-        """缓存命中（TTL 内）返回段落；TTL 过期视为 miss。"""
+        """缓存命中（TTL 内 / sticky 模式）返回段落；否则视为 miss。
+
+        【STICKY 文件级】_sticky_fdir 非空时先查 run 落盘文件（跨 run 语义，
+        文件读成功即命中，绕过内存 LRU/TTL）。
+        """
+        if _sticky_fdir is not None:
+            fp = _sticky_file_path(_sticky_fdir, q)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    return content
+            except Exception:
+                pass
         with _lock:
             hit = _cache.get(q)
-            if hit is not None and time.time() - hit[0] < _CACHE_TTL_S:
+            if hit is not None and (_sticky or time.time() - hit[0] < _CACHE_TTL_S):
                 _cache.move_to_end(q)
                 return hit[1]
         return None
@@ -162,6 +207,13 @@ def generate_hypothesis(query: str, timeout: float = 2.0) -> Optional[str]:
                 _cache[q] = (time.time(), hypo)
                 while len(_cache) > _CACHE_CAPACITY:
                     _cache.popitem(last=False)
+            # 【STICKY 文件级】落盘供同 run-id 后续进程命中（写失败不阻断）
+            if _sticky_fdir is not None:
+                try:
+                    with open(_sticky_file_path(_sticky_fdir, q), "w", encoding="utf-8") as f:
+                        f.write(hypo)
+                except Exception:
+                    pass
             return hypo
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):

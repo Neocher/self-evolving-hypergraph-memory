@@ -1,12 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.24.0"
-__version_info__ = (6, 24, 0)
+__version__ = "6.25.0"
+__version_info__ = (6, 25, 0)
 __version_name__ = "PowerLaw-Tau"
 __release_date__ = "2026-10-02"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.25.0 (2026-10-02) PowerLaw-Tau:
+  • 评测臂 LLM 粘性缓存 (STICKY) — 消除评测 run 间/批内由 HyDE 假设文档与
+    suff_check/followup_query 的 LLM 非确定性注入的 ctx 漂移 (实测生产臂 ctx 臂内
+    重复率仅 6/26; HYDE=0 后 11/26; HYDE=0+ROUND2=0 后 25/26 → suff/followup 是漂移
+    主源)。
+    - retrieval/hyde.py: 新增 env HYDE_STICKY (默认 "0" 零回归); =1 时假设文档缓存
+      命中忽略 _CACHE_TTL_S (sticky 项不过期, LRU 容量 256 不变); _PERM_FAILED/
+      _last_fail_ts 熔断与 single-flight 语义不变, 失败项 (hypo=None) 不写缓存。
+    - scripts/sticky_cache.py (新, 纯 stdlib): suff_check/followup_query 的 prompt/解析/
+      异常逻辑逐字搬入 cached_suff_check/cached_followup_query, 按指纹进程内缓存
+      (suff = sha1(question + top10 每条前 120 字符); followup = sha1(question + missing),
+      \x00 分隔消除跨块拼接歧义); 异常路径维持 True,""/question 兜底且不写缓存。
+    - scripts/bench_locomo_v72_ontology.py: 新增 env STICKY_SUFF (默认 "0" 零回归) +
+      两函数薄委托 sticky_cache (enabled 门控, off 时与 a662aaf 逐字节等价)。
+    - 两开关相互独立; 双 off 零回归。跨 run (独立进程) 语义需 per-run 落盘缓存文件,
+      本轮按进程内语义实现并验证 (已知限制, 报告记录)。
+    - 新增 tests/test_sticky_cache.py (mock 计数断言不触 LLM)。
 v6.24.0 (2026-10-02) PowerLaw-Tau:
   • τ 衰减形式 A/B 开关 — TauConfig/TauDecayConfig 新增 tau_form（默认 "exp"
     逐点向后兼容 | "pow" 幂律长记忆 τ₀·(1+dt/τc)^(-α) | "frac" K 个对数间隔

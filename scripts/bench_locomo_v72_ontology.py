@@ -15,6 +15,7 @@ from rag_v4_common import append_predict_error, ctx_composition
 import time_anchors  # P0-b 确定性时间层: 纯 regex+datetime 日历算术, 零 LLM (同目录)
 import fact_clusters  # R6-A 确定性事实簇聚合: 实体-谓词完整列表 + 事件窗口去重 (同目录)
 import neg_clean     # R6-C 摘要清洁: 否定句过滤 + 组织段题面实体优先 (同目录)
+import sticky_cache  # 2026-10-02: suff_check/followup_query 粘性缓存纯模块 (STICKY_SUFF 开关)
 
 DATA = os.environ.get("DATA_PATH", "/home/admin/shm/data/bench/locomo10.json")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/locomo_og_eval_v71")
@@ -81,6 +82,7 @@ SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 
 TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
 HYDE_ON = os.environ.get("HYDE", "1") == "1"  # 2026-10-02: HyDE 检索臂开关 (默认 on 零回归; off 隔离候选池漂移变量)
 ROUND2_ON = os.environ.get("ROUND2", "1") == "1"  # 2026-10-02: suff/round2 agentic 臂开关 (默认 on 零回归)
+STICKY_SUFF = os.environ.get("STICKY_SUFF", "0") == "1"  # 2026-10-02: suff/followup 粘性缓存开关 (默认 off 零回归; on 去 qwen3.8-max 非确定性源)
 
 # 2026-09-05 达摩院 R6 (round5 实证研究 §cat1/cat2/cat4 + new_wrong 主回退; 任务书
 #   R6-task.md): 证据形态三改造 — 全部 ctx 装配层附加/过滤, 原文消息逐字不变,
@@ -1294,35 +1296,10 @@ def _r6_evidence_forms_ctx(ctx, question, qa_id=None, conv_msgs=None,
 
 # ═══ D. agentic 两轮（EverOS）═══
 def suff_check(question, docs_top):
-    ctx = "\n".join(f"[{j+1}] {d[:120]}" for j, d in enumerate(docs_top[:10]))
-    prompt = f"""You are searching a conversation log. Given the retrieved snippets below, decide whether they are SUFFICIENT to answer the question.
-
-Question: {question}
-
-Retrieved snippets:
-{ctx}
-
-Output STRICT JSON: {{"sufficient": true/false, "missing_info": "what specific info is missing, or empty string"}}
-No other text."""
-    try:
-        raw = llm_generate(prompt, max_tokens=200, temperature=0.0)
-        s, e = raw.find("{"), raw.rfind("}")
-        d = json.loads(raw[s:e + 1]) if s >= 0 and e > s else {}
-        return bool(d.get("sufficient")), str(d.get("missing_info", ""))
-    except Exception:
-        return True, ""
+    return sticky_cache.cached_suff_check(llm_generate, question, docs_top, STICKY_SUFF)
 
 def followup_query(question, missing):
-    prompt = f"""Generate a search query to find the missing information in a conversation log.
-
-Question: {question}
-Missing information needed: {missing}
-
-Output a single search query string. No other text."""
-    try:
-        return llm_generate(prompt, max_tokens=80, temperature=0.0).strip()[:200]
-    except Exception:
-        return question
+    return sticky_cache.cached_followup_query(llm_generate, question, missing, STICKY_SUFF)
 
 def parse_session_ts(ts):
     """会话时间锚 → epoch float。数字直通; ISO/自然语言 ('1:56 pm on 8 May, 2023')
