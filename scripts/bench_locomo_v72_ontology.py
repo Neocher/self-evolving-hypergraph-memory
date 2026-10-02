@@ -1518,7 +1518,7 @@ if PREDICT_QUESTIONS:
 else:
     for item in data:
         qa_all.extend(item.get("qa", []))
-qa_all = [q for q in qa_all if q.get("category") != 5 and q.get("answer")]
+qa_all = [q for q in qa_all if int(q.get("category", 0)) != 5 and q.get("answer")]
 if CAT_FILTER:
     cats = {int(c) for c in CAT_FILTER.split(",") if c.strip().isdigit()}
     qa_all = [q for q in qa_all if int(q.get("category", 0)) in cats]
