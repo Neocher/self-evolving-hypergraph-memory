@@ -79,6 +79,8 @@ SESSION_SCOPE_POOL = int(os.environ.get("SESSION_SCOPE_POOL", "500"))  # scoped 
 #   于 SESSION_SCOPE A/B (四象限: scope×anchors); scope=on 时注解只落在会话内消息
 #   (DIRECT EVIDENCE 已引擎限定, 污染池上注解是次优的 — 报告 §61/§2 口径)。
 TIME_ANCHORS = os.environ.get("TIME_ANCHORS", "0") == "1"
+HYDE_ON = os.environ.get("HYDE", "1") == "1"
+ROUND2_ON = os.environ.get("ROUND2", "1") == "1"  # 2026-10-02: suff/round2 agentic 臂开关 (默认 on 零回归)  # 2026-10-02: HyDE 检索臂开关 (默认 on 零回归; off 隔离候选池漂移变量)
 
 # 2026-09-05 达摩院 R6 (round5 实证研究 §cat1/cat2/cat4 + new_wrong 主回退; 任务书
 #   R6-task.md): 证据形态三改造 — 全部 ctx 装配层附加/过滤, 原文消息逐字不变,
@@ -949,9 +951,9 @@ def _fuse(q, seen, docs, session_ts=None, scope=None):
         # off (scope=None) → 调 retrieve 不带 scope, v6.15.0 全库逐字节等价基线。
         if scope is not None:
             raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts,
-                              hyde=True, scope=scope)
+                              hyde=HYDE_ON, scope=scope)
         else:
-            raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=True)
+            raw = qr.retrieve(q, level=RetrievalLevel.FUSION, session_ts=session_ts, hyde=HYDE_ON)
     except Exception:
         return
     for r in raw:
@@ -1675,7 +1677,9 @@ for i, q in enumerate(qa_all):
     # agentic 协同：sufficiency 基于分区后完整证据（保守触发——v71 教训 76% 太高）
     _processed_q += 1
     enough = True
-    if len(docs) >= 10:
+    if not ROUND2_ON:
+        pass  # ROUND2=0: 跳过 suff_check+round2 (检索臂确定性隔离探针)
+    elif len(docs) >= 10:
         try:
             enough, missing = suff_check(question, docs[:10])
         except Exception:
