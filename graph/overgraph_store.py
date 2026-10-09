@@ -498,6 +498,82 @@ class OverGraphCircuitBreaker(CircuitBreaker):
         super().record_failure(None)
 
 
+class _WriterPriorityLock:
+    """写线程优先的引擎互斥锁（v6.26 公平性修复，替代 threading.RLock）。
+
+    RLock 无调度公平性：检索洪峰（社区扩召回逐社区取锁）持续抢锁时，写线程
+    `shm-writer-worker` 反复 blocked → 写队列积压 → 503；/health 自身查图同样
+    排队 → 10~23s。本锁保持「互斥 + 可重入」（引擎非线程安全的串行化契约不变），
+    唯一区别是绑定写线程 ident 后的调度公平性：
+      - 写线程 acquire 优先于等待中的读者；
+      - 读者在写线程等待时让行（新读者同样 defer）。
+    可重入语义与 RLock 一致（owner + depth，同线程嵌套 acquire 不死锁）。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._owner: int | None = None
+        self._depth = 0
+        self._writers_waiting = 0
+        self._writer_ident: int | None = None
+
+    def bind_writer(self, ident: int | None) -> None:
+        """绑定写线程 ident（None 解绑；调用方在 WriteQueue 创建后注入）。"""
+        with self._cond:
+            self._writer_ident = ident
+
+    def acquire(self, timeout: float | None = None,
+                writer: bool | None = None) -> bool:
+        """获取锁。writer=None 时按绑定的写线程 ident 自动判定；超时返回 False。"""
+        me = threading.get_ident()
+        if writer is None:
+            writer = self._writer_ident is not None and me == self._writer_ident
+        with self._cond:
+            if self._owner == me:  # 重入
+                self._depth += 1
+                return True
+            if writer:
+                self._writers_waiting += 1
+            try:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while True:
+                    # 空闲时：写者无条件入场；读者仅在无写者等待时入场（让行）
+                    if self._owner is None and (writer or self._writers_waiting == 0):
+                        self._owner = me
+                        self._depth = 1
+                        return True
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return False
+                    if deadline is None:
+                        self._cond.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        self._cond.wait(remaining)
+            finally:
+                if writer:
+                    self._writers_waiting -= 1
+
+    def release(self) -> None:
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner != me:
+                raise RuntimeError("release of un-acquired _WriterPriorityLock")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._cond.notify_all()
+
+    def __enter__(self) -> "_WriterPriorityLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.release()
+        return False
+
+
 class OverGraphStore:
     """OverGraph-backed graph store（与 GraphLiteStore 同接口契约）。
 
@@ -515,12 +591,38 @@ class OverGraphStore:
                         "dense_vector_metric": "cosine"})()
         self.circuit_breaker = OverGraphCircuitBreaker(cb_config)
         # session 访问锁：OverGraph 引擎非线程安全防护 + 与 GraphLiteStore 相同的
-        # 串行化契约（RLock 可重入，写线程内嵌套调用不死锁）
-        self._session_lock = threading.RLock()
+        # 串行化契约。v6.26 起用 _WriterPriorityLock（写线程优先，防检索洪峰饿死
+        # 写线程 → 写队列 503）；可重入语义保留（写线程内嵌套调用不死锁）。
+        self._session_lock = _WriterPriorityLock()
         # thread-local 降级信号（query_cypher 永不抛契约，P3a R7）
         self._local = threading.local()
 
     # ─── 连接 ─────────────────────────────────────────
+
+    def bind_writer_thread(self, ident: int | None) -> None:
+        """绑定写队列 worker 线程 ident（写线程优先锁调度用）。
+
+        api/app.py 在创建 WriteQueue 后注入 worker_ident；写线程执行
+        _locked_upsert_node 时自动取得优先权，检索洪峰不再饿死写者。
+        """
+        self._session_lock.bind_writer(ident)
+
+    def health_probe(self, timeout: float = 0.5) -> bool:
+        """亚秒连通探针：timeout 内取得引擎锁并执行 1 条点查询。
+
+        锁竞争超时/异常 → False（调用方降级 degraded），**不持锁返回**——这是
+        /health 亚秒的关键：健康检查自身绝不因锁竞争而排队 10~23 秒。
+        """
+        if not self._session_lock.acquire(timeout=timeout, writer=False):
+            return False
+        try:
+            assert self._db is not None
+            self._db.get_node_by_key(LABEL_EPISODE, "__health_probe__")
+            return True
+        except Exception:
+            return False
+        finally:
+            self._session_lock.release()
 
     @property
     def conn(self):
@@ -544,11 +646,18 @@ class OverGraphStore:
     def _locked_upsert_node(self, label: str, key: str, props: dict,
                             dense_vector=None) -> None:
         """串行化 typed upsert_node（props 剔 None —— 对齐 GraphLite 缺省字段
-        IS NULL 语义）。"""
-        with self._session_lock:
+        IS NULL 语义）。
+
+        v6.26：upsert 是无歧义写操作，显式以 writer=True 取锁 —— 写线程
+        （无论是否绑定 worker ident）优先于检索读者，杜绝检索洪峰饿死写者。
+        """
+        self._session_lock.acquire(writer=True)
+        try:
             assert self._db is not None
             clean = {k: v for k, v in props.items() if v is not None}
             self._db.upsert_node(label, str(key), props=clean, dense_vector=dense_vector)
+        finally:
+            self._session_lock.release()
 
     def connect(self) -> None:
         """Open/create OverGraph DB（dense_vector_dimension 必配，否则向量写入报错）。
@@ -1570,6 +1679,43 @@ class OverGraphStore:
                 "tau_value": row.get("tau_value", 0.0) or 0.0,
             })
         return members
+
+    def get_community_members_batch(
+        self, community_ids: list[str], limit: int = 10,
+    ) -> dict[str, list[dict]]:
+        """一次取回多社区成员（N 次 get_community_members → 1 次 GQL）。
+
+        与逐社区 get_community_members 结果等价：同一 ORDER BY tau_initial DESC，
+        每社区在 Python 侧截断 limit 条。检索洪峰下把 N 次锁竞争降为 1 次，
+        是写线程不再被社区扩召回饿死的直接修复（AC1 方案②）。
+        """
+        if not community_ids:
+            return {}
+        rows = self.query_cypher(
+            f"MATCH (c:{LABEL_COMMUNITY})-[:COMMUNITY_MEMBER]->(e:{LABEL_EPISODE}) "
+            "WHERE c.id IN $cids "
+            "RETURN c.id AS community_id, e.id AS member_id, e.content AS content, "
+            "e.archived AS archived, e.fact_track AS fact_track, "
+            "e.tau_initial AS tau_value "
+            "ORDER BY e.tau_initial DESC",
+            {"cids": list(community_ids)},
+        )
+        out: dict[str, list[dict]] = {cid: [] for cid in community_ids}
+        for row in rows:
+            cid = row.get("community_id", "") or ""
+            mid = row.get("member_id", "") or ""
+            if not cid or not mid or cid not in out:
+                continue
+            if len(out[cid]) >= int(limit):
+                continue
+            out[cid].append({
+                "member_id": mid,
+                "content": row.get("content", "") or "",
+                "archived": row.get("archived", False),
+                "fact_track": row.get("fact_track", "active") or "active",
+                "tau_value": row.get("tau_value", 0.0) or 0.0,
+            })
+        return out
 
     # ─── Hebbian ───────────────────────────────────────
 

@@ -2377,13 +2377,32 @@ class QueryRouter:
                 [c.get("summary", "") or "" for c in communities],
             )
             existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
+            # 【v6.26 锁公平】N 次 get_community_members → 1 次批量取回，减少
+            # 检索洪峰下的锁竞争次数（写线程不再被逐社区查询饿死）。无批量原语
+            # 的 store（测试 mock/旧后端）回落逐社区查询，语义不变。
+            relevant_comm_ids = [
+                comm.get("community_id", "")
+                for comm, rel_score in zip(communities, relevance)
+                if rel_score >= threshold and comm.get("community_id")
+            ]
+            if not relevant_comm_ids:
+                return results
+            if hasattr(store, "get_community_members_batch"):
+                members_by_comm = store.get_community_members_batch(
+                    relevant_comm_ids, limit=max_members
+                )
+                if not isinstance(members_by_comm, dict):
+                    return results
+            else:
+                members_by_comm = {
+                    cid: store.get_community_members(cid, limit=max_members)
+                    for cid in relevant_comm_ids
+                }
             extra: list[dict] = []
             for comm, rel_score in zip(communities, relevance):
                 if rel_score < threshold:
                     continue
-                members = store.get_community_members(
-                    comm.get("community_id", ""), limit=max_members
-                )
+                members = members_by_comm.get(comm.get("community_id", ""), [])
                 if not isinstance(members, list):
                     continue
                 for m in members:

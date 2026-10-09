@@ -219,6 +219,11 @@ def _init_services() -> Services:
         svc.write_queue = WriteQueue(max_pending=100, wait_timeout=30.0, ping_fn=None)
         logger.info("WriteQueue initialized", max_pending=100, wait_timeout=30.0,
                     ping_probe=False)
+        # 【v6.26 锁公平】把写线程 ident 绑给 graph_store 的写线程优先锁——
+        # 写线程执行 _locked_upsert_node 时优先于检索读者，杜绝检索洪峰饿死写者。
+        _bind_writer = getattr(svc.graph_store, "bind_writer_thread", None)
+        if _bind_writer is not None:
+            _bind_writer(svc.write_queue.worker_ident)
     except Exception as e:
         errors.append(f"WriteQueue: {e}")
         logger.warning("WriteQueue init failed (fallback: sync direct writes)", error=str(e))

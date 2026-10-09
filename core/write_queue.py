@@ -168,6 +168,11 @@ class WriteQueue:
         # 60s → 长写期间 _last_activity 持续新鲜，看门狗不误报。
         self._heartbeat_interval: float = 30.0
 
+    @property
+    def worker_ident(self) -> Optional[int]:
+        """写线程 ident（供 graph_store 绑定写线程优先锁，v6.26）。"""
+        return self._worker_ident
+
     # ─── 事件循环侧：唯一入口 ───────────────────────────
 
     async def submit(

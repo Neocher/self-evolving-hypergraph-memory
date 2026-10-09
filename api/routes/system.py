@@ -166,6 +166,20 @@ async def get_audit_trail(
     )
 
 
+def _graph_probe(store, timeout: float = 0.3) -> bool:
+    """亚秒图连通探针：优先 store.health_probe(timeout)，旧后端回落合成行探测。"""
+    probe = getattr(store, "health_probe", None)
+    if probe is not None:
+        try:
+            return bool(probe(timeout))
+        except Exception:
+            return False
+    try:
+        return bool(store.query_cypher("RETURN 1 AS test"))
+    except Exception:
+        return False
+
+
 @router.get("/health", summary="深度健康检查")
 async def health_check(
     deps: Services = Depends(get_services),
@@ -233,12 +247,24 @@ async def health_check(
         # 重算整体状态（check() 在 graph_store=None 时将 status 误判为 error）
         health.status = _recompute_status(health)
     else:
-        health: HealthCheckResult = checker.check()
-        # 刷新缓存
-        with _HEALTH_STATS_CACHE_LOCK:
-            _HEALTH_STATS_CACHE["node_count"] = health.node_count
-            _HEALTH_STATS_CACHE["hyperedge_count"] = health.hyperedge_count
-            _HEALTH_STATS_CACHE_TIME = start
+        # 【v6.26 亚秒】有界连通探针先行：探针失败 = 锁竞争/图不可达，跳过
+        # COUNT 全扫（正是 10~23s 的来源），降级 + 缓存计数（可 stale）；
+        # 探针成功（锁空闲）或 graph_store 缺失时才跑完整 check()。
+        if deps.graph_store is None or _graph_probe(deps.graph_store):
+            health = checker.check()
+            with _HEALTH_STATS_CACHE_LOCK:
+                _HEALTH_STATS_CACHE["node_count"] = health.node_count
+                _HEALTH_STATS_CACHE["hyperedge_count"] = health.hyperedge_count
+                _HEALTH_STATS_CACHE_TIME = start
+        else:
+            health = HealthCheckResult(
+                status="degraded",
+                graph_connected=False,
+                faiss_loaded=False,
+            )
+            with _HEALTH_STATS_CACHE_LOCK:
+                health.node_count = _HEALTH_STATS_CACHE["node_count"]
+                health.hyperedge_count = _HEALTH_STATS_CACHE["hyperedge_count"]
 
     cb = getattr(deps.graph_store, "circuit_breaker", None)
     if cb is not None:

@@ -268,12 +268,30 @@ class TestF5SessionLock:
     """F5: GraphLiteStore session 访问锁（RLock 可重入 + 并发写串行化）。"""
 
     def test_session_lock_is_rlock(self, overgraph_store):
-        """_session_lock 应为 threading.RLock（写线程内嵌套调用不死锁）。
+        """_session_lock 应为可重入互斥锁（写线程内嵌套调用不死锁）。
 
-        注意：threading.RLock 在本环境是工厂函数而非类，isinstance 第二参
-        用 RLock() 实例的类型。
+        v6.26 起由 threading.RLock 换成 _WriterPriorityLock（写线程优先），
+        断言改为行为等价：同线程嵌套 acquire 不死锁（可重入）+ 跨线程互斥。
         """
-        assert isinstance(overgraph_store._session_lock, type(threading.RLock()))
+        lock = overgraph_store._session_lock
+        with lock:
+            # 同线程重入：不抛异常、不阻塞（RLock 语义）
+            assert lock.acquire() is True
+            lock.release()
+        # 跨线程互斥：持有期间另一线程 acquire(timeout) 应超时失败
+        acquired: list[bool] = []
+
+        def _try_acquire() -> None:
+            ok = lock.acquire(timeout=0.1)
+            acquired.append(ok)
+            if ok:
+                lock.release()
+
+        with lock:
+            t = threading.Thread(target=_try_acquire)
+            t.start()
+            t.join(timeout=5)
+        assert acquired == [False], f"跨线程应互斥，got {acquired}"
 
     def test_concurrent_session_access_serialized(self, overgraph_store):
         """4 线程 × 5 次 create_episode：无异常、无挂起、20 条全部落库。"""
