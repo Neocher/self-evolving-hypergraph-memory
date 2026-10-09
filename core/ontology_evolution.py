@@ -21,6 +21,8 @@ from typing import Any, Optional
 
 from core.ontology_validator import ONTOLOGY_TYPES
 from core.validation_gate import held_out_paired_gate
+# 【v6.26.0】未匹配概念的显式通道（研究落地）—— 热路径 fail-open
+from core.ontology_staging import note_classification, record_unmatched
 
 logger = logging.getLogger(__name__)
 
@@ -468,11 +470,18 @@ def _log_drift_if_skip(result: Optional[dict]) -> None:
 
 
 def classify_with_extended(text: str, entities: list, extended: Optional[dict] = None) -> str:
-    """合并后分类：遍历 {**extended, **ONTOLOGY_TYPES}，first-match-wins。"""
+    """合并后分类：遍历 {**extended, **ONTOLOGY_TYPES}，first-match-wins。
+
+    【v6.26.0】与 ``OntologyValidator._classify_ontology_type`` 同口径：
+    未匹配不再静默 —— 记入 ``core.ontology_staging`` 候选台账并计入漂移代理。
+    """
     text_lower = (text or "").lower()
     for otype, info in merged_types(extended).items():
         if any(k in text_lower for k in info.get("conflict_keys", [])):
+            note_classification(True)
             return otype
+    note_classification(False)
+    record_unmatched(text, entities)
     return "generic_fact"
 
 

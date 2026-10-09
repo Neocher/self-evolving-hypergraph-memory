@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+# 【v6.26.0】未匹配概念的显式通道（研究落地）—— 热路径 fail-open，绝不阻塞写入
+from core.ontology_staging import note_classification, record_unmatched
+
 # 确保日志输出到 stderr（即使 structlog 不可用）
 _log = logging.getLogger(__name__)
 if not _log.handlers:
@@ -273,12 +276,20 @@ class OntologyValidator:
         return self._ontology_types
 
     def _classify_ontology_type(self, text: str, entities: List[str]) -> str:
-        """根据文本内容推断本体类型。"""
+        """根据文本内容推断本体类型。
+
+        【v6.26.0】未匹配时**不再静默降级**：走 ``core.ontology_staging``
+        记录候选（可审计 / 可晋升 / 可度量漂移），而非只返回 generic_fact
+        丢掉「本体缺什么」这一信息。staging 内部 fail-open，不阻塞写入。
+        """
         text_lower = text.lower()
         for otype, info in self._merged_ontology_types().items():
             keys = info["conflict_keys"]
             if any(k in text_lower for k in keys):
+                note_classification(True)
                 return otype
+        note_classification(False)
+        record_unmatched(text, entities)
         return "generic_fact"
 
     def _extract_values(self, text: str, ontology_type: str) -> Dict[str, str]:

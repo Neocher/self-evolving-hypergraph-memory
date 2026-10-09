@@ -1,12 +1,29 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.25.0"
-__version_info__ = (6, 25, 0)
-__version_name__ = "PowerLaw-Tau"
-__release_date__ = "2026-10-02"
+__version__ = "6.26.0"
+__version_info__ = (6, 26, 0)
+__version_name__ = "Ontology-Staging"
+__release_date__ = "2026-10-09"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.26.0 (2026-10-09) Ontology-Staging:
+  • 未匹配概念的显式通道（研究落地）—— 修复「静默降级」短板。
+    根因: OntologyValidator._classify_ontology_type 与
+    ontology_evolution.classify_with_extended 无法匹配任何本体类型时
+    直接返回 "generic_fact"，既不记录「什么没匹配上」，也无晋升路径；
+    概念空间因此永远追不上真实语料，且缺口不可观测（本体漂移无指标）。
+    修复: 新增 core/ontology_staging.py —— 未匹配文本按归一化键去重记账
+    （计数/样本/证据 episode 链/实体），提供 promote/reject 裁决与
+    build_extended_patch() 产出可合入 ontology_extended.json 的片段
+    （默认不改活本体，避免自动演化污染全局）；并给出 unmatched_rate
+    作为廉价漂移代理指标（对齐 OntoDrift「度量新数据落在本体之外的比例」）。
+    接线: 两处分类入口命中→note_classification(True) / 未命中→
+    note_classification(False)+record_unmatched()；开关 SHM_ONTOLOGY_STAGING
+    （"0"/"false"/"" → 关，默认开）；热路径内存累加 + 每 20 次变更异步落盘，
+    fail-open 绝不阻塞写入。
+    验证: 新增 tests/test_ontology_staging.py（30 用例，含公共入口集成）；
+    全量 1537 passed / 2 skipped / 5 deselected。
 v6.25.0 (2026-10-02) PowerLaw-Tau:
   • 评测臂 LLM 粘性缓存 (STICKY) — 消除评测 run 间/批内由 HyDE 假设文档与
     suff_check/followup_query 的 LLM 非确定性注入的 ctx 漂移 (实测生产臂 ctx 臂内
