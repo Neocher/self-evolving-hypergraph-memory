@@ -1,12 +1,37 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.26.0"
-__version_info__ = (6, 26, 0)
-__version_name__ = "Ontology-Staging"
-__release_date__ = "2026-10-09"
+__version__ = "6.27.0"
+__version_info__ = (6, 27, 0)
+__version_name__ = "LockFairness"
+__release_date__ = "2026-10-10"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.27.0 (2026-10-10) LockFairness:
+  • 锁公平 — 消除 OverGraph 全局锁饿死导致的写队列 503 与 /health 劣化
+    （交付方=太极/DSH，Hermes 诊断 + 独立核验）。
+    根因: OverGraphStore._session_lock 是单把全局互斥锁，串行化所有图操作；
+    检索侧 _community_expansion 为每个相关社区各调一次 get_community_members，
+    每次都取锁 → 持锁时间长 → 写线程 _persist_entities（dream 管道）取不到锁 →
+    写队列积压至上限 → WriteQueueFullError → HTTP 503；/health 自身也要查图，
+    同样排队 → 19~23 秒。py-spy 5 次采样实证（检索线程持锁 active / 写线程反复 blocked）。
+    修复:
+    - graph/overgraph_store.py: threading.RLock → _WriterPriorityLock（写线程优先；
+      同线程可重入 + 跨线程互斥）；新增 bind_writer_thread() 与有界
+      health_probe(timeout=0.5)，超时不持锁直接返回。
+    - retrieval/query_router.py: N 次 get_community_members → 1 次批量取回；
+      无批量原语的 store（测试 mock/旧后端）回落逐社区查询，检索语义不变。
+    - api/app.py: 把 WriteQueue 的 worker_ident 绑给写优先锁。
+    - api/routes/system.py: /health 连通性探测改用有界 health_probe，超时降级 degraded。
+    - core/write_queue.py: 新增只读 worker_ident property（不动背压/看门狗）。
+    验证: 新增 tests/test_overgraph_lock_fairness.py（6 用例 / 21 断言 / 真并发）
+    与 scripts/stress_overgraph_lock_fairness.py 压测脚本；
+    RED→GREEN 可复现（暂存实现 6 failed → 恢复 6 passed）；
+    全量 1544 passed / 2 skipped / 5 deselected / 0 failed；
+    压测（8 并发读者 + 50 持续写入）写队列 503 = 0 次、/health P95 = 0.301s（基线 23.2s）；
+    生产实测（重启后）503 = 0 次、/health 0.12~0.30s。
+    既有测试 test_v529_concurrency_fixes.py 的锁断言同步升级为行为等价
+    （同线程可重入 + 跨线程互斥），断言强度不减。
 v6.26.0 (2026-10-09) Ontology-Staging:
   • 未匹配概念的显式通道（研究落地）—— 修复「静默降级」短板。
     根因: OntologyValidator._classify_ontology_type 与

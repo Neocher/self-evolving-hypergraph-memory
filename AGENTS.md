@@ -50,7 +50,7 @@ SHM v6.2.x — 自演化超图记忆系统。Python 3.11+, FastAPI, OverGraph（
 - commit 三段式：根因→修复→验证
 - 发布后打 tag `vX.Y.Z` 并推送
 - **release 必须带标题**：`gh release create vX.Y.Z --title "vX.Y.Z 特性摘要 — ..." --notes-file ...`，name 字段禁空（历史教训 2026-08-12：v5.26.0/26.1/27.0 三连空标题补过后 v5.27.1 再犯；补标题用 `gh release edit`）
-- **发布时同步 GitHub about description**：`gh repo edit --description "SHM vX.Y — ..."`（版本号与功能表述跟随 bump；历史教训 2026-08-11：about 停在 v5.21 漂移 3 个版本）。发布 checklist 见 trio-concerto skill 发布段
+- **GitHub about description 禁止出现版本号**（用户 2026-10-09 指示，覆盖此前所有相反约定）：`gh repo edit --description "<纯功能描述>"`，**description 内不得包含 `SHM vX.Y`、版本代号或任何形式版本号**。版本以 tag / release 为唯一出处，about 只讲能力。历史教训 2026-08-11（about 停在 v5.21 漂移 3 个版本）当时的对策「跟版本号一起 bump」已被否 —— 根治办法是 about 里根本不写版本，否则每次发布都要靠人记得同步。发布 checklist 见 trio-concerto skill 发布段
 
 ## 项目结构速查
 

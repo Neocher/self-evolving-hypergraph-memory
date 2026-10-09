@@ -18,8 +18,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
+from pathlib import Path
+
+# 脚本直跑时把仓库根加入 sys.path（scripts/ 不是包，docstring 的运行命令依赖此行）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.routes._deps import Services
 from api.routes.system import health_check
