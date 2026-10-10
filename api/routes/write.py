@@ -616,6 +616,17 @@ async def create_episode(
                         if float(_s) > _max_sim:
                             _max_sim = float(_s)
                     _surprise = 1.0 - _max_sim  # 相似度高 → 惊奇度低（重复信息）
+                    # 【P1 世界模型】α>0 时融合零训练预测残差 surprise_Σ；
+                    # 默认 α=0 → 不触发额外统计查询，结果恒等于 1-max_sim（零回归）。
+                    _wm_alpha = getattr(_wgc, "world_model_alpha", 0.0) or 0.0
+                    if _wm_alpha > 0.0:
+                        try:
+                            from core.world_model import PredictSigma, fuse_surprise
+                            _predictor = PredictSigma(store=deps.graph_store, alpha=_wm_alpha)
+                            _surprise = fuse_surprise(
+                                _surprise, _predictor.surprise_from_content(req.content), _wm_alpha)
+                        except Exception as _wm_exc:
+                            logger.warning("world model predict failed (non-fatal): %s", _wm_exc)
                     # 长期效用：实体丰富度代理（内容长度 + 数字/专名密度）
                     _alpha = sum(ch.isalpha() for ch in req.content) if req.content else 0
                     _len_u = min(len(req.content) / 200.0, 1.0)

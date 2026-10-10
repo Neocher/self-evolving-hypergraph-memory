@@ -87,6 +87,7 @@ class WriteGateConfig:
     utility_min: float = 0.5     # 效用下限（低于 → 忽略，即使高惊奇）
     cache_tau: float = 0.5       # 快速缓存 τ_initial（默认 1.0 的降级）
     top_k: int = 3              # 相似检索候选数
+    world_model_alpha: float = 0.0  # P1 世界模型融合权重（0=关闭，零回归）
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.surprise_cache <= self.surprise_deep <= 1.0:
@@ -95,6 +96,9 @@ class WriteGateConfig:
                 f"<= deep({self.surprise_deep}) <= 1")
         if not 0.0 < self.cache_tau <= 1.0:
             raise ValueError(f"WriteGateConfig.cache_tau={self.cache_tau} 必须 ∈ (0, 1]")
+        if not 0.0 <= self.world_model_alpha <= 1.0:
+            raise ValueError(
+                f"WriteGateConfig.world_model_alpha={self.world_model_alpha} 必须 ∈ [0, 1]")
 
 
 @dataclass
