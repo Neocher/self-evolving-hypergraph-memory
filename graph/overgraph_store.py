@@ -266,6 +266,20 @@ def _rewrite_edges(query: str) -> str:
     return head + "CREATE" + tail + "".join(sets)
 
 
+def _esc_literal(s: str) -> str:
+    """GQL 单引号字面量转义（OverGraph 单引号字符串支持 \\' 与 \\\\ 转义）。
+
+    顺序必须反斜杠先行 —— 后续步骤引入的反斜杠不会被二次转义；换行/回车
+    转为转义序列，杜绝字面量内裸换行破坏查询语义（注入面收敛）。
+    """
+    return (
+        s.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
 def _rewrite_like(query: str) -> str:
     """`LIKE 'apple%'` → `CONTAINS 'apple'`（OverGraph 无 LIKE；前缀语义等价）。"""
 
@@ -273,7 +287,7 @@ def _rewrite_like(query: str) -> str:
         literal = m.group(1)
         if literal.endswith("%"):
             literal = literal[:-1]
-        return f"CONTAINS '{literal}'"
+        return f"CONTAINS '{_esc_literal(literal)}'"
 
     return re.sub(r"LIKE\s+'([^']*)'", _repl, query)
 
@@ -892,9 +906,10 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (f:{LABEL_FACT})-[r:{LABEL_FACT_MENTIONS}]->(ep:{LABEL_EPISODE}) "
-                f"WHERE ep.id = '{episode_id}' RETURN f.id AS id, f.subject AS subject, "
+                f"WHERE ep.id = $eid RETURN f.id AS id, f.subject AS subject, "
                 f"f.predicate AS predicate, f.object AS object, f.valid_time AS valid_time "
-                f"LIMIT {int(limit)}"
+                f"LIMIT {int(limit)}",
+                {"eid": str(episode_id)},
             )
             rows = (result or {}).get("rows", [])
             out = []
@@ -928,13 +943,14 @@ class OverGraphStore:
             return []
         try:
             result = self._locked_execute_gql(
-                f"MATCH (f:{LABEL_FACT}) WHERE f.subject CONTAINS '{subj}' "
-                f"OR f.subject CONTAINS '{subj.lower()}' "
+                f"MATCH (f:{LABEL_FACT}) WHERE f.subject CONTAINS $subj "
+                f"OR f.subject CONTAINS $subj_lower "
                 f"AND (f.archived IS NULL OR f.archived = false) "
                 f"RETURN f.id AS id, f.subject AS subject, f.predicate AS predicate, "
                 f"f.object AS object, f.valid_time AS valid_time, "
                 f"f.superseded_at AS superseded_at "
-                f"LIMIT {int(limit)}"
+                f"LIMIT {int(limit)}",
+                {"subj": subj, "subj_lower": subj.lower()},
             )
             rows = (result or {}).get("rows", [])
             out = []
@@ -973,11 +989,12 @@ class OverGraphStore:
         if not subj or not pred:
             return []
         try:
-            where = f"f.subject = '{subj}' AND f.predicate = '{pred}'"
+            where = "f.subject = $subj AND f.predicate = $pred"
             if not include_superseded:
                 where += " AND (f.superseded_at IS NULL)"
             result = self._locked_execute_gql(
-                f"MATCH (f:{LABEL_FACT}) WHERE {where} RETURN f"
+                f"MATCH (f:{LABEL_FACT}) WHERE {where} RETURN f",
+                {"subj": subj, "pred": pred},
             )
             return [self._flatten_row(r, "f") for r in (result or {}).get("rows", [])]
         except Exception:
@@ -1046,7 +1063,8 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (e:{LABEL_ENTITY})-[r:{LABEL_MENTIONS}]->(ep:{LABEL_EPISODE}) "
-                f"WHERE e.id = '{eid.get('id')}' RETURN ep.id AS ep_id LIMIT {int(limit)}"
+                f"WHERE e.id = $eid RETURN ep.id AS ep_id LIMIT {int(limit)}",
+                {"eid": str(eid.get("id"))},
             )
             rows = (result or {}).get("rows", [])
             out = []
@@ -1063,7 +1081,8 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (e:{LABEL_ENTITY})-[r:{LABEL_MENTIONS}]->(ep:{LABEL_EPISODE}) "
-                f"WHERE ep.id = '{episode_id}' RETURN e.name AS ent_name LIMIT {int(limit)}"
+                f"WHERE ep.id = $eid RETURN e.name AS ent_name LIMIT {int(limit)}",
+                {"eid": str(episode_id)},
             )
             out = []
             for row in (result or {}).get("rows", []):
@@ -1144,9 +1163,10 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (e:{LABEL_ENTITY})-[r]->(n:{LABEL_ENTITY}) "
-                f"WHERE e.id = '{entity_id}' "
+                f"WHERE e.id = $eid "
                 f"RETURN n.id AS dst_id, r.predicate AS predicate, "
-                f"r.confidence AS confidence LIMIT 200"
+                f"r.confidence AS confidence LIMIT 200",
+                {"eid": str(entity_id)},
             )
             out = []
             for row in (result or {}).get("rows", []):
@@ -1201,15 +1221,17 @@ class OverGraphStore:
         try:
             result = self._locked_execute_gql(
                 f"MATCH (e:{LABEL_ENTITY})-[r]->(n:{LABEL_ENTITY}) "
-                f"WHERE e.id = '{entity_id}' AND r.predicate IS NOT NULL "
+                f"WHERE e.id = $eid AND r.predicate IS NOT NULL "
                 f"RETURN n.id AS dst_id, r.predicate AS predicate, "
-                f"r.confidence AS confidence, 'out' AS direction LIMIT 200"
+                f"r.confidence AS confidence, 'out' AS direction LIMIT 200",
+                {"eid": str(entity_id)},
             )
             result_in = self._locked_execute_gql(
                 f"MATCH (n:{LABEL_ENTITY})-[r]->(e:{LABEL_ENTITY}) "
-                f"WHERE e.id = '{entity_id}' AND r.predicate IS NOT NULL "
+                f"WHERE e.id = $eid AND r.predicate IS NOT NULL "
                 f"RETURN n.id AS dst_id, r.predicate AS predicate, "
-                f"r.confidence AS confidence, 'in' AS direction LIMIT 200"
+                f"r.confidence AS confidence, 'in' AS direction LIMIT 200",
+                {"eid": str(entity_id)},
             )
             rows = ((result or {}).get("rows", []) + (result_in or {}).get("rows", []))
             for row in rows:
@@ -1478,6 +1500,7 @@ class OverGraphStore:
             return []
         from core.entity_resolver import normalize_entity_name
         patterns: list[str] = []
+        params: dict[str, str] = {}
         seen: set[str] = set()
         for eid in entity_ids:
             norm = normalize_entity_name(eid)
@@ -1485,9 +1508,14 @@ class OverGraphStore:
                 continue
             seen.add(norm)
             # N6 词边界后置过滤：'apple' 命中 'Apple Inc' 但不命中 "Applebee's"
+            i = len(params)
+            k_eq = f"norm_eq_{i}"
+            k_contains = f"norm_contains_{i}"
+            params[k_eq] = norm
+            params[k_contains] = norm + " "
             patterns.append(
-                f"(LOWER(p.entity_id) = '{norm}' "
-                f"OR LOWER(p.entity_id) CONTAINS '{norm} ')"
+                f"(LOWER(p.entity_id) = ${k_eq} "
+                f"OR LOWER(p.entity_id) CONTAINS ${k_contains})"
             )
         if not patterns:
             return []
@@ -1497,7 +1525,8 @@ class OverGraphStore:
             f"WHERE {where} "
             "RETURN p.id AS id, p.entity_id AS entity_id, p.attr_name AS attr_name, "
             "p.value AS value, p.valid_from AS valid_from, p.expired_at AS expired_at "
-            "ORDER BY p.valid_from DESC"
+            "ORDER BY p.valid_from DESC",
+            params,
         )
 
     def get_distinct_attr_names(self) -> list[str]:
