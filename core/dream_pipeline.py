@@ -220,6 +220,10 @@ class DreamPipeline:
         self._write_queue = write_queue
         self.ontology_evolution = ontology_evolution
         self.retrieval_guard = retrieval_guard
+        # 【P2 schema 级版本化演化】内存态注册表 + 已注册 episode 计数
+        # （settings.schema_versioning.enabled 时惰性建；默认关 → 永不触碰）
+        self._schema_registry = None
+        self._schema_episodes: set[str] = set()
 
     async def retrieval_health_probe(self, nodes: list[dict],
                                      sample_size: int = 5) -> float:
@@ -1625,7 +1629,128 @@ Text:
             raise RuntimeError(f"schema-evolution failed for {failures}/{len(communities)} communities")
         if evolved:
             logger.info("Dream PERSIST: %d attr/rel evolutions (schema self-evolution P0-②)", evolved)
+        # 【P2 schema 级版本化演化】门控步骤（默认关零回归）：enabled 时 per-community
+        # 构造 SchemaState/Episode/Signals → decide() 四动作 → 执行并记日志（纯内存态）。
+        # 开关关 → 内部立即返回 0，既有 _evolve_attrs/_evolve_rels 副作用逐字节不变。
+        try:
+            self._persist_schema_versioning(communities)
+        except Exception:
+            logger.warning("Dream PERSIST schema-versioning failed (non-fatal)", exc_info=True)
         return evolved
+
+    # ─── Schema 级版本化演化 P2：四动作决策 + 版本链（默认关零回归）───
+
+    def _build_schema_versioning_input(self, comm: dict):
+        """从 community 构造 schema 级演化输入（enabled 时每 community 一次）。
+
+        community 字段契约（生产由上游 synthesis 提供；测试可直接构造）：
+          id / episode_id : schema 键 + episode id（缺 content/id → 返回 None）
+          content/summary : episode 原文（tokenize → centroid / episode tokens）
+          slots           : [(槽名, 值串), ...]（可选；无 → 空槽 → p=0 恒 REINFORCE）
+          schema_signals  : {m_c, m_t, o_e, o_r, x, ell, r}（可选；默认全对齐无异常）
+        返回 (schema, episode, signals, schema_id)；无法构造 → None。
+        """
+        from core import schema_versioning as sv
+        content = str(comm.get("content") or comm.get("summary") or "").strip()
+        ep_id = str(comm.get("episode_id") or comm.get("id") or "").strip()
+        if not content or not ep_id:
+            return None
+        schema_id = str(comm.get("schema_id") or comm.get("id") or ep_id)
+        slots = tuple(
+            (str(s[0]), str(s[1])) for s in (comm.get("slots") or [])
+            if isinstance(s, (list, tuple)) and len(s) >= 2
+        )
+        tokens = sv.tokenize(content)
+        episode = sv.Episode(id=ep_id, raw_text=content, tokens=tokens, slots=slots)
+        sig_data = comm.get("schema_signals") or {}
+        signals = sv.Signals(
+            m_c=float(sig_data.get("m_c", 1.0)),
+            m_t=float(sig_data.get("m_t", 1.0)),
+            o_e=float(sig_data.get("o_e", 1.0)),
+            o_r=float(sig_data.get("o_r", 1.0)),
+            x=float(sig_data.get("x", 0.0)),
+            ell=float(sig_data.get("ell", 1.0)),
+            r=float(sig_data.get("r", 0.0)),
+        )
+        registry = self._schema_registry
+        schema = registry.schemas.get(schema_id)
+        if schema is None:
+            schema = sv.SchemaState(
+                id=schema_id, version=1,
+                centroid_tokens=set(tokens),
+                slot_values={name: (sv.tokenize(value),) for name, value in slots},
+                support=set(),
+                active=True,
+            )
+            registry.add(schema)
+        else:
+            # SUPERSEDE 后旧 id 已 historical → 沿 successor 链取当前 active 头
+            schema = registry.head(schema_id)
+        return schema, episode, signals, schema_id
+
+    def _persist_schema_versioning(self, communities: list[dict]) -> int:
+        """【P2 schema 级版本化演化】门控步骤（默认关零回归）。
+
+        settings.schema_versioning.enabled=False → 立即返回 0（零副作用）。
+        开启后：每 community 构造 SchemaState/Episode/Signals → decide() 四动作 →
+        按决策执行（REINFORCE 累积证据 / SUPERSEDE 版本后继 / SPLIT 分支 /
+        NEW 独立 schema）并把 action/reason/delta/m_eff 记日志。纯内存态，不写 graph 库。
+        """
+        try:
+            from config.settings import get_settings
+            if not get_settings().schema_versioning.enabled:
+                return 0
+        except Exception:
+            return 0
+        from core import schema_versioning as sv
+
+        if self._schema_registry is None:
+            self._schema_registry = sv.SchemaRegistry()
+        registry = self._schema_registry
+
+        executed = 0
+        for comm in communities:
+            built = self._build_schema_versioning_input(comm)
+            if built is None:
+                continue
+            schema, episode, signals, schema_id = built
+            self._schema_episodes.add(episode.id)
+            stats = sv.CollectionStats(
+                active=sum(1 for s in registry.schemas.values() if s.active),
+                thin=sum(1 for s in registry.schemas.values()
+                         if s.active and len(s.support) < sv.M_MIN),
+                episodes=len(self._schema_episodes),
+            )
+            decision = sv.decide(schema, episode, signals, stats)
+            action = decision.action
+            if action == sv.SchemaAction.REINFORCE:
+                # 累积证据（不新建版本）：support + 异常 episode + centroid 增量
+                schema.support.add(episode.id)
+                if decision.as_exception:
+                    schema.exception.add(episode.id)
+                schema.centroid_tokens |= set(episode.tokens)
+            elif action == sv.SchemaAction.SUPERSEDE:
+                registry.supersede(schema.id)  # 生成版本后继（不覆盖旧 schema）
+                executed += 1
+            elif action == sv.SchemaAction.SPLIT:
+                registry.split(schema.id)      # 保留旧状态 + 加分支
+                executed += 1
+            elif action == sv.SchemaAction.NEW:
+                new_schema = sv.SchemaState(
+                    id=f"{schema_id}#{episode.id}", version=1,
+                    centroid_tokens=set(episode.tokens),
+                    slot_values={name: (sv.tokenize(value),) for name, value in episode.slots},
+                    support={episode.id},
+                    active=True,
+                )
+                registry.add(new_schema)       # 独立 schema
+                executed += 1
+            logger.info(
+                "Schema versioning decision: schema_id=%s action=%s reason=%s delta=%s m_eff=%s as_exception=%s",
+                schema_id, action, decision.reason, decision.delta,
+                decision.m_eff, decision.as_exception,
+            )
+        return executed
 
     def _evolve_attrs(self, store, attrs: list) -> int:
         """属性演化：sidecar 累票 → 固化（PropertyVerNode / sidecar solidified）。"""

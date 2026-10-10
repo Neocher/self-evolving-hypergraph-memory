@@ -279,6 +279,10 @@ class QueryRouterConfig:
     rpe_rerank_enabled: bool = False
     rpe_rerank_high: float = 0.7   # surprise > 此值 → ×1.05 boost
     rpe_rerank_low: float = 0.3    # surprise < 此值 → ×0.95 dampen
+    # 【P1 世界模型】rpe_surprise_sigma 独立阈值消费（默认关零回归；仅 FUSION 生效）
+    rpe_sigma_enabled: bool = False
+    rpe_sigma_high: float = 0.7    # sigma 预测残差 > 此值 → ×1.05 boost（钳制不超原最高分）
+    rpe_sigma_low: float = 0.3     # sigma 预测残差 < 此值 → ×0.95 dampen
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -4173,28 +4177,49 @@ class QueryRouter:
 
         rpe_surprise > high (0.7)  → ×1.05 boost（钳制不超原最高分）
         rpe_surprise < low  (0.3)  → ×0.95 dampen
-        无 rpe_surprise / 开关关   → 不变
+        rpe_surprise_sigma（P1 世界模型预测残差）→ 独立阈值 rpe_sigma_* 消费
+        （rpe_sigma_enabled 默认关；字段缺失/开关关 → 行为完全不变）。
         """
         cfg = getattr(self, "config", None)
-        if cfg is None or not getattr(cfg, "rpe_rerank_enabled", False):
+        if cfg is None:
+            return results
+        rpe_enabled = bool(getattr(cfg, "rpe_rerank_enabled", False))
+        sigma_enabled = bool(getattr(cfg, "rpe_sigma_enabled", False))
+        if not rpe_enabled and not sigma_enabled:
             return results
         try:
-            hi_thr = float(getattr(cfg, "rpe_rerank_high", 0.7))
-            lo_thr = float(getattr(cfg, "rpe_rerank_low", 0.3))
             max_score = max(
                 (float(r.get("score") or 0.0) for r in results),
                 default=0.0,
             )
-            for r in results:
-                s = r.get("rpe_surprise")
-                if s is None:
-                    continue
-                sc = float(r.get("score") or 0.0)
-                if s > hi_thr:
-                    ns = min(sc * 1.05, max_score) if max_score > 0 else sc * 1.05
-                    r["score"] = round(ns, 6)
-                elif s < lo_thr:
-                    r["score"] = round(sc * 0.95, 6)
+            # 既有 rpe_surprise 路径（开关关时跳过 → 行为逐字节不变）
+            if rpe_enabled:
+                hi_thr = float(getattr(cfg, "rpe_rerank_high", 0.7))
+                lo_thr = float(getattr(cfg, "rpe_rerank_low", 0.3))
+                for r in results:
+                    s = r.get("rpe_surprise")
+                    if s is None:
+                        continue
+                    sc = float(r.get("score") or 0.0)
+                    if s > hi_thr:
+                        ns = min(sc * 1.05, max_score) if max_score > 0 else sc * 1.05
+                        r["score"] = round(ns, 6)
+                    elif s < lo_thr:
+                        r["score"] = round(sc * 0.95, 6)
+            # P1 世界模型 rpe_surprise_sigma 独立阈值路径（默认关零回归）
+            if sigma_enabled:
+                sigma_hi = float(getattr(cfg, "rpe_sigma_high", 0.7))
+                sigma_lo = float(getattr(cfg, "rpe_sigma_low", 0.3))
+                for r in results:
+                    s = r.get("rpe_surprise_sigma")
+                    if s is None:
+                        continue
+                    sc = float(r.get("score") or 0.0)
+                    if s > sigma_hi:
+                        ns = min(sc * 1.05, max_score) if max_score > 0 else sc * 1.05
+                        r["score"] = round(ns, 6)
+                    elif s < sigma_lo:
+                        r["score"] = round(sc * 0.95, 6)
             results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             return results
         except Exception:

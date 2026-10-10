@@ -602,6 +602,7 @@ async def create_episode(
     # 在 SSM gate 之后、defense 之前执行；force_promote 绕过（强制语义无条件写入）。
     rpe_route = None  # deep / cache / ignore
     _surprise = None  # 【P3-C】惊奇度信号（RPE 批判成功时赋值；检索侧重排消费）
+    _wm_fields = None  # 【P1 世界模型落库】α>0 时 {rpe_surprise_sigma, pred_entropy}；默认 None 不写
     if (not req.force_promote and deps.encoder is not None
             and deps.graph_store is not None):
         try:
@@ -623,8 +624,14 @@ async def create_episode(
                         try:
                             from core.world_model import PredictSigma, fuse_surprise
                             _predictor = PredictSigma(store=deps.graph_store, alpha=_wm_alpha)
-                            _surprise = fuse_surprise(
-                                _surprise, _predictor.surprise_from_content(req.content), _wm_alpha)
+                            _sigma_surprise, _pred_entropy = _predictor.sigma_from_content(req.content)
+                            _surprise = fuse_surprise(_surprise, _sigma_surprise, _wm_alpha)
+                            # 预测残差 + 预测分布熵落库（消费端 rpe_sigma 独立阈值消费）；
+                            # α=0 时本分支不执行 → _wm_fields=None → episode_data 不写新字段（零回归）。
+                            _wm_fields = {
+                                "rpe_surprise_sigma": float(_sigma_surprise),
+                                "pred_entropy": float(_pred_entropy),
+                            }
                         except Exception as _wm_exc:
                             logger.warning("world model predict failed (non-fatal): %s", _wm_exc)
                     # 长期效用：实体丰富度代理（内容长度 + 数字/专名密度）
@@ -740,6 +747,10 @@ async def create_episode(
     # RPE 关闭 / 批判失败 / cache-ignore 路由 → _surprise 为 None 或非 deep → 不写（零回归）。
     if rpe_route == "deep" and _surprise is not None:
         episode_data["rpe_surprise"] = float(_surprise)
+    # 【P1 世界模型落库】α>0 时写入预测残差与分布熵（供检索侧 rpe_sigma 独立消费）；
+    # α=0 时 _wm_fields=None → 不写，episode_data 与改动前逐字段一致（零回归）。
+    if _wm_fields is not None:
+        episode_data.update(_wm_fields)
     # 【v5.27.0】force_promote=true → 打 protected 顶层标记，
     # 梦境 PRUNE 永不剪这类节点（dream_pipeline._prune_step 消费）。
     # GraphLite 布尔非 b64，读取经 _flatten_row 还原 Python True。

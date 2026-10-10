@@ -304,6 +304,10 @@ class RetrievalConfig:
     rpe_rerank_enabled: bool = False  # 开关：write 侧 rpe_surprise → 检索轻 boost/dampen
     rpe_rerank_high: float = 0.7      # 惊奇度 > 此值 → ×1.05 boost（钳制不超种子最高分）
     rpe_rerank_low: float = 0.3       # 惊奇度 < 此值 → ×0.95 dampen
+    # P1 世界模型预测残差独立阈值消费（默认关零回归；仅 FUSION 生效）
+    rpe_sigma_enabled: bool = False   # 开关：rpe_surprise_sigma → 检索轻 boost/dampen
+    rpe_sigma_high: float = 0.7       # 预测残差 > 此值 → ×1.05 boost（钳制不超种子最高分）
+    rpe_sigma_low: float = 0.3        # 预测残差 < 此值 → ×0.95 dampen
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，

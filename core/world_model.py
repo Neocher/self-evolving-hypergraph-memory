@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -104,6 +105,23 @@ class PredictSigma:
             return 1.0 - (n / total)
         return 1.0 - self.predict(subject).probability
 
+    def distribution_entropy(self, subject: str) -> float:
+        """预测分布熵 H(P) = −Σ p·ln p（nats；空分布 → 0.0）。
+
+        对 subject 的历史 (predicate, object) 频率归一化后计算 Shannon 熵，
+        度量"下一步预测有多不确定"。零训练只读，不写库。
+        """
+        counts = self._pair_counts(subject)
+        total = sum(counts.values())
+        if total <= 0:
+            return 0.0
+        entropy = 0.0
+        for c in counts.values():
+            p = c / total
+            if p > 0.0:
+                entropy -= p * math.log(p)
+        return entropy
+
     # ── 内容级零训练 subject 识别 ────────────────────────────────────
     def surprise_from_content(self, content: str) -> float:
         """从原始内容识别 subject 后计算 surprise_Σ（写路径融合用）。"""
@@ -111,6 +129,16 @@ class PredictSigma:
         if not subject:
             return 1.0
         return self.surprise(subject)
+
+    def sigma_from_content(self, content: str) -> tuple[float, float]:
+        """从原始内容返回 (surprise_Σ, 预测分布熵)；无 subject 匹配 → (1.0, 0.0)。
+
+        写路径一次匹配 subject 同时取预测残差与分布熵，避免重复实体检索。
+        """
+        subject = self._match_subject(content)
+        if not subject:
+            return 1.0, 0.0
+        return self.surprise(subject), self.distribution_entropy(subject)
 
     def _match_subject(self, content: str) -> str:
         """零训练 subject 识别：已知实体名在内容中的最长子串匹配。"""
