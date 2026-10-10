@@ -24,6 +24,7 @@ from core.ontology_validator import OntologyConfig
 # （同 v5.44.1 OntologyConfig 方案 A）。core.defense 不依赖 config.settings,
 # 无循环 import; 字段一致由 _build_settings 的 __dataclass_fields__ 过滤保证。
 from core.defense import DefenseConfig
+from core.schema_versioning import SchemaVersioningConfig
 
 
 def _get_defaults_path() -> Path:
@@ -444,6 +445,8 @@ class Settings:
     health: HealthConfig = field(default_factory=HealthConfig)
     # 【D-MEM RPE 写入门控】（v6.4.0 实验，默认关）
     write_gate: WriteGateConfig = field(default_factory=WriteGateConfig)
+    # 【schema 级版本化演化】（MINDSET 能量+迟滞，默认关零回归）
+    schema_versioning: SchemaVersioningConfig = field(default_factory=SchemaVersioningConfig)
 
 
 def _env_override(raw: dict[str, Any], prefix: str = "SHM") -> dict[str, Any]:
