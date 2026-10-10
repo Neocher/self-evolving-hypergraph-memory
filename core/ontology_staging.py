@@ -79,23 +79,65 @@ _WS_RE = re.compile(r"\s+")
 # 目标：语义模板相同、仅实例槽位不同的文本 → 同一个候选键（AC1），
 #       语义不同绝不误合（AC2）。只抹「不改变主题」的槽位，绝不抹语义内容。
 #
-# 1) 序数槽位：第<N>（第0条…第11条、第1章…）→ 第<ORD>。
-#    数字是序号/索引，不是主题 —— 纯数字不同 = 同主题。
-# 2) 报告主语槽位：<NAME> 认为/说/表示… → <NAME>。
+# 槽位与掩码（全部须在**小写前**跑：姓名检测依赖大小写/形制）：
+# 1) 报告主语槽位：<说话人> 紧跟报告动词（中/英）→ <NAME>。
 #    说话人是「来源」不是主题（真正主题在报告动词后的补足语里）。
-#    只抹「报告动词紧邻前的大写拉丁专名」：这样 "Alice 认为X"（Alice 是来源）
-#    会聚合，而 "Python 是主语言"（主语即主题）、"使用 Python/Java"
-#    （宾语即主题）不会被误抹 —— 满足 AC2 负样本。
-_REPORTING_VERBS = (
+#    —— 大写拉丁名（Alice 认为 / Alice said）
+#    —— 句首小写拉丁名（alice 认为，句首小写也属来源）
+#    —— 中文姓名（单姓 + 1–2 字名 / 复姓：张三、王小明、欧阳修）
+#    只抹「报告动词紧邻前」的专名：Python 是主语言（主语即主题）、
+#    使用 Python（宾语即主题）不会被误抹 —— 满足 AC2/AC5 负样本。
+# 2) 序数槽位：第<N> → 第<ORD>（数字是序号/索引，不是主题）。
+# 3) 编号式槽位：Report <N> / No. <N> → 编号 <NUM>（同上）。
+_CN_REPORTING_VERBS = (
     "认为", "觉得", "想", "说", "称", "表示", "指出", "提到", "提及", "写道",
     "声称", "宣称", "宣布", "强调", "回复", "回答", "反馈", "确认", "否认", "质疑",
     "断言", "透露", "讲述", "回忆", "猜测", "估计", "判断", "主张", "声明", "报告",
     "汇报", "提议", "建议", "要求", "询问", "提问", "评论", "解释", "说明", "澄清",
     "相信", "猜想", "推断", "推测", "假设",
 )
+_EN_REPORTING_VERBS = (
+    "said", "reported", "stated", "claimed", "noted", "mentioned", "argued",
+    "proposed", "wrote", "explained", "described", "suggested", "asserted",
+    "declared", "announced", "emphasized", "believed", "thought", "replied",
+    "responded", "confirmed", "denied", "recalled", "commented", "concluded",
+)
+# 常见复姓（放在单姓前，保证「欧阳修」按复姓整体匹配）
+_COMPOUND_SURNAMES = (
+    "欧阳", "司马", "上官", "诸葛", "夏侯", "东方", "皇甫", "尉迟", "公孙",
+    "慕容", "长孙", "宇文", "司徒", "司空", "令狐", "南宫", "万俟", "闻人",
+    "澹台", "公羊", "赫连", "濮阳", "淳于", "单于", "太叔", "申屠", "公冶",
+    "宗政", "乐正", "百里", "呼延", "颛孙", "钟离", "端木", "公良", "拓跋",
+    "夹谷", "宰父", "谷梁", "段干", "轩辕", "独孤", "闾丘", "西门", "东郭",
+)
+# 常见单姓（百家姓子集，覆盖生产语料中的中文姓名）
+_SINGLE_SURNAMES = (
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
+    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐"
+    "费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄"
+    "和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁"
+    "杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍"
+    "虞万支柯昝管卢莫经房裘缪干解应宗丁宣贲邓郁单杭洪包诸左石崔吉钮龚"
+    "程嵇邢滑裴陆荣翁荀羊於惠甄曲家封芮羿储靳汲邴糜松井段富巫乌焦巴弓"
+    "牧隗山谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴甘钭厉戎祖武符刘景詹束龙"
+    "叶幸司韶郜黎蓟薄印宿白怀蒲邰从鄂索咸籍赖卓蔺屠蒙池乔阴郁胥能苍双"
+    "闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍郤璩桑桂濮牛寿通边扈燕冀郏浦尚农"
+    "温别庄晏柴瞿阎充慕连茹习宦艾鱼容向古易慎戈廖庾终暨居衡步都耿满弘"
+    "匡国文寇广禄阙东欧殳沃利蔚越夔隆师巩厍聂晁勾敖融冷訾辛阚那简饶空"
+    "曾毋沙乜养鞠须丰巢关蒯相查后荆红游竺权逯盖益桓公"
+)
+
+_VERB_ALT = "|".join(re.escape(v) for v in (*_CN_REPORTING_VERBS, *_EN_REPORTING_VERBS))
+_SURNAME_ALT = "|".join(
+    re.escape(s) for s in (*_COMPOUND_SURNAMES, *tuple(_SINGLE_SURNAMES))
+)
+
 _ORDINAL_RE = re.compile(r"第\s*\d+(?:\.\d+)?")
-_NAME_RE = re.compile(
-    r"(?<![A-Za-z])[A-Z][A-Za-z]+(?=\s*(?:%s))" % "|".join(_REPORTING_VERBS)
+_LABELED_NUM_RE = re.compile(r"\b(Report|No\.)\s*\d+", re.IGNORECASE)
+_NAME_RE = re.compile(r"(?<![A-Za-z])[A-Z][A-Za-z]+(?=\s*(?:%s))" % _VERB_ALT)
+_NAME_LOWER_RE = re.compile(r"^\s*[a-z][a-z]+(?=\s*(?:%s))" % _VERB_ALT)
+_NAME_CN_RE = re.compile(
+    r"(?:%s)[一-鿿]{1,2}(?=\s*(?:%s))" % (_SURNAME_ALT, _VERB_ALT)
 )
 
 
@@ -112,14 +154,20 @@ def _normalize(text: str) -> str:
 
 
 def _mask_instance_slots(text: str) -> str:
-    """抹掉实例槽位（序数第<N> / 报告主语 <NAME>），保留语义内容。
+    """抹掉实例槽位（报告主语 <NAME> / 序数第<N> / 编号 Report N），保留语义内容。
 
-    必须在**小写前**跑：姓名检测依赖大写首字母（Alice/Bob/…）。
+    必须在**小写前**跑：姓名检测依赖大写首字母（Alice/…）与汉字形制。
+    抹完若残余为空串则回退原文 —— 绝不把非空文本塌缩成空键（AC5e）。
     """
-    text = (text or "").strip()
-    text = _NAME_RE.sub("<NAME>", text)
-    text = _ORDINAL_RE.sub("第<ORD>", text)
-    return text
+    original = (text or "").strip()
+    masked = _NAME_RE.sub("<NAME>", original)          # 大写拉丁名（中/英报告动词）
+    masked = _NAME_LOWER_RE.sub("<NAME>", masked)      # 句首小写拉丁名
+    masked = _NAME_CN_RE.sub("<NAME>", masked)         # 中文姓名（含复姓）
+    masked = _ORDINAL_RE.sub("第<ORD>", masked)        # 第<N> 序数
+    masked = _LABELED_NUM_RE.sub(r"\1 <NUM>", masked)  # Report N / No. N
+    if not masked.strip():
+        return original  # AC5e：抹除后残余不得为空
+    return masked
 
 
 def candidate_key(text: str) -> str:
