@@ -32,6 +32,25 @@ if not _log.handlers:
 logger = _log
 
 
+def classify_ontology_type(text: str, entities: List[str], types: dict) -> str:
+    """合并本体类型后分类：first-match-wins，未匹配记入台账并返回 generic_fact。
+
+    【v6.26.0】未匹配不再静默 —— 记入 core.ontology_staging 候选台账并计入漂移代理。
+    【v6.27.0+ 聚合修复】OntologyValidator._classify_ontology_type 与
+    ontology_evolution.classify_with_extended 共用本实现（AC5 入口统一），
+    对既有输入分类结果完全等价（由 test_ontology_validator /
+    test_ontology_evolution / test_ontology_matcher 既有用例证明）。
+    """
+    text_lower = (text or "").lower()
+    for otype, info in types.items():
+        if any(k in text_lower for k in info.get("conflict_keys", [])):
+            note_classification(True)
+            return otype
+    note_classification(False)
+    record_unmatched(text, entities)
+    return "generic_fact"
+
+
 def _as_num(v, default: Optional[float]) -> Optional[float]:
     """GraphLite 缺失属性以字符串 'Null' 返回，归一为 float（None/'Null' → default）。"""
     if v is None:
@@ -281,16 +300,9 @@ class OntologyValidator:
         【v6.26.0】未匹配时**不再静默降级**：走 ``core.ontology_staging``
         记录候选（可审计 / 可晋升 / 可度量漂移），而非只返回 generic_fact
         丢掉「本体缺什么」这一信息。staging 内部 fail-open，不阻塞写入。
+        【v6.27.0+】委托 ``classify_ontology_type``（与 evolution 入口共用实现）。
         """
-        text_lower = text.lower()
-        for otype, info in self._merged_ontology_types().items():
-            keys = info["conflict_keys"]
-            if any(k in text_lower for k in keys):
-                note_classification(True)
-                return otype
-        note_classification(False)
-        record_unmatched(text, entities)
-        return "generic_fact"
+        return classify_ontology_type(text, entities, self._merged_ontology_types())
 
     def _extract_values(self, text: str, ontology_type: str) -> Dict[str, str]:
         """提取用于矛盾检测的关键值。"""

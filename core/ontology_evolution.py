@@ -19,10 +19,8 @@ import re
 import tempfile
 from typing import Any, Optional
 
-from core.ontology_validator import ONTOLOGY_TYPES
+from core.ontology_validator import ONTOLOGY_TYPES, classify_ontology_type
 from core.validation_gate import held_out_paired_gate
-# 【v6.26.0】未匹配概念的显式通道（研究落地）—— 热路径 fail-open
-from core.ontology_staging import note_classification, record_unmatched
 
 logger = logging.getLogger(__name__)
 
@@ -474,15 +472,9 @@ def classify_with_extended(text: str, entities: list, extended: Optional[dict] =
 
     【v6.26.0】与 ``OntologyValidator._classify_ontology_type`` 同口径：
     未匹配不再静默 —— 记入 ``core.ontology_staging`` 候选台账并计入漂移代理。
+    【v6.27.0+】委托 ``classify_ontology_type``（与 validator 入口共用实现，AC5）。
     """
-    text_lower = (text or "").lower()
-    for otype, info in merged_types(extended).items():
-        if any(k in text_lower for k in info.get("conflict_keys", [])):
-            note_classification(True)
-            return otype
-    note_classification(False)
-    record_unmatched(text, entities)
-    return "generic_fact"
+    return classify_ontology_type(text, entities, merged_types(extended))
 
 
 class OntologyEvolution:

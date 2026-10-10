@@ -66,15 +66,37 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_PATH = os.path.join(_REPO_ROOT, "data", "ontology_staging.json")
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _FLUSH_EVERY = 10          # 每 N 次变更落盘一次（热路径不写盘）
 _FLUSH_INTERVAL_S = 60.0   # 或距上次落盘超过 N 秒且有变更 → 落盘（防进程重启丢账）
 _TEXT_CLIP = 200           # 样本文本截断长度
-_MAX_SAMPLES = 3           # 每个候选保留的样本文本数
 _MAX_EVIDENCE = 20         # 每个候选保留的证据 episode id 数
 _LIST_LIMIT = 200          # 单次列出上限，防大台账刷屏
 
 _WS_RE = re.compile(r"\s+")
+
+# ─── 实例槽位掩码（候选聚合） ───────────────────────────────
+# 目标：语义模板相同、仅实例槽位不同的文本 → 同一个候选键（AC1），
+#       语义不同绝不误合（AC2）。只抹「不改变主题」的槽位，绝不抹语义内容。
+#
+# 1) 序数槽位：第<N>（第0条…第11条、第1章…）→ 第<ORD>。
+#    数字是序号/索引，不是主题 —— 纯数字不同 = 同主题。
+# 2) 报告主语槽位：<NAME> 认为/说/表示… → <NAME>。
+#    说话人是「来源」不是主题（真正主题在报告动词后的补足语里）。
+#    只抹「报告动词紧邻前的大写拉丁专名」：这样 "Alice 认为X"（Alice 是来源）
+#    会聚合，而 "Python 是主语言"（主语即主题）、"使用 Python/Java"
+#    （宾语即主题）不会被误抹 —— 满足 AC2 负样本。
+_REPORTING_VERBS = (
+    "认为", "觉得", "想", "说", "称", "表示", "指出", "提到", "提及", "写道",
+    "声称", "宣称", "宣布", "强调", "回复", "回答", "反馈", "确认", "否认", "质疑",
+    "断言", "透露", "讲述", "回忆", "猜测", "估计", "判断", "主张", "声明", "报告",
+    "汇报", "提议", "建议", "要求", "询问", "提问", "评论", "解释", "说明", "澄清",
+    "相信", "猜想", "推断", "推测", "假设",
+)
+_ORDINAL_RE = re.compile(r"第\s*\d+(?:\.\d+)?")
+_NAME_RE = re.compile(
+    r"(?<![A-Za-z])[A-Z][A-Za-z]+(?=\s*(?:%s))" % "|".join(_REPORTING_VERBS)
+)
 
 
 # ─────────────────────────── 开关与工具 ───────────────────────────
@@ -89,12 +111,24 @@ def _normalize(text: str) -> str:
     return _WS_RE.sub(" ", (text or "").strip().lower())
 
 
+def _mask_instance_slots(text: str) -> str:
+    """抹掉实例槽位（序数第<N> / 报告主语 <NAME>），保留语义内容。
+
+    必须在**小写前**跑：姓名检测依赖大写首字母（Alice/Bob/…）。
+    """
+    text = (text or "").strip()
+    text = _NAME_RE.sub("<NAME>", text)
+    text = _ORDINAL_RE.sub("第<ORD>", text)
+    return text
+
+
 def candidate_key(text: str) -> str:
     """未匹配文本 → 稳定去重键（sha1 前 16 位十六进制）。
 
-    同一句被反复降级只累加计数，不会灌爆台账。
+    先抹实例槽位再归一：同一语义模板的不同实例（人名/序号不同）
+    聚合成同一键，语义不同绝不误合（见 ``_mask_instance_slots``）。
     """
-    return hashlib.sha1(_normalize(text).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1(_normalize(_mask_instance_slots(text)).encode("utf-8")).hexdigest()[:16]
 
 
 def _atomic_write(path: str, payload: dict) -> bool:
@@ -137,6 +171,7 @@ class StagedCandidate:
     status: str = "pending"                             # pending | promoted | rejected
     promoted_to: Optional[str] = None
     decided_at: Optional[float] = None
+    legacy: bool = False                                 # 旧键算法时代遗留的条目
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -171,11 +206,19 @@ class OntologyStaging:
         try:
             with open(self.path, encoding="utf-8") as fh:
                 raw = json.load(fh)
+            # 数据迁移（候选键算法变更，旧键失效）：v1 台账里的旧键一律标 legacy
+            # 保留在台账中，新记录走新键，stats() 区分。选 (b) 而非重算迁移 (a) 的
+            # 理由：sample_text 被 _TEXT_CLIP 截断，>200 字的原文无法还原真实全量键，
+            # 重算会改错键 —— 保留旧键 + 标记 legacy 是唯一无损、不可丢弃的方案。
+            legacy_file = int(raw.get("version", 1)) < _SCHEMA_VERSION
             for k, v in (raw.get("candidates") or {}).items():
                 try:
-                    self._candidates[k] = StagedCandidate.from_dict(v)
+                    c = StagedCandidate.from_dict(v)
                 except Exception:
                     continue
+                if legacy_file and not c.legacy:
+                    c.legacy = True
+                self._candidates[k] = c
             for k, v in (raw.get("counters") or {}).items():
                 if isinstance(v, int):
                     self._counters[k] = v
@@ -253,7 +296,8 @@ class OntologyStaging:
                     self._candidates[key] = c
                 c.count += 1
                 c.last_seen = now
-                if len(c.samples) < _MAX_SAMPLES and clip not in c.samples:
+                # AC3 可回溯：聚合不得丢弃证据 —— 保留全部去重后的原始样本。
+                if clip not in c.samples:
                     c.samples.append(clip)
                 for e in (entities or []):
                     if isinstance(e, str) and e and e not in c.entities and len(c.entities) < 12:
@@ -339,8 +383,11 @@ class OntologyStaging:
             self._load_locked()
             counters = dict(self._counters)
             by_status: dict[str, int] = {}
+            legacy_count = 0
             for c in self._candidates.values():
                 by_status[c.status] = by_status.get(c.status, 0) + 1
+                if c.legacy:
+                    legacy_count += 1
             total_candidates = len(self._candidates)
             ranked = sorted(
                 ((c.count, c.key, c.sample_text)
@@ -355,6 +402,7 @@ class OntologyStaging:
             "counters": counters,
             "unmatched_rate": round(counters.get("unmatched", 0) / total, 4) if total else 0.0,
             "total_candidates": total_candidates,
+            "legacy_candidates": legacy_count,
             "by_status": by_status,
             "top_pending": top,
         }
