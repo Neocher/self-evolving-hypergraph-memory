@@ -173,10 +173,18 @@ class TestCommunityMembersSidecar:
         assert edge_calls == [], "sidecar 命中却仍走了边遍历路径"
 
     def test_missing_community_falls_back_to_edges(self, overgraph_store):
-        """AC5：sidecar 中不存在的社区 id → 整次回落原边遍历且结果正确。"""
+        """AC5：sidecar 中不存在的社区 id → 整次回落原边遍历且结果正确。
+
+        【v6.33】all-or-nothing 回落语义已由 strict_fallback=True 保留（旧语义
+        回归）；默认（False）改为按社区门控（缺失视为空集），见
+        test_community_index_coverage.py。
+        """
         _create_episode(overgraph_store, "ep_a", "A", tau=1.0)
         _persist_community(overgraph_store, "comm_in", ["ep_a"], "report")
         assert overgraph_store.refresh_community_members_index() is True
+
+        overgraph_store.config.community_members_index_strict_fallback = True
+        overgraph_store.reload_community_members_index()
 
         _create_episode(overgraph_store, "ep_b", "B", tau=1.0)
         _persist_community(overgraph_store, "comm_out", ["ep_b"], "report")

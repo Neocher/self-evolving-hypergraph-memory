@@ -2,7 +2,7 @@
 v6.30 检索超时修复第三轮验收测试
 ================================
 覆盖任务书 AC1..AC8：
-  AC1 配置生效：_DEGRADE_TIMEOUT==3.0；community budget_s==0.5/breaker_s==300；
+  AC1 配置生效：_DEGRADE_TIMEOUT==3.0；community budget_s==2.0/breaker_s==300；
       total_step_budget_s==3.0（defaults.yaml 与 settings.py 一致）
   AC2 社区扩展熔断（计数断言）：慢 store（每调用 2s）→ 第 1 次调用后熔断打开；
       后续调用在 50ms 内跳过且返回原入参；跳过时产生 WARNING 日志
@@ -85,7 +85,7 @@ class TestConfigValues:
     def test_community_expansion_budget_and_breaker(self):
         from config.settings import load_settings
         ce = load_settings().retrieval.community_expansion
-        assert ce.budget_s == 0.5
+        assert ce.budget_s == 2.0
         assert ce.breaker_s == 300.0
         assert ce.backoff_n == 3
         assert ce.backoff_max_s == 3600.0
@@ -100,7 +100,7 @@ class TestConfigValues:
         yaml_path = Path(__file__).resolve().parent.parent / "config" / "defaults.yaml"
         raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         ce = raw["retrieval"]["community_expansion"]
-        assert ce["budget_s"] == 0.5
+        assert ce["budget_s"] == 2.0
         assert ce["breaker_s"] == 300.0
         assert ce["backoff_n"] == 3
         assert ce["backoff_max_s"] == 3600.0

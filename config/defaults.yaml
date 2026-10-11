@@ -79,7 +79,7 @@ retrieval:
     boost: 0.6                   # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
     threshold: 0.5               # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
     max_members: 10              # 每社区最大成员召回数
-    budget_s: 0.5                # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
+    budget_s: 2.0                # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断。2.0 = sidecar 路径实测 ≤36ms 永不误触，真慢路径 8s 照常熔断
     breaker_s: 300.0             # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试（结构性慢 → 长窗口）
     backoff_n: 3                 # 连续 N 次半开重试仍超预算 → 退避加倍
     backoff_max_s: 3600.0        # 退避窗口上限（秒）

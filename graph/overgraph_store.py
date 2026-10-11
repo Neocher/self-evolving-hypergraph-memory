@@ -115,6 +115,10 @@ PROPERTY_MAX_VERSIONS = 8
 # 全量扫描/构建类代码必须核对返回行数是否触顶，触顶即视为截断，不得当作扫尽。
 _MAX_QUERY_ROWS = 10_000
 
+# 社区 id keyset 分页的安全页数上限（默认页大小 _MAX_QUERY_ROWS 时对应 1000 万
+# 节点；超限说明游标推进异常 / 引擎异常，fail loud 拒绝写残缺索引）。
+_COMMUNITY_ENUM_MAX_PAGES = 1000
+
 # 已持久化向量分页读取页大小（启动加载路径防大库一次性物化：每个 view 含
 # 512d dense_vector，整表读取会瞬时抬高峰值内存）
 VECTOR_LOAD_PAGE = 1000
@@ -653,6 +657,8 @@ class OverGraphStore:
         # 惰性加载一次后复用内存引用；命中时跳过结构性慢的边遍历（源侧全表扫描）。
         self._community_members_index: dict[str, list[str]] | None = None
         self._community_members_index_attempted = False
+        # 后台刷新冷却时间戳（v6.33 社区索引覆盖率修复）：None = 从未触发过刷新。
+        self._community_members_index_last_refresh_ts: float | None = None
 
     # ─── 连接 ─────────────────────────────────────────
 
@@ -1773,9 +1779,14 @@ class OverGraphStore:
         全量失效（见 core/dream_candidate_store.py 落库后调用）。
 
         【v6.31 检索超时修复 Part 4】三层读取：进程内缓存命中 → sidecar 命中
-        （索引取成员 id → get_episodes_batch 取详情）→ 任一社区不在 sidecar /
-        sidecar 缺失 → 回落原边遍历（逐字节保留原行为）。sidecar 与边遍历逐字段、
-        逐顺序一致（含 archived 缺失 None、tau 相同按 member_id 升序）。
+        （索引取成员 id → get_episodes_batch 取详情）→ 回落原边遍历。sidecar 与
+        边遍历逐字段、逐顺序一致（含 archived 缺失 None、tau 相同按 member_id 升序）。
+
+        【v6.33 社区索引覆盖率修复】sidecar 覆盖 100% 社区（空社区存空列表）后，
+        「索引缺失社区」=「构建快照之后新建」→ 默认按社区门控：缺失社区视为空集
+        （不回落到 8s 边遍历，避免 1 个社区毁掉整批 → 误触熔断），缺失占比超阈值
+        时后台刷新重建。旧 all-or-nothing 回落语义由
+        community_members_index_strict_fallback=True 保留（默认 False）。
         """
         if not community_ids:
             return {}
@@ -1790,10 +1801,30 @@ class OverGraphStore:
                     for cid in community_ids
                 }
         index = self._load_community_members_index()
-        if index is not None and all(cid in index for cid in community_ids):
-            out = self._community_members_from_sidecar(community_ids, index, limit)
-        else:
+        if index is None:
+            # sidecar 缺失/关闭 → 完全走原边遍历（与改动前逐字节一致）。
             out = self._community_members_from_edges(community_ids, limit)
+        elif self._community_members_index_strict_fallback():
+            # 旧「严格回落」语义（v6.31）：任一社区不在索引 → 整批回落原边遍历。
+            if all(cid in index for cid in community_ids):
+                out = self._community_members_from_sidecar(community_ids, index, limit)
+            else:
+                out = self._community_members_from_edges(community_ids, limit)
+        else:
+            # 新「按社区」门控（v6.33）：索引缺失的社区（构建快照之后新建）视为
+            # 空集，不回落到 8s 边遍历；缺失占比超阈值时后台刷新重建索引。
+            out = self._community_members_from_sidecar(community_ids, index, limit)
+            missing = [cid for cid in community_ids if cid not in index]
+            if missing:
+                logger.warning(
+                    "community members index missing %d/%d communities (%.1f%%); "
+                    "treating missing as empty",
+                    len(missing), len(community_ids),
+                    100.0 * len(missing) / len(community_ids),
+                )
+                self._maybe_refresh_community_members_index(
+                    len(missing), len(community_ids)
+                )
         snapshot = {cid: [dict(m) for m in members] for cid, members in out.items()}
         with self._community_members_cache_lock:
             self._community_members_cache[cache_key] = snapshot
@@ -1878,6 +1909,20 @@ class OverGraphStore:
         """sidecar 开关（默认开；False 关闭 → 完全走原边遍历路径）。"""
         return bool(getattr(self.config, "community_members_index_enabled", True))
 
+    def _community_members_index_strict_fallback(self) -> bool:
+        """旧「严格回落」开关（v6.33）：True → 任一社区缺失即整批回落原边遍历
+        （逐字节保留 v6.31 语义）；False（默认）→ 按社区门控，缺失社区视为空集。
+        """
+        return bool(getattr(self.config, "community_members_index_strict_fallback", False))
+
+    def _community_members_index_refresh_threshold(self) -> float:
+        """缺失社区占比超过此阈值（>threshold）→ 触发后台刷新重建 sidecar。"""
+        return float(getattr(self.config, "community_members_index_refresh_threshold", 0.05))
+
+    def _community_members_index_refresh_cooldown_s(self) -> float:
+        """两次后台刷新最小间隔（秒），防高 QPS 下反复重建。"""
+        return float(getattr(self.config, "community_members_index_refresh_cooldown_s", 600.0))
+
     def _community_members_index_path(self) -> str:
         """sidecar 索引文件路径（相对路径按项目根解析，对齐 database_path 约定）。
 
@@ -1917,10 +1962,69 @@ class OverGraphStore:
             if key == "_meta" or not isinstance(value, list):
                 continue
             members = [str(v) for v in value if isinstance(v, (str, int)) and str(v)]
-            if members:
-                index[str(key)] = members
+            # v6.33：空社区保留空列表条目（而非缺失），使「索引缺失 = 社区不存在」
+            # 的前提成立，门控不再把空社区误判为「构建后新建」。
+            index[str(key)] = members
         self._community_members_index = index
         return index
+
+    def _enumerate_community_ids(self, limit: int = _MAX_QUERY_ROWS) -> list[str]:
+        """keyset 游标分页枚举全部 CommunityNode id（v6.34 社区枚举分页）。
+
+        单查询行上限 _MAX_QUERY_ROWS（超限**静默截断**，不报错）→ 不能一次
+        `MATCH (c:CommunityNode) RETURN c.id` 扫全表；`SKIP` 超过 max_skip 报
+        InvalidReturnExpression、无 ORDER BY 时页间重叠 → 用严格 `>` keyset
+        游标 + `ORDER BY c.id ASC` 递增（id 唯一，不重不漏）。
+
+        每页满页即视为可能触顶：游标必须推进（`WHERE c.id > $cur`），否则 fail
+        loud 抛 OverGraphError；页数超 _COMMUNITY_ENUM_MAX_PAGES 同样抛错 ——
+        绝不静默接受截断。返回按 id 升序的完整社区 id 列表。
+        """
+        limit = max(1, int(limit))
+        ids: list[str] = []
+        cursor = ""
+        pages = 0
+        while True:
+            pages += 1
+            if pages > _COMMUNITY_ENUM_MAX_PAGES:
+                raise OverGraphError(
+                    f"community id enumeration exceeded "
+                    f"{_COMMUNITY_ENUM_MAX_PAGES} pages (cursor stuck?)"
+                )
+            if not cursor:
+                result = self._locked_execute_gql(
+                    f"MATCH (c:{LABEL_COMMUNITY}) RETURN c.id AS id "
+                    f"ORDER BY c.id ASC LIMIT {limit}"
+                )
+            else:
+                result = self._locked_execute_gql(
+                    f"MATCH (c:{LABEL_COMMUNITY}) WHERE c.id > $cur "
+                    f"RETURN c.id AS id ORDER BY c.id ASC LIMIT {limit}",
+                    {"cur": cursor},
+                )
+            rows = list((result or {}).get("rows") or [])
+            if len(rows) > limit:
+                raise OverGraphError(
+                    f"community id enumeration returned {len(rows)} rows "
+                    f"(> page limit {limit})"
+                )
+            page_ids = [
+                str(r.get("id")) for r in rows
+                if isinstance(r, dict) and r.get("id")
+            ]
+            if len(rows) < limit:
+                # 末页（不足一页）→ 引擎已扫尽
+                ids.extend(page_ids)
+                break
+            # 满页 → 可能触顶截断：游标必须推进，否则死循环 / 重复 / 遗漏
+            if not page_ids or page_ids[-1] == cursor:
+                raise OverGraphError(
+                    "community id enumeration cursor did not advance "
+                    f"(page={pages}, rows={len(rows)}, cursor={cursor!r})"
+                )
+            ids.extend(page_ids)
+            cursor = page_ids[-1]
+        return ids
 
     def build_community_members_index(
         self, page_size: int = 15,
@@ -1935,6 +2039,10 @@ class OverGraphStore:
         id 折半重试（递归，最小粒度 1 个 id），单个 id 仍触顶则 fail loud 抛
         OverGraphError —— 绝不接受截断写出残缺 sidecar。本方法不落盘，供构建
         脚本 / refresh 调用；异常向上抛（构建类代码 fail loud 契约）。
+
+        【v6.33 覆盖率修复】扫边之后额外枚举全部 CommunityNode：无成员的社区在
+        索引里存空列表 []（而非缺失）→ 索引覆盖 100% 社区，「索引缺失 = 社区不
+        存在」的前提成立。
         """
         ep_result = self._locked_execute_gql(
             f"MATCH (e:{LABEL_EPISODE}) RETURN e.id AS id"
@@ -1985,6 +2093,12 @@ class OverGraphStore:
 
         for i in range(0, len(ep_ids), page):
             scan(ep_ids[i:i + page])
+        # v6.33 覆盖率修复：枚举全部 CommunityNode，无成员的社区存空列表 → 索引
+        # 覆盖 100%（「不在索引 = 不存在」前提成立），不再因空社区缺失而整批回落。
+        # v6.34 社区枚举分页：单查询 10,000 行上限 + 静默截断 → keyset 游标分页
+        # （_enumerate_community_ids 内部 fail loud，绝不留残缺索引）。
+        for cid in self._enumerate_community_ids():
+            index.setdefault(cid, [])
         return edge_total, index
 
     def refresh_community_members_index(self, output_path: str | None = None) -> bool:
@@ -2011,6 +2125,39 @@ class OverGraphStore:
             return False
         self.reload_community_members_index()
         return True
+
+    def _maybe_refresh_community_members_index(self, missing: int, total: int) -> bool:
+        """缺失占比超阈值 → 冷却期外 → 后台线程重建 sidecar（fail-soft）。
+
+        返回是否触发了刷新（供测试 / 日志）。冷却防止高 QPS 下反复重建；
+        刷新在后台线程执行，失败只记 WARNING，不影响检索。
+        """
+        if total <= 0 or missing <= 0:
+            return False
+        if float(missing) / float(total) <= self._community_members_index_refresh_threshold():
+            return False
+        now = time.monotonic()
+        last = self._community_members_index_last_refresh_ts
+        if last is not None and now - last < self._community_members_index_refresh_cooldown_s():
+            return False
+        self._community_members_index_last_refresh_ts = now
+        self._spawn_community_members_index_refresh()
+        return True
+
+    def _spawn_community_members_index_refresh(self) -> None:
+        """起一个 daemon 线程重建 sidecar（不阻塞检索线程）。"""
+        threading.Thread(
+            target=self._community_members_index_refresh_worker,
+            name="community-members-index-refresh",
+            daemon=True,
+        ).start()
+
+    def _community_members_index_refresh_worker(self) -> None:
+        """后台刷新线程体：失败只记 WARNING（fail-soft），不影响检索。"""
+        try:
+            self.refresh_community_members_index()
+        except Exception as e:
+            logger.warning("community members index background refresh failed: %s", e)
 
     def reload_community_members_index(self) -> None:
         """清空内存 sidecar 引用 + 进程内 LRU（下次查询惰性重载）。幂等、线程安全。"""
