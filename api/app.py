@@ -132,6 +132,61 @@ def _persist_dream_state(svc: Services, state: dict) -> None:
         logger.warning("Dream scheduler state persist failed (non-fatal)")
 
 
+# 【v6.32 启动预热】固定短查询：前缀保证不可能与真实用户查询碰撞（避免预热
+# 结果被真实查询经结果缓存命中 → 语义污染）。FUSION 全链路一次性覆盖 reranker
+# 模型 / BM25 索引 / 社区成员 sidecar / 向量编码器 四类冷启动加载。
+_WARMUP_QUERY_PREFIX = "__shm_startup_warmup__"
+_WARMUP_QUERY = (
+    f"{_WARMUP_QUERY_PREFIX} 服务启动预热检索，用于预加载重排模型、"
+    "BM25 索引、社区成员 sidecar 与向量编码器。"
+)
+
+
+def _run_retrieval_warmup(svc: Services) -> None:
+    """【v6.32 启动预热】用固定短查询跑一次完整 FUSION 检索。
+
+    把冷启动一次性加载（bge-reranker 模型 / BM25 索引 / 社区成员 sidecar /
+    向量编码器）从「首条用户查询」挪到「服务启动」，使首条真实查询落在稳态量级。
+    fail-soft：内部任何异常只记 WARNING，不阻断服务启动（预热是优化，非启动前置）。
+
+    finally 恒清空结果缓存：预热查询结果不得留给真实查询（即使预热失败也执行）。
+    """
+    from retrieval.query_router import RetrievalLevel
+    from api.routes._deps import clear_result_cache
+
+    try:
+        cfg = get_settings()
+        if not getattr(cfg.retrieval, "warmup_retrieval_enabled", True):
+            logger.info("Retrieval warmup disabled (warmup_retrieval_enabled=False)")
+            return
+        qr = svc.query_router
+        if qr is None:
+            logger.warning("Retrieval warmup skipped: query_router unavailable")
+            return
+        # sidecar 先显式预加载（0.38s 读盘）：避免把它算进社区扩展的单次批量预算，
+        # 触发结构性熔断误判（预热本就把这一次性加载挪到启动，不该因此熔断社区扩展）。
+        # 之后跑完整 FUSION 检索时社区扩展走「已加载」路径，与真实用户查询同态。
+        store = getattr(svc, "graph_store", None)
+        if store is not None and hasattr(store, "_load_community_members_index"):
+            try:
+                store._load_community_members_index()
+            except Exception:
+                logger.warning("Retrieval warmup: sidecar preload failed (non-fatal)",
+                               exc_info=True)
+        start = time.monotonic()
+        qr.retrieve(_WARMUP_QUERY, level=RetrievalLevel.FUSION)
+        logger.info("Retrieval warmup done in %.2fs", time.monotonic() - start,
+                    query_prefix=_WARMUP_QUERY_PREFIX)
+    except Exception:
+        logger.warning("Retrieval warmup failed (non-fatal), first query pays cold-start",
+                       exc_info=True)
+    finally:
+        try:
+            clear_result_cache()
+        except Exception:
+            logger.warning("Result cache clear after warmup failed (non-fatal)", exc_info=True)
+
+
 def make_store(cfg):
     """图存储后端构造（v6.0.0: OverGraph 唯一后端，GraphLite 已移除）。
 
@@ -677,6 +732,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 logger.info("Startup: reranker prewarm complete")
             except Exception as e:
                 logger.warning("Startup reranker prewarm skipped (non-fatal): %s", e)
+
+        # 【v6.32 启动预热】固定短查询跑一次完整 FUSION 检索（全链路预热：reranker /
+        # BM25 / 社区成员 sidecar / 向量编码器）。默认开、fail-soft、可经配置关闭；
+        # 检索是同步链路 → 线程池执行，不阻塞事件循环。预热后清空结果缓存防污染。
+        try:
+            await asyncio.to_thread(_run_retrieval_warmup, svc)
+        except Exception as e:
+            logger.warning("Startup retrieval warmup skipped (non-fatal): %s", e)
 
         # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
         # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；

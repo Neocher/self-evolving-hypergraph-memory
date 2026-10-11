@@ -137,6 +137,9 @@ retrieval:
   # 直接去重/排序/返回。rerank 与去重属必须步骤，不受此守卫跳过。默认宽松到正常
   # 查询（总耗时约 1.6-3.7s）不受影响，仅异常慢时兜底；<=0 关闭守卫（逐字节一致）。
   total_step_budget_s: 3.0       # 扩展步骤总预算（秒）
+  # 【v6.32 启动预热】服务启动用固定短查询跑一次完整 FUSION 检索（冷启动一次性
+  # 加载从首条用户查询挪到启动）。默认开；false 关闭 → 与无预热逐字节一致。
+  warmup_retrieval_enabled: true
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

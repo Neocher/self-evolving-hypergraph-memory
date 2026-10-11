@@ -323,6 +323,10 @@ class RetrievalConfig:
     # 此值 → 跳过后续尚未执行的扩展步骤，直接去重/排序/返回。rerank 与去重属必须
     # 步骤不受此守卫跳过。默认宽松，正常查询（1.6-3.7s）不受影响；<=0 关闭守卫。
     total_step_budget_s: float = 3.0   # 扩展步骤总预算（秒）
+    # 【v6.32 启动预热】服务启动时用固定短查询跑一次完整 FUSION 检索，把冷启动
+    # 一次性加载（reranker/BM25/社区成员 sidecar/向量编码器）从首条用户查询挪到
+    # 服务启动。默认开；False 关闭 → 行为与无预热逐字节一致。
+    warmup_retrieval_enabled: bool = True
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，

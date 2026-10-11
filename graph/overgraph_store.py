@@ -56,6 +56,7 @@ import time
 import uuid
 import hashlib
 import json
+import tempfile
 from collections import OrderedDict
 from contextlib import contextmanager
 
@@ -110,6 +111,10 @@ LABEL_ONTOLOGY_ENTITY = "OntologyEntity"
 # 每 (entity_id, attr_name) 属性版本上限（与 GraphLiteStore PROPERTY_MAX_VERSIONS 对齐）
 PROPERTY_MAX_VERSIONS = 8
 
+# OverGraph 单查询返回行数上限（引擎静默截断到 10,000 行，超限不报错）——
+# 全量扫描/构建类代码必须核对返回行数是否触顶，触顶即视为截断，不得当作扫尽。
+_MAX_QUERY_ROWS = 10_000
+
 # 已持久化向量分页读取页大小（启动加载路径防大库一次性物化：每个 view 含
 # 512d dense_vector，整表读取会瞬时抬高峰值内存）
 VECTOR_LOAD_PAGE = 1000
@@ -117,6 +122,31 @@ VECTOR_LOAD_PAGE = 1000
 
 def _now() -> float:
     return time.time()
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """原子写 JSON 文件：同目录 tempfile.mkstemp + os.replace。
+
+    写盘失败不破坏已有文件（os.replace 原子替换语义）；异常向上抛由调用方处理
+    （构建类代码 fail loud，不静默吞掉）。
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".community_members_index.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _fact_supersede_enabled() -> bool:
@@ -619,6 +649,10 @@ class OverGraphStore:
         self._community_members_cache: OrderedDict = OrderedDict()
         self._community_members_cache_lock = threading.Lock()
         self._community_members_cache_max = 512
+        # 社区成员 sidecar 索引（v6.31 检索超时修复 Part 4）：{community_id: [episode_id]}。
+        # 惰性加载一次后复用内存引用；命中时跳过结构性慢的边遍历（源侧全表扫描）。
+        self._community_members_index: dict[str, list[str]] | None = None
+        self._community_members_index_attempted = False
 
     # ─── 连接 ─────────────────────────────────────────
 
@@ -798,6 +832,11 @@ class OverGraphStore:
             # 社区节点无 content 字段 → 回落 summary（下游 get("content","") 契约）
             if not flat.get("content") and flat.get("summary"):
                 flat["content"] = flat["summary"]
+            # 【v6.31 缺陷A】DB 属性缺失时 archived=None：对齐原边遍历
+            # `row.get("archived", False)` 在属性缺失时的 None 语义。若不补，
+            # sidecar 路径经本函数取回会把「缺失」退化为 False，与边遍历产出
+            # None 不等价。
+            flat.setdefault("archived", None)
             result.append(flat)
         return result
 
@@ -1723,9 +1762,8 @@ class OverGraphStore:
     ) -> dict[str, list[dict]]:
         """一次取回多社区成员（N 次 get_community_members → 1 次 GQL）。
 
-        与逐社区 get_community_members 结果等价：同一 ORDER BY tau_initial DESC，
-        每社区在 Python 侧截断 limit 条。检索洪峰下把 N 次锁竞争降为 1 次，
-        是写线程不再被社区扩召回饿死的直接修复（AC1 方案②）。
+        与逐社区 get_community_members 结果等价：同一 ORDER BY tau_initial DESC,
+        e.id ASC（确定性 tie-break），每社区在 Python 侧截断 limit 条。
 
         【v6.28 检索超时修复 Part A】进程内 LRU 缓存：key =
         (tuple(sorted(community_ids)), limit)。命中直接按调用方 community_ids 顺序
@@ -1733,6 +1771,11 @@ class OverGraphStore:
         后缓存快照。缓存键对 ids 排序 → ["a","b"] 与 ["b","a"] 共享同一条目，
         但返回仍按调用方顺序。社区成员变更经 invalidate_community_members_cache()
         全量失效（见 core/dream_candidate_store.py 落库后调用）。
+
+        【v6.31 检索超时修复 Part 4】三层读取：进程内缓存命中 → sidecar 命中
+        （索引取成员 id → get_episodes_batch 取详情）→ 任一社区不在 sidecar /
+        sidecar 缺失 → 回落原边遍历（逐字节保留原行为）。sidecar 与边遍历逐字段、
+        逐顺序一致（含 archived 缺失 None、tau 相同按 member_id 升序）。
         """
         if not community_ids:
             return {}
@@ -1746,13 +1789,34 @@ class OverGraphStore:
                     cid: [dict(m) for m in cached.get(cid, [])]
                     for cid in community_ids
                 }
+        index = self._load_community_members_index()
+        if index is not None and all(cid in index for cid in community_ids):
+            out = self._community_members_from_sidecar(community_ids, index, limit)
+        else:
+            out = self._community_members_from_edges(community_ids, limit)
+        snapshot = {cid: [dict(m) for m in members] for cid, members in out.items()}
+        with self._community_members_cache_lock:
+            self._community_members_cache[cache_key] = snapshot
+            self._community_members_cache.move_to_end(cache_key)
+            while len(self._community_members_cache) > self._community_members_cache_max:
+                self._community_members_cache.popitem(last=False)
+        return {cid: [dict(m) for m in members] for cid, members in out.items()}
+
+    def _community_members_from_edges(
+        self, community_ids: list[str], limit: int,
+    ) -> dict[str, list[dict]]:
+        """原边遍历路径（sidecar 未命中/缺失时的回落，v6.28 前实现逐字节保留）。
+
+        ORDER BY e.tau_initial DESC, e.id ASC：tau 相同者按 member_id 升序的
+        确定性 tie-break（v6.31 缺陷B，与 sidecar 路径 Python 侧排序对齐）。
+        """
         rows = self.query_cypher(
             f"MATCH (c:{LABEL_COMMUNITY})-[:COMMUNITY_MEMBER]->(e:{LABEL_EPISODE}) "
             "WHERE c.id IN $cids "
             "RETURN c.id AS community_id, e.id AS member_id, e.content AS content, "
             "e.archived AS archived, e.fact_track AS fact_track, "
             "e.tau_initial AS tau_value "
-            "ORDER BY e.tau_initial DESC",
+            "ORDER BY e.tau_initial DESC, e.id ASC",
             {"cids": list(community_ids)},
         )
         out: dict[str, list[dict]] = {cid: [] for cid in community_ids}
@@ -1770,13 +1834,190 @@ class OverGraphStore:
                 "fact_track": row.get("fact_track", "active") or "active",
                 "tau_value": row.get("tau_value", 0.0) or 0.0,
             })
-        snapshot = {cid: [dict(m) for m in members] for cid, members in out.items()}
+        return out
+
+    def _community_members_from_sidecar(
+        self, community_ids: list[str], index: dict[str, list[str]], limit: int,
+    ) -> dict[str, list[dict]]:
+        """sidecar 路径：索引取成员 id → get_episodes_batch 取详情 → 排序截断。
+
+        与 _community_members_from_edges 逐字段、逐顺序等价。排序键
+        (tau_value DESC, member_id ASC) 对齐边遍历 ORDER BY e.tau_initial DESC,
+        e.id ASC；archived 缺失 → None（get_episodes_batch 已补 None 缺省）。
+        """
+        member_ids: list[str] = []
+        for cid in community_ids:
+            member_ids.extend(index.get(cid, []))
+        episodes = self.get_episodes_batch(list(dict.fromkeys(member_ids)))
+        by_id: dict[str, dict] = {}
+        for ep in episodes:
+            if not isinstance(ep, dict):
+                continue
+            eid = ep.get("id", "") or ""
+            if eid:
+                by_id[str(eid)] = ep
+        out: dict[str, list[dict]] = {}
+        for cid in community_ids:
+            members: list[dict] = []
+            for mid in index.get(cid, []):
+                ep = by_id.get(str(mid))
+                if ep is None:
+                    continue
+                members.append({
+                    "member_id": str(mid),
+                    "content": ep.get("content", "") or "",
+                    "archived": ep.get("archived", False),
+                    "fact_track": ep.get("fact_track", "active") or "active",
+                    "tau_value": ep.get("tau_initial", 0.0) or 0.0,
+                })
+            members.sort(key=lambda m: (-m["tau_value"], m["member_id"]))
+            out[cid] = members[:limit]
+        return out
+
+    def _community_members_index_enabled(self) -> bool:
+        """sidecar 开关（默认开；False 关闭 → 完全走原边遍历路径）。"""
+        return bool(getattr(self.config, "community_members_index_enabled", True))
+
+    def _community_members_index_path(self) -> str:
+        """sidecar 索引文件路径（相对路径按项目根解析，对齐 database_path 约定）。
+
+        未显式配置时落到 DB 同目录 —— 临时测试库不污染生产 data/ 目录。
+        """
+        raw = str(getattr(self.config, "community_members_index_path", "") or "")
+        if raw:
+            if not os.path.isabs(raw):
+                raw = os.path.join(os.path.dirname(__file__), "..", raw)
+            return os.path.abspath(raw)
+        db_dir = os.path.dirname(self._db_path) if self._db_path else os.path.join(
+            os.path.dirname(__file__), "..", "data",
+        )
+        return os.path.abspath(os.path.join(db_dir, "community_members_index.json"))
+
+    def _load_community_members_index(self) -> dict[str, list[str]] | None:
+        """惰性加载 sidecar（首次调用读盘一次，之后复用内存引用）。
+
+        缺失/损坏/格式不符 → None（视为未加载，回落原边遍历），不抛异常。
+        开关关闭 → None。
+        """
+        if self._community_members_index_attempted:
+            return self._community_members_index
+        self._community_members_index_attempted = True
+        if not self._community_members_index_enabled():
+            return None
+        try:
+            with open(self._community_members_index_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.debug("community members index not loaded: %s", e)
+            return None
+        if not isinstance(data, dict):
+            return None
+        index: dict[str, list[str]] = {}
+        for key, value in data.items():
+            if key == "_meta" or not isinstance(value, list):
+                continue
+            members = [str(v) for v in value if isinstance(v, (str, int)) and str(v)]
+            if members:
+                index[str(key)] = members
+        self._community_members_index = index
+        return index
+
+    def build_community_members_index(
+        self, page_size: int = 15,
+    ) -> tuple[int, dict[str, list[str]]]:
+        """目标侧分批枚举全部 COMMUNITY_MEMBER 边 → (edge_total, {cid: [eid]})。
+
+        利用「引擎只对边的目标侧建索引」：目标节点（EpisodeNode）仅约 2,100 个，
+        按批取 episode id，用快方向 `WHERE e.id IN $batch_ids` 反建整张成员表
+        （实测 ~45,000 边/秒，vs 源侧 `WHERE c.id IN $cids` 约 48 边/秒）。
+
+        每批返回行数必须 < _MAX_QUERY_ROWS：触顶即被引擎静默截断 → 自动把该批
+        id 折半重试（递归，最小粒度 1 个 id），单个 id 仍触顶则 fail loud 抛
+        OverGraphError —— 绝不接受截断写出残缺 sidecar。本方法不落盘，供构建
+        脚本 / refresh 调用；异常向上抛（构建类代码 fail loud 契约）。
+        """
+        ep_result = self._locked_execute_gql(
+            f"MATCH (e:{LABEL_EPISODE}) RETURN e.id AS id"
+        )
+        ep_rows = list((ep_result or {}).get("rows") or [])
+        if len(ep_rows) >= _MAX_QUERY_ROWS:
+            raise OverGraphError(
+                f"episode id enumeration hit {_MAX_QUERY_ROWS}-row cap "
+                "(truncated); cannot enumerate all episode ids"
+            )
+        ep_ids = [str(r.get("id") or "") for r in ep_rows if r.get("id")]
+        page = max(1, int(page_size))
+        edge_total = 0
+        index: dict[str, list[str]] = {}
+
+        def scan(batch_ids: list[str]) -> None:
+            nonlocal edge_total
+            result = self._locked_execute_gql(
+                f"MATCH (c:{LABEL_COMMUNITY})-[:COMMUNITY_MEMBER]->"
+                f"(e:{LABEL_EPISODE}) "
+                "WHERE e.id IN $batch_ids "
+                "RETURN c.id AS cid, e.id AS eid",
+                {"batch_ids": list(batch_ids)},
+            )
+            rows = list((result or {}).get("rows") or [])
+            if len(rows) >= _MAX_QUERY_ROWS:
+                if len(batch_ids) <= 1:
+                    raise OverGraphError(
+                        f"single episode id batch truncated at "
+                        f"{_MAX_QUERY_ROWS} rows (cid: {batch_ids})"
+                    )
+                logger.warning(
+                    "community members index batch truncated (%d ids → %d rows), "
+                    "shrinking", len(batch_ids), len(rows),
+                )
+                mid = len(batch_ids) // 2
+                scan(batch_ids[:mid])
+                scan(batch_ids[mid:])
+                return
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cid = row.get("cid") or ""
+                eid = row.get("eid") or ""
+                if cid and eid:
+                    index.setdefault(str(cid), []).append(str(eid))
+            edge_total += len(rows)
+
+        for i in range(0, len(ep_ids), page):
+            scan(ep_ids[i:i + page])
+        return edge_total, index
+
+    def refresh_community_members_index(self, output_path: str | None = None) -> bool:
+        """重建 sidecar：目标侧分批枚举 → 原子替换 → 清内存引用 + LRU。
+
+        供构建脚本 / 后台刷新调用。成功返回 True；失败仅 WARNING 返回 False
+        （不抛）—— 失败期间检索走原边遍历回落，不产生错误结果。
+        """
+        try:
+            edge_total, index = self.build_community_members_index()
+            payload: dict = {
+                "_meta": {
+                    "built_at": time.time(),
+                    "edge_total": int(edge_total),
+                    "community_total": len(index),
+                },
+            }
+            payload.update(index)
+            _atomic_write_json(
+                output_path or self._community_members_index_path(), payload
+            )
+        except Exception as e:
+            logger.warning("community members index refresh failed: %s", e)
+            return False
+        self.reload_community_members_index()
+        return True
+
+    def reload_community_members_index(self) -> None:
+        """清空内存 sidecar 引用 + 进程内 LRU（下次查询惰性重载）。幂等、线程安全。"""
+        self._community_members_index = None
+        self._community_members_index_attempted = False
         with self._community_members_cache_lock:
-            self._community_members_cache[cache_key] = snapshot
-            self._community_members_cache.move_to_end(cache_key)
-            while len(self._community_members_cache) > self._community_members_cache_max:
-                self._community_members_cache.popitem(last=False)
-        return {cid: [dict(m) for m in members] for cid, members in out.items()}
+            self._community_members_cache.clear()
 
     def invalidate_community_members_cache(self) -> None:
         """社区成员变更后的缓存失效钩子（v6.28 检索超时修复 Part A2）。
@@ -1784,9 +2025,13 @@ class OverGraphStore:
         CommunityNode / COMMUNITY_MEMBER 边落库后由写路径调用
         （core/dream_candidate_store._persist_community_nodes 等）；全量清空 ——
         进程内 LRU 重建成本远低于返回过期成员的功能错误。幂等、线程安全。
+        【v6.31】同时丢弃内存侧 sidecar 引用，下次查询从盘重载（若后台已重建
+        则拾取新索引；文件缺失/未重建 → 回落原边遍历，正确性优先）。
         """
         with self._community_members_cache_lock:
             self._community_members_cache.clear()
+        self._community_members_index = None
+        self._community_members_index_attempted = False
 
     # ─── Hebbian ───────────────────────────────────────
 
