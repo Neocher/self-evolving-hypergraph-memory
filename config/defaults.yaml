@@ -109,7 +109,7 @@ retrieval:
     max_results: 10              # 每查询最多追加的图作用域结果数（硬上限）
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
   rerank_enabled: true           # bge-reranker 重排开关（默认开，仅 FUSION 生效）
-  rerank_input_k: 40             # 送入 reranker 的头部候选数（尾部保持原序 append）
+  rerank_input_k: 15             # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -125,6 +125,11 @@ retrieval:
   fusion_dedup_enabled: true     # 近重复去重开关
   fusion_dedup_threshold: 0.9    # 相似度 ≥ 此值判近重复（∈ (0,1)）
   fusion_dedup_min_len: 40       # 短文本跳过（字符数 < 此值不参与去重）
+  # 【v6.29 检索超时修复 Part 2】扩展步骤预算熔断统一兜底：单步耗时超 budget_s → 打开
+  # 该步熔断 breaker_s 秒，窗口内跳过并返回原入参（fail-soft）。默认宽松，正常不触发；
+  # step_budget_s<=0 关闭（行为逐字节一致）。
+  step_budget_s: 1.0             # 统一兜底熔断阈值（秒）
+  step_breaker_s: 30.0           # 统一兜底熔断窗口（秒），到期半开重试
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

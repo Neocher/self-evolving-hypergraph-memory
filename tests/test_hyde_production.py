@@ -397,22 +397,22 @@ class TestLevelFromStrategyConfigAware:
 
 
 class TestRetrieveTimeout:
-    """_retrieve_timeout(level, config)：FUSION+HyDE → 5.0；否则 3.0（零回归）。"""
+    """_retrieve_timeout(level, config)：FUSION+HyDE → 8.0；否则 6.0（零回归）。"""
 
-    def test_fusion_with_hyde_is_5s(self):
+    def test_fusion_with_hyde_is_8s(self):
         cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=True)
-        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 5.0
+        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 8.0
 
-    def test_fusion_without_hyde_is_3s(self):
+    def test_fusion_without_hyde_is_6s(self):
         cfg = QueryRouterConfig(rerank_enabled=False, hyde_enabled=False)
-        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 3.0
+        assert _retrieve_timeout(RetrievalLevel.FUSION, cfg) == 6.0
 
-    def test_hypergraph_is_3s_even_with_hyde(self):
+    def test_hypergraph_is_6s_even_with_hyde(self):
         cfg = QueryRouterConfig(hyde_enabled=True)
-        assert _retrieve_timeout(RetrievalLevel.HYPERGRAPH, cfg) == 3.0
+        assert _retrieve_timeout(RetrievalLevel.HYPERGRAPH, cfg) == 6.0
 
-    def test_none_config_is_3s(self):
-        assert _retrieve_timeout(RetrievalLevel.FUSION, None) == 3.0
+    def test_none_config_is_6s(self):
+        assert _retrieve_timeout(RetrievalLevel.FUSION, None) == 6.0
 
 
 class TestQueryRouterConfigHydeModeValidation:

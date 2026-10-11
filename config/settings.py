@@ -288,7 +288,7 @@ class RetrievalConfig:
     scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
     rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
-    rerank_input_k: int = 40        # 送入 reranker 的头部候选数（尾部保持原序 append）
+    rerank_input_k: int = 15        # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -310,6 +310,13 @@ class RetrievalConfig:
     rpe_sigma_enabled: bool = False   # 开关：rpe_surprise_sigma → 检索轻 boost/dampen
     rpe_sigma_high: float = 0.7       # 预测残差 > 此值 → ×1.05 boost（钳制不超种子最高分）
     rpe_sigma_low: float = 0.3        # 预测残差 < 此值 → ×0.95 dampen
+    # 【v6.29 检索超时修复 Part 2】扩展步骤预算熔断统一兜底：单步耗时超 budget_s → 打开
+    # 该步熔断 breaker_s 秒，窗口内跳过并返回原入参（fail-soft）。默认宽松，正常不触发；
+    # step_budget_s<=0 关闭（行为逐字节一致）。step_budget 可选 per-step 覆盖
+    # {name: {budget_s, breaker_s}}，缺省回落统一兜底值。
+    step_budget_s: float = 1.0        # 统一兜底熔断阈值（秒）
+    step_breaker_s: float = 30.0      # 统一兜底熔断窗口（秒），到期半开重试
+    step_budget: dict = field(default_factory=dict)  # 个别步覆盖 {name: {budget_s, breaker_s}}
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，

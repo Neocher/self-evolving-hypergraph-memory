@@ -170,7 +170,7 @@ def _build_router_config(rcfg):
         mesa_threshold=getattr(mesa, "threshold", 0.5),
         mesa_max_nodes=getattr(mesa, "max_nodes", 5),
         rerank_enabled=getattr(rcfg, "rerank_enabled", True),
-        rerank_input_k=getattr(rcfg, "rerank_input_k", 40),
+        rerank_input_k=getattr(rcfg, "rerank_input_k", 15),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
@@ -181,6 +181,10 @@ def _build_router_config(rcfg):
         fusion_dedup_enabled=getattr(rcfg, "fusion_dedup_enabled", True),
         fusion_dedup_threshold=getattr(rcfg, "fusion_dedup_threshold", 0.9),
         fusion_dedup_min_len=getattr(rcfg, "fusion_dedup_min_len", 40),
+        # 【v6.29 检索超时修复 Part 2】扩展步骤预算熔断透传（getattr 缺省，旧配置零回归）
+        step_budget_s=getattr(rcfg, "step_budget_s", 1.0),
+        step_breaker_s=getattr(rcfg, "step_breaker_s", 30.0),
+        step_budget=getattr(rcfg, "step_budget", None) or {},
     )
     # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）

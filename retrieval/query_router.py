@@ -263,7 +263,7 @@ class QueryRouterConfig:
     mesa_max_nodes: int = 5  # 每查询最多合成节点数
     # bge-reranker 重排配置（P3a，默认开；仅 FUSION 路径生效，失败静默降级）
     rerank_enabled: bool = True  # 重排开关（retrieve(rerank=False) 可显式关）
-    rerank_input_k: int = 40  # 送入 reranker 的头部候选数（尾部保持原序 append）
+    rerank_input_k: int = 15  # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
@@ -275,6 +275,13 @@ class QueryRouterConfig:
     fact_channel: FactChannelConfig = field(default_factory=FactChannelConfig)
     # 图作用域召回配置（阶段3 v6.0.0；仅 overgraph 后端生效，graphlite hasattr 假 no-op）
     scope_recall: ScopeRecallConfig = field(default_factory=ScopeRecallConfig)
+    # 【v6.29 检索超时修复 Part 2】扩展步骤预算熔断统一兜底：单步耗时超 budget_s → 打开
+    # 该步熔断 breaker_s 秒，窗口内跳过并返回原入参（fail-soft，与「补充非替代」语义
+    # 一致）。默认宽松（1.0s/30s）正常情况下不触发；step_budget_s<=0 关闭（行为逐字节
+    # 一致）。step_budget 可选 per-step 覆盖：{name: {budget_s, breaker_s}}。
+    step_budget_s: float = 1.0  # 统一兜底熔断阈值（秒）
+    step_breaker_s: float = 30.0  # 统一兜底熔断窗口（秒），到期半开重试
+    step_budget: dict = field(default_factory=dict)  # 个别步覆盖 {name: {budget_s, breaker_s}}
     # 【P3-C】RPE 惊奇度检索重排（默认关零回归；仅 FUSION 生效）
     rpe_rerank_enabled: bool = False
     rpe_rerank_high: float = 0.7   # surprise > 此值 → ×1.05 boost
@@ -416,6 +423,10 @@ class QueryRouter:
         # 到期自动半开：下一次调用实测耗时，仍超阈值则续熔断。纯 float 单调钟
         # 时间戳（GIL 下赋值原子；竞争最多多一次慢调用/多一次跳过，fail-soft 无害）。
         self._community_expansion_breaker_open_until = 0.0
+        # 【v6.29 检索超时修复 Part 2】扩展步骤预算熔断状态表：step_name → 熔断打开截止
+        # 时间戳（纯 float 单调钟，GIL 下赋值原子）。测试经 QueryRouter.__new__ 构造
+        # （不跑 __init__）时缺省，由 _run_with_budget 的 getattr 懒初始化兜底。
+        self._step_breakers: dict[str, float] = {}
         # 【达摩院 P0-a】会话作用域索引（node_id → session_id）。显式注入优先，
         # 缺省回落 episode_cache（与评测灌库同坐标：episode.session_id）。
         self._session_index = session_index if session_index is not None else {}
@@ -1587,19 +1598,31 @@ class QueryRouter:
             # 【P0-1 属性时间版本链】补充非替代：实体属性版本 append（PropertyVerNode
             # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
             # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
-            results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
+            results = self._run_with_budget(
+                "property_temporal_retrieve", self._property_temporal_retrieve,
+                results, query, raw_query, now_ts=session_ts,
+            )
             # 【P3c 跨消息多跳增强】补充非替代：查询专名实体跨会话召回 append
             # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
             # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
+            results = self._run_with_budget(
+                "entity_expansion", self._entity_expansion,
+                results, query, raw_query, now_ts=session_ts,
+            )
             # 【Schema 自进化 P0-② 检索通道 P1】属性匹配：查询词命中实体固化属性
             # → MENTIONS episodes 补充召回（score = max(种子) × 0.85 降权）
-            results = self._attribute_expansion(results, query, raw_query, now_ts=session_ts)
+            results = self._run_with_budget(
+                "attribute_expansion", self._attribute_expansion,
+                results, query, raw_query, now_ts=session_ts,
+            )
             # 【阶段3 图作用域检索】补充非替代：种子 EpisodeNode → 邻域向量检索
             # append（仅 overgraph 后端；EpisodeNode 带 archived 字段，
             # _filter_archived 正常过滤；score = max(种子分) × boost(0.9) 仅低于
             # 最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._scope_retrieve(results, query, query_embedding, now_ts=session_ts)
+            results = self._run_with_budget(
+                "scope_retrieve", self._scope_retrieve,
+                results, query, query_embedding, now_ts=session_ts,
+            )
             # 【阶段4-1 Schema 模式蒸馏】补充非替代：Schema 节点（:Conceptual 标签）
             # 命中 → append 聚合线索上下文（尾分缩放；无 archived 字段恒保留）
             results = self._schema_recall(results, raw_query or query)
@@ -1620,7 +1643,9 @@ class QueryRouter:
             # 在 rerank 头部切分（head=results[:rerank_input_k]）之前收缩近重复簇，
             # 防扩池引入的同义改写/跨通道重复项把有效证据挤出 top-40。
             if level == RetrievalLevel.FUSION and self.config.fusion_dedup_enabled:
-                sorted_results = self._dedup_near_duplicates(sorted_results)
+                sorted_results = self._run_with_budget(
+                    "dedup_near_duplicates", self._dedup_near_duplicates, sorted_results
+                )
             # 【P3a】bge-reranker 重排：仅在 FUSION 且 rerank 开启时触发，在去重+boost+钳制
             # 之后重排头部覆盖 score，尾部原序保留。rerank=None → 读 config.rerank_enabled；
             # 异常/模型失败静默降级原列表（零回归）。
@@ -2341,6 +2366,46 @@ class QueryRouter:
             results = results[:self.config.graph_expansion_max]
 
         return results
+
+    def _step_budget_params(self, name: str) -> tuple[float, float]:
+        """解析某扩展步骤的预算熔断参数 (budget_s, breaker_s)。
+
+        统一兜底 config.step_budget_s / step_breaker_s；config.step_budget 中该步
+        dict 可覆盖个别值。config 缺省（测试 __new__ 构造未设 config）回落默认宽松值。
+        """
+        cfg = getattr(self, "config", None)
+        budget_s = float(getattr(cfg, "step_budget_s", 1.0))
+        breaker_s = float(getattr(cfg, "step_breaker_s", 30.0))
+        overrides = getattr(cfg, "step_budget", None) or {}
+        ov = overrides.get(name) if isinstance(overrides, dict) else None
+        if isinstance(ov, dict):
+            budget_s = float(ov.get("budget_s", budget_s))
+            breaker_s = float(ov.get("breaker_s", breaker_s))
+        return budget_s, breaker_s
+
+    def _run_with_budget(self, name: str, fn, results: list[dict], *args, **kwargs):
+        """【v6.29 Part 2】扩展步骤预算熔断包装器（推广上一轮 _community_expansion 模式）。
+
+        - 记录 fn 单步耗时；超 budget_s → 打开该步熔断 breaker_s 秒。
+        - 窗口内直接跳过该步并返回其入参 results（fail-soft，与「补充非替代」语义
+          一致——扩展通道本就是 append/收缩，跳过只影响增量，不影响主检索）。
+        - budget_s<=0 → 直接调用 fn（行为与改动前逐字节一致）。
+        - 到期半开重试：下次实测耗时，仍超阈值则续熔断（open→half-open 自动转换）。
+        """
+        budget_s, breaker_s = self._step_budget_params(name)
+        if budget_s <= 0.0:
+            return fn(results, *args, **kwargs)
+        breakers = getattr(self, "_step_breakers", None)
+        if breakers is None:
+            breakers = {}
+            self._step_breakers = breakers
+        if time.monotonic() < breakers.get(name, 0.0):
+            return results
+        t0 = time.monotonic()
+        out = fn(results, *args, **kwargs)
+        if time.monotonic() - t0 > budget_s:
+            breakers[name] = time.monotonic() + breaker_s
+        return out
 
     def _community_expansion(
         self,

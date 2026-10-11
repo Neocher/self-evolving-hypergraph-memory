@@ -27,11 +27,14 @@ from retrieval.query_router import RetrievalLevel
 # 【P3b R1 P0-2】基线 3.0s；FUSION+HyDE 开启时 _retrieve_timeout 放宽到 5.0s
 # （LLM 生成假设段落预留预算）。【PERF 2026-08-07】15s→3s: 大库下实体匹配/超边
 # 遍历超时立即降级返回向量结果, 不空等
-_RETRIEVE_TIMEOUT = 3.0
+# 【v6.29 检索超时修复 Part 3】基线 3.0s→6.0s：rerank_input_k 40→15 + 扩展步骤
+# 预算化把真实耗时压到 ~3-4s 后，6s 预算让请求正常完成而不是被砍成空结果；
+# FUSION+HyDE 分支相应提高到 8.0s（保留「HyDE 更长」分层）。
+_RETRIEVE_TIMEOUT = 6.0
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
-# 超时即跳过该降级分支。注意：10.0 实际长于主检索超时（3.0/5.0s）——主检索
+# 超时即跳过该降级分支。注意：10.0 实际长于主检索超时（6.0/8.0s）——主检索
 # 超时返回空后，兜底仍有 10s 窗口尽力补充（非"短于"语义，2026-08-19 R2 修正注释）。
 _DEGRADE_TIMEOUT = 10.0
 
@@ -79,12 +82,12 @@ def _query_router_config(qr):
 
 
 def _retrieve_timeout(level, config) -> float:
-    """检索超时预算（秒）【P3b R1 P0-2 方案 B】：FUSION 且 HyDE 开启 → 5.0
-    （LLM 生成假设段落预留预算），否则 3.0（原 _RETRIEVE_TIMEOUT——HyDE 默认关，
+    """检索超时预算（秒）【P3b R1 P0-2 方案 B】：FUSION 且 HyDE 开启 → 8.0
+    （LLM 生成假设段落预留预算），否则 6.0（_RETRIEVE_TIMEOUT——HyDE 默认关，
     关闭路径零回归）。config 缺省（None）按 hyde_enabled=False 处理。
     """
     if level == RetrievalLevel.FUSION and getattr(config, "hyde_enabled", False):
-        return 5.0
+        return 8.0
     return _RETRIEVE_TIMEOUT
 
 
