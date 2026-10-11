@@ -141,6 +141,11 @@ _WARMUP_QUERY = (
     "BM25 索引、社区成员 sidecar 与向量编码器。"
 )
 
+# 【v6.33 预热阻塞就绪】预热在 lifespan yield 前 await（不再由 _startup_rebuild
+# 的 create_task 承载）；此标志在预热步骤结束（成功/失败/被配置关闭）后置位，
+# 供 tests/test_warmup_blocking.py 断言「服务就绪时预热已执行，不存在后台预热任务」。
+_retrieval_warmup_done: bool = False
+
 
 def _run_retrieval_warmup(svc: Services) -> None:
     """【v6.32 启动预热】用固定短查询跑一次完整 FUSION 检索。
@@ -153,6 +158,8 @@ def _run_retrieval_warmup(svc: Services) -> None:
     """
     from retrieval.query_router import RetrievalLevel
     from api.routes._deps import clear_result_cache
+
+    global _retrieval_warmup_done
 
     try:
         cfg = get_settings()
@@ -185,6 +192,9 @@ def _run_retrieval_warmup(svc: Services) -> None:
             clear_result_cache()
         except Exception:
             logger.warning("Result cache clear after warmup failed (non-fatal)", exc_info=True)
+        # 预热步骤结束（成功/失败/被配置关闭）即视为「就绪侧不阻塞」；标志置位
+        # 供 tests/test_warmup_blocking.py 断言服务就绪时预热已执行。
+        _retrieval_warmup_done = True
 
 
 def make_store(cfg):
@@ -675,6 +685,61 @@ def _init_services() -> Services:
     return svc
 
 
+async def _startup_retrieval_prep(svc: Services) -> None:
+    """启动期检索就绪准备（在 lifespan yield 前 await，阻塞就绪）。
+
+    把冷启动一次性加载从「首条用户查询」挪到「服务启动」，使首条真实查询落在稳态量级。
+    依序：FAISS 索引加载/重建 → BM25/visual/reranker 三段 prewarm → 完整 FUSION 检索预热。
+    每段独立 fail-soft：单段失败只记 WARNING，不阻断服务启动（预热是优化，非启动前置）。
+    """
+    # 重建 FAISS 索引 + TF-IDF 拟合（在 yield 前完成，避免与首条查询抢资源）
+    try:
+        from api.routes import rebuild_index
+        logger.info("Startup: auto-building FAISS + TF-IDF...")
+        result = await rebuild_index(svc)
+        idx = result.get("indexed_count", 0)
+        # 注意: rebuild_index (api/routes/system.py) 内部已做 TF-IDF fit
+        # (含 GraphLite 嵌套/b64 兼容解析), 此处无需重复拟合。
+        logger.info("Startup: FAISS auto-build complete", indexed=idx)
+    except Exception as e:
+        logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
+
+    # 【P1-2】启动异步预热 BM25 索引（超时保护；失败静默降级，不阻塞启动）
+    qr = svc.query_router
+    # SelfEvolvingRetrieval 包装时取内层 QueryRouter（_qr 为私有包装目标）
+    inner_qr = getattr(qr, "_qr", qr) if qr is not None else None
+    if inner_qr is not None and hasattr(inner_qr, "prewarm_bm25"):
+        try:
+            await inner_qr.prewarm_bm25()
+            logger.info("Startup: BM25 prewarm complete")
+        except Exception as e:
+            logger.warning("Startup BM25 prewarm skipped (non-fatal): %s", e)
+
+    # 【P2-a V-Mem】启动异步预热视觉索引（失败静默降级，不阻塞启动）
+    if inner_qr is not None and hasattr(inner_qr, "prewarm_visual"):
+        try:
+            await inner_qr.prewarm_visual()
+            logger.info("Startup: visual index prewarm complete")
+        except Exception as e:
+            logger.warning("Startup visual prewarm skipped (non-fatal): %s", e)
+
+    # 【P3a R1】启动异步预热 bge-reranker（冷启动护栏，失败静默降级不阻塞启动）
+    if inner_qr is not None and hasattr(inner_qr, "prewarm_reranker"):
+        try:
+            await inner_qr.prewarm_reranker()
+            logger.info("Startup: reranker prewarm complete")
+        except Exception as e:
+            logger.warning("Startup reranker prewarm skipped (non-fatal): %s", e)
+
+    # 【v6.32 启动预热】固定短查询跑一次完整 FUSION 检索（全链路预热：reranker /
+    # BM25 / 社区成员 sidecar / 向量编码器）。默认开、fail-soft、可经配置关闭；
+    # 检索是同步链路 → 线程池执行，不阻塞事件循环。预热后清空结果缓存防污染。
+    try:
+        await asyncio.to_thread(_run_retrieval_warmup, svc)
+    except Exception as e:
+        logger.warning("Startup retrieval warmup skipped (non-fatal): %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """应用生命周期管理"""
@@ -692,55 +757,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     init_services(svc)
     logger.info("Services injected into route handlers")
 
-    # 启动后台重建 FAISS 索引 + TF-IDF 拟合（非阻塞）
-    async def _startup_rebuild() -> None:
-        try:
-            from api.routes import rebuild_index
-            from fastapi import Depends
-            logger.info("Startup: auto-building FAISS + TF-IDF...")
-            result = await rebuild_index(svc)
-            idx = result.get("indexed_count", 0)
-            # 注意: rebuild_index (api/routes/system.py) 内部已做 TF-IDF fit
-            # (含 GraphLite 嵌套/b64 兼容解析), 此处无需重复拟合。
-            logger.info("Startup: FAISS auto-build complete", indexed=idx)
-        except Exception as e:
-            logger.warning("Startup FAISS auto-build skipped (non-fatal): %s", e)
-
-        # 【P1-2】启动异步预热 BM25 索引（超时保护；失败静默降级，不阻塞启动）
-        qr = svc.query_router
-        # SelfEvolvingRetrieval 包装时取内层 QueryRouter（_qr 为私有包装目标）
-        inner_qr = getattr(qr, "_qr", qr) if qr is not None else None
-        if inner_qr is not None and hasattr(inner_qr, "prewarm_bm25"):
-            try:
-                await inner_qr.prewarm_bm25()
-                logger.info("Startup: BM25 prewarm complete")
-            except Exception as e:
-                logger.warning("Startup BM25 prewarm skipped (non-fatal): %s", e)
-
-        # 【P2-a V-Mem】启动异步预热视觉索引（失败静默降级，不阻塞启动）
-        if inner_qr is not None and hasattr(inner_qr, "prewarm_visual"):
-            try:
-                await inner_qr.prewarm_visual()
-                logger.info("Startup: visual index prewarm complete")
-            except Exception as e:
-                logger.warning("Startup visual prewarm skipped (non-fatal): %s", e)
-
-        # 【P3a R1】启动异步预热 bge-reranker（冷启动护栏，失败静默降级不阻塞启动）
-        if inner_qr is not None and hasattr(inner_qr, "prewarm_reranker"):
-            try:
-                await inner_qr.prewarm_reranker()
-                logger.info("Startup: reranker prewarm complete")
-            except Exception as e:
-                logger.warning("Startup reranker prewarm skipped (non-fatal): %s", e)
-
-        # 【v6.32 启动预热】固定短查询跑一次完整 FUSION 检索（全链路预热：reranker /
-        # BM25 / 社区成员 sidecar / 向量编码器）。默认开、fail-soft、可经配置关闭；
-        # 检索是同步链路 → 线程池执行，不阻塞事件循环。预热后清空结果缓存防污染。
-        try:
-            await asyncio.to_thread(_run_retrieval_warmup, svc)
-        except Exception as e:
-            logger.warning("Startup retrieval warmup skipped (non-fatal): %s", e)
-
+    # user-profile 构建不影响检索正确性/延迟 → 保留为后台任务（yield 后执行）。
+    # 检索相关启动工作（FAISS 加载 + prewarm 三段 + FUSION 预热）已移至模块级
+    # _startup_retrieval_prep，在 yield 前 await（见下方调用点）。
+    async def _startup_user_profile() -> None:
         # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
         # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；
         #  仅非空重建结果才覆盖写，失败静默降级，不阻塞启动）
@@ -789,7 +809,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception:
             pass
 
-    startup_task = asyncio.create_task(_startup_rebuild())
+    # 【v6.33】检索就绪准备在 yield 前 await —— 服务在预热完成前不接受任何请求，
+    # 消除「首条真实查询与预热抢 CPU/模型/DB」的竞态（Hermes 实测首条 12.73s）。
+    await _startup_retrieval_prep(svc)
+
+    # user-profile 构建不影响检索正确性/延迟 → 仍在后台执行
+    startup_task = asyncio.create_task(_startup_user_profile())
     cleanup_task = asyncio.create_task(_cleanup_dream_candidates())
 
     # 启动梦境调度器后台轮询（每60秒检查一次触发条件）
