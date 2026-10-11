@@ -34,6 +34,17 @@ _LABEL_COMMUNITY_MEMBER = "COMMUNITY_MEMBER"
 _PERSIST_CHUNK_SIZE = 10
 
 
+def _invalidate_community_members_cache(store) -> None:
+    """社区成员落库后失效 OverGraphStore 的社区成员批量查询缓存。
+
+    幂等、后端无关：仅当 store 暴露 invalidate_community_members_cache 钩子时
+    调用（GraphLite / 测试 mock 无该钩子 → no-op）。v6.28 检索超时修复 Part A2。
+    """
+    hook = getattr(store, "invalidate_community_members_cache", None)
+    if hook is not None:
+        hook()
+
+
 @dataclass
 class DreamCandidate:
     """梦境候选 — 一次梦境输出，等待审查。"""
@@ -463,6 +474,7 @@ class DreamCandidateStore:
                     "Community persist chunk failed (rolled back): %s", e,
                 )
                 continue
+            _invalidate_community_members_cache(graphlite_store)
             created += chunk_created
             new_member_sets.update(chunk_member_sets)
             # 【心跳】每块（~10 社区）touch 一次（长写防看门狗误判 CRITICAL）
@@ -524,6 +536,7 @@ class DreamCandidateStore:
                     "Failed to clean up stale COMMUNITY_MEMBER edges",
                     exc_info=True,
                 )
+            _invalidate_community_members_cache(graphlite_store)
 
         # ✅ Phase 1 + Phase 3 同源湮灭 bug 已在 dream_pipeline.py 同步修复：
         #    - Phase 1 (L1117-1127): MATCH 限定 {id: $cid}，不碰外部社区边

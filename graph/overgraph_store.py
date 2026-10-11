@@ -56,6 +56,7 @@ import time
 import uuid
 import hashlib
 import json
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import numpy as np
@@ -610,6 +611,14 @@ class OverGraphStore:
         self._session_lock = _WriterPriorityLock()
         # thread-local 降级信号（query_cypher 永不抛契约，P3a R7）
         self._local = threading.local()
+        # 社区成员批量查询进程内缓存（v6.28 检索超时修复 Part A）。
+        # key = (排序后的 community_ids 元组, limit)；value = {cid: [成员 dict]}。
+        # 独立 threading.Lock：引擎访问走 _session_lock，缓存不触引擎，专用锁
+        # 避免与 _WriterPriorityLock 的锁序耦合（get_community_members_batch 在
+        # 未持 _session_lock 时被调用，命中路径绝不能先去抢引擎锁）。
+        self._community_members_cache: OrderedDict = OrderedDict()
+        self._community_members_cache_lock = threading.Lock()
+        self._community_members_cache_max = 512
 
     # ─── 连接 ─────────────────────────────────────────
 
@@ -1717,9 +1726,26 @@ class OverGraphStore:
         与逐社区 get_community_members 结果等价：同一 ORDER BY tau_initial DESC，
         每社区在 Python 侧截断 limit 条。检索洪峰下把 N 次锁竞争降为 1 次，
         是写线程不再被社区扩召回饿死的直接修复（AC1 方案②）。
+
+        【v6.28 检索超时修复 Part A】进程内 LRU 缓存：key =
+        (tuple(sorted(community_ids)), limit)。命中直接按调用方 community_ids 顺序
+        重建返回（成员列表/字段内容+顺序与未命中逐字节一致），未命中走 1 次 GQL
+        后缓存快照。缓存键对 ids 排序 → ["a","b"] 与 ["b","a"] 共享同一条目，
+        但返回仍按调用方顺序。社区成员变更经 invalidate_community_members_cache()
+        全量失效（见 core/dream_candidate_store.py 落库后调用）。
         """
         if not community_ids:
             return {}
+        limit = int(limit)
+        cache_key = (tuple(sorted(community_ids)), limit)
+        with self._community_members_cache_lock:
+            cached = self._community_members_cache.get(cache_key)
+            if cached is not None:
+                self._community_members_cache.move_to_end(cache_key)
+                return {
+                    cid: [dict(m) for m in cached.get(cid, [])]
+                    for cid in community_ids
+                }
         rows = self.query_cypher(
             f"MATCH (c:{LABEL_COMMUNITY})-[:COMMUNITY_MEMBER]->(e:{LABEL_EPISODE}) "
             "WHERE c.id IN $cids "
@@ -1735,7 +1761,7 @@ class OverGraphStore:
             mid = row.get("member_id", "") or ""
             if not cid or not mid or cid not in out:
                 continue
-            if len(out[cid]) >= int(limit):
+            if len(out[cid]) >= limit:
                 continue
             out[cid].append({
                 "member_id": mid,
@@ -1744,7 +1770,23 @@ class OverGraphStore:
                 "fact_track": row.get("fact_track", "active") or "active",
                 "tau_value": row.get("tau_value", 0.0) or 0.0,
             })
-        return out
+        snapshot = {cid: [dict(m) for m in members] for cid, members in out.items()}
+        with self._community_members_cache_lock:
+            self._community_members_cache[cache_key] = snapshot
+            self._community_members_cache.move_to_end(cache_key)
+            while len(self._community_members_cache) > self._community_members_cache_max:
+                self._community_members_cache.popitem(last=False)
+        return {cid: [dict(m) for m in members] for cid, members in out.items()}
+
+    def invalidate_community_members_cache(self) -> None:
+        """社区成员变更后的缓存失效钩子（v6.28 检索超时修复 Part A2）。
+
+        CommunityNode / COMMUNITY_MEMBER 边落库后由写路径调用
+        （core/dream_candidate_store._persist_community_nodes 等）；全量清空 ——
+        进程内 LRU 重建成本远低于返回过期成员的功能错误。幂等、线程安全。
+        """
+        with self._community_members_cache_lock:
+            self._community_members_cache.clear()
 
     # ─── Hebbian ───────────────────────────────────────
 

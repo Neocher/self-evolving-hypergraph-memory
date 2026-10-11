@@ -409,6 +409,13 @@ class QueryRouter:
         self._episode_cache = episode_cache if episode_cache is not None else {}
         # 【M4】CJK 通道跳过一次性标志（进程内首次 warning，不刷屏）
         self._cjk_warned = False
+        # 【v6.28 检索超时修复 Part B】社区扩展独立预算熔断：
+        # get_community_members_batch 单次耗时超过 community_expansion.budget_s →
+        # 熔断 community_expansion.breaker_s 秒，窗口期内直接跳过社区扩展
+        # （该通道本就 fail-soft）。budget_s<=0 时禁用（行为与改动前逐字节一致）。
+        # 到期自动半开：下一次调用实测耗时，仍超阈值则续熔断。纯 float 单调钟
+        # 时间戳（GIL 下赋值原子；竞争最多多一次慢调用/多一次跳过，fail-soft 无害）。
+        self._community_expansion_breaker_open_until = 0.0
         # 【达摩院 P0-a】会话作用域索引（node_id → session_id）。显式注入优先，
         # 缺省回落 episode_cache（与评测灌库同坐标：episode.session_id）。
         self._session_index = session_index if session_index is not None else {}
@@ -2392,9 +2399,26 @@ class QueryRouter:
             if not relevant_comm_ids:
                 return results
             if hasattr(store, "get_community_members_batch"):
+                budget_s = float(getattr(cfg, "budget_s", 1.5))
+                breaker_s = float(getattr(cfg, "breaker_s", 60.0))
+                # 熔断打开：窗口期内直接跳过社区扩展（fail-soft，主检索零影响）。
+                # getattr 兜底：测试经 QueryRouter.__new__ 构造（不跑 __init__）时
+                # 缺省 0.0 = 熔断关闭，行为与改动前一致。
+                if budget_s > 0.0 and time.monotonic() < getattr(
+                    self, "_community_expansion_breaker_open_until", 0.0
+                ):
+                    return results
+                t0 = time.monotonic()
                 members_by_comm = store.get_community_members_batch(
                     relevant_comm_ids, limit=max_members
                 )
+                elapsed = time.monotonic() - t0
+                if budget_s > 0.0 and elapsed > budget_s:
+                    # 单次超过预算 → 打开熔断；到期后半开重试（下次实测耗时，
+                    # 仍超阈值则续熔断——标准 open→half-open 自动转换）。
+                    self._community_expansion_breaker_open_until = (
+                        time.monotonic() + breaker_s
+                    )
                 if not isinstance(members_by_comm, dict):
                     return results
             else:

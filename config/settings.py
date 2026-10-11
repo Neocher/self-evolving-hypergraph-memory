@@ -163,6 +163,8 @@ class CommunityExpansionConfig:
     boost: float = 0.6          # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
     threshold: float = 0.5      # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
     max_members: int = 10       # 每社区最大成员召回数
+    budget_s: float = 1.5       # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
+    breaker_s: float = 60.0     # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试
 
 
 @dataclass
