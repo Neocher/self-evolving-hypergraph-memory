@@ -264,6 +264,12 @@ class QueryRouterConfig:
     # bge-reranker 重排配置（P3a，默认开；仅 FUSION 路径生效，失败静默降级）
     rerank_enabled: bool = True  # 重排开关（retrieve(rerank=False) 可显式关）
     rerank_input_k: int = 15  # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
+    # 【长度分桶加速】按 len(content) 排序后连续切桶、逐桶 predict——桶内 padding 大幅
+    # 减少（实测 ~1.9-2.3x）。cross-encoder 逐对独立打分，桶只影响 padding，与整批
+    # predict 语义等价。max_length 默认 512 = 现状零回归（此前未指定，SDK 默认即 512）。
+    rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
+    rerank_buckets: int = 3  # 桶数（默认 3；> 候选数时按候选数截断）
+    rerank_max_length: int = 512  # 送入 reranker 的最大 token 长度（默认 512 = 现状零回归）
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
@@ -321,6 +327,16 @@ class QueryRouterConfig:
         if self.session_scope_pool < 1:
             raise ValueError(
                 f"QueryRouterConfig.session_scope_pool={self.session_scope_pool} 必须 >= 1"
+            )
+        # 【长度分桶】桶数/最大长度下界校验：0/负数会让分桶空转或 CrossEncoder 报错，
+        # 配置期 fail-fast 拒绝非法值。
+        if self.rerank_buckets < 1:
+            raise ValueError(
+                f"QueryRouterConfig.rerank_buckets={self.rerank_buckets} 必须 >= 1"
+            )
+        if self.rerank_max_length < 1:
+            raise ValueError(
+                f"QueryRouterConfig.rerank_max_length={self.rerank_max_length} 必须 >= 1"
             )
 
 
@@ -4265,6 +4281,7 @@ class QueryRouter:
                 self._reranker = CrossEncoder(
                     "BAAI/bge-reranker-base",
                     device="cpu",
+                    max_length=int(self.config.rerank_max_length),
                 )
                 return self._reranker
             except Exception:
@@ -4313,8 +4330,21 @@ class QueryRouter:
                 return results
             query_text = raw_query or ""
             pairs = [(query_text, c[:3000]) for c, _ in scorable]
-            scores = reranker.predict(pairs)
-            logits = np.asarray(scores, dtype=np.float64).reshape(-1)
+            if self._rerank_bucketing_enabled():
+                # 长度分桶路径：任何异常 → WARNING + 回落原整批 predict（fail-soft，
+                # 不抛给上层；整批路径语义与改动前逐字节一致）。
+                try:
+                    logits = self._predict_length_bucketed(reranker, pairs)
+                except Exception:
+                    logger.warning(
+                        "rerank length bucketing degraded to whole-batch predict",
+                        exc_info=True,
+                    )
+                    scores = reranker.predict(pairs)
+                    logits = np.asarray(scores, dtype=np.float64).reshape(-1)
+            else:
+                scores = reranker.predict(pairs)
+                logits = np.asarray(scores, dtype=np.float64).reshape(-1)
             # 【F5】长度失配 → 静默降级原列表（防部分候选被丢）
             if len(logits) != len(scorable):
                 return results
@@ -4345,6 +4375,46 @@ class QueryRouter:
                 "rerank degraded, returning original results", exc_info=True
             )
             return results
+
+    def _rerank_bucketing_enabled(self) -> bool:
+        """长度分桶开关（默认开；候选 < 2 时调用方已短路）。"""
+        return bool(getattr(self.config, "rerank_length_bucketing", True))
+
+    def _predict_length_bucketed(self, reranker, pairs: list[tuple]) -> np.ndarray:
+        """长度分桶预测：按内容长度排序 → 连续切桶 → 逐桶 predict → 按原索引映射回。
+
+        cross-encoder 逐对独立打分，桶只影响 padding，故与整批 predict 语义等价
+        （加速来自桶内 padding 大幅减少）。关键：必须连续切分（sorted 后的连续块）
+        ——交错切分（order[i::n]）会把长文档均匀分到每桶，桶内最长仍是大值，实测
+        无加速。任何异常抛给调用方（fail-soft 回落整批）。
+        """
+        n = len(pairs)
+        buckets = max(1, int(getattr(self.config, "rerank_buckets", 3)))
+        if buckets > n:
+            buckets = n
+        # 按 content 长度排序（稳定排序，等长保持原相对顺序）
+        order = sorted(range(n), key=lambda i: len(pairs[i][1]))
+        # 连续块切分：前 rem 桶各多 1 个，桶大小尽量均匀
+        size, rem = divmod(n, buckets)
+        scores = np.empty(n, dtype=np.float64)
+        start = 0
+        for b in range(buckets):
+            end = start + size + (1 if b < rem else 0)
+            if end <= start:
+                break
+            bucket_pairs = [pairs[order[i]] for i in range(start, end)]
+            bucket_scores = np.asarray(
+                reranker.predict(bucket_pairs, batch_size=len(bucket_pairs)),
+                dtype=np.float64,
+            ).reshape(-1)
+            if len(bucket_scores) != (end - start):
+                raise ValueError(
+                    f"bucket predict length mismatch: {len(bucket_scores)} != {end - start}"
+                )
+            for j in range(start, end):
+                scores[order[j]] = bucket_scores[j - start]
+            start = end
+        return scores
 
     def _rpe_rerank_results(self, results: list[dict]) -> list[dict]:
         """【P3-C】RPE 惊奇度 → 检索轻重排（默认关零回归）。

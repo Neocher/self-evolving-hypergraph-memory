@@ -236,6 +236,10 @@ def _build_router_config(rcfg):
         mesa_max_nodes=getattr(mesa, "max_nodes", 5),
         rerank_enabled=getattr(rcfg, "rerank_enabled", True),
         rerank_input_k=getattr(rcfg, "rerank_input_k", 15),
+        # 【长度分桶】getattr 缺省（旧配置对象零回归）
+        rerank_length_bucketing=getattr(rcfg, "rerank_length_bucketing", True),
+        rerank_buckets=getattr(rcfg, "rerank_buckets", 3),
+        rerank_max_length=getattr(rcfg, "rerank_max_length", 512),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),

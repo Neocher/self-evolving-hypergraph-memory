@@ -291,6 +291,11 @@ class RetrievalConfig:
     agentic_enabled: bool = False   # P0-2 多步锚点检索编排开关（默认关）
     rerank_enabled: bool = True     # bge-reranker 重排开关（默认开；仅 FUSION 生效）
     rerank_input_k: int = 15        # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
+    # 【长度分桶加速】按 len(content) 排序后连续切桶、逐桶 predict（桶内 padding 减少，
+    # 实测 ~1.9-2.3x；cross-encoder 逐对独立，桶只影响 padding，与整批语义等价）
+    rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
+    rerank_buckets: int = 3              # 桶数（默认 3；> 候选数时按候选数截断）
+    rerank_max_length: int = 512         # 送入 reranker 的最大 token 长度（默认 512 = 现状零回归）
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -333,6 +338,11 @@ class RetrievalConfig:
         # 静默跳过重排（配置期 fail-fast 拒绝非法值）。
         if self.rerank_input_k < 1:
             raise ValueError(f"RetrievalConfig.rerank_input_k={self.rerank_input_k} 必须 >= 1")
+        # 【长度分桶】桶数/最大长度下界校验：0/负数会让分桶空转或 CrossEncoder 报错。
+        if self.rerank_buckets < 1:
+            raise ValueError(f"RetrievalConfig.rerank_buckets={self.rerank_buckets} 必须 >= 1")
+        if self.rerank_max_length < 1:
+            raise ValueError(f"RetrievalConfig.rerank_max_length={self.rerank_max_length} 必须 >= 1")
         # 【P3b】hyde_mode 枚举校验：检索路径只分 dual/replace 两分支，非法值会
         # 静默落回单路与操作者意图不符（配置期 fail-fast 拒绝非法值）。
         if self.hyde_mode not in ("dual", "replace"):

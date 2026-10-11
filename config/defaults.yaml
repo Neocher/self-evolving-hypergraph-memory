@@ -112,6 +112,9 @@ retrieval:
   agentic_enabled: false         # P0-2 多步锚点检索编排开关（默认关，开启需 level=FUSION）
   rerank_enabled: true           # bge-reranker 重排开关（默认开，仅 FUSION 生效）
   rerank_input_k: 15             # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
+  rerank_length_bucketing: true  # 长度分桶开关（默认开；按 len(content) 排序连续切桶逐桶 predict）
+  rerank_buckets: 3              # 桶数（默认 3；> 候选数时按候选数截断）
+  rerank_max_length: 512         # 送入 reranker 的最大 token 长度（默认 512 = 现状零回归）
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
