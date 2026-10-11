@@ -185,6 +185,8 @@ def _build_router_config(rcfg):
         step_budget_s=getattr(rcfg, "step_budget_s", 1.0),
         step_breaker_s=getattr(rcfg, "step_breaker_s", 30.0),
         step_budget=getattr(rcfg, "step_budget", None) or {},
+        # 【v6.30 检索超时修复 Part 3】扩展步骤总预算守卫透传（getattr 缺省，旧配置零回归）
+        total_step_budget_s=getattr(rcfg, "total_step_budget_s", 3.0),
     )
     # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）

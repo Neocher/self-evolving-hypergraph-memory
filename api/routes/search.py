@@ -34,9 +34,10 @@ _RETRIEVE_TIMEOUT = 6.0
 
 # 【H2-a】降级分支超时（秒）：Cypher 兜底 / 隔离 ID 拉取 / 命名空间预取
 # 同样套 wait_for —— 若挂的是 GraphLite，主检索超时后走兜底会再次无限挂起，
-# 超时即跳过该降级分支。注意：10.0 实际长于主检索超时（6.0/8.0s）——主检索
-# 超时返回空后，兜底仍有 10s 窗口尽力补充（非"短于"语义，2026-08-19 R2 修正注释）。
-_DEGRADE_TIMEOUT = 10.0
+# 超时即跳过该降级分支。【v6.30 检索超时修复 Part 1】10.0→3.0：主检索 6s 超时
+# 返回空后兜底再等 10s 会把客户端实测拖到 16.47s；改 3.0 后最坏约 9s，且仍
+# 保留兜底能力（非删除功能）。
+_DEGRADE_TIMEOUT = 3.0
 
 
 def _level_from_strategy(strategy, config=None) -> "RetrievalLevel":

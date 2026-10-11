@@ -79,8 +79,10 @@ retrieval:
     boost: 0.6                   # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
     threshold: 0.5               # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
     max_members: 10              # 每社区最大成员召回数
-    budget_s: 1.5                # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
-    breaker_s: 60.0              # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试
+    budget_s: 0.5                # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
+    breaker_s: 300.0             # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试（结构性慢 → 长窗口）
+    backoff_n: 3                 # 连续 N 次半开重试仍超预算 → 退避加倍
+    backoff_max_s: 3600.0        # 退避窗口上限（秒）
   visual_recall:                 # v5.46.0 P2-a V-Mem 模态路由检索（补充非替代，关闭=现状）
     enabled: true                # 开关
     boost: 0.6                   # 视觉分 = 1/(1+dist) × min(种子分) × boost（相对尾分缩放，严格低于文本种子）
@@ -130,6 +132,11 @@ retrieval:
   # step_budget_s<=0 关闭（行为逐字节一致）。
   step_budget_s: 1.0             # 统一兜底熔断阈值（秒）
   step_breaker_s: 30.0           # 统一兜底熔断窗口（秒），到期半开重试
+  # 【v6.30 检索超时修复 Part 3】扩展步骤总预算守卫：进入 _finish 后已耗时超过
+  # 此值 → 跳过后续尚未执行的扩展步骤（社区/MESA/视觉/属性/实体/作用域/schema/fact），
+  # 直接去重/排序/返回。rerank 与去重属必须步骤，不受此守卫跳过。默认宽松到正常
+  # 查询（总耗时约 1.6-3.7s）不受影响，仅异常慢时兜底；<=0 关闭守卫（逐字节一致）。
+  total_step_budget_s: 3.0       # 扩展步骤总预算（秒）
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

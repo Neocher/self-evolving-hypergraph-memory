@@ -282,6 +282,10 @@ class QueryRouterConfig:
     step_budget_s: float = 1.0  # 统一兜底熔断阈值（秒）
     step_breaker_s: float = 30.0  # 统一兜底熔断窗口（秒），到期半开重试
     step_budget: dict = field(default_factory=dict)  # 个别步覆盖 {name: {budget_s, breaker_s}}
+    # 【v6.30 检索超时修复 Part 3】扩展步骤总预算守卫：进入 _finish 后已耗时超过
+    # 此值 → 跳过后续尚未执行的扩展步骤，直接去重/排序/返回。rerank 与去重属必须
+    # 步骤不受此守卫跳过。默认宽松，正常查询（1.6-3.7s）不受影响；<=0 关闭守卫。
+    total_step_budget_s: float = 3.0  # 扩展步骤总预算（秒）
     # 【P3-C】RPE 惊奇度检索重排（默认关零回归；仅 FUSION 生效）
     rpe_rerank_enabled: bool = False
     rpe_rerank_high: float = 0.7   # surprise > 此值 → ×1.05 boost
@@ -1587,49 +1591,88 @@ class QueryRouter:
             # 【v5.41 社区扩召回】补充非替代：统一去重/排序/boost 前 append 社区成员
             # （闭包可捕获 query/query_embedding/raw_query；候选经
             # _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大）
-            results = self._community_expansion(results, query, query_embedding, raw_query)
+            # 【v6.30 检索超时修复 Part 3】总耗时守卫：进入 _finish 即记起始钟；扩展
+            # 通道（community/MESA/视觉/属性/实体/属性匹配/作用域/schema/fact）各自
+            # 可选、skip 只损增量。单步慢叠加会把总耗时顶过检索超时预算 → 已耗时超过
+            # total_step_budget_s 时跳过后续尚未执行的扩展步骤（记日志一次），直接
+            # 去重/排序/返回。rerank 与去重属必须步骤，不受此守卫跳过（否则相关性
+            # 崩塌）。total_step_budget_s<=0 → 关闭守卫（行为逐字节一致）。
+            finish_started = time.monotonic()
+            total_budget_s = float(getattr(self.config, "total_step_budget_s", 3.0))
+            skipped_expansions: list[str] = []
+
+            def _expansion_budget_exhausted() -> bool:
+                return total_budget_s > 0.0 and (
+                    time.monotonic() - finish_started
+                ) > total_budget_s
+
+            def _guarded(name: str, fn, results: list[dict], *args, **kwargs) -> list[dict]:
+                if _expansion_budget_exhausted():
+                    skipped_expansions.append(name)
+                    return results
+                return fn(results, *args, **kwargs)
+
+            results = _guarded(
+                "community_expansion", self._community_expansion,
+                results, query, query_embedding, raw_query)
             # 【v5.49.0 MESA 记忆增强检索】补充非替代：社区摘要合成节点 append
             # （node_id=community_id 可回溯，content=summary；无 archived 字段恒保留）
-            results = self._mesa_synthesis(results, query, raw_query)
+            results = _guarded(
+                "mesa_synthesis", self._mesa_synthesis, results, query, raw_query)
             # 【P2-a V-Mem 视觉召回】补充非替代：_filter_archived 前 append VisualNode
             # （视觉节点无 archived 字段，走 _filter_archived 恒保留；候选同样经
             # _deduplicate_and_sort 单点去重 + score 钳制，相对尾分缩放严格低于种子）
-            results = self._visual_recall(results, query, raw_query)
+            results = _guarded(
+                "visual_recall", self._visual_recall, results, query, raw_query)
             # 【P0-1 属性时间版本链】补充非替代：实体属性版本 append（PropertyVerNode
             # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
             # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
-            results = self._run_with_budget(
-                "property_temporal_retrieve", self._property_temporal_retrieve,
-                results, query, raw_query, now_ts=session_ts,
-            )
+            results = _guarded(
+                "property_temporal_retrieve",
+                lambda r, *a, **kw: self._run_with_budget(
+                    "property_temporal_retrieve", self._property_temporal_retrieve,
+                    r, *a, **kw),
+                results, query, raw_query, now_ts=session_ts)
             # 【P3c 跨消息多跳增强】补充非替代：查询专名实体跨会话召回 append
             # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
             # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._run_with_budget(
-                "entity_expansion", self._entity_expansion,
-                results, query, raw_query, now_ts=session_ts,
-            )
+            results = _guarded(
+                "entity_expansion",
+                lambda r, *a, **kw: self._run_with_budget(
+                    "entity_expansion", self._entity_expansion, r, *a, **kw),
+                results, query, raw_query, now_ts=session_ts)
             # 【Schema 自进化 P0-② 检索通道 P1】属性匹配：查询词命中实体固化属性
             # → MENTIONS episodes 补充召回（score = max(种子) × 0.85 降权）
-            results = self._run_with_budget(
-                "attribute_expansion", self._attribute_expansion,
-                results, query, raw_query, now_ts=session_ts,
-            )
+            results = _guarded(
+                "attribute_expansion",
+                lambda r, *a, **kw: self._run_with_budget(
+                    "attribute_expansion", self._attribute_expansion, r, *a, **kw),
+                results, query, raw_query, now_ts=session_ts)
             # 【阶段3 图作用域检索】补充非替代：种子 EpisodeNode → 邻域向量检索
             # append（仅 overgraph 后端；EpisodeNode 带 archived 字段，
             # _filter_archived 正常过滤；score = max(种子分) × boost(0.9) 仅低于
             # 最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._run_with_budget(
-                "scope_retrieve", self._scope_retrieve,
-                results, query, query_embedding, now_ts=session_ts,
-            )
+            results = _guarded(
+                "scope_retrieve",
+                lambda r, *a, **kw: self._run_with_budget(
+                    "scope_retrieve", self._scope_retrieve, r, *a, **kw),
+                results, query, query_embedding, now_ts=session_ts)
             # 【阶段4-1 Schema 模式蒸馏】补充非替代：Schema 节点（:Conceptual 标签）
             # 命中 → append 聚合线索上下文（尾分缩放；无 archived 字段恒保留）
-            results = self._schema_recall(results, raw_query or query)
+            results = _guarded(
+                "schema_recall", self._schema_recall, results, raw_query or query)
             # 【P0-③ AtomicFact 事实级中间层】补充非替代：查询实体命中
             # AtomicFactNode → 事实文本（subject/predicate/object/time）直接进
             # 上下文（事实级证据，EverOS 93.05 核心）；默认关（fact_channel_enabled）
-            results = self._fact_retrieve(results, query, raw_query, now_ts=session_ts)
+            results = _guarded(
+                "fact_retrieve", self._fact_retrieve, results, query, raw_query,
+                now_ts=session_ts)
+            if skipped_expansions:
+                logger.warning(
+                    "Retrieval expansion budget exhausted, skipping remaining expansion steps",
+                    skipped=skipped_expansions,
+                    total_step_budget_s=total_budget_s,
+                )
             # 【达摩院 P0-a】会话作用域：去重/boost 前按 session_id 后置过滤（rerank 在
             # 会话内候选池做）。scoped 时聚合增强通道（community/MESA/视觉/schema 等
             # 无 session 归属）在此按 session_scope_drop_unattributed 丢弃——异会话文本
@@ -2464,14 +2507,31 @@ class QueryRouter:
             if not relevant_comm_ids:
                 return results
             if hasattr(store, "get_community_members_batch"):
-                budget_s = float(getattr(cfg, "budget_s", 1.5))
-                breaker_s = float(getattr(cfg, "breaker_s", 60.0))
+                budget_s = float(getattr(cfg, "budget_s", 0.5))
+                breaker_s = float(getattr(cfg, "breaker_s", 300.0))
+                backoff_n = int(getattr(cfg, "backoff_n", 3))
+                backoff_max_s = float(getattr(cfg, "backoff_max_s", 3600.0))
                 # 熔断打开：窗口期内直接跳过社区扩展（fail-soft，主检索零影响）。
                 # getattr 兜底：测试经 QueryRouter.__new__ 构造（不跑 __init__）时
                 # 缺省 0.0 = 熔断关闭，行为与改动前一致。
-                if budget_s > 0.0 and time.monotonic() < getattr(
+                open_until = getattr(
                     self, "_community_expansion_breaker_open_until", 0.0
-                ):
+                )
+                if budget_s > 0.0 and time.monotonic() < open_until:
+                    # 【v6.30 Part 2 P2.2】诚实降级语义：跳过时记 WARNING（含社区
+                    # 数与累计跳过次数），节流到每秒最多 1 条防刷屏（高 QPS 下
+                    # 不淹没日志；skip_count 聚合已跳过总次数）。
+                    skip_count = getattr(self, "_community_expansion_skip_count", 0) + 1
+                    self._community_expansion_skip_count = skip_count
+                    now = time.monotonic()
+                    if now - getattr(self, "_community_expansion_skip_log_ts", 0.0) >= 1.0:
+                        self._community_expansion_skip_log_ts = now
+                        logger.warning(
+                            "Community expansion skipped by circuit breaker",
+                            community_ids=len(relevant_comm_ids),
+                            skip_count=skip_count,
+                            retry_after_s=max(0.0, open_until - now),
+                        )
                     return results
                 t0 = time.monotonic()
                 members_by_comm = store.get_community_members_batch(
@@ -2481,9 +2541,34 @@ class QueryRouter:
                 if budget_s > 0.0 and elapsed > budget_s:
                     # 单次超过预算 → 打开熔断；到期后半开重试（下次实测耗时，
                     # 仍超阈值则续熔断——标准 open→half-open 自动转换）。
+                    # 【v6.30 Part 2 P2.3】结构性慢（只要真执行就慢）而非偶发抖动：
+                    # 连续 backoff_n 次半开重试仍超预算 → 退避窗口加倍（上限
+                    # backoff_max_s），避免每窗口首条请求反复全额支付 8s。
+                    if open_until > 0.0:
+                        # 半开重试仍超预算：累加连续慢次数，达 backoff_n 次则退避加倍
+                        consec = getattr(
+                            self, "_community_expansion_consecutive_slow", 0
+                        ) + 1
+                        backoff_s = getattr(
+                            self, "_community_expansion_breaker_backoff_s", breaker_s
+                        )
+                        if consec >= backoff_n:
+                            backoff_s = min(backoff_s * 2.0, backoff_max_s)
+                            consec = 0
+                    else:
+                        # 首次慢调用：按基础窗口打开，退避复位
+                        consec = 0
+                        backoff_s = breaker_s
+                    self._community_expansion_consecutive_slow = consec
+                    self._community_expansion_breaker_backoff_s = backoff_s
                     self._community_expansion_breaker_open_until = (
-                        time.monotonic() + breaker_s
+                        time.monotonic() + backoff_s
                     )
+                elif budget_s > 0.0:
+                    # 半开恢复（未超预算）→ 熔断完全复位，下次慢调用回到基础窗口。
+                    self._community_expansion_consecutive_slow = 0
+                    self._community_expansion_breaker_backoff_s = breaker_s
+                    self._community_expansion_breaker_open_until = 0.0
                 if not isinstance(members_by_comm, dict):
                     return results
             else:

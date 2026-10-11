@@ -163,8 +163,10 @@ class CommunityExpansionConfig:
     boost: float = 0.6          # 扩展分 = relevance × min(种子分) × boost（相对尾分缩放）
     threshold: float = 0.5      # 社区相关度闸口（BM25-on-summary relevance < threshold 丢弃）
     max_members: int = 10       # 每社区最大成员召回数
-    budget_s: float = 1.5       # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
-    breaker_s: float = 60.0     # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试
+    budget_s: float = 0.5       # 单次 get_community_members_batch 熔断阈值（秒）；<=0 关闭熔断
+    breaker_s: float = 300.0    # 熔断窗口（秒）：打开后跳过社区扩展，到期半开重试（结构性慢 → 长窗口）
+    backoff_n: int = 3          # 连续 N 次半开重试仍超预算 → 退避加倍
+    backoff_max_s: float = 3600.0  # 退避窗口上限（秒）
 
 
 @dataclass
@@ -317,6 +319,10 @@ class RetrievalConfig:
     step_budget_s: float = 1.0        # 统一兜底熔断阈值（秒）
     step_breaker_s: float = 30.0      # 统一兜底熔断窗口（秒），到期半开重试
     step_budget: dict = field(default_factory=dict)  # 个别步覆盖 {name: {budget_s, breaker_s}}
+    # 【v6.30 检索超时修复 Part 3】扩展步骤总预算守卫：进入 _finish 后已耗时超过
+    # 此值 → 跳过后续尚未执行的扩展步骤，直接去重/排序/返回。rerank 与去重属必须
+    # 步骤不受此守卫跳过。默认宽松，正常查询（1.6-3.7s）不受影响；<=0 关闭守卫。
+    total_step_budget_s: float = 3.0   # 扩展步骤总预算（秒）
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
