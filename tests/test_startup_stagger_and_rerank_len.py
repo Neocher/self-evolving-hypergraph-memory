@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""【Part B + Part C】rerank_max_length 512→384 + 启动后台任务错峰 验收测试。
+"""【Part B + Part C】rerank_max_length 回退 512（严格零行为变更）+ 启动后台任务错峰 验收测试。
 
 覆盖任务书验收点：
-  AC1(B)  rerank_max_length 默认 384，defaults.yaml / settings.py / QueryRouterConfig 一致
-  AC2(B)  精度不掉：真实 store/真实候选 + 真实 query，384 vs 512 top-5 重合 ≥95%
-          （真实 bge-reranker-base 交叉编码器实测，绝不合成短文本、绝不空集）
-  AC3(B)  提速：同一批真实数据 384 比 512 快 ≥1.15x（真实推理计时，贴出实测数字）
+  AC1(B)  rerank_max_length 默认 512，defaults.yaml / settings.py / QueryRouterConfig /
+          _build_router_config 一致（384 已回退，历史默认零回归）
+  AC2(B)  可选提速 384 vs 512：真实 bge-reranker-base 实测 top-5 重合 ≥95%（短文档不被截断）
+  AC3(B)  可选提速 384 比 512 快 ≥1.15x（真实推理计时，贴出实测数字；非默认，仅佐证注释）
   AC5(C)  可回退：startup_background_stagger_s = 0 → 后台任务立即执行（无错峰延迟）
   AC7(C)  错峰机制：4 个启动后台任务首次执行前各加 stagger*slot 初始延迟，fail-soft
 
@@ -91,19 +91,19 @@ def _top5(model, query: str, candidates: list[str]) -> list[int]:
     return [i for i in order[:5]]
 
 
-# ── AC1(B)：默认值 384，defaults / settings / QueryRouterConfig 三处一致 ──────
+# ── AC1(B)：默认值 512，defaults / settings / QueryRouterConfig / build_router_config 一致 ──
 class TestRerankMaxLengthDefault:
-    def test_settings_default_is_384(self):
-        assert load_settings().retrieval.rerank_max_length == 384
+    def test_settings_default_is_512(self):
+        assert load_settings().retrieval.rerank_max_length == 512
 
-    def test_query_router_default_is_384(self):
-        assert QueryRouterConfig().rerank_max_length == 384
+    def test_query_router_default_is_512(self):
+        assert QueryRouterConfig().rerank_max_length == 512
 
-    def test_defaults_yaml_is_384(self):
+    def test_defaults_yaml_is_512(self):
         raw = yaml.safe_load((_REPO_ROOT / "config" / "defaults.yaml").read_text(encoding="utf-8"))
-        assert raw["retrieval"]["rerank_max_length"] == 384
+        assert raw["retrieval"]["rerank_max_length"] == 512
 
-    def test_build_router_config_default_is_384(self):
+    def test_build_router_config_default_is_512(self):
         class NoMaxLength:
             tau_weight = 0.4
             vector_weight = 0.6
@@ -112,7 +112,7 @@ class TestRerankMaxLengthDefault:
             top_k_keyword = 20
 
         qcfg = app_module._build_router_config(NoMaxLength())
-        assert qcfg.rerank_max_length == 384
+        assert qcfg.rerank_max_length == 512
 
 
 # ── AC2(B) + AC3(B)：真实数据 × 真实 reranker，384 vs 512 精度 + 提速 ─────────

@@ -4,7 +4,7 @@
 覆盖任务书验收点：
   - AC1 零精度损失：真实 store + 真实候选，分桶 vs 整批 → 排序逐位一致 + 分数差 < 1e-4
   - AC2 提速机制：分桶后 padding 工作量严格小于整批（真实加速 ~1.9-2.3x 的确定性代理）
-  - AC3 默认零回归：max_length=384 透传 CrossEncoder；关闭分桶 → 走原整批 predict
+  - AC3 默认零回归：max_length=512 透传 CrossEncoder；关闭分桶 → 走原整批 predict
   - AC4 fail-soft：分桶路径抛异常 → 回落整批 predict，不抛给上层
   - 阈值守卫：桶数 > 候选数按候选数截断；候选 < 2 直接返回
 
@@ -210,7 +210,7 @@ class TestBucketingZeroRegression:
         cfg = QueryRouterConfig()
         assert cfg.rerank_length_bucketing is True
         assert cfg.rerank_buckets == 3
-        assert cfg.rerank_max_length == 384
+        assert cfg.rerank_max_length == 512
 
     def test_bucketing_disabled_uses_whole_batch_predict(self):
         router = _make_router()
@@ -231,14 +231,14 @@ class TestBucketingZeroRegression:
         from unittest.mock import MagicMock
 
         router = _make_router()
-        router.config.rerank_max_length = 384
+        router.config.rerank_max_length = 512
         fake_ce = MagicMock()
         st = types.SimpleNamespace(CrossEncoder=MagicMock(return_value=fake_ce))
         with patch.dict(sys.modules, {"sentence_transformers": st}):
             r = router._get_reranker()
         assert r is fake_ce
         st.CrossEncoder.assert_called_once_with(
-            "BAAI/bge-reranker-base", device="cpu", max_length=384
+            "BAAI/bge-reranker-base", device="cpu", max_length=512
         )
 
     def test_config_validation_rejects_invalid_values(self):
@@ -253,7 +253,7 @@ class TestBucketingZeroRegression:
     def test_settings_and_yaml_defaults_consistent(self):
         from config.settings import load_settings
 
-        assert QueryRouterConfig().rerank_max_length == 384
+        assert QueryRouterConfig().rerank_max_length == 512
         assert load_settings().retrieval.rerank_buckets == 3
         assert load_settings().retrieval.rerank_length_bucketing is True
 
@@ -285,7 +285,7 @@ class TestBucketingZeroRegression:
         qcfg2 = _build_router_config(NoBuckets())
         assert qcfg2.rerank_length_bucketing is True
         assert qcfg2.rerank_buckets == 3
-        assert qcfg2.rerank_max_length == 384
+        assert qcfg2.rerank_max_length == 512
 
 
 # ── AC4：fail-soft 回落整批，不抛给上层 ─────────────────────────────────────

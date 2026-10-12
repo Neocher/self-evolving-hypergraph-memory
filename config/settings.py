@@ -295,7 +295,7 @@ class RetrievalConfig:
     # 实测 ~1.9-2.3x；cross-encoder 逐对独立，桶只影响 padding，与整批语义等价）
     rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
     rerank_buckets: int = 3              # 桶数（默认 3；> 候选数时按候选数截断）
-    rerank_max_length: int = 384         # 送入 reranker 的最大 token 长度（Hermes 实测：384 vs 512 → 1.27x，top-5 重合 97.5%，最大名次变动 0）
+    rerank_max_length: int = 512         # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路

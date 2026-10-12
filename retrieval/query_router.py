@@ -266,11 +266,11 @@ class QueryRouterConfig:
     rerank_input_k: int = 15  # 送入 reranker 的头部候选数（尾部保持原序 append；40→15 压重排延迟）
     # 【长度分桶加速】按 len(content) 排序后连续切桶、逐桶 predict——桶内 padding 大幅
     # 减少（实测 ~1.9-2.3x）。cross-encoder 逐对独立打分，桶只影响 padding，与整批
-    # predict 语义等价。max_length 默认 384（Hermes 实测：384 vs 512 → 1.27x 提速、
-    # top-5 重合 97.5%、最大名次变动 0，精度无实质损失；此前未指定时 SDK 默认即 512）。
+    # predict 语义等价。max_length 默认 512 = 历史默认、严格零行为变更（此前未指定时
+    # SDK 默认即 512）；如需提速可选 384（Hermes 实测 1.27x、top-5 重合 97.5%）。
     rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
     rerank_buckets: int = 3  # 桶数（默认 3；> 候选数时按候选数截断）
-    rerank_max_length: int = 384  # 送入 reranker 的最大 token 长度（Hermes 实测：384 vs 512 → 1.27x，top-5 重合 97.5%，最大名次变动 0）
+    rerank_max_length: int = 512  # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
