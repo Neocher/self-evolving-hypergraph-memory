@@ -2,7 +2,7 @@
 """reranker 并发闸门验收测试（进程级 Semaphore + 有界等待降级）
 =================================================================
 覆盖验收点：
-  AC1  rerank_max_concurrency 默认 1、rerank_gate_wait_ms 默认 2000，
+  AC1  rerank_max_concurrency 默认 1、rerank_gate_wait_ms 默认 300，
        defaults.yaml / settings.py / QueryRouterConfig / _build_router_config 四处一致
   AC2  进程级 Semaphore 有界等待：拿不到闸门 → WARNING + 原列表返回（优雅降级，
        不调用 predict、不抛异常、不无限等待）
@@ -96,17 +96,17 @@ class TestGateDefaults:
     def test_settings_defaults(self):
         cfg = load_settings().retrieval
         assert cfg.rerank_max_concurrency == 1
-        assert cfg.rerank_gate_wait_ms == 2000
+        assert cfg.rerank_gate_wait_ms == 300
 
     def test_query_router_defaults(self):
         cfg = QueryRouterConfig()
         assert cfg.rerank_max_concurrency == 1
-        assert cfg.rerank_gate_wait_ms == 2000
+        assert cfg.rerank_gate_wait_ms == 300
 
     def test_defaults_yaml(self):
         raw = yaml.safe_load((_REPO_ROOT / "config" / "defaults.yaml").read_text(encoding="utf-8"))
         assert raw["retrieval"]["rerank_max_concurrency"] == 1
-        assert raw["retrieval"]["rerank_gate_wait_ms"] == 2000
+        assert raw["retrieval"]["rerank_gate_wait_ms"] == 300
 
     def test_build_router_config_defaults(self):
         from api.app import _build_router_config
@@ -120,7 +120,7 @@ class TestGateDefaults:
 
         qcfg = _build_router_config(_NoGate())
         assert qcfg.rerank_max_concurrency == 1
-        assert qcfg.rerank_gate_wait_ms == 2000
+        assert qcfg.rerank_gate_wait_ms == 300
 
     def test_build_router_config_passthrough(self):
         from api.app import _build_router_config

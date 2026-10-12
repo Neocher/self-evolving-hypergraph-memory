@@ -166,6 +166,68 @@ def _community_relevance_cached_state(summaries: list[str]) -> Optional[tuple]:
         _community_relevance_cache_lock.release()
 
 
+# ── _community_relevance 全局词表快路径（开关默认关）──────────────────────
+# 【社区相关性全局词表】背景：摘要集随查询变化（两两重叠仅 2.5%–42%），上一提交的
+# 指纹缓存（键=整份 summaries）对生产几乎不命中；每请求对 553–1509 条摘要重新
+# fit_transform 实测 ~845ms。全局词表把「fit」从请求内挪到一次惰性构建（进程级
+# 单例），请求内只剩 transform + 子集 IDF + 打分。只存 vectorizer（含 vocabulary_/
+# idf_），绝不长期持有 fit 产生的大稀疏矩阵。
+_community_relevance_global_cache: dict = {}
+_community_relevance_global_lock = threading.Lock()
+# 有界等待：拿不到全局词表构建锁（构建中且超时）→ 回落逐次路径（fail-soft）
+_COMMUNITY_RELEVANCE_GLOBAL_LOCK_TIMEOUT_S = 5.0
+
+
+def _community_relevance_global_vectorizer(sample: list[str], refresh_s: float):
+    """取/建全局词表单例（只存 vectorizer，绝不持有大稀疏矩阵）。失败返回 None。
+
+    单槽缓存 key = sample 指纹（内容驱动失效）；命中且未超 refresh_s → 复用；
+    miss / 超时（refresh_s 到期或社区集变化）→ 持锁重建一次（有界等待）。
+    fit 产生的矩阵在函数栈内释放，不进入缓存。refresh_s<=0 → 不按时间失效。
+    """
+    if not sample:
+        return None
+    try:
+        fingerprint = _community_relevance_fingerprint(sample)
+    except Exception:
+        fingerprint = None
+    now = time.monotonic()
+    if fingerprint is not None:
+        state = _community_relevance_global_cache.get(fingerprint)
+        if state is not None:
+            vectorizer, built_at = state
+            if refresh_s <= 0.0 or (now - built_at) < refresh_s:
+                return vectorizer
+    try:
+        if not _community_relevance_global_lock.acquire(
+            timeout=_COMMUNITY_RELEVANCE_GLOBAL_LOCK_TIMEOUT_S
+        ):
+            return None
+    except Exception:
+        return None
+    try:
+        if fingerprint is not None:
+            state = _community_relevance_global_cache.get(fingerprint)  # 双重检查
+            if state is not None:
+                vectorizer, built_at = state
+                if refresh_s <= 0.0 or (now - built_at) < refresh_s:
+                    return vectorizer
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(2, 4), lowercase=True,
+            max_features=50000,
+        )
+        vectorizer.fit(sample)  # 只保留 vectorizer（vocabulary_/idf_ 在其内部）；矩阵栈内释放
+        _community_relevance_global_cache.clear()  # 单槽：只保留最新一份
+        if fingerprint is not None:
+            _community_relevance_global_cache[fingerprint] = (vectorizer, time.monotonic())
+        return vectorizer
+    except Exception:
+        logger.warning("community relevance global vocab build failed", exc_info=True)
+        return None
+    finally:
+        _community_relevance_global_lock.release()
+
+
 class _EntityChannelDegraded(Exception):
     """entity 通道基础设施降级哨兵（private）。
 
@@ -379,7 +441,10 @@ class QueryRouterConfig:
     # 1 = 串行（默认，消除并发 predict 的 CPU 争抢）；0 = 完全禁用闸门（与改动前一致）；
     # 拿不到闸门（等待超过 rerank_gate_wait_ms）→ WARNING + 跳过重排返回完整融合结果。
     rerank_max_concurrency: int = 1  # 闸门容量（并发上限）；0 完全禁用
-    rerank_gate_wait_ms: int = 2000  # 有界等待超时（ms），严禁无限等待
+    # 【并发闸门】有界等待超时（ms），严禁无限等待。Hermes 三配置实测（同口径全新查询）：
+    # A 2000ms：并发8 5/8、并发12 12/12、压测后单条 2.98s；B 300ms：并发8 6/8、
+    # 并发12 9/12、压测后单条 2.17s；C 关闸门：全超时、压测后单条 6.65s（最差）→ 定 300。
+    rerank_gate_wait_ms: int = 300
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
@@ -410,6 +475,13 @@ class QueryRouterConfig:
     rpe_sigma_enabled: bool = False
     rpe_sigma_high: float = 0.7    # sigma 预测残差 > 此值 → ×1.05 boost（钳制不超原最高分）
     rpe_sigma_low: float = 0.3     # sigma 预测残差 < 此值 → ×0.95 dampen
+    # 【社区相关性全局词表快路径】开关默认关（零回归）。ON 时对社区摘要语料（取样
+    # ≤ max_docs 条，稳定顺序）惰性构建一次全局 char_wb 2-4gram 词表/IDF，每请求
+    # 只 transform（不再 fit）；IDF 仍用本请求子集文档频率（贴近原语义）。超过
+    # refresh_s 或社区集变化 → 允许重建。构建/使用任何异常 → WARNING + 回落现有路径。
+    community_relevance_global_vocab: bool = False        # 默认 False = 现有行为，逐字节零回归
+    community_relevance_global_vocab_max_docs: int = 5000  # 全局拟合取样上限（0 = 全部社区摘要）
+    community_relevance_global_vocab_refresh_s: float = 3600.0  # 全局词表最长复用时间（秒）
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -457,6 +529,17 @@ class QueryRouterConfig:
         if self.rerank_gate_wait_ms < 0:
             raise ValueError(
                 f"QueryRouterConfig.rerank_gate_wait_ms={self.rerank_gate_wait_ms} 必须 >= 0"
+            )
+        # 【社区相关性全局词表】负取样/负刷新周期会让采样空转或语义颠倒，配置期 fail-fast。
+        if self.community_relevance_global_vocab_max_docs < 0:
+            raise ValueError(
+                f"QueryRouterConfig.community_relevance_global_vocab_max_docs="
+                f"{self.community_relevance_global_vocab_max_docs} 必须 >= 0"
+            )
+        if self.community_relevance_global_vocab_refresh_s < 0:
+            raise ValueError(
+                f"QueryRouterConfig.community_relevance_global_vocab_refresh_s="
+                f"{self.community_relevance_global_vocab_refresh_s} 必须 >= 0"
             )
 
 
@@ -2751,6 +2834,40 @@ class QueryRouter:
             )
             return results
 
+    def _community_relevance_global_enabled(self) -> bool:
+        """全局词表快路径开关（默认关 = 现有行为，逐字节零回归）。"""
+        cfg = getattr(self, "config", None)
+        return bool(getattr(cfg, "community_relevance_global_vocab", False))
+
+    def _community_relevance_global(self, query: str, summaries: list[str]) -> Optional[list[float]]:
+        """全局词表快路径：每请求只 transform + 子集 IDF + 打分（不再 fit）。
+
+        IDF 仍用「本请求子集」的文档频率（贴近原语义）：df_subset = (tf > 0).sum(0)，
+        idf_subset = ln((1+n)/(1+df_subset)) + 1（n = 本请求摘要数，与 sklearn 默认
+        idf 公式一致）。禁止直接用全局语料的 IDF 覆盖子集 IDF。任何异常 → WARNING
+        + 返回 None（调用方回落现有逐次路径，fail-soft）。
+        """
+        try:
+            cfg = getattr(self, "config", None)
+            max_docs = int(getattr(cfg, "community_relevance_global_vocab_max_docs", 5000))
+            refresh_s = float(getattr(cfg, "community_relevance_global_vocab_refresh_s", 3600.0))
+            sample = summaries if max_docs <= 0 else summaries[:max_docs]
+            vectorizer = _community_relevance_global_vectorizer(sample, refresh_s)
+            if vectorizer is None:
+                return None
+            tf = vectorizer.transform(summaries)
+            n = len(summaries)
+            df_subset = np.asarray((tf > 0).sum(axis=0)).ravel()
+            idf_subset = np.log((1.0 + n) / (1.0 + df_subset)) + 1.0
+            doc_lens = tf.sum(axis=1).A1
+            avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
+            return _community_relevance_score(query, vectorizer, tf, idf_subset, doc_lens, avgdl)
+        except Exception:
+            logger.warning(
+                "community relevance global vocab degraded, falling back", exc_info=True
+            )
+            return None
+
     def _community_relevance(self, query: str, summaries: list[str]) -> list[float]:
         """BM25-on-summary 相关度（[0,1]）：社区 summary 语料上的 BM25 + 单调归一。
 
@@ -2761,9 +2878,18 @@ class QueryRouter:
 
         【并发超时专项】fit 改为进程级缓存（指纹失效，见 _community_relevance_cached_state）；
         query 相关 transform + 打分仍每次现算，分数与原实现 bit 级一致。
+
+        【全局词表快路径】开关 ON → _community_relevance_global（每请求只 transform，
+        不再 fit）；开关 OFF（默认）→ 下方现有逐次路径逐字节不变。开关 ON 但全局
+        词表构建/使用任何异常 → WARNING + 回落现有路径（fail-soft，检索不得失败）。
         """
         if not summaries or not query:
             return [0.0] * len(summaries)
+        if self._community_relevance_global_enabled():
+            result = self._community_relevance_global(query, summaries)
+            if result is not None:
+                return result
+            # fail-soft：全局词表路径失败（WARNING 已记录）→ 回落现有逐次路径
         state = _community_relevance_cached_state(summaries)
         if state is None:
             return [0.0] * len(summaries)
@@ -4431,7 +4557,7 @@ class QueryRouter:
         - 【F5】predict 返回长度失配 → 静默降级原列表（防部分候选被丢）
         - 【F6】NaN/Inf 防护：nan_to_num 后 sigmoid，防 SDK 返回 NaN/Inf 破坏 score 契约
         - 【并发闸门】进程级 Semaphore 有界等待（rerank_max_concurrency 默认 1、
-          rerank_gate_wait_ms 默认 2000）：拿不到闸门 → WARNING + 原列表返回（优雅
+          rerank_gate_wait_ms 默认 300）：拿不到闸门 → WARNING + 原列表返回（优雅
           降级）；finally 保证释放；rerank_max_concurrency=0 → 完全禁用闸门
         - 任何异常 → 原列表返回（静默降级，主检索零回归）
 
@@ -4444,7 +4570,7 @@ class QueryRouter:
         acquired = False
         try:
             if gate is not None:
-                wait_ms = int(getattr(self.config, "rerank_gate_wait_ms", 2000))
+                wait_ms = int(getattr(self.config, "rerank_gate_wait_ms", 300))
                 acquired = gate.acquire(timeout=wait_ms / 1000.0)
                 if not acquired:
                     logger.warning(

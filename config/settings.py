@@ -299,7 +299,10 @@ class RetrievalConfig:
     # 【并发闸门】进程级 Semaphore 有界等待限制同时进行 reranker.predict 的请求数
     # （1 = 串行；0 = 完全禁用闸门；拿不到闸门 → WARNING + 跳过重排返回完整融合结果）
     rerank_max_concurrency: int = 1     # 闸门容量（并发上限）；0 完全禁用
-    rerank_gate_wait_ms: int = 2000     # 有界等待超时（ms），严禁无限等待
+    # 【并发闸门】有界等待超时（ms），严禁无限等待。Hermes 三配置实测（同口径全新查询）：
+    # A 2000ms：并发8 5/8、并发12 12/12、压测后单条 2.98s；B 300ms：并发8 6/8、
+    # 并发12 9/12、压测后单条 2.17s；C 关闸门：全超时、压测后单条 6.65s（最差）→ 定 300。
+    rerank_gate_wait_ms: int = 300
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -336,6 +339,13 @@ class RetrievalConfig:
     # 一次性加载（reranker/BM25/社区成员 sidecar/向量编码器）从首条用户查询挪到
     # 服务启动。默认开；False 关闭 → 行为与无预热逐字节一致。
     warmup_retrieval_enabled: bool = True
+    # 【社区相关性全局词表快路径】开关默认关（零回归）。ON 时对社区摘要语料（取样
+    # ≤ max_docs 条，稳定顺序）惰性构建一次全局 char_wb 2-4gram 词表/IDF，每请求
+    # 只 transform（不再 fit）；IDF 仍用本请求子集文档频率（贴近原语义）。超过
+    # refresh_s 或社区集变化 → 允许重建。构建/使用任何异常 → WARNING + 回落现有路径。
+    community_relevance_global_vocab: bool = False        # 默认 False = 现有行为，逐字节零回归
+    community_relevance_global_vocab_max_docs: int = 5000  # 全局拟合取样上限（0 = 全部社区摘要）
+    community_relevance_global_vocab_refresh_s: float = 3600.0  # 全局词表最长复用时间（秒）
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
@@ -378,6 +388,17 @@ class RetrievalConfig:
             raise ValueError(
                 f"RetrievalConfig.rpe_rerank_low={self.rpe_rerank_low} 必须 <= "
                 f"rpe_rerank_high={self.rpe_rerank_high}"
+            )
+        # 【社区相关性全局词表】负取样/负刷新周期会让采样空转或语义颠倒，配置期 fail-fast。
+        if self.community_relevance_global_vocab_max_docs < 0:
+            raise ValueError(
+                f"RetrievalConfig.community_relevance_global_vocab_max_docs="
+                f"{self.community_relevance_global_vocab_max_docs} 必须 >= 0"
+            )
+        if self.community_relevance_global_vocab_refresh_s < 0:
+            raise ValueError(
+                f"RetrievalConfig.community_relevance_global_vocab_refresh_s="
+                f"{self.community_relevance_global_vocab_refresh_s} 必须 >= 0"
             )
 
 

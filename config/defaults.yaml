@@ -116,7 +116,9 @@ retrieval:
   rerank_buckets: 3              # 桶数（默认 3；> 候选数时按候选数截断）
   rerank_max_length: 512         # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
   rerank_max_concurrency: 1      # 进程级 reranker.predict 并发闸门容量（1 = 串行；0 = 完全禁用闸门）
-  rerank_gate_wait_ms: 2000      # 有界等待超时（ms）；拿不到闸门 → WARNING + 跳过重排返回完整融合结果
+  rerank_gate_wait_ms: 300       # 有界等待超时（ms）；拿不到闸门 → WARNING + 跳过重排返回完整融合结果。
+                                 # Hermes 三配置实测（同口径全新查询）：2000ms→并发8 5/8、并发12 12/12、压测后单条 2.98s；
+                                 # 300ms→并发8 6/8、并发12 9/12、压测后单条 2.17s；关闸门→全超时、压测后单条 6.65s（最差）
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -145,6 +147,13 @@ retrieval:
   # 【v6.32 启动预热】服务启动用固定短查询跑一次完整 FUSION 检索（冷启动一次性
   # 加载从首条用户查询挪到启动）。默认开；false 关闭 → 与无预热逐字节一致。
   warmup_retrieval_enabled: true
+  # 【社区相关性全局词表快路径】开关默认关（零回归）。ON 时对社区摘要语料（取样
+  # ≤ max_docs 条，稳定顺序）惰性构建一次全局 char_wb 2-4gram 词表/IDF，每请求只
+  # transform（不再 fit）；IDF 仍用本请求子集文档频率（贴近原语义）。超过 refresh_s
+  # 或社区集变化 → 允许重建。构建/使用任何异常 → WARNING + 回落现有路径。
+  community_relevance_global_vocab: false         # 默认 False = 现有行为，逐字节零回归
+  community_relevance_global_vocab_max_docs: 5000  # 全局拟合取样上限（0 = 全部社区摘要）
+  community_relevance_global_vocab_refresh_s: 3600.0  # 全局词表最长复用时间（秒）
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

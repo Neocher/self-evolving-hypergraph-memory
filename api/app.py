@@ -242,7 +242,7 @@ def _build_router_config(rcfg):
         rerank_max_length=getattr(rcfg, "rerank_max_length", 512),
         # 【并发闸门】getattr 缺省（旧配置对象零回归）
         rerank_max_concurrency=getattr(rcfg, "rerank_max_concurrency", 1),
-        rerank_gate_wait_ms=getattr(rcfg, "rerank_gate_wait_ms", 2000),
+        rerank_gate_wait_ms=getattr(rcfg, "rerank_gate_wait_ms", 300),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
@@ -259,6 +259,10 @@ def _build_router_config(rcfg):
         step_budget=getattr(rcfg, "step_budget", None) or {},
         # 【v6.30 检索超时修复 Part 3】扩展步骤总预算守卫透传（getattr 缺省，旧配置零回归）
         total_step_budget_s=getattr(rcfg, "total_step_budget_s", 3.0),
+        # 【社区相关性全局词表快路径】getattr 缺省（旧配置对象零回归）
+        community_relevance_global_vocab=getattr(rcfg, "community_relevance_global_vocab", False),
+        community_relevance_global_vocab_max_docs=getattr(rcfg, "community_relevance_global_vocab_max_docs", 5000),
+        community_relevance_global_vocab_refresh_s=getattr(rcfg, "community_relevance_global_vocab_refresh_s", 3600.0),
     )
     # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）
