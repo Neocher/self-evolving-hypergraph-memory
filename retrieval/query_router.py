@@ -88,6 +88,12 @@ _SCHEMA_BOOST = 0.5
 _SCHEMA_MAX_RESULTS = 3
 # 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
 _RERANK_PREWARM_TIMEOUT = 60.0
+# 【并发闸门】reranker.predict 进程级并发闸门：threading.Semaphore 进程内跨线程
+# 可见、跨 QueryRouter 实例共享，真正限制「同时进行 reranker.predict」的请求数。
+# _RERANK_GATE_VALUE 记录当前闸门容量，配置并发度变化时重建（运行期配置不变，正常不触发）。
+_RERANK_GATE: Optional[threading.Semaphore] = None
+_RERANK_GATE_VALUE: int = -1  # -1 = 未初始化
+_RERANK_GATE_LOCK = threading.Lock()
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
 _PROPERTY_CANDIDATE_STOPWORDS = frozenset({
     "how", "what", "when", "why", "where", "which", "who", "whose", "whom",
@@ -271,6 +277,11 @@ class QueryRouterConfig:
     rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
     rerank_buckets: int = 3  # 桶数（默认 3；> 候选数时按候选数截断）
     rerank_max_length: int = 512  # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
+    # 【并发闸门】进程级 Semaphore 有界等待限制同时进行 reranker.predict 的请求数。
+    # 1 = 串行（默认，消除并发 predict 的 CPU 争抢）；0 = 完全禁用闸门（与改动前一致）；
+    # 拿不到闸门（等待超过 rerank_gate_wait_ms）→ WARNING + 跳过重排返回完整融合结果。
+    rerank_max_concurrency: int = 1  # 闸门容量（并发上限）；0 完全禁用
+    rerank_gate_wait_ms: int = 2000  # 有界等待超时（ms），严禁无限等待
     # HyDE 假设文档增强检索配置（P3b，默认关零回归；仅 FUSION 路径生效，失败静默降级单路）
     hyde_enabled: bool = False  # HyDE 开关（retrieve(hyde=True) 可显式开）
     hyde_mode: str = "dual"  # dual=原始+假设双路融合合并；replace=仅假设向量单路
@@ -338,6 +349,16 @@ class QueryRouterConfig:
         if self.rerank_max_length < 1:
             raise ValueError(
                 f"QueryRouterConfig.rerank_max_length={self.rerank_max_length} 必须 >= 1"
+            )
+        # 【并发闸门】并发度/等待超时下界校验：负值会让 Semaphore(负) / acquire(负超时)
+        # 行为未定义，配置期 fail-fast 拒绝非法值（0 为合法语义：完全禁用 / 不等待）。
+        if self.rerank_max_concurrency < 0:
+            raise ValueError(
+                f"QueryRouterConfig.rerank_max_concurrency={self.rerank_max_concurrency} 必须 >= 0"
+            )
+        if self.rerank_gate_wait_ms < 0:
+            raise ValueError(
+                f"QueryRouterConfig.rerank_gate_wait_ms={self.rerank_gate_wait_ms} 必须 >= 0"
             )
 
 
@@ -4293,6 +4314,25 @@ class QueryRouter:
                 )
                 return None
 
+    def _get_rerank_gate(self) -> Optional[threading.Semaphore]:
+        """【并发闸门】获取进程级 reranker.predict 并发闸门（惰性初始化，按容量复用/重建）。
+
+        rerank_max_concurrency <= 0 → None（完全禁用闸门，与改动前逐字节一致）。
+        闸门为模块级单例：跨 QueryRouter 实例/请求线程共享，真正限制「同时进行
+        reranker.predict」的请求数（threading.Semaphore 进程内可见）。
+        """
+        global _RERANK_GATE, _RERANK_GATE_VALUE
+        max_conc = int(getattr(self.config, "rerank_max_concurrency", 1))
+        if max_conc <= 0:
+            return None
+        if _RERANK_GATE is not None and _RERANK_GATE_VALUE == max_conc:
+            return _RERANK_GATE
+        with _RERANK_GATE_LOCK:
+            if _RERANK_GATE is None or _RERANK_GATE_VALUE != max_conc:
+                _RERANK_GATE = threading.Semaphore(max_conc)
+                _RERANK_GATE_VALUE = max_conc
+            return _RERANK_GATE
+
     def _rerank_results(
         self,
         results: list[dict],
@@ -4308,6 +4348,9 @@ class QueryRouter:
           到可打分节点之后）
         - 【F5】predict 返回长度失配 → 静默降级原列表（防部分候选被丢）
         - 【F6】NaN/Inf 防护：nan_to_num 后 sigmoid，防 SDK 返回 NaN/Inf 破坏 score 契约
+        - 【并发闸门】进程级 Semaphore 有界等待（rerank_max_concurrency 默认 1、
+          rerank_gate_wait_ms 默认 2000）：拿不到闸门 → WARNING + 原列表返回（优雅
+          降级）；finally 保证释放；rerank_max_concurrency=0 → 完全禁用闸门
         - 任何异常 → 原列表返回（静默降级，主检索零回归）
 
         顺序契约：调用方（_finish）先执行 _deduplicate_and_sort（去重+boost+钳制），
@@ -4315,7 +4358,20 @@ class QueryRouter:
         """
         if not enabled or getattr(self, "_rerank_failed", False) or len(results) < 2:
             return results
+        gate = self._get_rerank_gate()
+        acquired = False
         try:
+            if gate is not None:
+                wait_ms = int(getattr(self.config, "rerank_gate_wait_ms", 2000))
+                acquired = gate.acquire(timeout=wait_ms / 1000.0)
+                if not acquired:
+                    logger.warning(
+                        "rerank gate busy (max_concurrency=%s wait=%sms), "
+                        "skipping rerank (returning fused results unchanged)",
+                        getattr(self.config, "rerank_max_concurrency", 1),
+                        wait_ms,
+                    )
+                    return results
             reranker = self._get_reranker()
             if reranker is None:
                 return results
@@ -4376,6 +4432,9 @@ class QueryRouter:
                 "rerank degraded, returning original results", exc_info=True
             )
             return results
+        finally:
+            if acquired:
+                gate.release()
 
     def _rerank_bucketing_enabled(self) -> bool:
         """长度分桶开关（默认开；候选 < 2 时调用方已短路）。"""

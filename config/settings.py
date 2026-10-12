@@ -296,6 +296,10 @@ class RetrievalConfig:
     rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
     rerank_buckets: int = 3              # 桶数（默认 3；> 候选数时按候选数截断）
     rerank_max_length: int = 512         # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
+    # 【并发闸门】进程级 Semaphore 有界等待限制同时进行 reranker.predict 的请求数
+    # （1 = 串行；0 = 完全禁用闸门；拿不到闸门 → WARNING + 跳过重排返回完整融合结果）
+    rerank_max_concurrency: int = 1     # 闸门容量（并发上限）；0 完全禁用
+    rerank_gate_wait_ms: int = 2000     # 有界等待超时（ms），严禁无限等待
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -343,6 +347,12 @@ class RetrievalConfig:
             raise ValueError(f"RetrievalConfig.rerank_buckets={self.rerank_buckets} 必须 >= 1")
         if self.rerank_max_length < 1:
             raise ValueError(f"RetrievalConfig.rerank_max_length={self.rerank_max_length} 必须 >= 1")
+        # 【并发闸门】并发度/等待超时下界校验：负值会让 Semaphore(负) / acquire(负超时)
+        # 行为未定义，配置期 fail-fast 拒绝非法值（0 为合法语义：完全禁用 / 不等待）。
+        if self.rerank_max_concurrency < 0:
+            raise ValueError(f"RetrievalConfig.rerank_max_concurrency={self.rerank_max_concurrency} 必须 >= 0")
+        if self.rerank_gate_wait_ms < 0:
+            raise ValueError(f"RetrievalConfig.rerank_gate_wait_ms={self.rerank_gate_wait_ms} 必须 >= 0")
         # 【P3b】hyde_mode 枚举校验：检索路径只分 dual/replace 两分支，非法值会
         # 静默落回单路与操作者意图不符（配置期 fail-fast 拒绝非法值）。
         if self.hyde_mode not in ("dual", "replace"):

@@ -240,6 +240,9 @@ def _build_router_config(rcfg):
         rerank_length_bucketing=getattr(rcfg, "rerank_length_bucketing", True),
         rerank_buckets=getattr(rcfg, "rerank_buckets", 3),
         rerank_max_length=getattr(rcfg, "rerank_max_length", 512),
+        # 【并发闸门】getattr 缺省（旧配置对象零回归）
+        rerank_max_concurrency=getattr(rcfg, "rerank_max_concurrency", 1),
+        rerank_gate_wait_ms=getattr(rcfg, "rerank_gate_wait_ms", 2000),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),

@@ -115,6 +115,8 @@ retrieval:
   rerank_length_bucketing: true  # 长度分桶开关（默认开；按 len(content) 排序连续切桶逐桶 predict）
   rerank_buckets: 3              # 桶数（默认 3；> 候选数时按候选数截断）
   rerank_max_length: 512         # 送入 reranker 的最大 token 长度（512 = 历史默认，严格零行为变更；如需提速可选 384（1.27x / top-5 97.5%））
+  rerank_max_concurrency: 1      # 进程级 reranker.predict 并发闸门容量（1 = 串行；0 = 完全禁用闸门）
+  rerank_gate_wait_ms: 2000      # 有界等待超时（ms）；拿不到闸门 → WARNING + 跳过重排返回完整融合结果
   hyde_enabled: false            # P3b HyDE 假设文档增强开关（默认关，仅 FUSION 生效）
   hyde_mode: dual                # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
   hyde_timeout: 1.5              # P3b HyDE LLM 生成超时（秒），失败静默降级单路
