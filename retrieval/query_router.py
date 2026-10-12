@@ -254,6 +254,52 @@ _RERANK_PREWARM_TIMEOUT = 60.0
 _RERANK_GATE: Optional[threading.Semaphore] = None
 _RERANK_GATE_VALUE: int = -1  # -1 = 未初始化
 _RERANK_GATE_LOCK = threading.Lock()
+# ── 进程级 in-flight 计数器（高并发显式卸载）──────────────────────────────────
+# 【高并发显式卸载】同时进行中的 retrieve 逻辑请求数（进程级，跨 QueryRouter 实例
+# 共享）。retrieve 入口自增、finally 自减（异常安全绝不泄漏）；递归级联
+# （HYPERGRAPH→VECTOR→KEYWORD 的 self.retrieve 内调）经 thread-local 嵌套标志只计
+# 一次，避免单逻辑请求被重复计数（并发 2 级联被误判成 6 会破坏零回归底线）。
+# 计数/读取任何异常 → fail-soft 不卸载（检索不得失败）。
+_RETRIEVE_INFLIGHT = 0
+_RETRIEVE_INFLIGHT_LOCK = threading.Lock()
+_RETRIEVE_INFLIGHT_TLS = threading.local()
+
+
+def _inflight_enter() -> bool:
+    """进入 retrieve：顶层（非嵌套）自增进程级 in-flight 并返回 True（退出须递减）。
+
+    嵌套调用（同线程已在 retrieve 内）或计数异常 → 返回 False（退出不递减）。
+    """
+    if getattr(_RETRIEVE_INFLIGHT_TLS, "entered", False):
+        return False
+    global _RETRIEVE_INFLIGHT
+    try:
+        with _RETRIEVE_INFLIGHT_LOCK:
+            _RETRIEVE_INFLIGHT += 1
+            _RETRIEVE_INFLIGHT_TLS.entered = True
+        return True
+    except Exception:
+        return False
+
+
+def _inflight_exit() -> None:
+    """离开 retrieve：自减并清除嵌套标志（仅顶层调用方调用）。异常吞掉（fail-soft）。"""
+    global _RETRIEVE_INFLIGHT
+    try:
+        with _RETRIEVE_INFLIGHT_LOCK:
+            _RETRIEVE_INFLIGHT = max(0, _RETRIEVE_INFLIGHT - 1)
+    finally:
+        _RETRIEVE_INFLIGHT_TLS.entered = False
+
+
+def _inflight_now() -> int:
+    """当前进程级 in-flight 数（只读）。异常 → -1（调用方 fail-soft 不卸载）。"""
+    global _RETRIEVE_INFLIGHT
+    try:
+        with _RETRIEVE_INFLIGHT_LOCK:
+            return _RETRIEVE_INFLIGHT
+    except Exception:
+        return -1
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
 _PROPERTY_CANDIDATE_STOPWORDS = frozenset({
     "how", "what", "when", "why", "where", "which", "who", "whose", "whom",
@@ -482,6 +528,13 @@ class QueryRouterConfig:
     community_relevance_global_vocab: bool = False        # 默认 False = 现有行为，逐字节零回归
     community_relevance_global_vocab_max_docs: int = 5000  # 全局拟合取样上限（0 = 全部社区摘要）
     community_relevance_global_vocab_refresh_s: float = 3600.0  # 全局词表最长复用时间（秒）
+    # 【高并发显式卸载】超载时主动跳过社区扩展，换取快速且完整的结果（帕累托改进）。
+    # 实测：并发 8 时全部请求撞 6s 超时（根因每请求社区相关性 526–900ms 对 553–1509 条
+    # 摘要 char-ngram 向量化 + reranker 叠加）。in-flight ≥ 阈值时跳过 _community_expansion
+    # （省 ~530ms+），卸载后仍是完整融合结果（20 条）而非超时兜底 9–10 条。in-flight <
+    # 阈值时行为与现状逐字节一致（零回归底线）；enabled=false 关闭 = 与改动前逐字节一致。
+    retrieval_load_shedding_enabled: bool = True   # 高并发卸载总开关
+    retrieval_load_shedding_threshold: int = 4     # in-flight ≥ 该值 → 触发卸载（<=0 关闭卸载）
 
     def __post_init__(self) -> None:
         # 【P3b R1 P2】hyde_mode 枚举校验：镜像 RetrievalConfig 的做法——检索路径只分
@@ -540,6 +593,13 @@ class QueryRouterConfig:
             raise ValueError(
                 f"QueryRouterConfig.community_relevance_global_vocab_refresh_s="
                 f"{self.community_relevance_global_vocab_refresh_s} 必须 >= 0"
+            )
+        # 【高并发显式卸载】负阈值会让「in-flight >= 阈值」语义颠倒（恒触发），
+        # 配置期 fail-fast 拒绝非法值（0 为合法语义：关闭卸载）。
+        if self.retrieval_load_shedding_threshold < 0:
+            raise ValueError(
+                f"QueryRouterConfig.retrieval_load_shedding_threshold="
+                f"{self.retrieval_load_shedding_threshold} 必须 >= 0"
             )
 
 
@@ -1754,7 +1814,43 @@ class QueryRouter:
         hyde: Optional[bool] = None,
         scope: Optional[int | str] = None,
     ) -> list[dict]:
-        """多信号检索融合入口。
+        """多信号检索融合入口（检索契约详见 _retrieve_impl 文档）。
+
+        【高并发显式卸载】进程级 in-flight 计数：进入自增、finally 自减（异常安全
+        绝不泄漏，覆盖异常/CancelledError 等所有返回路径）。递归级联
+        （HYPERGRAPH→VECTOR→KEYWORD 的 self.retrieve 内调）经 thread-local 嵌套标志
+        只计一次（单逻辑请求不重复计数）；计数任何异常 → fail-soft 不卸载（检索
+        不得失败）。卸载决策（跳过哪一步）在 _retrieve_impl._finish 内按实时
+        in-flight 判断，in-flight < 阈值时行为与改动前逐字节一致。
+        """
+        owner = _inflight_enter()
+        try:
+            return self._retrieve_impl(
+                query,
+                query_embedding=query_embedding,
+                level=level,
+                include_archived=include_archived,
+                session_ts=session_ts,
+                rerank=rerank,
+                hyde=hyde,
+                scope=scope,
+            )
+        finally:
+            if owner:
+                _inflight_exit()
+
+    def _retrieve_impl(
+        self,
+        query: str,
+        query_embedding: Optional[np.ndarray] = None,
+        level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
+        include_archived: bool = False,
+        session_ts: Optional[float] = None,
+        rerank: Optional[bool] = None,
+        hyde: Optional[bool] = None,
+        scope: Optional[int | str] = None,
+    ) -> list[dict]:
+        """多信号检索融合实现（retrieve 包装层委托目标，含全部检索逻辑）。
 
         支持两种模式：
           - 降级链模式（HYPERGRAPH/VECTOR/KEYWORD）— 向后兼容
@@ -1831,9 +1927,21 @@ class QueryRouter:
                     return results
                 return fn(results, *args, **kwargs)
 
-            results = _guarded(
-                "community_expansion", self._community_expansion,
-                results, query, query_embedding, raw_query)
+            # 【高并发显式卸载】in-flight ≥ 阈值时跳过社区扩展（省 ~530ms+ 社区相关性
+            # char-ngram 向量化），返回未扩展的完整融合结果（严格优于超时兜底 9–10 条）。
+            # in-flight < 阈值 / 开关关闭 / 计数异常 → 走原路径（fail-soft，逐字节一致）。
+            shed_load, inflight_n, shed_threshold = self._load_shedding_active()
+            if shed_load:
+                logger.info(
+                    "Retrieval load shedding: skipping community expansion",
+                    in_flight=inflight_n,
+                    threshold=shed_threshold,
+                    skipped_step="community_expansion",
+                )
+            else:
+                results = _guarded(
+                    "community_expansion", self._community_expansion,
+                    results, query, query_embedding, raw_query)
             # 【v5.49.0 MESA 记忆增强检索】补充非替代：社区摘要合成节点 append
             # （node_id=community_id 可回溯，content=summary；无 archived 字段恒保留）
             results = _guarded(
@@ -2668,6 +2776,24 @@ class QueryRouter:
         if time.monotonic() - t0 > budget_s:
             breakers[name] = time.monotonic() + breaker_s
         return out
+
+    def _load_shedding_active(self) -> tuple[bool, int, int]:
+        """【高并发显式卸载】判断是否触发卸载（跳过社区扩展）。
+
+        返回 (shed, in_flight, threshold)。shed=True 当且仅当开关开启、in-flight ≥
+        threshold；开关关闭 / threshold<=0（关闭卸载）/ 计数异常 / 配置异常 →
+        (False, in_flight, threshold)——fail-soft 不卸载（检索不得失败）。
+        """
+        try:
+            cfg = getattr(self, "config", None)
+            enabled = bool(getattr(cfg, "retrieval_load_shedding_enabled", True))
+            threshold = int(getattr(cfg, "retrieval_load_shedding_threshold", 4))
+            current = _inflight_now()
+            if not enabled or threshold <= 0 or current < 0:
+                return False, current, threshold
+            return current >= threshold, current, threshold
+        except Exception:
+            return False, -1, -1
 
     def _community_expansion(
         self,

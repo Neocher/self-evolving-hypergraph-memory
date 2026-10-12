@@ -154,6 +154,13 @@ retrieval:
   community_relevance_global_vocab: false         # 默认 False = 现有行为，逐字节零回归
   community_relevance_global_vocab_max_docs: 5000  # 全局拟合取样上限（0 = 全部社区摘要）
   community_relevance_global_vocab_refresh_s: 3600.0  # 全局词表最长复用时间（秒）
+  # 【高并发显式卸载】超载时主动跳过社区扩展，换取快速且完整的结果（帕累托改进）。
+  # 实测：并发 8 时全部请求撞 6s 超时 → 走兜底只给 9–10 条；根因每请求社区相关性
+  # 526–900ms（553–1509 条摘要 char-ngram 向量化）+ reranker 叠加。in-flight ≥ 阈值时
+  # 跳过 _community_expansion（省 ~530ms+），卸载后仍是完整融合结果（20 条），严格优于
+  # 超时兜底。in-flight < 阈值时行为与现状逐字节一致（零回归底线）。
+  retrieval_load_shedding_enabled: true   # 高并发卸载总开关（false = 与改动前逐字节一致，可回退）
+  retrieval_load_shedding_threshold: 4    # in-flight ≥ 该值 → 触发卸载（真实超载才生效；<=0 关闭卸载）
 
 embedding:
   model_name: "BAAI/bge-m3"  # v6.1: 多语言 embedding（1024d，MRL 截断 512 匹配 HNSW；ONNX O2 CPU 版由 encoder 自动加载）

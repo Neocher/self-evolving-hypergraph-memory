@@ -346,6 +346,13 @@ class RetrievalConfig:
     community_relevance_global_vocab: bool = False        # 默认 False = 现有行为，逐字节零回归
     community_relevance_global_vocab_max_docs: int = 5000  # 全局拟合取样上限（0 = 全部社区摘要）
     community_relevance_global_vocab_refresh_s: float = 3600.0  # 全局词表最长复用时间（秒）
+    # 【高并发显式卸载】超载时主动跳过社区扩展，换取快速且完整的结果（帕累托改进）。
+    # 实测：并发 8 时全部请求撞 6s 超时（根因每请求社区相关性 526–900ms 对 553–1509 条
+    # 摘要 char-ngram 向量化 + reranker 叠加）。in-flight ≥ 阈值时跳过 _community_expansion
+    # （省 ~530ms+），卸载后仍是完整融合结果（20 条）而非超时兜底 9–10 条。in-flight <
+    # 阈值时行为与现状逐字节一致；enabled=false 关闭 = 与改动前逐字节一致（可回退）。
+    retrieval_load_shedding_enabled: bool = True   # 高并发卸载总开关
+    retrieval_load_shedding_threshold: int = 4     # in-flight ≥ 该值 → 触发卸载（<=0 关闭卸载）
 
     def __post_init__(self) -> None:
         # rerank_input_k 下界校验：0/负数会让 _rerank_results 取空头部分支，
@@ -399,6 +406,13 @@ class RetrievalConfig:
             raise ValueError(
                 f"RetrievalConfig.community_relevance_global_vocab_refresh_s="
                 f"{self.community_relevance_global_vocab_refresh_s} 必须 >= 0"
+            )
+        # 【高并发显式卸载】负阈值会让「in-flight >= 阈值」语义颠倒（恒触发），
+        # 配置期 fail-fast 拒绝非法值（0 为合法语义：关闭卸载）。
+        if self.retrieval_load_shedding_threshold < 0:
+            raise ValueError(
+                f"RetrievalConfig.retrieval_load_shedding_threshold="
+                f"{self.retrieval_load_shedding_threshold} 必须 >= 0"
             )
 
 

@@ -263,6 +263,9 @@ def _build_router_config(rcfg):
         community_relevance_global_vocab=getattr(rcfg, "community_relevance_global_vocab", False),
         community_relevance_global_vocab_max_docs=getattr(rcfg, "community_relevance_global_vocab_max_docs", 5000),
         community_relevance_global_vocab_refresh_s=getattr(rcfg, "community_relevance_global_vocab_refresh_s", 3600.0),
+        # 【高并发显式卸载】getattr 缺省（旧配置对象零回归）
+        retrieval_load_shedding_enabled=getattr(rcfg, "retrieval_load_shedding_enabled", True),
+        retrieval_load_shedding_threshold=getattr(rcfg, "retrieval_load_shedding_threshold", 4),
     )
     # 【P3c】entity_expansion 嵌套配置透传：getattr 缺省（旧配置对象）→ 不传，
     # 让 QueryRouterConfig 默认 factory 生效（显式传 None 会把字段置 None 破坏读取）
