@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -66,6 +67,103 @@ def _safe_float_tau(value) -> float:
         return float(s)
     except (ValueError, TypeError):
         return 0.0
+
+
+# ── _community_relevance 的进程级 TF-IDF 构建缓存 ─────────────────────────
+# 【并发超时专项】社区摘要在社区重建之间不变，但原实现在每个请求里 fit_transform
+# 一次（真实 store 3000 条摘要实测 836.7ms / 93% 白付）。这里缓存只依赖
+# summaries 的构建态（vectorizer 含 idf_ / tf / doc_lens / avgdl）；query 相关
+# 的 transform + 打分仍每次现算。单槽（summaries 集合通常稳定），指纹变化即失效。
+_community_relevance_cache: dict = {}
+_community_relevance_cache_lock = threading.Lock()
+# 有界等待：拿不到构建锁（构建中且超时）→ 回落逐次构建（fail-soft，绝不无限阻塞）
+_COMMUNITY_RELEVANCE_CACHE_LOCK_TIMEOUT_S = 5.0
+
+
+def _community_relevance_fingerprint(summaries: list[str]) -> str:
+    """summaries 内容指纹（blake2b）：作为进程级缓存键。
+
+    "\x00".join 分隔（社区摘要为散文，不含 NUL）；实测 3000 条/754KB 时 <1ms。
+    用内容而非长度/条数做键：长度相同内容不同 → 指纹不同，杜绝脏缓存。
+    """
+    return hashlib.blake2b("\x00".join(summaries).encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _community_relevance_build(summaries: list[str]) -> Optional[tuple]:
+    """fit 一次 TF-IDF（与原实现逐字一致），失败返回 None。
+
+    返回 (vectorizer, tf, idf, doc_lens, avgdl)——全部只依赖 summaries。
+    """
+    try:
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(2, 4), lowercase=True,
+            max_features=50000,
+        )
+        tf = vectorizer.fit_transform(summaries)
+        idf = np.array(vectorizer.idf_)
+        doc_lens = tf.sum(axis=1).A1
+        avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
+        return (vectorizer, tf, idf, doc_lens, avgdl)
+    except Exception:
+        return None
+
+
+def _community_relevance_score(
+    query: str, vectorizer, tf, idf, doc_lens, avgdl,
+) -> list[float]:
+    """query → 打分（原逐特征循环，与未缓存实现逐字一致，保证分数 bit 级相等）。"""
+    q_vec = vectorizer.transform([query])
+    k1, b = 1.5, 0.75
+    scores = np.zeros(tf.shape[0], dtype=np.float64)
+    for qf_idx in q_vec.indices:
+        idf_w = idf[qf_idx]
+        col = tf[:, qf_idx]
+        # 【CSR 行索引修复】列切片 .indices 是列号（恒 0），须用 nonzero()[0] 取行号
+        vals = col.data
+        rows = col.nonzero()[0]
+        if rows.size == 0:
+            continue
+        numerator = vals * (k1 + 1.0)
+        denominator = vals + k1 * (1.0 - b + b * doc_lens[rows] / avgdl)
+        scores[rows] += idf_w * numerator / denominator
+    return (scores / (scores + 1.0)).tolist()
+
+
+def _community_relevance_cached_state(summaries: list[str]) -> Optional[tuple]:
+    """取 summaries 对应的构建态：命中缓存直接返回；miss 时持锁构建一次。
+
+    锁内双重检查 + 指纹比对；其余请求等待复用（等待有界）。任何异常 → 回落
+    逐次构建；逐次构建也失败 → None（调用方返回全 0，与原实现语义一致）。
+    """
+    try:
+        fingerprint = _community_relevance_fingerprint(summaries)
+    except Exception:
+        return _community_relevance_build(summaries)
+
+    # 读路径无锁：命中即返回（缓存只新增/替换整份 tuple，无原地改写，dict.get 原子）
+    state = _community_relevance_cache.get(fingerprint)
+    if state is not None:
+        return state
+
+    try:
+        if not _community_relevance_cache_lock.acquire(
+            timeout=_COMMUNITY_RELEVANCE_CACHE_LOCK_TIMEOUT_S
+        ):
+            # 有界：等待超时 → 逐次构建，绝不无限阻塞
+            return _community_relevance_build(summaries)
+    except Exception:
+        return _community_relevance_build(summaries)
+    try:
+        state = _community_relevance_cache.get(fingerprint)  # 双重检查：等锁期间他人已构建
+        if state is not None:
+            return state
+        state = _community_relevance_build(summaries)
+        if state is not None:
+            _community_relevance_cache.clear()  # 单槽：只保留最新一份
+            _community_relevance_cache[fingerprint] = state
+        return state
+    finally:
+        _community_relevance_cache_lock.release()
 
 
 class _EntityChannelDegraded(Exception):
@@ -2660,34 +2758,18 @@ class QueryRouter:
         created_at 5 字段）→ 相关度用 summary 词法（≤800 字散文含 Keywords 行）。
         与主 BM25 同特征空间（char_wb 2-4gram + IDF，k1=1.5/b=0.75）；归一化
         rel = bm25/(1+bm25)：无词法重叠 → 0（阈值闸口生效），强匹配 → 趋近 1。
+
+        【并发超时专项】fit 改为进程级缓存（指纹失效，见 _community_relevance_cached_state）；
+        query 相关 transform + 打分仍每次现算，分数与原实现 bit 级一致。
         """
         if not summaries or not query:
             return [0.0] * len(summaries)
+        state = _community_relevance_cached_state(summaries)
+        if state is None:
+            return [0.0] * len(summaries)
+        vectorizer, tf, idf, doc_lens, avgdl = state
         try:
-            vectorizer = TfidfVectorizer(
-                analyzer="char_wb", ngram_range=(2, 4), lowercase=True,
-                max_features=50000,
-            )
-            tf = vectorizer.fit_transform(summaries)
-            idf = np.array(vectorizer.idf_)
-            doc_lens = tf.sum(axis=1).A1
-            avgdl = float(doc_lens.mean()) if doc_lens.size > 0 else 1.0
-            q_vec = vectorizer.transform([query])
-            k1, b = 1.5, 0.75
-            scores = np.zeros(len(summaries), dtype=np.float64)
-            for qf_idx in q_vec.indices:
-                idf_w = idf[qf_idx]
-                col = tf[:, qf_idx]
-                # 【CSR 行索引修复】列切片 .indices 是列号（恒 0），须用 nonzero()[0] 取行号；
-                # 修复前多社区时所有 BM25 分累加到 summaries[0]，其余社区恒 0
-                vals = col.data
-                rows = col.nonzero()[0]
-                if rows.size == 0:
-                    continue
-                numerator = vals * (k1 + 1.0)
-                denominator = vals + k1 * (1.0 - b + b * doc_lens[rows] / avgdl)
-                scores[rows] += idf_w * numerator / denominator
-            return (scores / (scores + 1.0)).tolist()
+            return _community_relevance_score(query, vectorizer, tf, idf, doc_lens, avgdl)
         except Exception:
             return [0.0] * len(summaries)
 
