@@ -1,12 +1,40 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.27.0"
-__version_info__ = (6, 27, 0)
-__version_name__ = "LockFairness"
-__release_date__ = "2026-10-10"
+__version__ = "6.28.0"
+__version_info__ = (6, 28, 0)
+__version_name__ = "LoadShedding"
+__release_date__ = "2026-10-12"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.28.0 (2026-10-12) LoadShedding — 检索性能总纲（19 个提交合并发布）:
+  【成果】检索中位 15.40s → 1.6~3.0s（5~9x）；稳态超时率 ~11% → 0%；
+  重启后首条 12.7s → ~2.5s；**并发 8 超时 8/8 → 0/8、并发 12 12/12 → 0/12**
+  （且全部返回完整 20 条）；503 峰值 78/h → 0。
+  【根因定位方法论】py-spy 抓栈（`sudo py-spy dump --pid <uvicorn pid>`）取代猜测：
+  本轮 3 个假设被实测证伪（ONNX 加速 1.04x / 后台任务抢 CPU / 「93% 是词表拟合」），
+  1 个方案被实测否决（全局词表：1.0x 且语义偏离 84.4%）。全部过程与数字有据可查。
+  【关键改动】
+  - 社区成员 sidecar 索引（scripts/build_community_members_index.py + 三层回落）:
+    取成员 7,719ms → 3ms（2,166x）；构建 1,449s → 16.4s（88x，目标侧分批 +
+    keyset 游标分页，绕开引擎 1 万行上限与 max_skip 限制）。
+  - 社区索引覆盖率 100% + 按社区门控（缺失社区视为空集不回落 8s，触发后台刷新）:
+    社区扩展熔断误触 55% → 0。
+  - reranker 长度分桶（连续切分；交错切分无效已实测）: rerank 2.08x，
+    排序逐位一致（bit 级等价）；max_length 保持 512（严格零行为变更）。
+  - 一次性本体同步从「用户首个检索请求」前移到启动期 yield 之前:
+    首条 6.87s → 2.51s（根因：路由层 lazy sync 是预热盲区——预热直连
+    QueryRouter.retrieve 绕过 api/routes/，详见 shm-server skill）。
+  - reranker 进程级并发闸门（Semaphore + 有界 acquire + 优雅降级）:
+    限定重排争抢上界，无死锁（三配置对照实测关闭闸门显著更差）。
+  - **高并发显式卸载**（retrieval_load_shedding_enabled/threshold）:
+    in-flight ≥ 4 时跳过社区扩展，超载请求快速返回**未扩展的完整 20 条**
+    （严格优于原「超时 6s → Cypher 兜底只给 9–10 条」）；低并发逐字节不变。
+    计数器 try/finally 覆盖所有返回路径 + thread-local 防递归重复计数。
+  - 社区相关性 TF-IDF 拟合缓存（bit 级等价，固定语料 89x）。
+  【验证】全量 1783 passed / 1 skipped / 0 failed；生产实测稳态 0 超时 / 0 503。
+  【已知结构性成本】每请求社区相关性 char-ngram 向量化 ~530ms（摘要集随查询变化，
+  553–1509 条）；reranker 单次 ~0.94s。二者现由卸载机制兜住，超载不再超时。
 v6.27.0 (2026-10-10) LockFairness:
   • 锁公平 — 消除 OverGraph 全局锁饿死导致的写队列 503 与 /health 劣化
     （交付方=太极/DSH，Hermes 诊断 + 独立核验）。
