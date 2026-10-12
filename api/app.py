@@ -239,7 +239,7 @@ def _build_router_config(rcfg):
         # 【长度分桶】getattr 缺省（旧配置对象零回归）
         rerank_length_bucketing=getattr(rcfg, "rerank_length_bucketing", True),
         rerank_buckets=getattr(rcfg, "rerank_buckets", 3),
-        rerank_max_length=getattr(rcfg, "rerank_max_length", 512),
+        rerank_max_length=getattr(rcfg, "rerank_max_length", 384),
         hyde_enabled=getattr(rcfg, "hyde_enabled", False),
         hyde_mode=getattr(rcfg, "hyde_mode", "dual"),
         hyde_timeout=getattr(rcfg, "hyde_timeout", 1.5),
@@ -744,6 +744,72 @@ async def _startup_retrieval_prep(svc: Services) -> None:
         logger.warning("Startup retrieval warmup skipped (non-fatal): %s", e)
 
 
+async def _startup_ontology_sync(svc: Services) -> None:
+    """【v6.35 本体同步启动化】把一次性本体同步从「首条检索请求」挪到「启动期、就绪前」。
+
+    根因（Hermes py-spy 实测）：search.py 原 lazy 同步挂在首条用户检索请求上，
+    _populate_relationships 是「每 episode × 每对实体」的嵌套循环，逐条
+    execute_cypher（MATCH 存在性 + INSERT）——数百次单独 DB 锁，实测首条查询
+    ~5-8s。此处与请求路径同样经 qsubmit 走写队列并 await，在 lifespan yield 前
+    完成 → 服务对外服务时 _ontology_synced 已为 True，首条查询不再付这笔成本。
+    fail-soft：任何异常只记 WARNING 并继续启动，且异常时不置 _ontology_synced=True
+    （保留 search.py 请求期幂等兜底）。
+    """
+    ov = getattr(svc, "ontology_validator", None)
+    if ov is None:
+        return
+    if getattr(ov, "_ontology_synced", False):
+        return
+    try:
+        await qsubmit(svc, ov.sync_entity_types_to_graphlite)
+        await qsubmit(svc, ov._populate_relationships)
+        ov._ontology_synced = True
+        logger.info("Startup: ontology sync complete (entity types + RELATES_TO edges)")
+    except HTTPException:
+        # 写队列忙/关闭：不阻断启动，保留请求期兜底（首条查询仍会触发 lazy sync）
+        logger.warning("Startup ontology sync deferred (write queue busy); "
+                       "first query falls back to lazy sync")
+    except Exception:
+        logger.warning("Startup ontology sync failed (non-fatal); "
+                       "first query falls back to lazy sync", exc_info=True)
+
+
+def _startup_stagger_delay(slot: int) -> float:
+    """启动后台任务错峰延迟（秒）。
+
+    【v6.34 首条冷启动】就绪瞬间启动的后台任务（user-profile 扫描 / dream poll /
+    embed 队列消费 / hyperedge sweep）与首条用户查询抢 CPU，实测首条 ~6.7s（Batches
+    速率逐次衰减 7.6 → 2.86 → 1.53 it/s，典型 CPU 争抢特征）。给各任务在首次执行前
+    加 startup_background_stagger_s * slot 初始延迟，错开首条查询窗口。
+    0 = 现状行为（立即执行，可回退）。fail-soft：任何读取/换算异常回退 0，
+    绝不影响后台任务本身或启动。
+    """
+    try:
+        base = float(getattr(getattr(get_settings(), "api", None),
+                             "startup_background_stagger_s", 0.0))
+    except Exception:
+        return 0.0
+    if base <= 0:
+        return 0.0
+    return base * max(1, int(slot))
+
+
+async def _staggered_start(slot: int) -> None:
+    """后台任务错峰初始延迟（fail-soft；asyncio.CancelledError 照常向上传播）。
+
+    错峰是优化而非正确性前提：任何非取消异常都静默回退为「立即执行」，绝不影响
+    后台任务本体或启动；只有 shutdown 的取消信号（CancelledError）照常向上传播。
+    """
+    try:
+        delay = _startup_stagger_delay(slot)
+        if delay > 0:
+            await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """应用生命周期管理"""
@@ -765,6 +831,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # 检索相关启动工作（FAISS 加载 + prewarm 三段 + FUSION 预热）已移至模块级
     # _startup_retrieval_prep，在 yield 前 await（见下方调用点）。
     async def _startup_user_profile() -> None:
+        # 【v6.34 首条冷启动】错峰：首次扫描前睡 stagger*1，避免与首条查询抢 CPU
+        await _staggered_start(1)
         # 【User-Profile】后台扫描节点 → 构建画像 → 落盘 + 注入内存常驻
         # （先读持久画像；扫描/查询失败或空结果 → 保留旧画像，防空覆盖已有 JSON；
         #  仅非空重建结果才覆盖写，失败静默降级，不阻塞启动）
@@ -817,6 +885,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # 消除「首条真实查询与预热抢 CPU/模型/DB」的竞态（Hermes 实测首条 12.73s）。
     await _startup_retrieval_prep(svc)
 
+    # 【v6.35 本体同步启动化】本体一次性同步也在 yield 前 await（fail-soft）——
+    # 服务开始对外服务时 _ontology_synced 已为 True，首条查询不再付这笔成本。
+    await _startup_ontology_sync(svc)
+
     # user-profile 构建不影响检索正确性/延迟 → 仍在后台执行
     startup_task = asyncio.create_task(_startup_user_profile())
     cleanup_task = asyncio.create_task(_cleanup_dream_candidates())
@@ -850,6 +922,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.debug("Dream scheduler state restore skipped: %s", e)
 
     async def _dream_poll_loop() -> None:
+        # 【v6.34 首条冷启动】错峰：首次 poll 前睡 stagger*2，避免与首条查询抢 CPU
+        await _staggered_start(2)
         logger.info("Dream poll loop started", interval=DREAM_POLL_INTERVAL)
         while True:
             try:
@@ -932,6 +1006,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         """定时扫描未形成超边的节点，尝试自动创建超边。"""
         import asyncio
         HYPEREDGE_SWEEP_INTERVAL = 600.0  # 每10分钟
+        # 【v6.34 首条冷启动】错峰：在既有 600s 启动延迟前再睡 stagger*4
+        await _staggered_start(4)
         await asyncio.sleep(HYPEREDGE_SWEEP_INTERVAL)  # 启动后延迟
         while True:
             try:
@@ -957,6 +1033,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     # 【Perf】嵌入队列消费 loop — 每 5 秒 flush FAISS
     async def _embed_poll_loop() -> None:
+        # 【v6.34 首条冷启动】错峰：首次消费嵌入队列前睡 stagger*3，避免与首条查询抢 CPU
+        await _staggered_start(3)
         logger.info("Embed poll loop started (interval=5s)")
         while True:
             try:

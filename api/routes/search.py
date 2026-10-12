@@ -92,6 +92,23 @@ def _retrieve_timeout(level, config) -> float:
     return _RETRIEVE_TIMEOUT
 
 
+async def _ensure_ontology_synced(deps: Services) -> None:
+    """【v6.35】本体一次性同步的请求期幂等兜底（正常路径下启动期已完成，此处不执行）。
+
+    启动期 `_startup_ontology_sync` 已在就绪（yield）前置 `_ontology_synced=True`；
+    本守卫保留为兜底——若启动期因写队列忙/异常未完成，首条检索请求仍会触发
+    lazy 同步。与启动路径同样经 qsubmit 走写队列并 await（一次性，_ontology_synced
+    置位后检索纯读）。
+    """
+    if not deps.ontology_validator._ontology_synced:
+        try:
+            await qsubmit(deps, deps.ontology_validator.sync_entity_types_to_graphlite)
+            await qsubmit(deps, deps.ontology_validator._populate_relationships)
+            deps.ontology_validator._ontology_synced = True
+        except HTTPException:
+            logger.warning("Write queue busy, ontology sync deferred (validation continues)")
+
+
 @router.post("/memories/retrieve", summary="粗到精三级检索（带降级）")
 async def retrieve(
     req: RetrieveRequest,
@@ -321,16 +338,9 @@ async def retrieve(
     # [Ontology] 读时验证：一致性交叉检查 + 置信度修正
     if deps.ontology_validator is not None and results_raw:
         try:
-            # 【v5.24】首次检索触发的 lazy 同步（sync_entity_types + 关系边写）
-            # 预同步经写队列——不在 loop 线程同步写（一次性，_ontology_synced 置位
-            # 后检索纯读）。读验证本身留 loop。
-            if not deps.ontology_validator._ontology_synced:
-                try:
-                    await qsubmit(deps, deps.ontology_validator.sync_entity_types_to_graphlite)
-                    await qsubmit(deps, deps.ontology_validator._populate_relationships)
-                    deps.ontology_validator._ontology_synced = True
-                except HTTPException:
-                    logger.warning("Write queue busy, ontology sync deferred (validation continues)")
+            # 【v6.35】请求期幂等兜底：启动期未完成本体同步时才触发 lazy 同步，
+            # 正常路径（启动期已完成）此为快路径，不执行任何写。
+            await _ensure_ontology_synced(deps)
             validated = deps.ontology_validator.read_validate(
                 [{
                     "id": r.get("node_id", ""),

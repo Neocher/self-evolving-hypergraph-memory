@@ -213,7 +213,7 @@ class TestGetRerankerLazyLoad:
             r2 = router._get_reranker()
         assert r1 is r2 is fake_ce, "懒加载结果应缓存复用"
         st.CrossEncoder.assert_called_once_with(
-            "BAAI/bge-reranker-base", device="cpu", max_length=512
+            "BAAI/bge-reranker-base", device="cpu", max_length=384
         )
 
     def test_import_failure_marks_failed_permanently(self):

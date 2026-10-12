@@ -295,7 +295,7 @@ class RetrievalConfig:
     # 实测 ~1.9-2.3x；cross-encoder 逐对独立，桶只影响 padding，与整批语义等价）
     rerank_length_bucketing: bool = True  # 长度分桶开关（默认开；False → 原整批 predict）
     rerank_buckets: int = 3              # 桶数（默认 3；> 候选数时按候选数截断）
-    rerank_max_length: int = 512         # 送入 reranker 的最大 token 长度（默认 512 = 现状零回归）
+    rerank_max_length: int = 384         # 送入 reranker 的最大 token 长度（Hermes 实测：384 vs 512 → 1.27x，top-5 重合 97.5%，最大名次变动 0）
     hyde_enabled: bool = False      # P3b HyDE 假设文档增强开关（默认关；仅 FUSION 生效）
     hyde_mode: str = "dual"         # P3b HyDE 模式：dual（双路合并）/ replace（仅假设向量）
     hyde_timeout: float = 1.5       # P3b HyDE LLM 生成超时（秒），失败静默降级单路
@@ -383,6 +383,13 @@ class APIConfig:
     port: int = 8000
     log_level: str = "WARNING"
     cors_origins: list[str] = field(default_factory=lambda: ["http://127.0.0.1:8000", "http://localhost:8000"])
+    # 【v6.34 首条冷启动】启动后台任务错峰基准延迟（秒）：就绪瞬间启动的
+    # _dream_poll_loop / _embed_poll_loop / _hyperedge_sweep / _startup_user_profile
+    # 与首条用户查询抢 CPU（实测首条 ~6.7s），各自在首次执行前睡
+    # startup_background_stagger_s * slot 错峰。0 = 现状行为（立即执行，可回退）。
+    # 【v6.35 回退】默认 0.0（关闭）：Hermes py-spy 已证伪「后台任务抢 CPU」假设，
+    # 错峰生效后首条仍 ~6.87s，未验证的行为变更不应默认开启；代码与配置项保留。
+    startup_background_stagger_s: float = 0.0
 
 
 @dataclass
