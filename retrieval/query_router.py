@@ -3673,6 +3673,15 @@ class QueryRouter:
             freq_adaptive = bool(getattr(ecfg, "freq_adaptive", True))
             freq_threshold = int(getattr(ecfg, "freq_threshold", 50))
             freq_max = int(getattr(ecfg, "freq_max_results", 3))
+            # 【K4】频率门控折叠进单条 SELECT：不再先 COUNT 再 SELECT（每实体 2 次
+            # 全表 CONTAINS 扫描 → 1 次）。一次取回 max(per_entity, freq_threshold+1)
+            # 条（引擎侧 LIMIT 下推）：
+            #   - 命中行 > freq_threshold → 高频实体 → 只留 freq_max 条（ORDER BY 保最相关）
+            #   - 命中行 ≤ freq_threshold → 低频实体 → 截断到 per_entity
+            # 与旧 COUNT 语义等价：COUNT>threshold ⇔ 取满 threshold+1 行。
+            probe_limit = (
+                max(per_entity, freq_threshold + 1) if freq_adaptive else per_entity
+            )
             existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
             extra: list[dict] = []
             for i, ent in enumerate(entities):
@@ -3686,19 +3695,7 @@ class QueryRouter:
                 ent_cond = (
                     f"(e.content CONTAINS ${pkey_orig} OR e.content CONTAINS ${pkey_lower})"
                 )
-                ent_limit = per_entity
-                if freq_adaptive:
-                    try:
-                        cnt_rows = store.query_cypher(
-                            f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
-                            f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
-                            f"RETURN count(e) AS c", pparams)
-                        freq = int(cnt_rows[0]["c"]) if cnt_rows else 0
-                        if freq > freq_threshold:
-                            ent_limit = freq_max
-                    except Exception:
-                        pass  # 频率检测失败 → 默认参数（零回归）
-                pparams["limit"] = ent_limit
+                pparams["limit"] = probe_limit
                 ent_rows = store.query_cypher(
                     f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
                     f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
@@ -3707,6 +3704,11 @@ class QueryRouter:
                     f"ORDER BY e.created_at DESC LIMIT $limit", pparams)
                 if not isinstance(ent_rows, (list, tuple)):
                     continue
+                # 高频检测（单查询折叠）→ 降级召回量
+                if freq_adaptive and len(ent_rows) > freq_threshold:
+                    ent_rows = ent_rows[:freq_max]
+                elif len(ent_rows) > per_entity:
+                    ent_rows = ent_rows[:per_entity]
                 for row in ent_rows:
                     if isinstance(row, dict):
                         nid = row.get("node_id", "") or ""

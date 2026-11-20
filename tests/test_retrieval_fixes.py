@@ -174,3 +174,52 @@ def test_vector_cascade_to_keyword_on_circuit_breaker():
                           level=RetrievalLevel.VECTOR)
     assert [r["node_id"] for r in out] == ["k1"]
     assert out[0].get("_degradation_level") == "l2_circuit_breaker"
+
+
+# ══════════════════════════════════════════════════════════════════
+# K4 —— 实体扩展频率门控折叠进单条 SELECT（无独立 COUNT 全表扫描）
+# ══════════════════════════════════════════════════════════════════
+
+
+def test_entity_expansion_freq_gate_single_query_no_count():
+    """freq_adaptive=True 时频率门控折叠进单条 SELECT：无独立 COUNT，高频实体
+    按行数截断到 freq_max_results。"""
+    from config.settings import EntityExpansionConfig
+    from retrieval.query_router import QueryRouter, QueryRouterConfig, RetrievalLevel
+
+    store = MagicMock()
+    # 高频实体：返回 60 行（无视 LIMIT）→ len > freq_threshold(50) → 高频 → 只留 3
+    store.query_cypher.return_value = [
+        {"node_id": f"e{i}", "content": f"Apple msg {i}", "tau_value": 0.8,
+         "fact_track": "active"}
+        for i in range(60)
+    ]
+    router = QueryRouter.__new__(QueryRouter)
+    router.config = QueryRouterConfig(
+        rerank_enabled=False,
+        entity_expansion=EntityExpansionConfig(freq_adaptive=True),
+    )
+    router._zh_en_tech_map = {}
+    router._time_keywords = set()
+    router.graph_store = store
+    router._episode_cache = {}
+    router.encoder = None
+    router._fusion_retrieve = MagicMock(return_value=[
+        {"node_id": "seed", "content": "What did Apple do?", "score": 0.9,
+         "fact_track": "active", "tau_value": 1.0, "level": "l1_faiss"},
+    ])
+    for name in (
+        "_community_expansion", "_mesa_synthesis", "_visual_recall",
+        "_property_temporal_retrieve", "_attribute_expansion",
+        "_scope_retrieve", "_schema_recall", "_fact_retrieve",
+    ):
+        setattr(router, name, MagicMock(side_effect=lambda r, *a, **k: r))
+
+    out = router.retrieve("What did Apple do?", level=RetrievalLevel.FUSION)
+    exp = [r for r in out if r.get("level") == "entity_expansion"]
+    assert len(exp) == 3, f"高频实体应截断到 freq_max_results=3，实际 {len(exp)}"
+    # 关键：仅 1 次 query_cypher（SELECT），无独立 COUNT 全表扫描
+    assert store.query_cypher.call_count == 1, store.query_cypher.call_count
+    cypher, _params = store.query_cypher.call_args[0]
+    assert "count(e)" not in cypher
+    assert "ORDER BY e.created_at DESC" in cypher
