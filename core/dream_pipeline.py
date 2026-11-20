@@ -46,6 +46,28 @@ class _EntityView:
         self.entity_id = str(props.get("id") or "")
         self.aliases = list(props.get("aliases") or [])
 
+
+def _community_content(comm: dict) -> str:
+    """【H3/B-P0-3】community 原文：显式 content 键（若有）优先；否则拼接
+    成员 episode 原文（生产 CLUSTER 唯一写入的逐条内容字段，comm["episodes"]
+    = [{"id","content"}]）；最后兜底 report 摘要。
+
+    修复前 `_persist_schema_evolution` / `_build_schema_versioning_input` 只读
+    `comm.get("content")`——生产 community 从不写该键 → 两链恒空转。
+    """
+    content = comm.get("content")
+    if content:
+        return str(content)
+    episodes = comm.get("episodes") or comm.get("nodes") or []
+    parts = [
+        str(e.get("content", "")).strip()
+        for e in episodes if isinstance(e, dict)
+    ]
+    parts = [p for p in parts if p]
+    if parts:
+        return "\n".join(parts)
+    return str(comm.get("report") or "")
+
 # LLM-NER 每社区节点数上限：超出的节点跳过 LLM 由调用方正则降级
 # 防单社区节点多时串行 await（每节点 ~2.5s）→ SYNTHESIZE 阶段超时死循环
 _NER_MAX_NODES_PER_COMMUNITY = 5
@@ -1605,11 +1627,23 @@ Text:
         failures = 0
         if graphlite_store is None or not hasattr(graphlite_store, "locked_update_entity_props"):
             return 0
+        # 【H3/B-P0-3】空转可观测：计数无法进入抽取的 community（无内容/无
+        # 实体链接），末尾统一 warning——修复前生产 community 恒无 content 键
+        # → 本链 100% 静默空转、无任何日志。
+        skipped_no_content = 0
+        skipped_no_links = 0
         for comm in communities:
-            content = comm.get("content") or ""
+            # 【H3/B-P0-3】comm.get("content") 生产恒空（CLUSTER 从不写该键）
+            # → 兜底成员 episode 原文，让属性/关系抽取真正有输入；显式
+            # content 键（若有）仍优先，保持既有直接构造语义。
+            content = comm.get("content") or _community_content(comm)
             ep_id = str(comm.get("episode_id") or comm.get("id") or "")
             links = comm.get("entity_links") or []
-            if not content or not links:
+            if not content:
+                skipped_no_content += 1
+                continue
+            if not links:
+                skipped_no_links += 1
                 continue
             entities = []
             for link in links:
@@ -1633,6 +1667,12 @@ Text:
                 failures += 1
                 logger.warning("Dream PERSIST schema-evolution failed (%s): %s",
                                str(ep_id)[:12], exc)
+        if skipped_no_content or skipped_no_links:
+            logger.warning(
+                "Dream PERSIST schema-evolution: %d/%d communities skipped "
+                "(no_content=%d, no_links=%d) — self-evolution idle for them",
+                skipped_no_content + skipped_no_links, len(communities),
+                skipped_no_content, skipped_no_links)
         if failures:
             # 抛聚合异常 → _persist_direct 捕获 → persist_degraded=True → 下轮梦境重放
             # （blake3 证据键 + sha1 elementKey 幂等，重放不重复）
@@ -1661,7 +1701,12 @@ Text:
         返回 (schema, episode, signals, schema_id)；无法构造 → None。
         """
         from core import schema_versioning as sv
-        content = str(comm.get("content") or comm.get("summary") or "").strip()
+        # 【H3/B-P0-3】兜底链 content > summary > 成员 episode 原文（生产
+        # CLUSTER 不写 content/summary，旧实现恒 None → P2 恒空转）。
+        content = str(
+            comm.get("content") or comm.get("summary")
+            or _community_content(comm) or ""
+        ).strip()
         ep_id = str(comm.get("episode_id") or comm.get("id") or "").strip()
         if not content or not ep_id:
             return None
@@ -1683,6 +1728,10 @@ Text:
             r=float(sig_data.get("r", 0.0)),
         )
         registry = self._schema_registry
+        if registry is None:
+            # 与 _persist_schema_versioning 一致：直接调用本方法时兜底初始化
+            registry = sv.SchemaRegistry()
+            self._schema_registry = registry
         schema = registry.schemas.get(schema_id)
         if schema is None:
             schema = sv.SchemaState(
@@ -1719,9 +1768,12 @@ Text:
         registry = self._schema_registry
 
         executed = 0
+        skipped = 0
         for comm in communities:
             built = self._build_schema_versioning_input(comm)
             if built is None:
+                # 【H3/B-P0-3】跳过计数（enabled 时空转不静默）
+                skipped += 1
                 continue
             schema, episode, signals, schema_id = built
             self._schema_episodes.add(episode.id)
@@ -1760,6 +1812,10 @@ Text:
                 schema_id, action, decision.reason, decision.delta,
                 decision.m_eff, decision.as_exception,
             )
+        if skipped:
+            logger.info(
+                "Schema versioning: %d/%d communities skipped "
+                "(no usable content/id)", skipped, len(communities))
         return executed
 
     def _evolve_attrs(self, store, attrs: list) -> int:
