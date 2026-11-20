@@ -54,9 +54,11 @@ test = [
 ]
 # ONNX 快路径（EmbeddedLLM/bge-m3-onnx-o2-cpu）。可选：缺失时 encoder 自动回退
 # sentence-transformers，仅慢一些，不影响正确性。
+# 注意：这里只声明 onnxruntime。`optimum` 暂不声明 —— 实测 optimum-onnx 2.1.0
+# 要求 transformers<4.58，会把运行栈从 transformers 5.x / sentence-transformers
+# 6.x 强制降级（2026-11-20 安装验证），属于需要单独决策的依赖冲突。
 onnx = [
     "onnxruntime>=1.18",
-    "optimum[onnxruntime]>=1.16",
 ]
 
 [project.urls]
