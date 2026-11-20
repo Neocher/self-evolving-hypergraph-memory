@@ -104,3 +104,73 @@ def test_fusion_strong_bm25_still_competes_with_vector():
     by_id = {r["node_id"]: r["score"] for r in out}
     # 饱和映射 11/12≈0.917 × 0.40 ≈ 0.367 > 0.3×0.35=0.105
     assert by_id["b1"] > by_id["v1"], by_id
+
+
+# ══════════════════════════════════════════════════════════════════
+# K3 —— _vector_retrieve 熔断时通道可被上层感知
+# ══════════════════════════════════════════════════════════════════
+
+
+def _k3_router():
+    from retrieval.query_router import QueryRouter, QueryRouterConfig
+    router = QueryRouter.__new__(QueryRouter)
+    router.config = QueryRouterConfig()
+    router._zh_en_tech_map = {}
+    router._cjk_warned = False
+    return router
+
+
+def test_vector_retrieve_raises_on_circuit_breaker():
+    """图库熔断时 _vector_retrieve 上抛（不产出空 content 伪结果）。"""
+    from graph.common import CircuitBreakerOpen
+    router = _k3_router()
+    router.faiss_index = MagicMock()
+    router.faiss_index.search.return_value = (np.array([[0.1]]), np.array([[7]]))
+    router.faiss_id_map = {7: "ep_7"}
+    router.encoder = None
+    router.graph_store = MagicMock()
+    router.graph_store.get_episodes_batch.side_effect = CircuitBreakerOpen("open")
+    with pytest.raises(CircuitBreakerOpen):
+        router._vector_retrieve("q", np.zeros((1, 512)))
+
+
+def test_fusion_vector_channel_skipped_on_circuit_breaker():
+    """FUSION 下向量通道熔断 → 通道标记 skipped，不产出伪结果污染融合。"""
+    from graph.common import CircuitBreakerOpen
+    router = _k3_router()
+    router.graph_store = MagicMock()
+    router._vector_retrieve = MagicMock(side_effect=CircuitBreakerOpen("open"))
+    router._bm25_search = MagicMock(return_value=[
+        {"node_id": "b1", "content": "bm25 hit", "score": 0.8, "tau_value": 0.0,
+         "level": "bm25"},
+    ])
+    router._entity_match = MagicMock(return_value=[])
+    out = router._fusion_retrieve("hello world", np.zeros((1, 512)))
+    # 无空 content 伪结果；bm25 结果保留且带降级标记
+    assert [r["node_id"] for r in out] == ["b1"]
+    assert all(r.get("_degradation_level") == "fusion_channel_skip" for r in out)
+
+
+def test_vector_cascade_to_keyword_on_circuit_breaker():
+    """L2 VECTOR 熔断 → 级联到 L3 keyword，且结果带 l2_circuit_breaker 标记。"""
+    from graph.common import CircuitBreakerOpen
+    from retrieval.query_router import RetrievalLevel
+    router = _k3_router()
+    router._time_keywords = ["recent"]
+    router.graph_store = MagicMock()
+    router._vector_retrieve = MagicMock(side_effect=CircuitBreakerOpen("open"))
+    router._keyword_retrieve = MagicMock(return_value=[
+        {"node_id": "k1", "content": "kw", "score": 0.5, "tau_value": 0.0,
+         "fact_track": "active", "level": "keyword"},
+    ])
+    for name in (
+        "_community_expansion", "_mesa_synthesis", "_visual_recall",
+        "_property_temporal_retrieve", "_entity_expansion", "_attribute_expansion",
+        "_scope_retrieve", "_schema_recall", "_fact_retrieve",
+    ):
+        setattr(router, name, MagicMock(side_effect=lambda r, *a, **k: r))
+    router._load_shedding_active = MagicMock(return_value=(False, 0, 4))
+    out = router.retrieve("hello", query_embedding=np.zeros((1, 512)),
+                          level=RetrievalLevel.VECTOR)
+    assert [r["node_id"] for r in out] == ["k1"]
+    assert out[0].get("_degradation_level") == "l2_circuit_breaker"

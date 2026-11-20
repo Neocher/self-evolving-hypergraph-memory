@@ -2104,6 +2104,11 @@ class QueryRouter:
                 r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
+            except CircuitBreakerOpen:
+                logger.warning("L2 circuit breaker open, cascading to L3")
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                self._tag_degraded(r, level="l2_circuit_breaker")
+                return r
             if results:
                 return _finish(results)
             logger.info("L2 empty, cascading to L3")
@@ -4366,7 +4371,10 @@ class QueryRouter:
                     for ep in self.graph_store.get_episodes_batch(list(uuid_map.values()))
                 }
             except CircuitBreakerOpen:
-                episodes_dict = {}  # 熔断降级：静默跳过回查（内容为空，不刷异常日志）
+                # 【K3】熔断必须被上层感知：上抛让 FUSION 通道标记 skipped / L2 级联到
+                # L3，而不是伪装成一条空 content 结果参与融合（P1-4）。
+                logger.warning("_vector_retrieve: circuit breaker open, channel unavailable")
+                raise
             except Exception:
                 logger.exception(
                     "_vector_retrieve: GraphLite batch lookup failed, results will have empty content"
