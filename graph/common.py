@@ -55,7 +55,12 @@ def _gql_value(v: Any) -> Optional[str]:
     """Encode a single Python value to GQL literal (UTF-8-safe). None if unsupported."""
     if isinstance(v, str):
         # GraphLite lexer UTF-8 bug 已修复（fork Neocher/GraphLite 4452a96）——原生中文直写
-        v = v.replace("\\", "\\\\").replace("'", "\\'")
+        # 【K1】转义顺序与 overgraph_store._esc_literal 对齐（反斜杠→单引号→换行→回车），
+        # 杜绝字面量内裸换行破坏 SET 子句结构（注入面收敛）。
+        v = (v.replace("\\", "\\\\")
+              .replace("'", "\\'")
+              .replace("\n", "\\n")
+              .replace("\r", "\\r"))
         return f"'{v}'"
     if isinstance(v, bool):
         return str(v).lower()
