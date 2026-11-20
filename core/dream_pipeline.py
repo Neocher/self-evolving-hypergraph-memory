@@ -441,6 +441,16 @@ class DreamPipeline:
                 },
             )
             logger.info("Dream %s: saved to candidate store (review before apply)", dream_id)
+            # 【H1/B-P0-1】候选模式 prune 是"延迟物理删除"（auto_apply 才 DELETE），
+            # 若等 apply 后再清向量，候选积压期（≥20 文件才触发）删除节点会先留下
+            # ghost 向量占 top-k。这里立即把被剪节点 id 交给调度器既有的 FAISS
+            # 增量清理链路（_run_dream → _incremental_update_fn）：
+            #   OverGraph (D7): 向量随节点生命周期，此调用清 faiss_id_map 残留、
+            #     保持 ntotal/_count 准确（幂等，search 会 setdefault 回填）；
+            #   legacy FAISS 后端: remove_ids 真删向量（节点已排定删除，仅向量通道
+            #     提前不可见，图/关键词通道仍可命中；apply 真删后全通道一致）。
+            all_removed_ids.extend(
+                op.node_id for op in prune_ops if op.op_type == "delete")
             # 【v6.3.1】候选模式下也落库实体（幂等，只增不删）：
             # PERSIST 直接模式的 PRUNE/MERGE 破坏性操作仍经 apply 人工放行，
             # 但实体落库（_persist_entities）与 Schema 演化（_persist_schema_

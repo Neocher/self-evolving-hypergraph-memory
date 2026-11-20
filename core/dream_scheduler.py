@@ -84,6 +84,9 @@ class DreamScheduler:
         self._faiss_index = None
         self._faiss_id_map: dict = {}
         self._incremental_update_fn = None  # incremental_faiss_update 引用
+        # 【H1/B-P0-1】向量清理失败计数（不完整/异常都计）：失败不能静默，
+        # 供 health/observability 读取，累积可见。
+        self._faiss_cleanup_fail_count: int = 0
         # P2: 冲突驱动梦境
         self._unresolved_conflict_count: int = 0
         # 候选目录路径（可由 app.py 注入覆盖）
@@ -321,8 +324,24 @@ class DreamScheduler:
                                     "Dream FAISS cleanup: %d vectors removed",
                                     count,
                                 )
+                            # 【H1/B-P0-1】删除不完整（count < 请求数，含全失败 0）
+                            # 计数 + warning，失败不再静默（OverGraph D7 恒返回
+                            # 请求数，只有真失败/legacy FAISS 部分存在才 < 请求数）。
+                            if count < len(removed):
+                                self._faiss_cleanup_fail_count += 1
+                                logger.warning(
+                                    "Dream FAISS cleanup incomplete: %d/%d vectors "
+                                    "removed (cumulative fail_count=%d)",
+                                    count, len(removed),
+                                    self._faiss_cleanup_fail_count,
+                                )
                         except Exception:
-                            logger.exception("Dream FAISS cleanup failed")
+                            self._faiss_cleanup_fail_count += 1
+                            logger.exception(
+                                "Dream FAISS cleanup failed "
+                                "(cumulative fail_count=%d)",
+                                self._faiss_cleanup_fail_count,
+                            )
             self._new_node_count = 0
             self._last_run_time = time.time()
             self._dream_run_count += 1  # 【FIX】计数

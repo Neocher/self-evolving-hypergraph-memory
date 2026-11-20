@@ -241,7 +241,9 @@ class DreamCandidateStore:
 
         try:
             # Step 1: 执行 PRUNE 删除
+            # 【H1/B-P0-1】物理删除失败不能静默：per-op warning + 汇总计数。
             deleted_count = 0
+            prune_failed_count = 0
             for op in candidate.prune_ops:
                 try:
                     graphlite_store.query_cypher(
@@ -250,6 +252,7 @@ class DreamCandidateStore:
                     )
                     deleted_count += 1
                 except Exception as e:
+                    prune_failed_count += 1
                     logger.warning("Apply prune failed for %s: %s", op["node_id"], e)
 
             # Step 2: 执行 MERGE 合并
@@ -283,8 +286,10 @@ class DreamCandidateStore:
 
             # 标记候选已应用
             self._mark_applied(dream_id)
-            logger.info("Dream candidate applied: %s (%d prunes, %d merges)",
-                        dream_id, deleted_count, len(candidate.merge_ops))
+            # 【H1/B-P0-1】删除失败计数进汇总日志（observability 可见）
+            logger.info(
+                "Dream candidate applied: %s (%d prunes ok / %d prune failed, %d merges)",
+                dream_id, deleted_count, prune_failed_count, len(candidate.merge_ops))
             return True
         except Exception as e:
             logger.exception("Failed to apply dream candidate %s: %s", dream_id, e)
@@ -639,7 +644,10 @@ class DreamCandidateStore:
 
         try:
             # 1. 执行 PRUNE（删除已废弃节点）
+            # 【H1/B-P0-1】物理删除失败不能静默（原 except: pass）：
+            # per-op warning + 计数，汇总进 apply 日志。
             deleted_count = 0
+            prune_failed_count = 0
             for idx, op in enumerate(candidate.prune_ops):
                 try:
                     graphlite_store.query_cypher(
@@ -647,8 +655,11 @@ class DreamCandidateStore:
                         {"id": op.get("node_id", "")},
                     )
                     deleted_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    prune_failed_count += 1
+                    logger.warning(
+                        "auto-apply prune failed for %s: %s",
+                        op.get("node_id", ""), e)
                 # 【心跳】每 ~10 个 PRUNE 操作 touch 一次
                 if (idx + 1) % 10 == 0:
                     _hb()
@@ -667,8 +678,9 @@ class DreamCandidateStore:
                 logger.warning("Candidate file not found for deletion: %s", filepath)
 
             logger.info(
-                "Auto-applied dream %s: %d communities, %d prunes",
+                "Auto-applied dream %s: %d communities, %d prunes ok / %d prune failed",
                 candidate.dream_id[:12], comm_created, deleted_count,
+                prune_failed_count,
             )
             return (1, comm_created, 1, community_summaries)
 
