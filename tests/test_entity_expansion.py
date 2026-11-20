@@ -327,13 +327,23 @@ class TestEntityExpansion:
         assert exp_pos < seed6_pos  # 扩展分 0.81 仅低于最高种子 0.9 → 排序在 0.1 之前
 
     def test_total_append_capped_at_20(self):
-        """总 append 硬上限 20：25 条命中 → 只追加 20 条。"""
+        """总 append 硬上限 20：3 实体 × 各 25 条命中 → 只追加 20 条。
+
+        【K4】频率门控折叠进单条 SELECT 后，每实体在 Python 侧截断到
+        max_results(10)（旧实现靠 DB 侧 LIMIT，mock 无视 LIMIT 返回 25 条），
+        故改为 3 实体各返 25 条 → 30 条候选 → 硬上限 20。
+        """
         store = MagicMock()
-        store.query_cypher.return_value = [
-            _row(f"ep{i}", f"Apple session message number {i}.") for i in range(25)
+        store.query_cypher.side_effect = [
+            [_row(f"a{i}", f"Apple session message number {i}.") for i in range(25)],
+            [_row(f"b{i}", f"Tesla session message number {i}.") for i in range(25)],
+            [_row(f"c{i}", f"Google session message number {i}.") for i in range(25)],
         ]
-        router = _make_router(store, [_seed("ep1", "What did Apple do?", score=0.9)])
-        out = router.retrieve("What did Apple do?", level=RetrievalLevel.FUSION)
+        router = _make_router(
+            store, [_seed("ep1", "What did Apple and Tesla and Google do?", score=0.9)]
+        )
+        out = router.retrieve("What did Apple and Tesla and Google do?",
+                              level=RetrievalLevel.FUSION)
         exp = [r for r in out if r.get("level") == "entity_expansion"]
         assert len(exp) == 20
 

@@ -1347,7 +1347,18 @@ class OverGraphStore:
                 )
                 ms = (result or {}).get("mutation_stats") or {}
                 return int(ms.get("nodes_updated", 0)) > 0
-            except Exception:
+            except Exception as e:
+                # 【K1】写失败不可静默：记录 WARNING + 计数，与「CAS 版本不匹配返回 False」
+                # 区分开（后者是正常业务语义，前者是基础设施/语法异常）。
+                self._update_with_version_failures = (
+                    getattr(self, "_update_with_version_failures", 0) + 1
+                )
+                logger.warning(
+                    "update_with_version failed: %s (node_id=%s, expected_version=%s, "
+                    "total_failures=%d)",
+                    str(e)[:200], str(node_id)[:40], expected_version,
+                    self._update_with_version_failures,
+                )
                 return False
 
     def archive_node(self, node_id: str, replacement_id: str | None = None) -> bool:
