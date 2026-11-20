@@ -42,7 +42,10 @@ class TokenManager:
         """验证 token 有效性，返回 token 信息或 None（不含原始 token 值）。"""
         now = time.time()
         token_hash = self._hash_token(token)
-        for name, info in self._tokens.items():
+        # 【G4】list() 快照迭代：命中过期 token 时 revoke_key 会 del 字典元素，
+        # 直接迭代 self._tokens 会 RuntimeError（dictionary changed size during
+        # iteration）→ 500；快照后删除发生在迭代序列之外。
+        for name, info in list(self._tokens.items()):
             stored_hash = info.get("token_hash", "")
             if not secrets.compare_digest(token_hash, stored_hash):
                 continue
