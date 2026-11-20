@@ -14,6 +14,14 @@ from api.routes._deps import (
 )
 from fastapi import Query, Response
 
+import re
+
+# 【G2 安全面】edge_type 白名单：_upsert_batch_relation 把 rel_type 裸插进 GQL
+# 模板的标识符位（-[r:{rel_type}]->），客户端可控字符串只允许
+# [A-Z][A-Z0-9_]{0,63}（与代码库既有 RELATES_TO/ALIAS_OF/SESSION_MEMBER 命名
+# 一致）；非法值在路由层 400 拒绝，不进入查询。值位仍走 $rel 参数绑定。
+_REL_TYPE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+
 
 def _upsert_batch_relation(store, subj: str, obj: str, rel_type: str, rel: str) -> None:
     """单个三元组的 6 次 execute_cypher 组闭包（写线程内原子）。
@@ -338,6 +346,17 @@ async def batch_relations(
     """批量将抽取的三元组写入 RELATES_TO 边（不创建 EpisodeNode）"""
     results = {"total": len(input_data.relations), "created": 0, "errors": 0, "error_details": []}
     start = _now()
+
+    # 【G2 安全面】edge_type 进入 GQL 结构位（关系类型名，非属性值，无法参数绑定），
+    # 客户端可控字符串必须过白名单正则；任一非法即整请求 400，不让非法值进入查询。
+    for i, item in enumerate(input_data.relations):
+        rel_type = item.get("edge_type", "RELATES_TO")
+        if not isinstance(rel_type, str) or not _REL_TYPE_RE.fullmatch(rel_type):
+            raise HTTPException(
+                status_code=400,
+                detail=f"relations[{i}].edge_type={rel_type!r} invalid; "
+                       f"expected [A-Z][A-Z0-9_]{{0,63}}",
+            )
 
     for item in input_data.relations:
         subj = item.get("subject", "").strip()
