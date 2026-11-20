@@ -45,6 +45,70 @@ def _invalidate_community_members_cache(store) -> None:
         hook()
 
 
+_MERGE_CONTENT_MAX = 2000  # 【H2/P8】与 _persist_merge 一致：防连续合并无界增长
+
+
+def _apply_merge_ops(graphlite_store, merge_ops: list[dict]) -> tuple[int, int]:
+    """【H2/B-P0-2】候选 merge_ops 的唯一执行入口（apply_candidate 与
+    auto_apply_candidates 共用，语义对齐直接模式 DreamPipeline._persist_merge）。
+
+    每条 op（{"node_id","target","reason"}）：读 loser content → Python 侧
+    拼接 (winner_content + ' | merged: ' + loser_content)[:2000] → SET winner
+    → DETACH DELETE loser。per-op try/except：单条失败不阻断其余 merge。
+
+    Returns:
+        (ok_count, failed_count)
+    """
+    ok = 0
+    failed = 0
+    for op in merge_ops:
+        source_id = op.get("node_id", "")
+        target_id = op.get("target", "")
+        try:
+            if not source_id:
+                failed += 1
+                logger.warning("Apply merge skipped: op missing node_id: %r", op)
+                continue
+            source_rows = graphlite_store.query_cypher(
+                "MATCH (s:EpisodeNode {id: $id}) RETURN s.content AS content",
+                {"id": source_id},
+            )
+            source_content = ""
+            if source_rows:
+                row = source_rows[0]
+                if isinstance(row, dict):
+                    source_content = str(row.get("content", "") or "")
+                elif isinstance(row, (list, tuple)) and row:
+                    source_content = str(row[0] or "")
+            if target_id:
+                target_rows = graphlite_store.query_cypher(
+                    "MATCH (t:EpisodeNode {id: $id}) RETURN t.content AS content",
+                    {"id": target_id},
+                )
+                target_content = ""
+                if target_rows:
+                    row = target_rows[0]
+                    if isinstance(row, dict):
+                        target_content = str(row.get("content", "") or "")
+                    elif isinstance(row, (list, tuple)) and row:
+                        target_content = str(row[0] or "")
+                merged = (target_content + " | merged: " + source_content)[:_MERGE_CONTENT_MAX]
+                graphlite_store.query_cypher(
+                    "MATCH (t:EpisodeNode {id: $id}) SET t.content = $content",
+                    {"id": target_id, "content": merged},
+                )
+            graphlite_store.query_cypher(
+                "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
+                {"id": source_id},
+            )
+            ok += 1
+        except Exception as e:
+            failed += 1
+            logger.warning("Apply merge failed for %s -> %s: %s",
+                           source_id, target_id, e)
+    return ok, failed
+
+
 @dataclass
 class DreamCandidate:
     """梦境候选 — 一次梦境输出，等待审查。"""
@@ -256,40 +320,19 @@ class DreamCandidateStore:
                     logger.warning("Apply prune failed for %s: %s", op["node_id"], e)
 
             # Step 2: 执行 MERGE 合并
-            for op in candidate.merge_ops:
-                try:
-                    target = op.get("target", "")
-                    if target:
-                        source_rows = graphlite_store.query_cypher(
-                            "MATCH (s:EpisodeNode {id: $id}) RETURN s.content AS content",
-                            {"id": op["node_id"]}
-                        )
-                        source_content = ""
-                        if source_rows and len(source_rows) > 0:
-                            row = source_rows[0]
-                            if isinstance(row, (list, tuple)):
-                                source_content = str(row[0])
-                            elif isinstance(row, dict):
-                                source_content = str(row.get("content", ""))
-                        graphlite_store.query_cypher(
-                            "MATCH (target:EpisodeNode {id: $target}) "
-                            "SET target.content = target.content + ' | merged: ' + $content",
-                            {"target": target, "content": source_content}
-                        )
-                    graphlite_store.query_cypher(
-                        "MATCH (e:EpisodeNode {id: $id}) DETACH DELETE e",
-                        {"id": op["node_id"]}
-                    )
-                except Exception as e:
-                    logger.warning("Apply merge failed for %s -> %s: %s",
-                                   op["node_id"], op.get("target", ""), e)
+            # 【H2/B-P0-2】收口到 _apply_merge_ops（与 auto_apply 同一入口，
+            # 语义对齐直接模式 _persist_merge：Python 侧拼接 + [:2000] 截断）。
+            merge_ok, merge_failed = _apply_merge_ops(
+                graphlite_store, candidate.merge_ops)
 
             # 标记候选已应用
             self._mark_applied(dream_id)
-            # 【H1/B-P0-1】删除失败计数进汇总日志（observability 可见）
+            # 【H1/B-P0-1 + H2/B-P0-2】prune/merge 成败计数进汇总日志
             logger.info(
-                "Dream candidate applied: %s (%d prunes ok / %d prune failed, %d merges)",
-                dream_id, deleted_count, prune_failed_count, len(candidate.merge_ops))
+                "Dream candidate applied: %s (%d prunes ok / %d prune failed, "
+                "%d merges ok / %d merge failed)",
+                dream_id, deleted_count, prune_failed_count,
+                merge_ok, merge_failed)
             return True
         except Exception as e:
             logger.exception("Failed to apply dream candidate %s: %s", dream_id, e)
@@ -610,12 +653,22 @@ class DreamCandidateStore:
             comm for comm in candidate.community_summaries
             if comm.get("member_count", 0) > 0 and len((comm.get("report", "") or "")) > 30
         ]
-        if len(valid_communities) < 1 or candidate.conflict_count > 0 or candidate.community_count == 0:
-            logger.info(
+        # 【H2/B-P0-2】质量门不再按 conflict_count 拦截：RESOLVE 里
+        # conflict_count 恒等于 len(merge_ops)，旧条件等效"有 merge 就丢弃"，
+        # 而门控自身不执行 merge → merge_ops 永久丢失（B-P0-2）。现 auto_apply
+        # 经 _apply_merge_ops 执行 merge，冲突梦无需在此被整梦拦下；门只保留
+        # 社区质量条件。
+        if len(valid_communities) < 1 or candidate.community_count == 0:
+            # 丢弃时显式计数未应用的 merge/prune：op 仍持久化在候选 JSON
+            # （discarded=true，可人工审查），不再静默丢失。
+            logger.warning(
                 "Auto-apply skipped %s: quality gate failed "
-                "(valid_communities=%d, conflicts=%d, community_count=%d)",
+                "(valid_communities=%d, conflicts=%d, community_count=%d); "
+                "%d merge_ops + %d prune_ops not applied (kept in candidate "
+                "file for manual review)",
                 candidate.dream_id[:12], len(valid_communities),
                 candidate.conflict_count, candidate.community_count,
+                len(candidate.merge_ops), len(candidate.prune_ops),
             )
             # 【FIX 2026-07-31】质量门控失败 → 标记 discarded 跳过，避免卡死整个队列
             # 根因: auto-apply 永远处理最旧 pending 候选, 若其质量不合格则 return,
@@ -664,12 +717,19 @@ class DreamCandidateStore:
                 if (idx + 1) % 10 == 0:
                     _hb()
 
-            # 2. 创建 CommunityNode
+            # 2. 执行 MERGE 合并
+            # 【H2/B-P0-2】auto_apply 原不执行 merge（质量门先丢弃含冲突的梦，
+            # 而 conflict_count 恒 = len(merge_ops) → 同一份数据两条分叉的
+            # 持久化实现、merge 丢失）。现与 apply_candidate 收口同一入口。
+            merge_ok, merge_failed = _apply_merge_ops(
+                graphlite_store, candidate.merge_ops)
+
+            # 3. 创建 CommunityNode
             comm_created = self._persist_community_nodes(
                 candidate, graphlite_store, heartbeat_fn=heartbeat_fn,
             )
 
-            # 3. 删除候选 JSON 文件（而不是标记 applied）
+            # 4. 删除候选 JSON 文件（而不是标记 applied）
             filepath = self._candidate_path(candidate.dream_id)
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -678,9 +738,10 @@ class DreamCandidateStore:
                 logger.warning("Candidate file not found for deletion: %s", filepath)
 
             logger.info(
-                "Auto-applied dream %s: %d communities, %d prunes ok / %d prune failed",
+                "Auto-applied dream %s: %d communities, "
+                "%d prunes ok / %d prune failed, %d merges ok / %d merge failed",
                 candidate.dream_id[:12], comm_created, deleted_count,
-                prune_failed_count,
+                prune_failed_count, merge_ok, merge_failed,
             )
             return (1, comm_created, 1, community_summaries)
 
