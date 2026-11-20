@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           # 测试/开发期依赖（pytest、pytest-asyncio、rdflib、pytest-cov、ruff）与
-          # ONNX 快路径（onnxruntime/optimum）都在 pyproject 的 extras 里声明。
+          # ONNX 快路径（onnxruntime）都在 pyproject 的 extras 里声明。
           pip install -e ".[test,onnx]"
 
       - name: Run tests
