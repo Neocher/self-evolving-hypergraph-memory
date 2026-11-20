@@ -182,7 +182,7 @@ async def resolve_conflict(
         {"id": conflict_id},
     )
 
-    record_request("POST", f"/conflicts/{conflict_id}/resolve", "200", _now() - start)
+    record_request("POST", "/conflicts/{conflict_id}/resolve", "200", _now() - start)
     return {"status": "resolved", "conflict_id": conflict_id}
 
 

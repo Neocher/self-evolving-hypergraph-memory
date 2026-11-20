@@ -317,7 +317,8 @@ def create_app() -> FastAPI:
 def main() -> None:
     """A2A 服务器入口。"""
     parser = argparse.ArgumentParser(description="SHM A2A Gateway Server")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="监听地址（默认 loopback；对外监听须显式传 0.0.0.0 并设置 A2A_API_KEY）")
     parser.add_argument("--port", type=int, default=8001, help="监听端口")
     parser.add_argument("--debug", action="store_true", default=False, help="启用调试日志")
     parser.add_argument("--api-key", type=str, default="", help="API Key（覆盖 A2A_API_KEY 环境变量）")
@@ -332,6 +333,16 @@ def main() -> None:
     global A2A_API_KEY
     if args.api_key:
         A2A_API_KEY = args.api_key
+
+    # 【G1 安全面】非 loopback 监听必须启用 Bearer 认证，否则拒绝启动
+    # （原行为：仅 warning 后裸奔，任何可达主机可未认证写记忆）。
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not A2A_API_KEY:
+        logger.error(
+            "Refusing to bind %s:%d without A2A_API_KEY: non-loopback listen "
+            "requires Bearer auth. Set A2A_API_KEY (or --api-key), or listen "
+            "on loopback only (--host 127.0.0.1).", args.host, args.port,
+        )
+        raise SystemExit(2)
 
     import uvicorn
     app = create_app()

@@ -30,11 +30,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          # 测试/开发期依赖（pytest、pytest-asyncio、rdflib、pytest-cov、ruff）与
+          # ONNX 快路径（onnxruntime）都在 pyproject 的 extras 里声明。
+          pip install -e ".[test,onnx]"
 
       - name: Run tests
+        # 不使用 `| tail`：管道会吞掉 pytest 退出码（无 pipefail 时 CI 永绿）。
+        # -q + --tb=short 已足够控制日志量；失败时 GitHub 会展开完整输出。
         run: |
-          python -m pytest tests/ -v --tb=short 2>&1 | tail -30
+          python -m pytest tests/ -q --tb=short
 
       - name: Check version consistency
         run: |

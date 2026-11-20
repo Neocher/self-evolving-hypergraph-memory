@@ -24,7 +24,9 @@ for _env_file in [
 
 from api.app import create_app
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """控制台入口：对应 pyproject 的 ``shm-server = "run_server:main"``。"""
     app = create_app()
     uvicorn.run(
         app,
@@ -32,3 +34,7 @@ if __name__ == "__main__":
         port=8000,
         log_level="info",
     )
+
+
+if __name__ == "__main__":
+    main()

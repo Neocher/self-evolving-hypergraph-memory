@@ -1752,22 +1752,27 @@ class QueryRouter:
         w_b = cfg.weight_fusion_bm25
         w_e = cfg.weight_fusion_entity
 
-        def _normalize_scores(items: list[dict]) -> None:
-            """就地 min-max 归一化得分到 [0, 1]"""
+        def _normalize_scores(items: list[dict], channel: str) -> None:
+            """通道内固定尺度归一化（保留通道间绝对质量差）。
+
+            旧实现逐通道 min-max 拉伸到 [0,1]：低质量通道（全部弱匹配/单条弱命中）
+            也把 top 项顶到 1.0 → 拿满融合权重，通道间绝对质量不可比（P1-3）。
+            改为固定尺度：
+              - vector/entity 分数天然 ∈ [0,1]（余弦相似度 / 匹配置信度）→ clamp 保序
+              - bm25 为无上界 BM25 和 → 饱和映射 s/(s+1) ∈ (0,1)，保留绝对强弱差
+            """
             if not items:
                 return
-            scores = [r["score"] for r in items]
-            lo, hi = min(scores), max(scores)
-            if hi - lo < 1e-9:
-                for r in items:
-                    r["score"] = 1.0
-            else:
-                for r in items:
-                    r["score"] = (r["score"] - lo) / (hi - lo)
+            for r in items:
+                s = float(r["score"])
+                if channel == "bm25":
+                    r["score"] = s / (s + 1.0)
+                else:
+                    r["score"] = max(0.0, min(1.0, s))
 
-        _normalize_scores(vector_results)
-        _normalize_scores(bm25_results)
-        _normalize_scores(entity_results)
+        _normalize_scores(vector_results, "vector")
+        _normalize_scores(bm25_results, "bm25")
+        _normalize_scores(entity_results, "entity")
 
         # 加权融合
         fused: dict[str, dict] = {}
@@ -2098,6 +2103,11 @@ class QueryRouter:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
                 r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
+                return r
+            except CircuitBreakerOpen:
+                logger.warning("L2 circuit breaker open, cascading to L3")
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                self._tag_degraded(r, level="l2_circuit_breaker")
                 return r
             if results:
                 return _finish(results)
@@ -3663,6 +3673,15 @@ class QueryRouter:
             freq_adaptive = bool(getattr(ecfg, "freq_adaptive", True))
             freq_threshold = int(getattr(ecfg, "freq_threshold", 50))
             freq_max = int(getattr(ecfg, "freq_max_results", 3))
+            # 【K4】频率门控折叠进单条 SELECT：不再先 COUNT 再 SELECT（每实体 2 次
+            # 全表 CONTAINS 扫描 → 1 次）。一次取回 max(per_entity, freq_threshold+1)
+            # 条（引擎侧 LIMIT 下推）：
+            #   - 命中行 > freq_threshold → 高频实体 → 只留 freq_max 条（ORDER BY 保最相关）
+            #   - 命中行 ≤ freq_threshold → 低频实体 → 截断到 per_entity
+            # 与旧 COUNT 语义等价：COUNT>threshold ⇔ 取满 threshold+1 行。
+            probe_limit = (
+                max(per_entity, freq_threshold + 1) if freq_adaptive else per_entity
+            )
             existing_ids = {r.get("node_id") for r in results if r.get("node_id")}
             extra: list[dict] = []
             for i, ent in enumerate(entities):
@@ -3676,19 +3695,7 @@ class QueryRouter:
                 ent_cond = (
                     f"(e.content CONTAINS ${pkey_orig} OR e.content CONTAINS ${pkey_lower})"
                 )
-                ent_limit = per_entity
-                if freq_adaptive:
-                    try:
-                        cnt_rows = store.query_cypher(
-                            f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
-                            f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
-                            f"RETURN count(e) AS c", pparams)
-                        freq = int(cnt_rows[0]["c"]) if cnt_rows else 0
-                        if freq > freq_threshold:
-                            ent_limit = freq_max
-                    except Exception:
-                        pass  # 频率检测失败 → 默认参数（零回归）
-                pparams["limit"] = ent_limit
+                pparams["limit"] = probe_limit
                 ent_rows = store.query_cypher(
                     f"MATCH (e:EpisodeNode) WHERE {ent_cond} "
                     f"AND (e.archived IS NULL OR e.archived = false){at_clause} "
@@ -3697,6 +3704,11 @@ class QueryRouter:
                     f"ORDER BY e.created_at DESC LIMIT $limit", pparams)
                 if not isinstance(ent_rows, (list, tuple)):
                     continue
+                # 高频检测（单查询折叠）→ 降级召回量
+                if freq_adaptive and len(ent_rows) > freq_threshold:
+                    ent_rows = ent_rows[:freq_max]
+                elif len(ent_rows) > per_entity:
+                    ent_rows = ent_rows[:per_entity]
                 for row in ent_rows:
                     if isinstance(row, dict):
                         nid = row.get("node_id", "") or ""
@@ -4361,7 +4373,10 @@ class QueryRouter:
                     for ep in self.graph_store.get_episodes_batch(list(uuid_map.values()))
                 }
             except CircuitBreakerOpen:
-                episodes_dict = {}  # 熔断降级：静默跳过回查（内容为空，不刷异常日志）
+                # 【K3】熔断必须被上层感知：上抛让 FUSION 通道标记 skipped / L2 级联到
+                # L3，而不是伪装成一条空 content 结果参与融合（P1-4）。
+                logger.warning("_vector_retrieve: circuit breaker open, channel unavailable")
+                raise
             except Exception:
                 logger.exception(
                     "_vector_retrieve: GraphLite batch lookup failed, results will have empty content"
