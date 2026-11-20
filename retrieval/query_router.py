@@ -1752,22 +1752,27 @@ class QueryRouter:
         w_b = cfg.weight_fusion_bm25
         w_e = cfg.weight_fusion_entity
 
-        def _normalize_scores(items: list[dict]) -> None:
-            """就地 min-max 归一化得分到 [0, 1]"""
+        def _normalize_scores(items: list[dict], channel: str) -> None:
+            """通道内固定尺度归一化（保留通道间绝对质量差）。
+
+            旧实现逐通道 min-max 拉伸到 [0,1]：低质量通道（全部弱匹配/单条弱命中）
+            也把 top 项顶到 1.0 → 拿满融合权重，通道间绝对质量不可比（P1-3）。
+            改为固定尺度：
+              - vector/entity 分数天然 ∈ [0,1]（余弦相似度 / 匹配置信度）→ clamp 保序
+              - bm25 为无上界 BM25 和 → 饱和映射 s/(s+1) ∈ (0,1)，保留绝对强弱差
+            """
             if not items:
                 return
-            scores = [r["score"] for r in items]
-            lo, hi = min(scores), max(scores)
-            if hi - lo < 1e-9:
-                for r in items:
-                    r["score"] = 1.0
-            else:
-                for r in items:
-                    r["score"] = (r["score"] - lo) / (hi - lo)
+            for r in items:
+                s = float(r["score"])
+                if channel == "bm25":
+                    r["score"] = s / (s + 1.0)
+                else:
+                    r["score"] = max(0.0, min(1.0, s))
 
-        _normalize_scores(vector_results)
-        _normalize_scores(bm25_results)
-        _normalize_scores(entity_results)
+        _normalize_scores(vector_results, "vector")
+        _normalize_scores(bm25_results, "bm25")
+        _normalize_scores(entity_results, "entity")
 
         # 加权融合
         fused: dict[str, dict] = {}

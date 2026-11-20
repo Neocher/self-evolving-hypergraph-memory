@@ -65,3 +65,42 @@ def test_update_with_version_exception_is_observed(overgraph_store, caplog):
     assert ok is False
     assert getattr(store, "_update_with_version_failures", 0) == 1
     assert any("update_with_version failed" in r.message for r in caplog.records)
+
+
+# ══════════════════════════════════════════════════════════════════
+# K2 —— 融合归一化保留通道间绝对质量差
+# ══════════════════════════════════════════════════════════════════
+
+
+def _fuse_router():
+    from retrieval.query_router import QueryRouter, QueryRouterConfig
+    router = QueryRouter.__new__(QueryRouter)
+    router.config = QueryRouterConfig()
+    return router
+
+
+def test_fusion_noise_bm25_channel_does_not_beat_strong_vector():
+    """低质量 bm25 通道（单条弱命中 0.05）不再经 min-max 顶到 1.0 拿满权重。
+
+    旧实现：bm25 单条 → min-max → score=1.0 → 融合分 1.0×0.40=0.40，
+    高于 vector 0.9×0.35=0.315，弱噪声挤掉强证据。
+    新实现：bm25 0.05→0.05/1.05≈0.0476 → 融合分 0.019，低于 vector 0.315。
+    """
+    router = _fuse_router()
+    vector = [{"node_id": "v1", "content": "genuine strong", "score": 0.9, "tau_value": 0.0}]
+    bm25 = [{"node_id": "b1", "content": "weak noise", "score": 0.05, "tau_value": 0.0}]
+    out = router._fuse_results(vector, bm25, [])
+    by_id = {r["node_id"]: r["score"] for r in out}
+    assert by_id["v1"] > by_id["b1"], by_id
+    assert by_id["b1"] < 0.1, by_id  # 弱噪声不再拿满 0.40 权重
+
+
+def test_fusion_strong_bm25_still_competes_with_vector():
+    """强 bm25 命中（真实 BM25 和可 >10）经饱和映射后仍能与强向量竞争。"""
+    router = _fuse_router()
+    vector = [{"node_id": "v1", "content": "v", "score": 0.3, "tau_value": 0.0}]
+    bm25 = [{"node_id": "b1", "content": "b", "score": 11.0, "tau_value": 0.0}]
+    out = router._fuse_results(vector, bm25, [])
+    by_id = {r["node_id"]: r["score"] for r in out}
+    # 饱和映射 11/12≈0.917 × 0.40 ≈ 0.367 > 0.3×0.35=0.105
+    assert by_id["b1"] > by_id["v1"], by_id
