@@ -191,7 +191,7 @@ async def get_node_hyperedges(
         raise HTTPException(status_code=503, detail="HyperedgeManager not available")
 
     edges = deps.hyperedge_manager.get_hyperedges_by_node(node_id)
-    record_request("GET", f"/hyperedges/by-node/{node_id}", "200", _now() - start)
+    record_request("GET", "/hyperedges/by-node/{node_id}", "200", _now() - start)
     return HyperedgeListResponse(
         hyperedges=[
             HyperedgeResponse(

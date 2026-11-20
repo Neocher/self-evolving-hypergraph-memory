@@ -607,7 +607,7 @@ async def get_session_memories(
             "source": r.get("source", ""),
         })
 
-    record_request("GET", f"/sessions/{session_id}/memories", "200", _now() - start)
+    record_request("GET", "/sessions/{session_id}/memories", "200", _now() - start)
     return {"session_id": session_id, "memories": memories, "total": len(memories)}
 
 

@@ -1146,7 +1146,13 @@ def create_app() -> FastAPI:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        record_request(request.method, request.url.path, response.status_code, duration)
+        # 【G3 安全面】Prometheus endpoint label 用路由模板（去参数化），
+        # 不用原始 URL path——否则每个具体 ID 都创建永久序列（无界基数 +
+        # 免认证 /metrics 泄露访问过的 ID）。取不到 route 归 other，
+        # 绝不回退原始 path。
+        route = request.scope.get("route")
+        endpoint = getattr(route, "path", None) or "other"
+        record_request(request.method, endpoint, response.status_code, duration)
         response.headers["X-Trace-Id"] = trace_id
         return response
 

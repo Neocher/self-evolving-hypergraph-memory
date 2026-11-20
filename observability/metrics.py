@@ -59,7 +59,12 @@ INDEX_SIZE = Gauge(
 
 
 def record_request(method: str, endpoint: str, status: str, duration: float) -> None:
-    """记录一次 API 请求的指标。"""
+    """记录一次 API 请求的指标。
+
+    endpoint 必须是路由模板（如 /memories/episodes/{episode_id}），
+    禁止传入含具体 ID 的原始 path——prometheus label 每个组合永久保留，
+    原始 path 会造成无界基数（内存增长 + 免认证 /metrics 泄露访问过的 ID）。
+    """
     REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=status).inc()
     REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(duration)
 
