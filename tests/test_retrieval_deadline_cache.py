@@ -180,6 +180,88 @@ class TestDeadlineCooperative:
             "deadline=None 时 rerank 应正常被调用"
         )
 
+    def test_budget_too_small_for_rerank_skips_before_start(self):
+        """预算不够但还没过期：remaining=0.05s < 1.2×estimate(0.5s) → 不启动 rerank。"""
+        router = QueryRouter.__new__(QueryRouter)
+        router.config = QueryRouterConfig(
+            rerank_enabled=True,
+            fusion_dedup_enabled=False,
+            total_step_budget_s=0.0,
+        )
+        router._zh_en_tech_map = {}
+        router._time_keywords = set()
+        router.encoder = None
+        seeds = [{
+            "node_id": "n0", "content": "alpha beta", "score": 0.9,
+            "fact_track": "active", "tau_value": 1.0, "level": "l1_faiss",
+        }]
+        router._fusion_retrieve = MagicMock(return_value=[dict(s) for s in seeds])
+        for name in (
+            "_community_expansion", "_mesa_synthesis", "_visual_recall",
+            "_property_temporal_retrieve", "_entity_expansion",
+            "_attribute_expansion", "_scope_retrieve", "_schema_recall",
+            "_fact_retrieve",
+        ):
+            setattr(router, name, MagicMock(side_effect=lambda results, *a, **k: results))
+        router._rerank_results = MagicMock()
+        # 已学到 rerank 实测约 0.5s；deadline 只剩 0.05s → 1.2*0.5=0.6 > 0.05 → 跳过
+        router._rerank_duration_estimate = 0.5
+
+        deadline = time.monotonic() + 0.05
+        t0 = time.monotonic()
+        out = router.retrieve("alpha beta", level=RetrievalLevel.FUSION, deadline=deadline)
+        elapsed = time.monotonic() - t0
+
+        assert isinstance(out, list) and out
+        assert elapsed < 0.4, f"预算不足应快速返回而非启动慢 rerank: {elapsed:.3f}s"
+        assert router._rerank_results.call_count == 0, (
+            "预算不够时不应启动 _rerank_results"
+        )
+        assert router._is_rerank_budget_disabled() is False, (
+            "仅 1 次预算不足不应达到禁用阈值"
+        )
+
+    def test_three_consecutive_budget_exceeds_disables_rerank(self):
+        """连续 3 次超预算 → _is_rerank_budget_disabled() 为真；此后预算充足也跳过。"""
+        router = QueryRouter.__new__(QueryRouter)
+        router.config = QueryRouterConfig(
+            rerank_enabled=True,
+            fusion_dedup_enabled=False,
+            total_step_budget_s=0.0,
+        )
+        router._zh_en_tech_map = {}
+        router._time_keywords = set()
+        router.encoder = None
+        seeds = [{
+            "node_id": "n0", "content": "alpha beta", "score": 0.9,
+            "fact_track": "active", "tau_value": 1.0, "level": "l1_faiss",
+        }]
+        router._fusion_retrieve = MagicMock(return_value=[dict(s) for s in seeds])
+        for name in (
+            "_community_expansion", "_mesa_synthesis", "_visual_recall",
+            "_property_temporal_retrieve", "_entity_expansion",
+            "_attribute_expansion", "_scope_retrieve", "_schema_recall",
+            "_fact_retrieve",
+        ):
+            setattr(router, name, MagicMock(side_effect=lambda results, *a, **k: results))
+        router._rerank_results = MagicMock(side_effect=lambda results, *a, **k: results)
+
+        # 三次已过期（remaining<=0）→ 每次 note budget exceeded → 第三次禁用
+        for _ in range(3):
+            router.retrieve("alpha beta", level=RetrievalLevel.FUSION,
+                            deadline=time.monotonic() - 0.001)
+        assert router._is_rerank_budget_disabled() is True, (
+            "连续 3 次超预算后应进程内禁用重排"
+        )
+
+        # 已禁用：即便预算充足（deadline 很远），rerank 也不再启动
+        router._rerank_results.reset_mock()
+        router.retrieve("alpha beta", level=RetrievalLevel.FUSION,
+                        deadline=time.monotonic() + 10.0)
+        assert router._rerank_results.call_count == 0, (
+            "禁用后预算充足也不应再启动 rerank"
+        )
+
 
 class TestRetrieveWithDeadlineHelper:
     def test_forwards_deadline_when_callable_accepts_it(self):

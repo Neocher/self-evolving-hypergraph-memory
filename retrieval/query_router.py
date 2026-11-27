@@ -822,6 +822,8 @@ class QueryRouter:
         # ImportError/加载失败永久失败语义，二者独立，互不破坏）。
         self._rerank_budget_failures = 0
         self._rerank_budget_disabled = False
+        # 【C1】重排实测耗时 EWMA（秒，进程内按实例）。0.0 = 尚无估计。
+        self._rerank_duration_estimate = 0.0
         self._rerank_lock = threading.Lock()
 
     def _normalize_query(self, query: str) -> str:
@@ -2051,18 +2053,39 @@ class QueryRouter:
                 if rerank_enabled and self._is_rerank_budget_disabled():
                     # 本进程内已因连续超预算禁用重排（WARNING 在置位时已打，此处静默跳过）
                     pass
-                elif rerank_enabled and _deadline_exceeded():
-                    logger.info(
-                        "Retrieval deadline exceeded, skipping rerank",
-                        skipped="rerank",
-                        remaining_budget_s=round(_remaining_budget(), 3),
-                    )
-                    self._note_rerank_budget_exceeded()
                 elif rerank_enabled:
-                    self._reset_rerank_budget_failures()
-                    sorted_results = self._rerank_results(
-                        sorted_results, raw_query, True,
-                    )
+                    # 【C1】预算不够但还没过期也要拦：剩余预算 < 1.2 × 实测耗时估计
+                    # → 不启动重排（防 9.6~20s 的 rerank 把外层 wait_for 拖到放弃、
+                    # 产生孤儿线程）。首次无估计 → 放行并记录实测耗时。
+                    remaining = (deadline - time.monotonic()) if deadline is not None else None
+                    estimate = float(getattr(self, "_rerank_duration_estimate", 0.0))
+                    if remaining is not None and remaining <= 0.0:
+                        logger.info(
+                            "Retrieval deadline exceeded, skipping rerank",
+                            skipped="rerank",
+                            remaining_budget_s=0.0,
+                        )
+                        self._note_rerank_budget_exceeded()
+                    elif (remaining is not None and estimate > 0.0
+                            and remaining < 1.2 * estimate):
+                        logger.info(
+                            "Retrieval budget too small for rerank, skipping",
+                            skipped="rerank",
+                            remaining_budget_s=round(remaining, 3),
+                            rerank_estimate_s=round(estimate, 3),
+                        )
+                        self._note_rerank_budget_exceeded()
+                    else:
+                        self._reset_rerank_budget_failures()
+                        t0 = time.monotonic()
+                        sorted_results = self._rerank_results(
+                            sorted_results, raw_query, True,
+                        )
+                        elapsed = time.monotonic() - t0
+                        self._update_rerank_duration_estimate(elapsed)
+                        # 重排返回后若实际耗时 > 启动时剩余预算 → 计入连续超预算熔断
+                        if remaining is not None and elapsed > remaining:
+                            self._note_rerank_budget_exceeded()
             # 【P3-C】RPE 惊奇度轻重排（默认关零回归；仅 FUSION 生效）
             if level == RetrievalLevel.FUSION:
                 sorted_results = self._rpe_rerank_results(sorted_results)
@@ -4672,6 +4695,14 @@ class QueryRouter:
     def _reset_rerank_budget_failures(self) -> None:
         """重排成功启动时复位连续超预算计数。"""
         self._rerank_budget_failures = 0
+
+    def _update_rerank_duration_estimate(self, elapsed_s: float) -> None:
+        """更新重排实测耗时 EWMA（α=0.3 偏近期；首次直接记录）。"""
+        est = float(getattr(self, "_rerank_duration_estimate", 0.0))
+        if est <= 0.0:
+            self._rerank_duration_estimate = float(elapsed_s)
+        else:
+            self._rerank_duration_estimate = 0.7 * est + 0.3 * float(elapsed_s)
 
     def _get_reranker(self):
         """【P3a】懒加载 bge-reranker CrossEncoder（双重检查锁 + 失败永久标记）。
