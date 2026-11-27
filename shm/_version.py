@@ -1,12 +1,20 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.25.0"
-__version_info__ = (6, 25, 0)
-__version_name__ = "PowerLaw-Tau"
-__release_date__ = "2026-10-02"
+__version__ = "6.25.1"
+__version_info__ = (6, 25, 1)
+__version_name__ = "DeadlineCache"
+__release_date__ = "2026-11-27"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.25.1 (2026-11-27) DeadlineCache:
+  检索路径 C1+C2 回移（从 v6.28.1 PR #2 回移到生产 v6.25 基线）:
+  【C1 协作式 deadline】QueryRouter.retrieve 新增可选 deadline（time.monotonic() 口径，
+  None 零回归）；_finish 在 community/mesa/visual/property/entity/attribute/scope/
+  schema/fact 通道间自检超预算跳过并返回已得部分结果；重排预算不足不启动
+  （1.2×EWMA 预估拦截），连续 3 次超预算 → 本进程内禁用重排 + WARNING。
+  【C2 缓存修复】degraded 响应不进结果缓存；缓存键内嵌代际（_result_cache_generation），
+  新 episode 写成功后 bump 一次，旧代际键自然失效。
 v6.25.0 (2026-10-02) PowerLaw-Tau:
   • 评测臂 LLM 粘性缓存 (STICKY) — 消除评测 run 间/批内由 HyDE 假设文档与
     suff_check/followup_query 的 LLM 非确定性注入的 ctx 漂移 (实测生产臂 ctx 臂内

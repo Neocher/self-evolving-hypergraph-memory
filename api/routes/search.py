@@ -3,10 +3,12 @@
 """
 
 import asyncio
+import inspect
 
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     _result_cache, _result_cache_lock, _result_cache_max,
+    current_result_cache_generation,
     set_trace_id, record_request,
     Depends, Query, HTTPException,
     uuid, np, time, threading,
@@ -34,6 +36,23 @@ _RETRIEVE_TIMEOUT = 3.0
 # 超时即跳过该降级分支。注意：10.0 实际长于主检索超时（3.0/5.0s）——主检索
 # 超时返回空后，兜底仍有 10s 窗口尽力补充（非"短于"语义，2026-08-19 R2 修正注释）。
 _DEGRADE_TIMEOUT = 10.0
+
+
+def _retrieve_with_deadline(qr, query: str, *, deadline, **kwargs):
+    """调用 qr.retrieve 并仅在签名支持时透传 deadline。
+
+    生产 QueryRouter/SelfEvolvingRetrieval.retrieve 均新增了可选 deadline；
+    但历史测试替身（固定签名的 fake router）不接受该参数。这里用 inspect 探测签名，
+    避免把「协作式 deadline」这一可选能力强加给所有鸭子类型调用方——固定签名的
+    fake 仍按旧路径调用，生产路径则透传 deadline。
+    """
+    try:
+        accepts_deadline = "deadline" in inspect.signature(qr.retrieve).parameters
+    except (TypeError, ValueError):
+        accepts_deadline = False
+    if accepts_deadline:
+        kwargs["deadline"] = deadline
+    return qr.retrieve(query, **kwargs)
 
 
 def _level_from_strategy(strategy, config=None) -> "RetrievalLevel":
@@ -108,7 +127,9 @@ async def retrieve(
     qr = deps.query_router
     qr_config = _query_router_config(qr)
     level = _level_from_strategy(req.strategy, qr_config)
-    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:shared:{req.include_shared}:ts:{req.session_ts}:ns:{req.namespace or ''}:strategy:{level.value}:strategy_raw:{req.strategy or ''}"
+    # 【C2b】缓存键内嵌代际：新 episode 写入 bump 后旧代际键自然失效
+    cache_gen = current_result_cache_generation()
+    cache_key = f"{req.query}:{req.top_k}:archived:{req.include_archived}:shared:{req.include_shared}:ts:{req.session_ts}:ns:{req.namespace or ''}:strategy:{level.value}:strategy_raw:{req.strategy or ''}:gen:{cache_gen}"
     with _result_cache_lock:
         if cache_key in _result_cache:
             latency = (_now() - start) * 1000
@@ -121,12 +142,17 @@ async def retrieve(
         raise HTTPException(status_code=503, detail="Query router not available")
 
     retrieve_timeout = _retrieve_timeout(level, qr_config)
+    # 【C1】协作式 deadline：QueryRouter 在增强通道间自检，超预算跳过剩余通道并
+    # 用已得部分结果返回；外层 wait_for 仅作 GraphLite 真挂死的最后防线。
+    deadline = time.monotonic() + retrieve_timeout
     try:
         # 【P1-3】全同步检索链路（FAISS/sklearn/GraphLite）移到线程池，避免阻塞事件循环
         # 【H2】外层 wait_for：GraphLite/FAISS 挂起时超时返回空结果（降级），不无限挂起
         results_raw = await asyncio.wait_for(
             asyncio.to_thread(
-                deps.query_router.retrieve, req.query,
+                _retrieve_with_deadline,
+                deps.query_router, req.query,
+                deadline=deadline,
                 include_archived=req.include_archived,
                 session_ts=req.session_ts,
                 level=level,
@@ -428,12 +454,17 @@ async def retrieve(
         profile_context=profile_context,
     )
     # 【Perf】存入结果缓存
+    # 【C2a】degraded 结果不进缓存（防「刚写的记忆立刻查不到」被缓存放大）；
+    # 同 key 若已存在旧 degraded 值一并删除（防御性，正常情况下不写 degraded）。
     with _result_cache_lock:
-        if len(_result_cache) >= _result_cache_max:
-            keys = list(_result_cache.keys())
-            for k in keys[:_result_cache_max // 2]:
-                del _result_cache[k]
-        _result_cache[cache_key] = response
+        if response.degraded:
+            _result_cache.pop(cache_key, None)
+        else:
+            if len(_result_cache) >= _result_cache_max:
+                keys = list(_result_cache.keys())
+                for k in keys[:_result_cache_max // 2]:
+                    del _result_cache[k]
+            _result_cache[cache_key] = response
     record_request("POST", "/memories/retrieve", "200", _now() - start)
     return response
 
