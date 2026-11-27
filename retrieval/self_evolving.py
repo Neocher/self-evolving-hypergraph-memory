@@ -653,7 +653,8 @@ class SelfEvolvingRetrieval:
     def retrieve(self, query: str, include_archived: bool = False,
                  session_ts: Optional[float] = None,
                  level: RetrievalLevel = RetrievalLevel.HYPERGRAPH,
-                 rerank: Optional[bool] = None):
+                 rerank: Optional[bool] = None,
+                 deadline: Optional[float] = None):
         """执行检索 + 质量评估 + 自演化（线程安全）。
 
         【H1-a】锁粒度收窄：不再用方法级大锁包裹整个 _qr.retrieve
@@ -674,14 +675,22 @@ class SelfEvolvingRetrieval:
         level: 检索级别（P3a R1；透传给 QueryRouter，默认 HYPERGRAPH）。生产
             REST 入口经 _level_from_strategy 将 hybrid→FUSION，接通 bge-reranker。
         rerank: bge-reranker 重排开关（P3a R1；透传，None → 读 config.rerank_enabled）。
+        deadline: 协作式检索 deadline（绝对单调时钟，None 表示无预算；透传给底层
+            QueryRouter 做增强通道间超预算跳过）。
         """
         params_before = self.guard.current().snapshot()
         start = time.perf_counter()
 
         # 无锁执行检索（读操作，可并发执行；演化参数仅在 apply 后同步到 cfg）
         try:
-            raw = self._qr.retrieve(query, include_archived=include_archived,
-                                    session_ts=session_ts, level=level, rerank=rerank)
+            if deadline is not None:
+                raw = self._qr.retrieve(query, include_archived=include_archived,
+                                        session_ts=session_ts, level=level,
+                                        rerank=rerank, deadline=deadline)
+            else:
+                raw = self._qr.retrieve(query, include_archived=include_archived,
+                                        session_ts=session_ts, level=level,
+                                        rerank=rerank)
         except Exception as e:
             logger.error("检索失败: %s", e)
             return []

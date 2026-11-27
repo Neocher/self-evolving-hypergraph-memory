@@ -254,6 +254,8 @@ _RERANK_PREWARM_TIMEOUT = 60.0
 _RERANK_GATE: Optional[threading.Semaphore] = None
 _RERANK_GATE_VALUE: int = -1  # -1 = 未初始化
 _RERANK_GATE_LOCK = threading.Lock()
+# 【C1】连续超预算跳过重排达到该次数 → 本进程内禁用重排（WARNING 打一次）。
+_RERANK_BUDGET_FAILURE_THRESHOLD = 3
 # ── 进程级 in-flight 计数器（高并发显式卸载）──────────────────────────────────
 # 【高并发显式卸载】同时进行中的 retrieve 逻辑请求数（进程级，跨 QueryRouter 实例
 # 共享）。retrieve 入口自增、finally 自减（异常安全绝不泄漏）；递归级联
@@ -816,6 +818,10 @@ class QueryRouter:
         # 永久跳过（不再重试），主检索零回归降级。
         self._reranker = None
         self._rerank_failed = False
+        # 【C1】重排超预算跳过计数 / 进程内禁用标志（区别于 _rerank_failed 的
+        # ImportError/加载失败永久失败语义，二者独立，互不破坏）。
+        self._rerank_budget_failures = 0
+        self._rerank_budget_disabled = False
         self._rerank_lock = threading.Lock()
 
     def _normalize_query(self, query: str) -> str:
@@ -1818,6 +1824,7 @@ class QueryRouter:
         rerank: Optional[bool] = None,
         hyde: Optional[bool] = None,
         scope: Optional[int | str] = None,
+        deadline: Optional[float] = None,
     ) -> list[dict]:
         """多信号检索融合入口（检索契约详见 _retrieve_impl 文档）。
 
@@ -1839,6 +1846,7 @@ class QueryRouter:
                 rerank=rerank,
                 hyde=hyde,
                 scope=scope,
+                deadline=deadline,
             )
         finally:
             if owner:
@@ -1854,6 +1862,7 @@ class QueryRouter:
         rerank: Optional[bool] = None,
         hyde: Optional[bool] = None,
         scope: Optional[int | str] = None,
+        deadline: Optional[float] = None,
     ) -> list[dict]:
         """多信号检索融合实现（retrieve 包装层委托目标，含全部检索逻辑）。
 
@@ -1921,12 +1930,25 @@ class QueryRouter:
             total_budget_s = float(getattr(self.config, "total_step_budget_s", 3.0))
             skipped_expansions: list[str] = []
 
+            def _deadline_exceeded() -> bool:
+                return deadline is not None and time.monotonic() >= deadline
+
+            def _remaining_budget() -> float:
+                return max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
+
             def _expansion_budget_exhausted() -> bool:
                 return total_budget_s > 0.0 and (
                     time.monotonic() - finish_started
                 ) > total_budget_s
 
             def _guarded(name: str, fn, results: list[dict], *args, **kwargs) -> list[dict]:
+                if _deadline_exceeded():
+                    logger.info(
+                        "Retrieval deadline exceeded, skipping expansion step",
+                        skipped=name,
+                        remaining_budget_s=round(_remaining_budget(), 3),
+                    )
+                    return results
                 if _expansion_budget_exhausted():
                     skipped_expansions.append(name)
                     return results
@@ -2025,10 +2047,22 @@ class QueryRouter:
             # 之后重排头部覆盖 score，尾部原序保留。rerank=None → 读 config.rerank_enabled；
             # 异常/模型失败静默降级原列表（零回归）。
             if level == RetrievalLevel.FUSION:
-                rerank_enabled = self.config.rerank_enabled if rerank is None else rerank
-                sorted_results = self._rerank_results(
-                    sorted_results, raw_query, bool(rerank_enabled)
-                )
+                rerank_enabled = bool(self.config.rerank_enabled if rerank is None else rerank)
+                if rerank_enabled and self._is_rerank_budget_disabled():
+                    # 本进程内已因连续超预算禁用重排（WARNING 在置位时已打，此处静默跳过）
+                    pass
+                elif rerank_enabled and _deadline_exceeded():
+                    logger.info(
+                        "Retrieval deadline exceeded, skipping rerank",
+                        skipped="rerank",
+                        remaining_budget_s=round(_remaining_budget(), 3),
+                    )
+                    self._note_rerank_budget_exceeded()
+                elif rerank_enabled:
+                    self._reset_rerank_budget_failures()
+                    sorted_results = self._rerank_results(
+                        sorted_results, raw_query, True,
+                    )
             # 【P3-C】RPE 惊奇度轻重排（默认关零回归；仅 FUSION 生效）
             if level == RetrievalLevel.FUSION:
                 sorted_results = self._rpe_rerank_results(sorted_results)
@@ -2081,18 +2115,18 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l1_circuit_breaker")
                 return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l1_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
             self._tag_degraded(r, level="l1_empty")
             return r
 
@@ -2101,18 +2135,18 @@ class QueryRouter:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
             except CircuitBreakerOpen:
                 logger.warning("L2 circuit breaker open, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l2_circuit_breaker")
                 return r
             if results:
                 return _finish(results)
             logger.info("L2 empty, cascading to L3")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
             self._tag_degraded(r, level="l2_empty")
             return r
 
@@ -4618,6 +4652,26 @@ class QueryRouter:
         for r in results:
             if isinstance(r, dict) and "_degradation_level" not in r:
                 r["_degradation_level"] = level
+
+    def _is_rerank_budget_disabled(self) -> bool:
+        """重排是否已因连续超预算被本进程内禁用（独立于 _rerank_failed）。"""
+        return bool(getattr(self, "_rerank_budget_disabled", False))
+
+    def _note_rerank_budget_exceeded(self) -> None:
+        """记录一次「重排因超预算被跳过」；连续达到阈值 → 本进程内禁用重排 + WARNING。"""
+        failures = int(getattr(self, "_rerank_budget_failures", 0)) + 1
+        self._rerank_budget_failures = failures
+        if (failures >= _RERANK_BUDGET_FAILURE_THRESHOLD
+                and not getattr(self, "_rerank_budget_disabled", False)):
+            self._rerank_budget_disabled = True
+            logger.warning(
+                "rerank disabled in-process after %d consecutive budget exceeds",
+                failures,
+            )
+
+    def _reset_rerank_budget_failures(self) -> None:
+        """重排成功启动时复位连续超预算计数。"""
+        self._rerank_budget_failures = 0
 
     def _get_reranker(self):
         """【P3a】懒加载 bge-reranker CrossEncoder（双重检查锁 + 失败永久标记）。

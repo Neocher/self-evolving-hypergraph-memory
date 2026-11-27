@@ -1,12 +1,19 @@
 """SHM — 自演化超图记忆系统 版本信息"""
 
-__version__ = "6.28.0"
-__version_info__ = (6, 28, 0)
-__version_name__ = "LoadShedding"
-__release_date__ = "2026-10-12"
+__version__ = "6.28.1"
+__version_info__ = (6, 28, 1)
+__version_name__ = "DeadlineCache"
+__release_date__ = "2026-11-27"
 
 VERSION_SUMMARY = f"""SHM v{__version__} ({__version_name__})
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v6.28.1 (2026-11-27) DeadlineCache — 检索路径 C1+C2 修复:
+  【C1 协作式 deadline】QueryRouter.retrieve 新增可选 deadline（time.monotonic() 口径，
+  None 零回归）；_finish 在 community/mesa/visual/property/entity/attribute/scope/
+  schema/fact 通道间自检超预算跳过并返回已得部分结果，预算不足不启动 rerank；
+  连续 3 次超预算跳过 → 本进程内禁用重排 + WARNING（独立于 _rerank_failed）。
+  【C2 缓存修复】degraded 响应不进结果缓存；缓存键内嵌代际（_result_cache_generation），
+  新 episode 写成功后 bump 一次，旧代际键自然失效（写后即查不再回放降级旧值）。
 v6.28.0 (2026-10-12) LoadShedding — 检索性能总纲（19 个提交合并发布）:
   【成果】检索中位 15.40s → 1.6~3.0s（5~9x）；稳态超时率 ~11% → 0%；
   重启后首条 12.7s → ~2.5s；**并发 8 超时 8/8 → 0/8、并发 12 12/12 → 0/12**

@@ -19,7 +19,7 @@ import numpy as np
 
 from api._routes import Services
 from api.routes._deps import qsubmit, qsubmit_visual_index
-from api.routes.search import _level_from_strategy, _query_router_config, _retrieve_timeout, _DEGRADE_TIMEOUT
+from api.routes.search import _level_from_strategy, _query_router_config, _retrieve_timeout, _DEGRADE_TIMEOUT, _retrieve_with_deadline
 from api.models import (
     HealthStatus,
     HyperedgeListResponse,
@@ -504,6 +504,9 @@ class GatewayAPI:
         qr_config = _query_router_config(qr)
         level = _level_from_strategy(strategy, qr_config)
         retrieve_timeout = _retrieve_timeout(level, qr_config)
+        # 【C1】协作式 deadline（与 REST 入口一致）：QueryRouter 自检跳过超预算通道，
+        # 外层 wait_for 仅作 GraphLite 真挂死的最后防线。
+        deadline = time.monotonic() + retrieve_timeout
 
         try:
             # 【P3a R2】全同步检索链路移入线程池，避免阻塞事件循环（镜像 REST 入口）。
@@ -513,7 +516,9 @@ class GatewayAPI:
             # 不终止底层线程。
             results_raw = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._svc.query_router.retrieve, query,
+                    _retrieve_with_deadline,
+                    self._svc.query_router, query,
+                    deadline=deadline,
                     include_archived=include_archived, session_ts=session_ts,
                     level=level, rerank=None,
                 ),
