@@ -88,6 +88,8 @@ _SCHEMA_BOOST = 0.5
 _SCHEMA_MAX_RESULTS = 3
 # 【P3a R2】reranker 预热超时（秒）：CPU 冷加载 ~5-15s，60s 兜底防线程泄漏
 _RERANK_PREWARM_TIMEOUT = 60.0
+# 【C1】连续超预算跳过重排达到该次数 → 本进程内禁用重排（WARNING 打一次）。
+_RERANK_BUDGET_FAILURE_THRESHOLD = 3
 # 句首大写词误当实体的停用词（How/What/The/In ... 不是实体名）
 _PROPERTY_CANDIDATE_STOPWORDS = frozenset({
     "how", "what", "when", "why", "where", "which", "who", "whose", "whom",
@@ -511,6 +513,12 @@ class QueryRouter:
         # 永久跳过（不再重试），主检索零回归降级。
         self._reranker = None
         self._rerank_failed = False
+        # 【C1】重排超预算跳过计数 / 进程内禁用标志（区别于 _rerank_failed 的
+        # ImportError/加载失败永久失败语义，二者独立，互不破坏）。
+        self._rerank_budget_failures = 0
+        self._rerank_budget_disabled = False
+        # 【C1】重排实测耗时 EWMA（秒，进程内按实例）。0.0 = 尚无估计。
+        self._rerank_duration_estimate = 0.0
         self._rerank_lock = threading.Lock()
 
     def _normalize_query(self, query: str) -> str:
@@ -1508,6 +1516,7 @@ class QueryRouter:
         rerank: Optional[bool] = None,
         hyde: Optional[bool] = None,
         scope: Optional[int | str] = None,
+        deadline: Optional[float] = None,
     ) -> list[dict]:
         """多信号检索融合入口。
 
@@ -1545,6 +1554,9 @@ class QueryRouter:
                 参与检索（dual 双路合并 / replace 仅假设向量），生成失败静默
                 降级现状单路；False 显式关闭（逐字节等价旧行为）。
             scope: 会话作用域坐标（None → 全库；int/数字字符串 → 仅该会话；仅 FUSION）
+            deadline: 协作式检索 deadline（time.monotonic() 绝对时刻；None 零回归）。
+                在 _finish 各增强通道间自检：已过期即跳过剩余通道并返回已得部分
+                结果；重排预算不足则不启动（防外层 wait_for 放弃 + 孤儿线程）。
 
         Returns:
             检索结果列表 [...]
@@ -1565,37 +1577,48 @@ class QueryRouter:
             # 【v5.41 社区扩召回】补充非替代：统一去重/排序/boost 前 append 社区成员
             # （闭包可捕获 query/query_embedding/raw_query；候选经
             # _deduplicate_and_sort 单点去重 + core/画像 boost + 钳制，不双重放大）
-            results = self._community_expansion(results, query, query_embedding, raw_query)
-            # 【v5.49.0 MESA 记忆增强检索】补充非替代：社区摘要合成节点 append
-            # （node_id=community_id 可回溯，content=summary；无 archived 字段恒保留）
-            results = self._mesa_synthesis(results, query, raw_query)
-            # 【P2-a V-Mem 视觉召回】补充非替代：_filter_archived 前 append VisualNode
-            # （视觉节点无 archived 字段，走 _filter_archived 恒保留；候选同样经
-            # _deduplicate_and_sort 单点去重 + score 钳制，相对尾分缩放严格低于种子）
-            results = self._visual_recall(results, query, raw_query)
-            # 【P0-1 属性时间版本链】补充非替代：实体属性版本 append（PropertyVerNode
-            # 无 archived 字段，走 _filter_archived 恒保留；同样经单点去重 + score 钳制）
-            # 【P0-2】session_ts 透传：相对时间词按 session 时间锚解析（None 回落墙钟）
-            results = self._property_temporal_retrieve(results, query, raw_query, now_ts=session_ts)
-            # 【P3c 跨消息多跳增强】补充非替代：查询专名实体跨会话召回 append
-            # （EpisodeNode 带 archived 字段，_filter_archived 正常过滤；score = max(种子分)
-            # × boost(0.9) 仅低于最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._entity_expansion(results, query, raw_query, now_ts=session_ts)
-            # 【Schema 自进化 P0-② 检索通道 P1】属性匹配：查询词命中实体固化属性
-            # → MENTIONS episodes 补充召回（score = max(种子) × 0.85 降权）
-            results = self._attribute_expansion(results, query, raw_query, now_ts=session_ts)
-            # 【阶段3 图作用域检索】补充非替代：种子 EpisodeNode → 邻域向量检索
-            # append（仅 overgraph 后端；EpisodeNode 带 archived 字段，
-            # _filter_archived 正常过滤；score = max(种子分) × boost(0.9) 仅低于
-            # 最高种子，经 _deduplicate_and_sort 单点去重不双重放大）
-            results = self._scope_retrieve(results, query, query_embedding, now_ts=session_ts)
-            # 【阶段4-1 Schema 模式蒸馏】补充非替代：Schema 节点（:Conceptual 标签）
-            # 命中 → append 聚合线索上下文（尾分缩放；无 archived 字段恒保留）
-            results = self._schema_recall(results, raw_query or query)
-            # 【P0-③ AtomicFact 事实级中间层】补充非替代：查询实体命中
-            # AtomicFactNode → 事实文本（subject/predicate/object/time）直接进
-            # 上下文（事实级证据，EverOS 93.05 核心）；默认关（fact_channel_enabled）
-            results = self._fact_retrieve(results, query, raw_query, now_ts=session_ts)
+            # 【C1】协作式 deadline：每个增强通道执行前检查是否已过期，过期即跳过
+            # 后续通道并返回已得部分结果（只损增量，不损主检索）。
+            def _deadline_exceeded() -> bool:
+                return deadline is not None and time.monotonic() >= deadline
+
+            def _remaining_budget() -> float:
+                return max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
+
+            def _guarded(name: str, fn, results: list[dict], *args, **kwargs) -> list[dict]:
+                if _deadline_exceeded():
+                    logger.info(
+                        "Retrieval deadline exceeded, skipping expansion step",
+                        skipped=name,
+                        remaining_budget_s=round(_remaining_budget(), 3),
+                    )
+                    return results
+                return fn(results, *args, **kwargs)
+
+            results = _guarded(
+                "community_expansion", self._community_expansion,
+                results, query, query_embedding, raw_query)
+            results = _guarded(
+                "mesa_synthesis", self._mesa_synthesis, results, query, raw_query)
+            results = _guarded(
+                "visual_recall", self._visual_recall, results, query, raw_query)
+            results = _guarded(
+                "property_temporal_retrieve", self._property_temporal_retrieve,
+                results, query, raw_query, now_ts=session_ts)
+            results = _guarded(
+                "entity_expansion", self._entity_expansion,
+                results, query, raw_query, now_ts=session_ts)
+            results = _guarded(
+                "attribute_expansion", self._attribute_expansion,
+                results, query, raw_query, now_ts=session_ts)
+            results = _guarded(
+                "scope_retrieve", self._scope_retrieve,
+                results, query, query_embedding, now_ts=session_ts)
+            results = _guarded(
+                "schema_recall", self._schema_recall, results, raw_query or query)
+            results = _guarded(
+                "fact_retrieve", self._fact_retrieve,
+                results, query, raw_query, now_ts=session_ts)
             # 【达摩院 P0-a】会话作用域：去重/boost 前按 session_id 后置过滤（rerank 在
             # 会话内候选池做）。scoped 时聚合增强通道（community/MESA/视觉/schema 等
             # 无 session 归属）在此按 session_scope_drop_unattributed 丢弃——异会话文本
@@ -1614,10 +1637,43 @@ class QueryRouter:
             # 之后重排头部覆盖 score，尾部原序保留。rerank=None → 读 config.rerank_enabled；
             # 异常/模型失败静默降级原列表（零回归）。
             if level == RetrievalLevel.FUSION:
-                rerank_enabled = self.config.rerank_enabled if rerank is None else rerank
-                sorted_results = self._rerank_results(
-                    sorted_results, raw_query, bool(rerank_enabled)
-                )
+                rerank_enabled = bool(self.config.rerank_enabled if rerank is None else rerank)
+                if rerank_enabled and self._is_rerank_budget_disabled():
+                    # 本进程内已因连续超预算禁用重排（WARNING 在置位时已打，此处静默跳过）
+                    pass
+                elif rerank_enabled:
+                    # 【C1】预算不够但还没过期也要拦：剩余预算 < 1.2 × 实测耗时估计
+                    # → 不启动重排（防 9.6~20s 的 rerank 把外层 wait_for 拖到放弃、
+                    # 产生孤儿线程）。首次无估计 → 放行并记录实测耗时。
+                    remaining = (deadline - time.monotonic()) if deadline is not None else None
+                    estimate = float(getattr(self, "_rerank_duration_estimate", 0.0))
+                    if remaining is not None and remaining <= 0.0:
+                        logger.info(
+                            "Retrieval deadline exceeded, skipping rerank",
+                            skipped="rerank",
+                            remaining_budget_s=0.0,
+                        )
+                        self._note_rerank_budget_exceeded()
+                    elif (remaining is not None and estimate > 0.0
+                            and remaining < 1.2 * estimate):
+                        logger.info(
+                            "Retrieval budget too small for rerank, skipping",
+                            skipped="rerank",
+                            remaining_budget_s=round(remaining, 3),
+                            rerank_estimate_s=round(estimate, 3),
+                        )
+                        self._note_rerank_budget_exceeded()
+                    else:
+                        self._reset_rerank_budget_failures()
+                        t0 = time.monotonic()
+                        sorted_results = self._rerank_results(
+                            sorted_results, raw_query, True,
+                        )
+                        elapsed = time.monotonic() - t0
+                        self._update_rerank_duration_estimate(elapsed)
+                        # 重排返回后若实际耗时 > 启动时剩余预算 → 计入连续超预算熔断
+                        if remaining is not None and elapsed > remaining:
+                            self._note_rerank_budget_exceeded()
             # 【P3-C】RPE 惊奇度轻重排（默认关零回归；仅 FUSION 生效）
             if level == RetrievalLevel.FUSION:
                 sorted_results = self._rpe_rerank_results(sorted_results)
@@ -1670,18 +1726,18 @@ class QueryRouter:
                 results = self._hypergraph_retrieve(query, query_embedding)
             except CircuitBreakerOpen:
                 logger.warning("L1 circuit breaker open, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l1_circuit_breaker")
                 return r
             except FAISSUnavailable:
                 logger.warning("L1 FAISS unavailable, cascading to L2")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l1_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L1 empty, cascading to L2")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.VECTOR, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
             self._tag_degraded(r, level="l1_empty")
             return r
 
@@ -1690,13 +1746,13 @@ class QueryRouter:
                 results = self._vector_retrieve(query, query_embedding)
             except FAISSUnavailable:
                 logger.warning("L2 FAISS unavailable, cascading to L3")
-                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+                r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
                 self._tag_degraded(r, level="l2_faiss_unavailable")
                 return r
             if results:
                 return _finish(results)
             logger.info("L2 empty, cascading to L3")
-            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope)
+            r = self.retrieve(query, query_embedding, RetrievalLevel.KEYWORD, include_archived=include_archived, session_ts=session_ts, scope=scope, deadline=deadline)
             self._tag_degraded(r, level="l2_empty")
             return r
 
@@ -4034,6 +4090,34 @@ class QueryRouter:
         for r in results:
             if isinstance(r, dict) and "_degradation_level" not in r:
                 r["_degradation_level"] = level
+
+    def _is_rerank_budget_disabled(self) -> bool:
+        """重排是否已因连续超预算被本进程内禁用（独立于 _rerank_failed）。"""
+        return bool(getattr(self, "_rerank_budget_disabled", False))
+
+    def _note_rerank_budget_exceeded(self) -> None:
+        """记录一次「重排因超预算被跳过」；连续达到阈值 → 本进程内禁用重排 + WARNING。"""
+        failures = int(getattr(self, "_rerank_budget_failures", 0)) + 1
+        self._rerank_budget_failures = failures
+        if (failures >= _RERANK_BUDGET_FAILURE_THRESHOLD
+                and not getattr(self, "_rerank_budget_disabled", False)):
+            self._rerank_budget_disabled = True
+            logger.warning(
+                "rerank disabled in-process after %d consecutive budget exceeds",
+                failures,
+            )
+
+    def _reset_rerank_budget_failures(self) -> None:
+        """重排成功启动时复位连续超预算计数。"""
+        self._rerank_budget_failures = 0
+
+    def _update_rerank_duration_estimate(self, elapsed_s: float) -> None:
+        """更新重排实测耗时 EWMA（α=0.3 偏近期；首次直接记录）。"""
+        est = float(getattr(self, "_rerank_duration_estimate", 0.0))
+        if est <= 0.0:
+            self._rerank_duration_estimate = float(elapsed_s)
+        else:
+            self._rerank_duration_estimate = 0.7 * est + 0.3 * float(elapsed_s)
 
     def _get_reranker(self):
         """【P3a】懒加载 bge-reranker CrossEncoder（双重检查锁 + 失败永久标记）。

@@ -1,5 +1,24 @@
 # Changelog
 
+## v6.25.1 (2026-11-27) — DeadlineCache: 检索路径 C1+C2 回移（生产上线）
+
+> 本版本是从 v6.28.1（PR #2）回移到生产 v6.25 基线的 C1+C2 修复；不含 v6.28
+> LoadShedding 主线特性（见 PR body）。
+
+### C1 协作式 deadline（不再雪崩）
+- `QueryRouter.retrieve` 新增可选 `deadline`（`time.monotonic()` 绝对时刻，`None` 逐字节零回归）。
+- `_finish` 在 community → mesa → visual → property → entity → attribute → scope → schema → fact → dedupe → rerank 通道间自检：已过期即跳过剩余通道并返回已得部分结果。
+- 重排预算守卫：记录 rerank 实测耗时 EWMA（首次放行并记录）；启动前要求 `remaining >= 1.2 × estimate`，否则不启动；返回后实际耗时 > 剩余预算计入熔断；连续 3 次超预算 → 进程内禁用重排 + WARNING（独立于 `_rerank_failed`）。
+- 检索入口（`api/routes/search.py` / `gateway/gateway_api.py`）传 deadline；外层 `wait_for` 保留为最后防线。
+
+### C2 degraded 不进缓存 + 代际失效
+- `degraded=True` 响应不写 `_result_cache`，且同 key 已存在旧值一并删除。
+- `_result_cache_generation` + `bump_result_cache_generation`/`current_result_cache_generation`：缓存键内嵌代际，新 episode 写成功后 bump 一次，旧代际键自然失效。
+
+### 验证
+- 新增 `tests/test_retrieval_deadline_cache.py`（回移版）。
+- 全量 pytest（生产同款解释器 python3.12）见 PR body。
+
 ## v6.5.1 (2026-08-26) — Refined-Bench: LoCoMo-Refined 官方判卷全量评测
 
 ### 🎯 LoCoMo-Refined 全量评测 (1382 问, 官方判卷协议)

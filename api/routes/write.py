@@ -16,6 +16,7 @@ from core.user_profile import _SOURCE_WEIGHTS as _SOURCE_TYPE_LEVEL
 from api.routes._deps import (
     router, Services, get_services, _now, logger,
     _embed_queue, _embed_queue_lock, flush_faiss_buffer,
+    bump_result_cache_generation,
     set_trace_id, record_request, qsubmit, qsubmit_visual_index,
     Depends, Request, JSONResponse, HTTPException,
     uuid, np, base64, json, time,
@@ -269,6 +270,7 @@ async def write_sensory(
             "created_at": start,
             "tau_initial": 1.0,
         }, record.namespace or None)
+        bump_result_cache_generation()
         if deps.dream_scheduler:
             await deps.dream_scheduler.on_node_created()
 
@@ -478,6 +480,7 @@ async def write_multimodal(
             "created_at": created_at,
             "tau_initial": 1.0,
         }, req.namespace or None)
+        bump_result_cache_generation()
 
         # 通知梦境调度器
         if deps.dream_scheduler:
@@ -759,6 +762,8 @@ async def create_episode(
     # 【L4】create+ensure+link 合成单闭包单次 qsubmit（失败短路，消除半写）
     await qsubmit(deps, _write_episode_with_session, deps.graph_store,
                   episode_data, req.namespace or None)
+    # 【C2b】一次写请求 bump 一次：旧代际检索缓存键立即失效
+    bump_result_cache_generation()
 
     # 【P1 显式冲突撤销】新节点落库后仲裁（时序关键：SUPERSEDES 边 MATCH (b)
     # 需新节点已存在，归档必须在此之后；低优先级不抢 high 写额度）
@@ -951,6 +956,10 @@ async def create_episodes_batch(
         except Exception as e:
             results.append({"episode_id": episode_id, "status": "error", "error": str(e)})
 
+    # 【C2b】一次批量写请求 bump 一次（有任一 episode 成功创建时）
+    if created_entries:
+        bump_result_cache_generation()
+
     # 【P1-1】批量超边创建: 每 source 只查 1 次 recent 窗口
     try:
         await _auto_create_hyperedges_batch(created_entries, deps)
@@ -1038,6 +1047,7 @@ async def promote_to_episode(
         "created_at": created_at,
         "tau_initial": tau,
     })
+    bump_result_cache_generation()
 
     # 【FIX 2026-08-07】promote 后必须入 embedding 队列，否则提升的 episode
     # 永远不会进 FAISS 向量索引（检索链路 L1/L2 全空，数据不可检索）。

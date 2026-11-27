@@ -254,6 +254,25 @@ _result_cache: dict[str, Any] = {}  # f"{query}:{top_k}" → RetrieveResponse
 _result_cache_max: int = 128
 _result_cache_lock: threading.Lock = threading.Lock()
 
+# 【C2b】检索结果缓存代际：新 episode 写入成功后 bump 一次，缓存键内嵌 generation，
+# 旧代际键自然失效（不再命中）。clear_result_cache 仍保留供 self_evolving 使用。
+_result_cache_generation: int = 0
+_result_cache_generation_lock: threading.Lock = threading.Lock()
+
+
+def bump_result_cache_generation() -> int:
+    """新 episode 写入成功后调用：代际 +1，使所有旧代际缓存键失效。"""
+    global _result_cache_generation
+    with _result_cache_generation_lock:
+        _result_cache_generation += 1
+        return _result_cache_generation
+
+
+def current_result_cache_generation() -> int:
+    """读取当前缓存代际（cache_key 构建用）。"""
+    with _result_cache_generation_lock:
+        return _result_cache_generation
+
 
 def clear_result_cache() -> None:
     """清空检索结果缓存（检索配置演化后旧缓存失效）。
