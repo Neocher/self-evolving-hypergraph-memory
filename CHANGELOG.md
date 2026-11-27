@@ -1,5 +1,22 @@
 # Changelog
 
+## v6.28.1 (2026-11-27) — DeadlineCache: 检索路径 C1+C2 修复
+
+### C1 协作式 deadline（不再雪崩）
+- `QueryRouter.retrieve` / `_retrieve_impl` 新增可选 `deadline`（`time.monotonic()` 绝对时刻，`None` 逐字节零回归）。
+- `_finish` 在 community → mesa → visual → property → entity → attribute → scope → schema → fact → dedupe → rerank 通道间自检：已过期即跳过剩余通道，用已得部分结果返回；预算不足不启动 `_rerank_results`。
+- 检索入口（`api/routes/search.py` 与 `gateway/gateway_api.py`）传 `deadline = monotonic() + retrieve_timeout`；外层 `wait_for` 保留为 GraphLite 真挂死最后防线。
+- 进程级重排闸复用既有 `_RERANK_GATE`（Semaphore(1)）；新增连续 3 次超预算跳过 → 本进程内禁用重排 + WARNING（独立于 `_rerank_failed` 的 ImportError/加载失败语义）。
+
+### C2 degraded 不进缓存 + 代际失效
+- `degraded=True` 响应不写 `_result_cache`，且同 key 已存在旧值一并删除。
+- `_result_cache_generation` + `bump_result_cache_generation`/`current_result_cache_generation`：缓存键内嵌代际，新 episode 写成功后 bump 一次，旧代际键自然失效。
+- `clear_result_cache()` 行为不变（self_evolving 仍使用）。
+
+### 验证
+- 新增 `tests/test_retrieval_deadline_cache.py`（5 用例）。
+- 全量 1795 passed / 5 failed（5 个均为既有环境/数据问题，非本改动引入）/ 2 skipped / 5 deselected。
+
 ## v6.5.1 (2026-08-26) — Refined-Bench: LoCoMo-Refined 官方判卷全量评测
 
 ### 🎯 LoCoMo-Refined 全量评测 (1382 问, 官方判卷协议)
